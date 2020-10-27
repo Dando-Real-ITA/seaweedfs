@@ -2,11 +2,19 @@ package filesys
 
 import (
 	"bytes"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"io"
+	"runtime"
 	"sync"
 	"time"
+
+	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/chrislusf/seaweedfs/weed/util"
+)
+
+var (
+	concurrentWriterLimit = runtime.NumCPU()
+	concurrentWriters     = util.NewLimitedConcurrentExecutor(4 * concurrentWriterLimit)
 )
 
 type ContinuousDirtyPages struct {
@@ -15,17 +23,26 @@ type ContinuousDirtyPages struct {
 	writeWaitGroup         sync.WaitGroup
 	chunkSaveErrChan       chan error
 	chunkSaveErrChanClosed bool
+	lastErr                error
 	lock                   sync.Mutex
 	collection             string
 	replication            string
 }
 
 func newDirtyPages(file *File) *ContinuousDirtyPages {
-	return &ContinuousDirtyPages{
+	dirtyPages := &ContinuousDirtyPages{
 		intervals:        &ContinuousIntervals{},
 		f:                file,
-		chunkSaveErrChan: make(chan error, 8),
+		chunkSaveErrChan: make(chan error, concurrentWriterLimit),
 	}
+	go func() {
+		for t := range dirtyPages.chunkSaveErrChan {
+			if t != nil {
+				dirtyPages.lastErr = t
+			}
+		}
+	}()
+	return dirtyPages
 }
 
 func (pages *ContinuousDirtyPages) AddPage(offset int64, data []byte) {
@@ -39,7 +56,7 @@ func (pages *ContinuousDirtyPages) AddPage(offset int64, data []byte) {
 
 	pages.intervals.AddInterval(data, offset)
 
-	if pages.intervals.TotalSize() > pages.f.wfs.option.ChunkSizeLimit {
+	if pages.intervals.TotalSize() >= pages.f.wfs.option.ChunkSizeLimit {
 		pages.saveExistingLargestPageToStorage()
 	}
 
@@ -84,7 +101,7 @@ func (pages *ContinuousDirtyPages) saveExistingLargestPageToStorage() (hasSavedD
 func (pages *ContinuousDirtyPages) saveToStorage(reader io.Reader, offset int64, size int64) {
 
 	if pages.chunkSaveErrChanClosed {
-		pages.chunkSaveErrChan = make(chan error, 8)
+		pages.chunkSaveErrChan = make(chan error, concurrentWriterLimit)
 		pages.chunkSaveErrChanClosed = false
 	}
 
@@ -93,10 +110,8 @@ func (pages *ContinuousDirtyPages) saveToStorage(reader io.Reader, offset int64,
 	go func() {
 		defer pages.writeWaitGroup.Done()
 
-		dir, _ := pages.f.fullpath().DirAndName()
-
 		reader = io.LimitReader(reader, size)
-		chunk, collection, replication, err := pages.f.wfs.saveDataAsChunk(dir)(reader, pages.f.Name, offset)
+		chunk, collection, replication, err := pages.f.wfs.saveDataAsChunk(pages.f.fullpath())(reader, pages.f.Name, offset)
 		if err != nil {
 			glog.V(0).Infof("%s saveToStorage [%d,%d): %v", pages.f.fullpath(), offset, offset+size, err)
 			pages.chunkSaveErrChan <- err
@@ -105,7 +120,7 @@ func (pages *ContinuousDirtyPages) saveToStorage(reader io.Reader, offset int64,
 		chunk.Mtime = mtime
 		pages.collection, pages.replication = collection, replication
 		pages.f.addChunks([]*filer_pb.FileChunk{chunk})
-		pages.chunkSaveErrChan <- nil
+		glog.V(3).Infof("%s saveToStorage [%d,%d)", pages.f.fullpath(), offset, offset+size)
 	}()
 }
 

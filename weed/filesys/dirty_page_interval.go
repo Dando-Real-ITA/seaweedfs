@@ -3,6 +3,8 @@ package filesys
 import (
 	"bytes"
 	"io"
+
+	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
 type IntervalNode struct {
@@ -89,6 +91,15 @@ func subList(list *IntervalLinkedList, start, stop int64) *IntervalLinkedList {
 func (c *ContinuousIntervals) AddInterval(data []byte, offset int64) {
 
 	interval := &IntervalNode{Data: data, Offset: offset, Size: int64(len(data))}
+
+	// append to the tail and return
+	if len(c.lists) == 1 {
+		lastSpan := c.lists[0]
+		if lastSpan.Tail.Offset+lastSpan.Tail.Size == offset {
+			lastSpan.addNodeToTail(interval)
+			return
+		}
+	}
 
 	var newLists []*IntervalLinkedList
 	for _, list := range c.lists {
@@ -200,10 +211,13 @@ func (c *ContinuousIntervals) ReadDataAt(data []byte, startOffset int64) (maxSto
 func (l *IntervalLinkedList) ToReader() io.Reader {
 	var readers []io.Reader
 	t := l.Head
-	readers = append(readers, bytes.NewReader(t.Data))
+	readers = append(readers, util.NewBytesReader(t.Data))
 	for t.Next != nil {
 		t = t.Next
 		readers = append(readers, bytes.NewReader(t.Data))
+	}
+	if len(readers) == 1 {
+		return readers[0]
 	}
 	return io.MultiReader(readers...)
 }
