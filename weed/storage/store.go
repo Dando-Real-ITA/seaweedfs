@@ -194,6 +194,12 @@ func (s *Store) SetDataCenter(dataCenter string) {
 func (s *Store) SetRack(rack string) {
 	s.rack = rack
 }
+func (s *Store) GetDataCenter() string {
+	return s.dataCenter
+}
+func (s *Store) GetRack() string {
+	return s.rack
+}
 
 func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 	var volumeMessages []*master_pb.VolumeInformationMessage
@@ -229,7 +235,6 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 				}
 			}
 			if v.IsReadOnly() {
-				collectionVolumeReadOnlyCount[v.Collection] = make(map[string]uint8)
 				collectionVolumeReadOnlyCount[v.Collection]["IsReadOnly"] += 1
 				if v.noWriteOrDelete {
 					collectionVolumeReadOnlyCount[v.Collection]["noWriteOrDelete"] += 1
@@ -456,7 +461,8 @@ func (s *Store) GetVolumeSizeLimit() uint64 {
 func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 	volumeSizeLimit := s.GetVolumeSizeLimit()
 	for _, diskLocation := range s.Locations {
-		if diskLocation.MaxVolumeCount == 0 {
+		if diskLocation.OriginalMaxVolumeCount == 0 {
+			currentMaxVolumeCount := diskLocation.MaxVolumeCount
 			diskStatus := stats.NewDiskStatus(diskLocation.Directory)
 			unusedSpace := diskLocation.UnUsedSpace(volumeSizeLimit)
 			unclaimedSpaces := int64(diskStatus.Free) - int64(unusedSpace)
@@ -468,7 +474,7 @@ func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 			diskLocation.MaxVolumeCount = maxVolumeCount
 			glog.V(0).Infof("disk %s max %d unclaimedSpace:%dMB, unused:%dMB volumeSizeLimit:%dMB",
 				diskLocation.Directory, maxVolumeCount, unclaimedSpaces/1024/1024, unusedSpace/1024/1024, volumeSizeLimit/1024/1024)
-			hasChanges = true
+			hasChanges = hasChanges || currentMaxVolumeCount != diskLocation.MaxVolumeCount
 		}
 	}
 	return
