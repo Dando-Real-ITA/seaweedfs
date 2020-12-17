@@ -3,6 +3,7 @@ package filer
 import (
 	"context"
 	"errors"
+	"github.com/chrislusf/seaweedfs/weed/glog"
 	"strings"
 	"time"
 
@@ -45,6 +46,7 @@ type FilerStore interface {
 type VirtualFilerStore interface {
 	FilerStore
 	DeleteHardLink(ctx context.Context, hardLinkId HardLinkId) error
+	DeleteOneEntry(ctx context.Context, entry *Entry) error
 }
 
 type FilerStoreWrapper struct {
@@ -84,6 +86,7 @@ func (fsw *FilerStoreWrapper) InsertEntry(ctx context.Context, entry *Entry) err
 		return err
 	}
 
+	glog.V(4).Infof("InsertEntry %s", entry.FullPath)
 	return fsw.ActualStore.InsertEntry(ctx, entry)
 }
 
@@ -103,6 +106,7 @@ func (fsw *FilerStoreWrapper) UpdateEntry(ctx context.Context, entry *Entry) err
 		return err
 	}
 
+	glog.V(4).Infof("UpdateEntry %s", entry.FullPath)
 	return fsw.ActualStore.UpdateEntry(ctx, entry)
 }
 
@@ -113,6 +117,7 @@ func (fsw *FilerStoreWrapper) FindEntry(ctx context.Context, fp util.FullPath) (
 		stats.FilerStoreHistogram.WithLabelValues(fsw.ActualStore.GetName(), "find").Observe(time.Since(start).Seconds())
 	}()
 
+	glog.V(4).Infof("FindEntry %s", fp)
 	entry, err = fsw.ActualStore.FindEntry(ctx, fp)
 	if err != nil {
 		return nil, err
@@ -137,12 +142,33 @@ func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath)
 	}
 	if len(existingEntry.HardLinkId) != 0 {
 		// remove hard link
+		glog.V(4).Infof("DeleteHardLink %s", existingEntry.FullPath)
 		if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
 			return err
 		}
 	}
 
+	glog.V(4).Infof("DeleteEntry %s", fp)
 	return fsw.ActualStore.DeleteEntry(ctx, fp)
+}
+
+func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry *Entry) (err error) {
+	stats.FilerStoreCounter.WithLabelValues(fsw.ActualStore.GetName(), "delete").Inc()
+	start := time.Now()
+	defer func() {
+		stats.FilerStoreHistogram.WithLabelValues(fsw.ActualStore.GetName(), "delete").Observe(time.Since(start).Seconds())
+	}()
+
+	if len(existingEntry.HardLinkId) != 0 {
+		// remove hard link
+		glog.V(4).Infof("DeleteHardLink %s", existingEntry.FullPath)
+		if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
+			return err
+		}
+	}
+
+	glog.V(4).Infof("DeleteOneEntry %s", existingEntry.FullPath)
+	return fsw.ActualStore.DeleteEntry(ctx, existingEntry.FullPath)
 }
 
 func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.FullPath) (err error) {
@@ -152,6 +178,7 @@ func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.
 		stats.FilerStoreHistogram.WithLabelValues(fsw.ActualStore.GetName(), "deleteFolderChildren").Observe(time.Since(start).Seconds())
 	}()
 
+	glog.V(4).Infof("DeleteFolderChildren %s", fp)
 	return fsw.ActualStore.DeleteFolderChildren(ctx, fp)
 }
 
@@ -162,6 +189,7 @@ func (fsw *FilerStoreWrapper) ListDirectoryEntries(ctx context.Context, dirPath 
 		stats.FilerStoreHistogram.WithLabelValues(fsw.ActualStore.GetName(), "list").Observe(time.Since(start).Seconds())
 	}()
 
+	glog.V(4).Infof("ListDirectoryEntries %s from %s limit %d", dirPath, startFileName, limit)
 	entries, err := fsw.ActualStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit)
 	if err != nil {
 		return nil, err
@@ -179,6 +207,7 @@ func (fsw *FilerStoreWrapper) ListDirectoryPrefixedEntries(ctx context.Context, 
 	defer func() {
 		stats.FilerStoreHistogram.WithLabelValues(fsw.ActualStore.GetName(), "prefixList").Observe(time.Since(start).Seconds())
 	}()
+	glog.V(4).Infof("ListDirectoryPrefixedEntries %s from %s prefix %s limit %d", dirPath, startFileName, prefix, limit)
 	entries, err := fsw.ActualStore.ListDirectoryPrefixedEntries(ctx, dirPath, startFileName, includeStartFile, limit, prefix)
 	if err == ErrUnsupportedListDirectoryPrefixed {
 		entries, err = fsw.prefixFilterEntries(ctx, dirPath, startFileName, includeStartFile, limit, prefix)

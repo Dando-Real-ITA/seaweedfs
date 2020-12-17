@@ -39,6 +39,7 @@ func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.L
 			Extended:        entry.Extended,
 			HardLinkId:      entry.HardLinkId,
 			HardLinkCounter: entry.HardLinkCounter,
+			Content:         entry.Content,
 		},
 	}, nil
 }
@@ -84,6 +85,7 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 					Extended:        entry.Extended,
 					HardLinkId:      entry.HardLinkId,
 					HardLinkCounter: entry.HardLinkCounter,
+					Content:         entry.Content,
 				},
 			}); err != nil {
 				return err
@@ -168,6 +170,7 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 		Extended:        req.Entry.Extended,
 		HardLinkId:      filer.HardLinkId(req.Entry.HardLinkId),
 		HardLinkCounter: req.Entry.HardLinkCounter,
+		Content:         req.Entry.Content,
 	}, req.OExcl, req.IsFromOtherCluster, req.Signatures)
 
 	if createErr == nil {
@@ -202,6 +205,7 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 		Chunks:          chunks,
 		HardLinkId:      filer.HardLinkId(req.Entry.HardLinkId),
 		HardLinkCounter: req.Entry.HardLinkCounter,
+		Content:         req.Entry.Content,
 	}
 
 	glog.V(3).Infof("updating %s: %+v, chunks %d: %v => %+v, chunks %d: %v, extended: %v => %v",

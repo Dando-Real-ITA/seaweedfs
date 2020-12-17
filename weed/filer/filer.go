@@ -18,7 +18,7 @@ import (
 
 const (
 	LogFlushInterval = time.Minute
-	PaginationSize   = 1024 * 256
+	PaginationSize   = 1024
 	FilerStoreId     = "filer.store.id"
 )
 
@@ -238,6 +238,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, o_excl bool, isFr
 
 func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry) (err error) {
 	if oldEntry != nil {
+		entry.Attr.Crtime = oldEntry.Attr.Crtime
 		if oldEntry.IsDirectory() && !entry.IsDirectory() {
 			glog.Errorf("existing %s is a directory", entry.FullPath)
 			return fmt.Errorf("existing %s is a directory", entry.FullPath)
@@ -250,26 +251,28 @@ func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry) (err er
 	return f.Store.UpdateEntry(ctx, entry)
 }
 
+var (
+	Root = &Entry{
+		FullPath: "/",
+		Attr: Attr{
+			Mtime:  time.Now(),
+			Crtime: time.Now(),
+			Mode:   os.ModeDir | 0755,
+			Uid:    OS_UID,
+			Gid:    OS_GID,
+		},
+	}
+)
+
 func (f *Filer) FindEntry(ctx context.Context, p util.FullPath) (entry *Entry, err error) {
 
-	now := time.Now()
-
 	if string(p) == "/" {
-		return &Entry{
-			FullPath: p,
-			Attr: Attr{
-				Mtime:  now,
-				Crtime: now,
-				Mode:   os.ModeDir | 0755,
-				Uid:    OS_UID,
-				Gid:    OS_GID,
-			},
-		}, nil
+		return Root, nil
 	}
 	entry, err = f.Store.FindEntry(ctx, p)
 	if entry != nil && entry.TtlSec > 0 {
 		if entry.Crtime.Add(time.Duration(entry.TtlSec) * time.Second).Before(time.Now()) {
-			f.Store.DeleteEntry(ctx, p.Child(entry.Name()))
+			f.Store.DeleteOneEntry(ctx, entry)
 			return nil, filer_pb.ErrNotFound
 		}
 	}
@@ -303,7 +306,7 @@ func (f *Filer) doListDirectoryEntries(ctx context.Context, p util.FullPath, sta
 		lastFileName = entry.Name()
 		if entry.TtlSec > 0 {
 			if entry.Crtime.Add(time.Duration(entry.TtlSec) * time.Second).Before(time.Now()) {
-				f.Store.DeleteEntry(ctx, p.Child(entry.Name()))
+				f.Store.DeleteOneEntry(ctx, entry)
 				expiredCount++
 				continue
 			}
@@ -316,12 +319,4 @@ func (f *Filer) doListDirectoryEntries(ctx context.Context, p util.FullPath, sta
 func (f *Filer) Shutdown() {
 	f.LocalMetaLogBuffer.Shutdown()
 	f.Store.Shutdown()
-}
-
-func (f *Filer) maybeDeleteHardLinks(hardLinkIds []HardLinkId) {
-	for _, hardLinkId := range hardLinkIds {
-		if err := f.Store.DeleteHardLink(context.Background(), hardLinkId); err != nil {
-			glog.Errorf("delete hard link id %d : %v", hardLinkId, err)
-		}
-	}
 }

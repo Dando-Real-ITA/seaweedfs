@@ -55,6 +55,7 @@ type FilerOption struct {
 	Port               uint32
 	recursiveDelete    bool
 	Cipher             bool
+	CacheToFilerLimit  int64
 	Filers             []string
 }
 
@@ -126,6 +127,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		defaultMux.HandleFunc("/", fs.filerHandler)
 	}
 	if defaultMux != readonlyMux {
+		handleStaticResources(readonlyMux)
 		readonlyMux.HandleFunc("/", fs.readonlyFilerHandler)
 	}
 

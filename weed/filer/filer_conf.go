@@ -9,13 +9,15 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
 	"github.com/viant/ptrie"
 )
 
 const (
-	DirectoryEtc  = "/etc"
-	FilerConfName = "filer.conf"
+	DirectoryEtcRoot      = "/etc"
+	DirectoryEtcSeaweedFS = "/etc/seaweedfs"
+	FilerConfName         = "filer.conf"
+	IamConfigDirecotry    = "/etc/iam"
+	IamIdentityFile       = "identity.json"
 )
 
 type FilerConf struct {
@@ -30,7 +32,7 @@ func NewFilerConf() (fc *FilerConf) {
 }
 
 func (fc *FilerConf) loadFromFiler(filer *Filer) (err error) {
-	filerConfPath := util.NewFullPath(DirectoryEtc, FilerConfName)
+	filerConfPath := util.NewFullPath(DirectoryEtcSeaweedFS, FilerConfName)
 	entry, err := filer.FindEntry(context.Background(), filerConfPath)
 	if err != nil {
 		if err == filer_pb.ErrNotFound {
@@ -38,6 +40,10 @@ func (fc *FilerConf) loadFromFiler(filer *Filer) (err error) {
 		}
 		glog.Errorf("read filer conf entry %s: %v", filerConfPath, err)
 		return
+	}
+
+	if len(entry.Content) > 0 {
+		return fc.LoadFromBytes(entry.Content)
 	}
 
 	return fc.loadFromChunks(filer, entry.Chunks)
@@ -57,15 +63,7 @@ func (fc *FilerConf) LoadFromBytes(data []byte) (err error) {
 	conf := &filer_pb.FilerConf{}
 
 	if err := jsonpb.Unmarshal(bytes.NewReader(data), conf); err != nil {
-
-		err = proto.UnmarshalText(string(data), conf)
-		if err != nil {
-			glog.Errorf("unable to parse filer conf: %v", err)
-			// this is not recoverable
-			return nil
-		}
-
-		return nil
+		return err
 	}
 
 	return fc.doLoadConf(conf)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/glog"
 	"io"
 	"net/http"
 	"net/url"
@@ -197,11 +198,12 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 		sepIndex := strings.Index(marker, "/")
 		subDir, subMarker := marker[0:sepIndex], marker[sepIndex+1:]
 		// println("doListFilerEntries dir", dir+"/"+subDir, "subMarker", subMarker, "maxKeys", maxKeys)
-		subCounter, _, subNextMarker, subErr := s3a.doListFilerEntries(client, dir+"/"+subDir, "", maxKeys, subMarker, delimiter, eachEntryFn)
+		subCounter, subIsTruncated, subNextMarker, subErr := s3a.doListFilerEntries(client, dir+"/"+subDir, "", maxKeys, subMarker, delimiter, eachEntryFn)
 		if subErr != nil {
 			err = subErr
 			return
 		}
+		isTruncated = isTruncated || subIsTruncated
 		maxKeys -= subCounter
 		nextMarker = subDir + "/" + subNextMarker
 		counter += subCounter
@@ -245,8 +247,8 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 		if entry.IsDirectory {
 			// println("ListEntries", dir, "dir:", entry.Name)
 			if entry.Name != ".uploads" { // FIXME no need to apply to all directories. this extra also affects maxKeys
-				eachEntryFn(dir, entry)
 				if delimiter != "/" {
+					eachEntryFn(dir, entry)
 					// println("doListFilerEntries2 dir", dir+"/"+entry.Name, "maxKeys", maxKeys-counter)
 					subCounter, subIsTruncated, subNextMarker, subErr := s3a.doListFilerEntries(client, dir+"/"+entry.Name, "", maxKeys-counter, "", delimiter, eachEntryFn)
 					if subErr != nil {
@@ -261,7 +263,14 @@ func (s3a *S3ApiServer) doListFilerEntries(client filer_pb.SeaweedFilerClient, d
 						return
 					}
 				} else {
-					counter++
+					var isEmpty bool
+					if isEmpty, err = s3a.isDirectoryAllEmpty(client, dir, entry.Name); err != nil {
+						return
+					}
+					if !isEmpty {
+						eachEntryFn(dir, entry)
+						counter++
+					}
 				}
 			}
 		} else {
@@ -297,4 +306,50 @@ func getListObjectsV1Args(values url.Values) (prefix, marker, delimiter string, 
 		maxkeys = maxObjectListSizeLimit
 	}
 	return
+}
+
+func (s3a *S3ApiServer) isDirectoryAllEmpty(filerClient filer_pb.SeaweedFilerClient, parentDir, name string) (isEmpty bool, err error) {
+	// println("+ isDirectoryAllEmpty", dir, name)
+	var fileCounter int
+	var subDirs []string
+	currentDir := parentDir + "/" + name
+	var startFrom string
+	var isExhausted bool
+	for fileCounter == 0 && !isExhausted {
+		err = filer_pb.SeaweedList(filerClient, currentDir, "", func(entry *filer_pb.Entry, isLast bool) error {
+			if entry.IsDirectory {
+				subDirs = append(subDirs, entry.Name)
+			} else {
+				fileCounter++
+			}
+			startFrom = entry.Name
+			isExhausted = isExhausted || isLast
+			return nil
+		}, startFrom, false, 8)
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	if fileCounter > 0 {
+		return false, nil
+	}
+
+	for _, subDir := range subDirs {
+		isSubEmpty, subErr := s3a.isDirectoryAllEmpty(filerClient, currentDir, subDir)
+		if subErr != nil {
+			return false, subErr
+		}
+		if !isSubEmpty {
+			return false, nil
+		}
+	}
+
+	glog.V(1).Infof("deleting empty folder %s", currentDir)
+	if err = doDeleteEntry(filerClient, parentDir, name, true, true); err != nil {
+		return
+	}
+
+	return true, nil
 }

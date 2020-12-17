@@ -5,14 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
-	"net/http"
 	"strings"
 
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
-	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
 func init() {
@@ -65,25 +62,16 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 
 	var buf bytes.Buffer
 	if err = commandEnv.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-
-		request := &filer_pb.LookupDirectoryEntryRequest{
-			Directory: filer.DirectoryEtc,
-			Name:      filer.FilerConfName,
-		}
-		respLookupEntry, err := filer_pb.LookupEntry(client, request)
-		if err != nil {
-			return err
-		}
-
-		return filer.StreamContent(commandEnv.MasterClient, &buf, respLookupEntry.Entry.Chunks, 0, math.MaxInt64)
-
-	}); err != nil {
+		return filer.ReadEntry(commandEnv.MasterClient, client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, &buf)
+	}); err != nil && err != filer_pb.ErrNotFound {
 		return err
 	}
 
 	fc := filer.NewFilerConf()
-	if err = fc.LoadFromBytes(buf.Bytes()); err != nil {
-		return err
+	if buf.Len() > 0 {
+		if err = fc.LoadFromBytes(buf.Bytes()); err != nil {
+			return err
+		}
 	}
 
 	if *locationPrefix != "" {
@@ -107,7 +95,7 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 			if err != nil {
 				return fmt.Errorf("parse replication %s: %v", *replication, err)
 			}
-			if *volumeGrowthCount % rp.GetCopyCount() != 0 {
+			if *volumeGrowthCount%rp.GetCopyCount() != 0 {
 				return fmt.Errorf("volumeGrowthCount %d should be devided by replication copy count %d", *volumeGrowthCount, rp.GetCopyCount())
 			}
 		}
@@ -128,21 +116,9 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 
 	if *apply {
 
-		target := fmt.Sprintf("http://%s:%d%s/%s", commandEnv.option.FilerHost, commandEnv.option.FilerPort, filer.DirectoryEtc, filer.FilerConfName)
-
-		// set the HTTP method, url, and request body
-		req, err := http.NewRequest(http.MethodPut, target, &buf)
-		if err != nil {
+		if err := filer.SaveAs(commandEnv.option.FilerHost, int(commandEnv.option.FilerPort), filer.DirectoryEtcSeaweedFS, filer.FilerConfName, "text/plain; charset=utf-8", &buf); err != nil {
 			return err
 		}
-
-		// set the request header Content-Type for json
-		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-		util.CloseResponse(resp)
 
 	}
 
