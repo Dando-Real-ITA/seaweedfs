@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2020-10-09 20:03:59
+# 2020-12-18 21:17:47
 
 ########################################################################################################################################################################################################################
 
-sleep 3
+sleep 10
 
 # Read all commands
 ARGS=""
@@ -81,6 +81,11 @@ if ! [ -z "$CIP" ]; then
   ARGS=${ARGS:+${ARGS} }$CIP
 elif ! [ -z "$IP" ]; then
   ARGS=${ARGS:+${ARGS} }$IP
+fi
+
+# If there is a public url, add it to the parameters
+if ! [ -z "$PUBLIC_URL" ]; then
+  ARGS=${ARGS:+${ARGS} }"-publicUrl=$PUBLIC_URL"
 fi
 
 exec /entrypoint.sh $ARGS
