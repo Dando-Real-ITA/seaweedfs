@@ -1,4 +1,4 @@
-# 2020-12-18 21:26:40
+# 2020-12-19 18:43:40
 FROM frolvlad/alpine-glibc as builder
 RUN apk add git go g++
 RUN mkdir -p /go/src/github.com/chrislusf/
@@ -11,7 +11,7 @@ ADD https://api.github.com/repos/Dando-Real-ITA/seaweedfs/git/refs/heads/develop
 RUN git clone --depth 1 https://github.com/Dando-Real-ITA/seaweedfs -b develop --shallow-submodules seaweedfs
 WORKDIR seaweedfs/weed
 
-RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" \
+RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" && \
   go install -ldflags "${LDFLAGS}"
 
 FROM alpine AS final
