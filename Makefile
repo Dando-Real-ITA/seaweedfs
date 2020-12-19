@@ -11,11 +11,11 @@ sources := $(wildcard *.go)
 COMMIT ?= $(shell git rev-parse --short HEAD)
 LDFLAGS ?= -X github.com/chrislusf/seaweedfs/weed/util.COMMIT=${COMMIT}
 
-build = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -a -ldflags "-linkmode external -extldflags '-static' $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
+build = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -ldflags "-extldflags -static $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
 tar = cd build && tar -cvzf $(1)_$(2).tar.gz $(appname)$(3) && rm $(appname)$(3)
 zip = cd build && zip $(1)_$(2).zip $(appname)$(3) && rm $(appname)$(3)
 
-build_large = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -a -tags 5BytesOffset -ldflags "-linkmode external -extldflags '-static' $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
+build_large = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -tags 5BytesOffset -ldflags "-extldflags -static $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
 tar_large = cd build && tar -cvzf $(1)_$(2)_large_disk.tar.gz $(appname)$(3) && rm $(appname)$(3)
 zip_large = cd build && zip $(1)_$(2)_large_disk.zip $(appname)$(3) && rm $(appname)$(3)
 
