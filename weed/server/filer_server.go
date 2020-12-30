@@ -23,6 +23,7 @@ import (
 	_ "github.com/chrislusf/seaweedfs/weed/filer/cassandra"
 	_ "github.com/chrislusf/seaweedfs/weed/filer/elastic/v7"
 	_ "github.com/chrislusf/seaweedfs/weed/filer/etcd"
+	_ "github.com/chrislusf/seaweedfs/weed/filer/hbase"
 	_ "github.com/chrislusf/seaweedfs/weed/filer/leveldb"
 	_ "github.com/chrislusf/seaweedfs/weed/filer/leveldb2"
 	_ "github.com/chrislusf/seaweedfs/weed/filer/mongodb"
@@ -109,6 +110,8 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 			os.MkdirAll(option.DefaultLevelDbDir, 0755)
 		}
 		glog.V(0).Infof("default to create filer store dir in %s", option.DefaultLevelDbDir)
+	} else {
+		glog.Warningf("skipping default store dir in %s", option.DefaultLevelDbDir)
 	}
 	util.LoadConfiguration("notification", false)
 

@@ -44,6 +44,8 @@ func runScaffold(cmd *Command, args []string) bool {
 		content = SECURITY_TOML_EXAMPLE
 	case "master":
 		content = MASTER_TOML_EXAMPLE
+	case "shell":
+		content = SHELL_TOML_EXAMPLE
 	}
 	if content == "" {
 		println("need a valid -config option")
@@ -138,12 +140,21 @@ hosts=[
 ]
 username=""
 password=""
+# This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
+superLargeDirectories = []
+
+[hbase]
+enabled = false
+zkquorum = ""
+table = "seaweedfs"
 
 [redis2]
 enabled = false
 address  = "localhost:6379"
 password = ""
 database = 0
+# This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
+superLargeDirectories = []
 
 [redis_cluster2]
 enabled = false
@@ -160,6 +171,8 @@ password = ""
 readOnly = true
 # automatically use the closest Redis server for reads
 routeByLatency = true
+# This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
+superLargeDirectories = []
 
 [etcd]
 enabled = false
@@ -447,6 +460,20 @@ copy_other = 1            # create n x 1 = n actual volumes
 # try to replicate to all available volumes. You should only use this option
 # if you are doing your own replication or periodic sync of volumes.
 treat_replication_as_minimums = false
+
+`
+	SHELL_TOML_EXAMPLE = `
+
+[cluster]
+default = "c1"
+
+[cluster.c1]
+master = "localhost:9333"    # comma-separated master servers
+filer = "localhost:8888"     # filer host and port
+
+[cluster.c2]
+master = ""
+filer = ""
 
 `
 )

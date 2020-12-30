@@ -25,7 +25,7 @@ func (f *Filer) LoadConfiguration(config *viper.Viper) {
 				glog.Fatalf("failed to initialize store for %s: %+v", store.GetName(), err)
 			}
 			f.SetStore(store)
-			glog.V(0).Infof("configured filer for %s", store.GetName())
+			glog.V(0).Infof("configured filer store to %s", store.GetName())
 			hasDefaultStoreConfigured = true
 			break
 		}
@@ -59,12 +59,15 @@ func (f *Filer) LoadConfiguration(config *viper.Viper) {
 		parts := strings.Split(key, ".")
 		storeName, storeId := parts[0], parts[1]
 
-		store := storeNames[storeName]
+		store, found := storeNames[storeName]
+		if !found {
+			continue
+		}
 		store = reflect.New(reflect.ValueOf(store).Elem().Type()).Interface().(FilerStore)
 		if err := store.Initialize(config, key+"."); err != nil {
 			glog.Fatalf("Failed to initialize store for %s: %+v", key, err)
 		}
-		location := config.GetString(key+".location")
+		location := config.GetString(key + ".location")
 		if location == "" {
 			glog.Errorf("path-specific filer store needs %s", key+".location")
 			os.Exit(-1)
