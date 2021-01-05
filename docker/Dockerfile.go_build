@@ -1,4 +1,4 @@
-# 2020-12-19 18:43:40
+# 2021-01-05 19:21:07
 FROM frolvlad/alpine-glibc as builder
 RUN apk add git go g++ fuse
 RUN mkdir -p /go/src/github.com/chrislusf/
@@ -14,11 +14,21 @@ WORKDIR seaweedfs/weed
 RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" && \
   go install -ldflags "${LDFLAGS}"
 
+  ###########################################################################
+
+FROM builder as builder_large
+
+RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" && \
+  go install -tags 5BytesOffset -ldflags "${LDFLAGS}"
+
+  ###########################################################################
+
 FROM alpine AS final
 RUN \
   apk add --no-cache --update bind-tools bash fuse && \
   rm -rf /tmp/*
 LABEL author="Chris Lu"
+LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
 COPY --from=builder /root/go/bin/weed /usr/bin/
 RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
@@ -48,3 +58,6 @@ RUN chmod +x /entrypoint.sh
 RUN chmod +x /start.sh
 
 ENTRYPOINT ["/start.sh"]
+
+FROM final AS final_large
+COPY --from=builder_large /root/go/bin/weed /usr/bin/
