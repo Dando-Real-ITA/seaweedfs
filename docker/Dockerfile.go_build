@@ -1,6 +1,6 @@
 # 2020-12-19 18:43:40
 FROM frolvlad/alpine-glibc as builder
-RUN apk add git go g++
+RUN apk add git go g++ fuse
 RUN mkdir -p /go/src/github.com/chrislusf/
 WORKDIR /go/src/github.com/chrislusf/
 COPY go.mod .
