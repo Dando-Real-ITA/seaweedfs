@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2020-12-18 21:17:47
+# 2021-01-05 19:35:47
 
 ########################################################################################################################################################################################################################
 
@@ -86,6 +86,14 @@ fi
 # If there is a public url, add it to the parameters
 if ! [ -z "$PUBLIC_URL" ]; then
   ARGS=${ARGS:+${ARGS} }"-publicUrl=$PUBLIC_URL"
+
+  # If there is a tld, use it to extract rack and datacenter
+  # gpu01.dal1.llnw.katapy.io with tld=katapy.io -> -rack=dal1 -dataCenter=llnw
+  if ! [ -z "$TLD" ]; then
+    IFS='.' read -a hostname_parts <<<${PUBLIC_URL%.${TLD}}
+    ARGS=${ARGS:+${ARGS} }"-rack=${hostname_parts[1]} -dataCenter=${hostname_parts[2]}"
+  fi
+
 fi
 
 exec /entrypoint.sh $ARGS
