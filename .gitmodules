@@ -1,0 +1,3 @@
+[submodule "docker/plugin"]
+	path = docker/plugin
+	url = https://github.com/Dando-Real-ITA/seaweedfs_plugin.git
