@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2021-01-05 19:35:47
+# 2021-01-13 15:53:48
 
 ########################################################################################################################################################################################################################
 
@@ -11,69 +11,74 @@ ARGS=""
 IP=""
 CIP=""
 for ARG in $@; do
-  # Detect a *peers command
-  if [[ $ARG == *"peers="* ]]; then
-    # TODO detect quotes after the =
-    OPTION=$(expr "$ARG" : '\(.*=\)')
-    VALUE=$(expr "$ARG" : '.*=\(.*\)')
 
-    echo "Detected ${OPTION}"
+  if [[ ${DETECT_PEERS:-true} != "false" ]]; then
+    # Detect a *peers command
+    if [[ $ARG == *"peers="* ]]; then
+      # TODO detect quotes after the =
+      OPTION=$(expr "$ARG" : '\(.*=\)')
+      VALUE=$(expr "$ARG" : '.*=\(.*\)')
 
-    # Split all peers
-    PEERS=""
-    IFS=',' read -ra ADDRS <<< "$VALUE"
-    for ADDR in "${ADDRS[@]}"; do
-      # Get HOST:PORT
-      HOST=$(expr "$ADDR" : '\(.*\):')
-      PORT=$(expr "$ADDR" : '.*:\(.*\)')
-      # Add directly IP peers
-      if [[ $HOST =~ ^[0-9\.]+$ ]]; then
-        PEERS=${PEERS:+${PEERS},}${HOST}:${PORT}
-      else
-        echo "Getting IPs for ${HOST}"
+      echo "Detected ${OPTION}"
 
-        # Get all tasks ips
-        typeset -i nbt
-        nbt=0
-        SECONDS=0
+      # Split all peers
+      PEERS=""
+      IFS=',' read -ra ADDRS <<< "$VALUE"
+      for ADDR in "${ADDRS[@]}"; do
+        # Get HOST:PORT
+        HOST=$(expr "$ADDR" : '\(.*\):')
+        PORT=$(expr "$ADDR" : '.*:\(.*\)')
+        # Add directly IP peers
+        if [[ $HOST =~ ^[0-9\.]+$ ]]; then
+          PEERS=${PEERS:+${PEERS},}${HOST}:${PORT}
+        else
+          echo "Getting IPs for ${HOST}"
 
-        echo "Waiting for the min peers count (${CLUSTER_SIZE})"
+          # Get all tasks ips
+          typeset -i nbt
+          nbt=0
+          SECONDS=0
 
-        while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
-          tips=$(dig @127.0.0.11 +short tasks.${HOST})
-          nbt=$(echo $tips | wc -w)
-          [[ $SECONDS -gt 120 ]] && break
-          sleep 1
-        done
-        for tip in $tips; do
-          echo "Adding peer: ${tip}"
-          PEERS=${PEERS:+${PEERS},}${tip}:${PORT}
+          echo "Waiting for the min peers count (${CLUSTER_SIZE})"
 
-          cip=$(grep ${tip} /etc/hosts | awk '{print $1}' | head -1)
-          if [[ -n "$cip" ]]; then
-            echo "Found current ip: ${cip}"
-            CIP="-ip=${cip}"
-          fi
-        done
+          while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
+            tips=$(dig @127.0.0.11 +short tasks.${HOST})
+            nbt=$(echo $tips | wc -w)
+            [[ $SECONDS -gt 120 ]] && break
+            sleep 1
+          done
+          for tip in $tips; do
+            echo "Adding peer: ${tip}"
+            PEERS=${PEERS:+${PEERS},}${tip}:${PORT}
 
-        # TODO handle normal hostnames correctly, in case no service is found
-        # # Get all direct ips
-        # ips=$(dig @127.0.0.11 +short ${HOST})
-        # for ip in $ips; do
-        #   echo "Adding peer: ${ip}" 
-        #   PEERS=${PEERS:+${PEERS},}${ip}:${PORT}
-        # done
-      fi
-    done
+            cip=$(grep ${tip} /etc/hosts | awk '{print $1}' | head -1)
+            if [[ -n "$cip" ]]; then
+              echo "Found current ip: ${cip}"
+              CIP="-ip=${cip}"
+            fi
+          done
 
-    ARG=${PEERS:+${OPTION}${PEERS}}
-  # Detect an ip command
-  elif [[ $ARG == *"ip="* ]]; then
-    # Save the IP as a fallback
-    IP=$ARG
-    # Not writing the ip for now
-    ARG=""
+          # TODO handle normal hostnames correctly, in case no service is found
+          # # Get all direct ips
+          # ips=$(dig @127.0.0.11 +short ${HOST})
+          # for ip in $ips; do
+          #   echo "Adding peer: ${ip}"
+          #   PEERS=${PEERS:+${PEERS},}${ip}:${PORT}
+          # done
+        fi
+      done
+
+      ARG=${PEERS:+${OPTION}${PEERS}}
+
+    # Detect an ip command
+    elif [[ $ARG == *"ip="* ]]; then
+      # Save the IP as a fallback
+      IP=$ARG
+      # Not writing the ip for now
+      ARG=""
+    fi
   fi
+
   ARGS=${ARGS:+${ARGS} }$ARG
 done
 
