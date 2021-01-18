@@ -125,17 +125,16 @@ func (store *UniversalRedisStore) DeleteFolderChildren(ctx context.Context, full
 	return nil
 }
 
-func (store *UniversalRedisStore) ListDirectoryPrefixedEntries(ctx context.Context, fullpath util.FullPath, startFileName string, inclusive bool, limit int, prefix string) (entries []*filer.Entry, err error) {
-	return nil, filer.ErrUnsupportedListDirectoryPrefixed
+func (store *UniversalRedisStore) ListDirectoryPrefixedEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
+	return lastFileName, filer.ErrUnsupportedListDirectoryPrefixed
 }
 
-func (store *UniversalRedisStore) ListDirectoryEntries(ctx context.Context, fullpath util.FullPath, startFileName string, inclusive bool,
-	limit int) (entries []*filer.Entry, err error) {
+func (store *UniversalRedisStore) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
 
-	dirListKey := genDirectoryListKey(string(fullpath))
+	dirListKey := genDirectoryListKey(string(dirPath))
 	members, err := store.Client.SMembers(ctx, dirListKey).Result()
 	if err != nil {
-		return nil, fmt.Errorf("list %s : %v", fullpath, err)
+		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
 	}
 
 	// skip
@@ -144,7 +143,7 @@ func (store *UniversalRedisStore) ListDirectoryEntries(ctx context.Context, full
 		for _, m := range members {
 			if strings.Compare(m, startFileName) >= 0 {
 				if m == startFileName {
-					if inclusive {
+					if includeStartFile {
 						t = append(t, m)
 					}
 				} else {
@@ -161,16 +160,20 @@ func (store *UniversalRedisStore) ListDirectoryEntries(ctx context.Context, full
 	})
 
 	// limit
-	if limit < len(members) {
+	if limit < int64(len(members)) {
 		members = members[:limit]
 	}
 
 	// fetch entry meta
 	for _, fileName := range members {
-		path := util.NewFullPath(string(fullpath), fileName)
+		path := util.NewFullPath(string(dirPath), fileName)
 		entry, err := store.FindEntry(ctx, path)
+		lastFileName = fileName
 		if err != nil {
 			glog.V(0).Infof("list %s : %v", path, err)
+			if err == filer_pb.ErrNotFound {
+				continue
+			}
 		} else {
 			if entry.TtlSec > 0 {
 				if entry.Attr.Crtime.Add(time.Duration(entry.TtlSec) * time.Second).Before(time.Now()) {
@@ -179,11 +182,13 @@ func (store *UniversalRedisStore) ListDirectoryEntries(ctx context.Context, full
 					continue
 				}
 			}
-			entries = append(entries, entry)
+			if !eachEntryFunc(entry) {
+				break
+			}
 		}
 	}
 
-	return entries, err
+	return lastFileName, err
 }
 
 func genDirectoryListKey(dir string) (dirList string) {

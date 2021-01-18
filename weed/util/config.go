@@ -52,17 +52,50 @@ type ViperProxy struct {
 	sync.Mutex
 }
 
+var (
+	vp = &ViperProxy{}
+)
+
 func (vp *ViperProxy) SetDefault(key string, value interface{}) {
 	vp.Lock()
 	defer vp.Unlock()
 	vp.Viper.SetDefault(key, value)
 }
 
+func (vp *ViperProxy) GetString(key string) string {
+	vp.Lock()
+	defer vp.Unlock()
+	return vp.Viper.GetString(key)
+}
+
+func (vp *ViperProxy) GetBool(key string) bool {
+	vp.Lock()
+	defer vp.Unlock()
+	return vp.Viper.GetBool(key)
+}
+
+func (vp *ViperProxy) GetInt(key string) int {
+	vp.Lock()
+	defer vp.Unlock()
+	return vp.Viper.GetInt(key)
+}
+
+func (vp *ViperProxy) GetStringSlice(key string) []string {
+	vp.Lock()
+	defer vp.Unlock()
+	return vp.Viper.GetStringSlice(key)
+}
+
 func GetViper() *ViperProxy {
-	v := &ViperProxy{}
-	v.Viper = viper.GetViper()
-	v.AutomaticEnv()
-	v.SetEnvPrefix("weed")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	return v
+	vp.Lock()
+	defer vp.Unlock()
+
+	if vp.Viper == nil {
+		vp.Viper = viper.GetViper()
+		vp.AutomaticEnv()
+		vp.SetEnvPrefix("weed")
+		vp.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	}
+
+	return vp
 }
