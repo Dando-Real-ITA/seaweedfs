@@ -82,7 +82,7 @@ target
 other/java/hdfs/dependency-reduced-pom.xml
 
 # binary file
-weed/weed
-linux/weed/weed
+weed/weed*
+linux/weed/weed*
 
 .vscode/
