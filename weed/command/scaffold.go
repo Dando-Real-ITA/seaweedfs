@@ -101,7 +101,7 @@ dir = "./filerldb3"					# directory to store level db files
 enabled = false
 dir = "./filerrdb"					# directory to store rocksdb files
 
-[mysql]  # or tidb
+[mysql]  # or memsql, tidb
 # CREATE TABLE IF NOT EXISTS filemeta (
 #   dirhash     BIGINT         COMMENT 'first 64 bits of MD5 hash value of directory field',
 #   name        VARCHAR(1000)  COMMENT 'directory or file name',
@@ -121,7 +121,28 @@ connection_max_open = 100
 connection_max_lifetime_seconds = 0
 interpolateParams = false
 
-[postgres] # or cockroachdb
+[mysql2]  # or memsql, tidb
+enabled = false
+createTable = """
+  CREATE TABLE IF NOT EXISTS %s (
+    dirhash BIGINT, 
+    name VARCHAR(1000), 
+    directory TEXT, 
+    meta LONGBLOB, 
+    PRIMARY KEY (dirhash, name)
+  ) DEFAULT CHARSET=utf8;
+"""
+hostname = "localhost"
+port = 3306
+username = "root"
+password = ""
+database = ""              # create or use an existing database
+connection_max_idle = 2
+connection_max_open = 100
+connection_max_lifetime_seconds = 0
+interpolateParams = false
+
+[postgres] # or cockroachdb, YugabyteDB
 # CREATE TABLE IF NOT EXISTS filemeta (
 #   dirhash     BIGINT,
 #   name        VARCHAR(65535),
@@ -134,7 +155,29 @@ hostname = "localhost"
 port = 5432
 username = "postgres"
 password = ""
-database = ""              # create or use an existing database
+database = "postgres"          # create or use an existing database
+schema = ""
+sslmode = "disable"
+connection_max_idle = 100
+connection_max_open = 100
+
+[postgres2]
+enabled = false
+createTable = """
+  CREATE TABLE IF NOT EXISTS %s (
+    dirhash   BIGINT, 
+    name      VARCHAR(65535), 
+    directory VARCHAR(65535), 
+    meta      bytea, 
+    PRIMARY KEY (dirhash, name)
+  );
+"""
+hostname = "localhost"
+port = 5432
+username = "postgres"
+password = ""
+database = "postgres"          # create or use an existing database
+schema = ""
 sslmode = "disable"
 connection_max_idle = 100
 connection_max_open = 100
