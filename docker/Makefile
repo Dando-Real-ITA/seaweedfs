@@ -12,6 +12,9 @@ build:
 dev: build
 	docker-compose -f local-dev-compose.yml -p seaweedfs up
 
+dev_mount: build
+	docker-compose -f local-mount-compose.yml -p seaweedfs up
+
 k8s: build
 	docker-compose -f local-k8s-compose.yml -p seaweedfs up
 
@@ -20,6 +23,9 @@ dev_registry: build
 
 cluster: build
 	docker-compose -f local-cluster-compose.yml -p seaweedfs up
+
+2clusters: build
+	docker-compose -f local-clusters-compose.yml -p seaweedfs up
 
 clean:
 	rm ./weed
