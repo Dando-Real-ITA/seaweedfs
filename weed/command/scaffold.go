@@ -329,7 +329,8 @@ enabled = false
 # This URL will Dial the RabbitMQ server at the URL in the environment
 # variable RABBIT_SERVER_URL and open the exchange "myexchange".
 # The exchange must have already been created by some other means, like
-# the RabbitMQ management plugin.
+# the RabbitMQ management plugin. Сreate myexchange of type fanout and myqueue then
+# create binding myexchange => myqueue
 topic_url = "rabbit://myexchange"
 sub_url = "rabbit://myqueue"
 `
@@ -349,6 +350,16 @@ grpcAddress = "localhost:18888"
 # this is not a directory on your hard drive, but on your filer.
 # i.e., all files with this "prefix" are sent to notification message queue.
 directory = "/buckets"
+
+[sink.local]
+enabled = false
+directory = "/data"
+
+[sink.local_incremental]
+# all replicated files are under modified time as yyyy-mm-dd directories
+# so each date directory contains all new and updated files.
+enabled = false
+directory = "/backup"
 
 [sink.filer]
 enabled = false

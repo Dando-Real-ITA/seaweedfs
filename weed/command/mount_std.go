@@ -100,9 +100,9 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	uid, gid := uint32(0), uint32(0)
 	mountMode := os.ModeDir | 0777
 	if err == nil {
-		mountMode = os.ModeDir | fileInfo.Mode()
+		mountMode = os.ModeDir | os.FileMode(0777)&^umask
 		uid, gid = util.GetFileUidGid(fileInfo)
-		fmt.Printf("mount point owner uid=%d gid=%d mode=%s\n", uid, gid, fileInfo.Mode())
+		fmt.Printf("mount point owner uid=%d gid=%d mode=%s\n", uid, gid, mountMode)
 	} else {
 		fmt.Printf("can not stat %s\n", dir)
 		return false
@@ -169,6 +169,8 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	}
 
 	seaweedFileSystem := filesys.NewSeaweedFileSystem(&filesys.Option{
+		MountDirectory:              dir,
+		FilerAddress:                filer,
 		FilerGrpcAddress:            filerGrpcAddress,
 		GrpcDialOption:              grpcDialOption,
 		FilerMountRootPath:          mountRoot,
@@ -206,7 +208,9 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	})
 
 	glog.V(0).Infof("mounted %s%s to %s", filer, mountRoot, dir)
-	err = fs.Serve(c, seaweedFileSystem)
+	server := fs.New(c, nil)
+	seaweedFileSystem.Server = server
+	err = server.Serve(seaweedFileSystem)
 
 	// check if the mount process has an error to report
 	<-c.Ready
