@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
@@ -175,16 +176,15 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 	var deletedObjects []ObjectIdentifier
 	var deleteErrors []DeleteError
 
+	directoriesWithDeletion := make(map[string]int)
+
 	s3a.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 
+		// delete file entries
 		for _, object := range deleteObjects.Objects {
-			response, _ := s3a.listFilerEntries(bucket, object.ObjectName, 1, "", "/")
-			if len(response.Contents) != 0 && strings.HasSuffix(object.ObjectName, "/") {
-				continue
-			}
 
 			lastSeparator := strings.LastIndex(object.ObjectName, "/")
-			parentDirectoryPath, entryName, isDeleteData, isRecursive := "/", object.ObjectName, true, true
+			parentDirectoryPath, entryName, isDeleteData, isRecursive := "/", object.ObjectName, true, false
 			if lastSeparator > 0 && lastSeparator+1 < len(object.ObjectName) {
 				entryName = object.ObjectName[lastSeparator+1:]
 				parentDirectoryPath = "/" + object.ObjectName[:lastSeparator]
@@ -193,8 +193,10 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 
 			err := doDeleteEntry(client, parentDirectoryPath, entryName, isDeleteData, isRecursive)
 			if err == nil {
+				directoriesWithDeletion[parentDirectoryPath]++
 				deletedObjects = append(deletedObjects, object)
 			} else {
+				delete(directoriesWithDeletion, parentDirectoryPath)
 				deleteErrors = append(deleteErrors, DeleteError{
 					Code:    "",
 					Message: err.Error(),
@@ -202,6 +204,22 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 				})
 			}
 		}
+
+		// purge empty folders, only checking folders with deletions
+		var allDirs []string
+		for dir, _ := range directoriesWithDeletion {
+			allDirs = append(allDirs, dir)
+		}
+		sort.Slice(allDirs, func(i, j int) bool {
+			return len(allDirs[i]) > len(allDirs[j])
+		})
+		for _, dir := range allDirs {
+			parentDir, dirName := util.FullPath(dir).DirAndName()
+			if err := doDeleteEntry(client, parentDir, dirName, false, false); err != nil {
+				glog.V(4).Infof("directory %s has %d deletion but still not empty: %v", dir, directoriesWithDeletion[dir], err)
+			}
+		}
+
 		return nil
 	})
 

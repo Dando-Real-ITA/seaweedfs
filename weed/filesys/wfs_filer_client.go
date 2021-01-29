@@ -25,3 +25,10 @@ func (wfs *WFS) WithFilerClient(fn func(filer_pb.SeaweedFilerClient) error) erro
 	return err
 
 }
+
+func (wfs *WFS) AdjustedUrl(location *filer_pb.Location) string {
+	if wfs.option.VolumeServerAccess == "publicUrl" {
+		return location.PublicUrl
+	}
+	return location.Url
+}

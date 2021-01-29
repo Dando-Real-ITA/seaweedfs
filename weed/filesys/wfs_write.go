@@ -44,7 +44,7 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 				Url:       resp.Url,
 				PublicUrl: resp.PublicUrl,
 			}
-			host = loc.Url
+			host = wfs.AdjustedUrl(loc)
 			collection, replication = resp.Collection, resp.Replication
 
 			return nil
@@ -53,7 +53,7 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 		}
 
 		fileUrl := fmt.Sprintf("http://%s/%s", host, fileId)
-		if wfs.option.OutsideContainerClusterMode {
+		if wfs.option.VolumeServerAccess == "filerProxy" {
 			fileUrl = fmt.Sprintf("http://%s/?proxyChunkId=%s", wfs.option.FilerAddress, fileId)
 		}
 		uploadResult, err, data := operation.Upload(fileUrl, filename, wfs.option.Cipher, reader, false, "", nil, auth)
