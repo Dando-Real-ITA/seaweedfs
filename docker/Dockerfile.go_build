@@ -1,4 +1,4 @@
-# 2021-01-28 14:38:47
+# 2021-01-29 07:56:36
 FROM frolvlad/alpine-glibc as builder
 RUN apk add git go g++ fuse fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
@@ -23,13 +23,12 @@ RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev
 
   ###########################################################################
 
-FROM alpine AS final
+FROM alpine AS pre_final
 RUN \
   apk add --no-cache --update bind-tools bash fuse fuse3 && \
   rm -rf /tmp/*
 LABEL author="Chris Lu"
 LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
-COPY --from=builder /root/go/bin/weed /usr/bin/
 RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/entrypoint.sh /entrypoint.sh
@@ -59,5 +58,8 @@ RUN chmod +x /start.sh
 
 ENTRYPOINT ["/start.sh"]
 
-FROM final AS final_large
+FROM pre_final AS final
+COPY --from=builder /root/go/bin/weed /usr/bin/
+
+FROM pre_final AS final_large
 COPY --from=builder_large /root/go/bin/weed /usr/bin/
