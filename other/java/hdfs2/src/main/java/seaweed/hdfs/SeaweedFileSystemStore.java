@@ -216,7 +216,7 @@ public class SeaweedFileSystemStore {
             SeaweedWrite.writeMeta(filerGrpcClient, getParentDirectory(path), entry);
         }
 
-        return new SeaweedOutputStream(filerGrpcClient, path, entry, writePosition, bufferSize, replication);
+        return new SeaweedHadoopOutputStream(filerGrpcClient, path.toString(), entry, writePosition, bufferSize, replication);
 
     }
 
@@ -230,7 +230,7 @@ public class SeaweedFileSystemStore {
             throw new FileNotFoundException("read non-exist file " + path);
         }
 
-        return new SeaweedInputStream(filerGrpcClient,
+        return new SeaweedHadoopInputStream(filerGrpcClient,
             statistics,
             path.toUri().getPath(),
             entry);
