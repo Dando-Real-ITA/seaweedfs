@@ -206,18 +206,8 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 		}
 
 		// purge empty folders, only checking folders with deletions
-		var allDirs []string
-		for dir, _ := range directoriesWithDeletion {
-			allDirs = append(allDirs, dir)
-		}
-		sort.Slice(allDirs, func(i, j int) bool {
-			return len(allDirs[i]) > len(allDirs[j])
-		})
-		for _, dir := range allDirs {
-			parentDir, dirName := util.FullPath(dir).DirAndName()
-			if err := doDeleteEntry(client, parentDir, dirName, false, false); err != nil {
-				glog.V(4).Infof("directory %s has %d deletion but still not empty: %v", dir, directoriesWithDeletion[dir], err)
-			}
+		for len(directoriesWithDeletion) > 0 {
+			directoriesWithDeletion = doDeleteEmptyDirectories(client, directoriesWithDeletion)
 		}
 
 		return nil
@@ -231,6 +221,26 @@ func (s3a *S3ApiServer) DeleteMultipleObjectsHandler(w http.ResponseWriter, r *h
 
 	writeSuccessResponseXML(w, encodeResponse(deleteResp))
 
+}
+
+func doDeleteEmptyDirectories(client filer_pb.SeaweedFilerClient, directoriesWithDeletion map[string]int) (newDirectoriesWithDeletion map[string]int){
+	var allDirs []string
+	for dir, _ := range directoriesWithDeletion {
+		allDirs = append(allDirs, dir)
+	}
+	sort.Slice(allDirs, func(i, j int) bool {
+		return len(allDirs[i]) > len(allDirs[j])
+	})
+	newDirectoriesWithDeletion = make(map[string]int)
+	for _, dir := range allDirs {
+		parentDir, dirName := util.FullPath(dir).DirAndName()
+		if err := doDeleteEntry(client, parentDir, dirName, false, false); err != nil {
+			glog.V(4).Infof("directory %s has %d deletion but still not empty: %v", dir, directoriesWithDeletion[dir], err)
+		} else {
+			newDirectoriesWithDeletion[parentDir]++
+		}
+	}
+	return
 }
 
 var passThroughHeaders = []string{
@@ -286,8 +296,10 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 	defer util.CloseResponse(resp)
 
 	if (resp.ContentLength == -1 || resp.StatusCode == 404) && !strings.HasSuffix(destUrl, "/") {
-		writeErrorResponse(w, s3err.ErrNoSuchKey, r.URL)
-		return
+		if r.Method != "DELETE" {
+			writeErrorResponse(w, s3err.ErrNoSuchKey, r.URL)
+			return
+		}
 	}
 
 	responseFn(resp, w)
