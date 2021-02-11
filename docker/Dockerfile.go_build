@@ -1,6 +1,6 @@
 # 2021-01-29 07:56:36
 FROM frolvlad/alpine-glibc as builder
-RUN apk add git go g++ fuse
+RUN apk add git go g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
 WORKDIR /go/src/github.com/chrislusf/
 COPY go.mod .
@@ -25,7 +25,7 @@ RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev
 
 FROM alpine AS pre_final
 RUN \
-  apk add --no-cache --update bind-tools bash fuse && \
+  apk add --no-cache --update bind-tools bash fuse3 && \
   rm -rf /tmp/*
 LABEL author="Chris Lu"
 LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
