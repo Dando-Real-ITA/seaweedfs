@@ -27,6 +27,11 @@ FROM alpine AS pre_final
 RUN \
   apk add --no-cache --update bind-tools bash fuse3 && \
   rm -rf /tmp/*
+
+WORKDIR /usr/bin
+RUN ln -sfnv fusermount3 fusermount
+WORKDIR /
+
 LABEL author="Chris Lu"
 LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
 RUN mkdir -p /etc/seaweedfs
