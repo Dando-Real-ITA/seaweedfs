@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"net/http"
 	httppprof "net/http/pprof"
 	"os"
@@ -77,7 +78,7 @@ func init() {
 	v.dataCenter = cmdVolume.Flag.String("dataCenter", "", "current volume server's data center name")
 	v.rack = cmdVolume.Flag.String("rack", "", "current volume server's rack name")
 	v.indexType = cmdVolume.Flag.String("index", "memory", "Choose [memory|leveldb|leveldbMedium|leveldbLarge] mode for memory~performance balance.")
-	v.diskType = cmdVolume.Flag.String("disk", "", "[hdd|ssd] choose between hard drive or solid state drive")
+	v.diskType = cmdVolume.Flag.String("disk", "", "[hdd|ssd] hard drive or solid state drive")
 	v.fixJpgOrientation = cmdVolume.Flag.Bool("images.fix.orientation", false, "Adjust jpg orientation when uploading.")
 	v.readRedirect = cmdVolume.Flag.Bool("read.redirect", true, "Redirect moved or non-local volumes.")
 	v.cpuProfile = cmdVolume.Flag.String("cpuprofile", "", "cpu profile output file")
@@ -170,14 +171,10 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 	}
 
 	// set disk types
-	var diskTypes []storage.DiskType
+	var diskTypes []types.DiskType
 	diskTypeStrings := strings.Split(*v.diskType, ",")
 	for _, diskTypeString := range diskTypeStrings {
-		if diskType, err := storage.ToDiskType(diskTypeString); err == nil {
-			diskTypes = append(diskTypes, diskType)
-		} else {
-			glog.Fatalf("failed to parse volume type: %v", err)
-		}
+		diskTypes = append(diskTypes, types.ToDiskType(diskTypeString))
 	}
 	if len(diskTypes) == 1 && len(v.folders) > 1 {
 		for i := 0; i < len(v.folders)-1; i++ {

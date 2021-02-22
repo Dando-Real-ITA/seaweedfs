@@ -173,6 +173,7 @@ func collectStatForOneVolume(vid needle.VolumeId, v *Volume) (s *VolumeInfo) {
 		ReadOnly:         v.IsReadOnly(),
 		Ttl:              v.Ttl,
 		CompactRevision:  uint32(v.CompactionRevision),
+		DiskType:         v.DiskType().String(),
 	}
 	s.RemoteStorageName, s.RemoteStorageKey = v.RemoteStorageNameKey()
 
@@ -206,19 +207,13 @@ func (s *Store) GetRack() string {
 
 func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 	var volumeMessages []*master_pb.VolumeInformationMessage
-	maxVolumeCount := 0
-	maxSsdVolumeCount := 0
+	maxVolumeCounts := make(map[string]uint32)
 	var maxFileKey NeedleId
 	collectionVolumeSize := make(map[string]uint64)
 	collectionVolumeReadOnlyCount := make(map[string]map[string]uint8)
 	for _, location := range s.Locations {
 		var deleteVids []needle.VolumeId
-		switch location.DiskType {
-		case SsdType:
-			maxSsdVolumeCount = maxSsdVolumeCount + location.MaxVolumeCount
-		case HardDriveType:
-			maxVolumeCount = maxVolumeCount + location.MaxVolumeCount
-		}
+		maxVolumeCounts[string(location.DiskType)] += uint32(location.MaxVolumeCount)
 		location.volumesLock.RLock()
 		for _, v := range location.volumes {
 			curMaxFileKey, volumeMessage := v.ToVolumeInformationMessage()
@@ -290,16 +285,15 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 	}
 
 	return &master_pb.Heartbeat{
-		Ip:                s.Ip,
-		Port:              uint32(s.Port),
-		PublicUrl:         s.PublicUrl,
-		MaxVolumeCount:    uint32(maxVolumeCount),
-		MaxSsdVolumeCount: uint32(maxSsdVolumeCount),
-		MaxFileKey:        NeedleIdToUint64(maxFileKey),
-		DataCenter:        s.dataCenter,
-		Rack:              s.rack,
-		Volumes:           volumeMessages,
-		HasNoVolumes:      len(volumeMessages) == 0,
+		Ip:              s.Ip,
+		Port:            uint32(s.Port),
+		PublicUrl:       s.PublicUrl,
+		MaxVolumeCounts: maxVolumeCounts,
+		MaxFileKey:      NeedleIdToUint64(maxFileKey),
+		DataCenter:      s.dataCenter,
+		Rack:            s.rack,
+		Volumes:         volumeMessages,
+		HasNoVolumes:    len(volumeMessages) == 0,
 	}
 
 }
@@ -477,6 +471,9 @@ func (s *Store) GetVolumeSizeLimit() uint64 {
 
 func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 	volumeSizeLimit := s.GetVolumeSizeLimit()
+	if volumeSizeLimit == 0 {
+		return
+	}
 	for _, diskLocation := range s.Locations {
 		if diskLocation.OriginalMaxVolumeCount == 0 {
 			currentMaxVolumeCount := diskLocation.MaxVolumeCount

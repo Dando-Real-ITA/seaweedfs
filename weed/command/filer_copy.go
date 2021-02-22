@@ -55,7 +55,7 @@ func init() {
 	copy.replication = cmdCopy.Flag.String("replication", "", "replication type")
 	copy.collection = cmdCopy.Flag.String("collection", "", "optional collection name")
 	copy.ttl = cmdCopy.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
-	copy.diskType = cmdCopy.Flag.String("disk", "", "[hdd|ssd] choose between hard drive or solid state drive")
+	copy.diskType = cmdCopy.Flag.String("disk", "", "[hdd|ssd] hard drive or solid state drive")
 	copy.maxMB = cmdCopy.Flag.Int("maxMB", 32, "split files larger than the limit")
 	copy.concurrenctFiles = cmdCopy.Flag.Int("c", 8, "concurrent file copy goroutines")
 	copy.concurrenctChunks = cmdCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
@@ -463,7 +463,9 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 		for _, chunk := range chunks {
 			fileIds = append(fileIds, chunk.FileId)
 		}
-		operation.DeleteFiles(copy.masters[0], false, worker.options.grpcDialOption, fileIds)
+		operation.DeleteFiles(func() string {
+			return copy.masters[0]
+		}, false, worker.options.grpcDialOption, fileIds)
 		return uploadError
 	}
 

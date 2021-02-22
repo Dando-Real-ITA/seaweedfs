@@ -63,7 +63,7 @@ func init() {
 	}}
 }
 
-var fileNameEscaper = strings.NewReplacer("\\", "\\\\", "\"", "\\\"")
+var fileNameEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 
 // Upload sends a POST request to a volume server to upload the content with adjustable compression level
 func UploadData(uploadUrl string, filename string, cipher bool, data []byte, isInputCompressed bool, mtype string, pairMap map[string]string, jwt security.EncodedJwt) (uploadResult *UploadResult, err error) {
@@ -100,6 +100,7 @@ func retriedUploadData(uploadUrl string, filename string, cipher bool, data []by
 		} else {
 			glog.Warningf("uploading to %s: %v", uploadUrl, err)
 		}
+		time.Sleep(time.Millisecond * time.Duration(237*(i+1)))
 	}
 	return
 }

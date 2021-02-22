@@ -3,7 +3,7 @@ package weed_server
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage"
+	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -125,13 +125,13 @@ func (ms *MasterServer) selfUrl(r *http.Request) string {
 }
 func (ms *MasterServer) submitFromMasterServerHandler(w http.ResponseWriter, r *http.Request) {
 	if ms.Topo.IsLeader() {
-		submitForClientHandler(w, r, ms.selfUrl(r), ms.grpcDialOption)
+		submitForClientHandler(w, r, func() string { return ms.selfUrl(r) }, ms.grpcDialOption)
 	} else {
 		masterUrl, err := ms.Topo.Leader()
 		if err != nil {
 			writeJsonError(w, r, http.StatusInternalServerError, err)
 		} else {
-			submitForClientHandler(w, r, masterUrl, ms.grpcDialOption)
+			submitForClientHandler(w, r, func() string { return masterUrl }, ms.grpcDialOption)
 		}
 	}
 }
@@ -158,10 +158,7 @@ func (ms *MasterServer) getVolumeGrowOption(r *http.Request) (*topology.VolumeGr
 	if err != nil {
 		return nil, err
 	}
-	diskType, err := storage.ToDiskType(r.FormValue("disk"))
-	if err != nil {
-		return nil, err
-	}
+	diskType := types.ToDiskType(r.FormValue("disk"))
 
 	preallocate := ms.preallocateSize
 	if r.FormValue("preallocate") != "" {
