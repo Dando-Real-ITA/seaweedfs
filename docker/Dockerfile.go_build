@@ -7,8 +7,8 @@ COPY go.mod .
 COPY go.sum .
 RUN go mod download
 
-ADD https://api.github.com/repos/Dando-Real-ITA/seaweedfs/git/refs/heads/develop version.json
-RUN git clone --depth 1 https://github.com/Dando-Real-ITA/seaweedfs -b develop --recurse-submodules --shallow-submodules seaweedfs
+ADD https://api.github.com/repos/Dando-Real-ITA/seaweedfs/git/refs/heads/master version.json
+RUN git clone --depth 1 https://github.com/Dando-Real-ITA/seaweedfs -b master --recurse-submodules --shallow-submodules seaweedfs
 WORKDIR seaweedfs/weed
 
 RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" && \
