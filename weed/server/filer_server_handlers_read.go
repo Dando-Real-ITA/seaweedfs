@@ -61,15 +61,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	if len(entry.Chunks) == 0 && len(entry.Content) == 0 {
-		glog.V(1).Infof("no file chunks for %s, attr=%+v", path, entry.Attr)
-		stats.FilerRequestCounter.WithLabelValues("read.nocontent").Inc()
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Last-Modified", entry.Attr.Mtime.Format(http.TimeFormat))
 
 	// mime type
 	mimeType := entry.Attr.Mime
@@ -139,6 +131,9 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 
 	if r.Method == "HEAD" {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+		processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
+			return filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size, true)
+		})
 		return
 	}
 
@@ -158,15 +153,15 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64, httpStatusCode int) error {
-		if httpStatusCode != 0 {
-			w.WriteHeader(httpStatusCode)
-		}
+	processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
 		if offset+size <= int64(len(entry.Content)) {
 			_, err := writer.Write(entry.Content[offset : offset+size])
+			if err != nil {
+				glog.Errorf("failed to write entry content: %v", err)
+			}
 			return err
 		}
-		return filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size)
+		return filer.StreamContent(fs.filer.MasterClient, writer, entry.Chunks, offset, size, false)
 	})
 
 }

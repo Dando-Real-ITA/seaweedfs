@@ -38,10 +38,10 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 
 	chunkSize := 1024 * 1024 * maxMB
 
-	stats.FilerRequestCounter.WithLabelValues("postAutoChunk").Inc()
+	stats.FilerRequestCounter.WithLabelValues("chunk").Inc()
 	start := time.Now()
 	defer func() {
-		stats.FilerRequestHistogram.WithLabelValues("postAutoChunk").Observe(time.Since(start).Seconds())
+		stats.FilerRequestHistogram.WithLabelValues("chunk").Observe(time.Since(start).Seconds())
 	}()
 
 	var reply *FilerPostResult
@@ -212,7 +212,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		entry.Extended = make(map[string][]byte)
 	}
 
-	fs.saveAmzMetaData(r, entry)
+	SaveAmzMetaData(r, entry.Extended, false)
 
 	for k, v := range r.Header {
 		if len(v) > 0 && strings.HasPrefix(k, needle.PairNamePrefix) {
@@ -302,13 +302,16 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 
 func (fs *FilerServer) doUpload(urlLocation string, w http.ResponseWriter, r *http.Request, limitedReader io.Reader, fileName string, contentType string, pairMap map[string]string, auth security.EncodedJwt) (*operation.UploadResult, error, []byte) {
 
-	stats.FilerRequestCounter.WithLabelValues("postAutoChunkUpload").Inc()
+	stats.FilerRequestCounter.WithLabelValues("chunkUpload").Inc()
 	start := time.Now()
 	defer func() {
-		stats.FilerRequestHistogram.WithLabelValues("postAutoChunkUpload").Observe(time.Since(start).Seconds())
+		stats.FilerRequestHistogram.WithLabelValues("chunkUpload").Observe(time.Since(start).Seconds())
 	}()
 
 	uploadResult, err, data := operation.Upload(urlLocation, fileName, fs.option.Cipher, limitedReader, false, contentType, pairMap, auth)
+	if uploadResult != nil && uploadResult.RetryCount > 0 {
+		stats.FilerRequestCounter.WithLabelValues("chunkUploadRetry").Add(float64(uploadResult.RetryCount))
+	}
 	return uploadResult, err, data
 }
 
@@ -380,17 +383,24 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 	return filerResult, replyerr
 }
 
-func (fs *FilerServer) saveAmzMetaData(r *http.Request, entry *filer.Entry) {
+func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool) (metadata map[string][]byte) {
+
+	metadata = make(map[string][]byte)
+	if !isReplace {
+		for k, v := range existing {
+			metadata[k] = v
+		}
+	}
 
 	if sc := r.Header.Get(xhttp.AmzStorageClass); sc != "" {
-		entry.Extended[xhttp.AmzStorageClass] = []byte(sc)
+		metadata[xhttp.AmzStorageClass] = []byte(sc)
 	}
 
 	if tags := r.Header.Get(xhttp.AmzObjectTagging); tags != "" {
 		for _, v := range strings.Split(tags, "&") {
 			tag := strings.Split(v, "=")
 			if len(tag) == 2 {
-				entry.Extended[xhttp.AmzObjectTagging+"-"+tag[0]] = []byte(tag[1])
+				metadata[xhttp.AmzObjectTagging+"-"+tag[0]] = []byte(tag[1])
 			}
 		}
 	}
@@ -398,8 +408,11 @@ func (fs *FilerServer) saveAmzMetaData(r *http.Request, entry *filer.Entry) {
 	for header, values := range r.Header {
 		if strings.HasPrefix(header, xhttp.AmzUserMetaPrefix) {
 			for _, value := range values {
-				entry.Extended[header] = []byte(value)
+				metadata[header] = []byte(value)
 			}
 		}
 	}
+
+	return
+
 }

@@ -62,6 +62,7 @@ type VolumeServerOptions struct {
 	preStopSeconds        *int
 	metricsHttpPort       *int
 	// pulseSeconds          *int
+	enableTcp *bool
 }
 
 func init() {
@@ -70,7 +71,7 @@ func init() {
 	v.publicPort = cmdVolume.Flag.Int("port.public", 0, "port opened to public")
 	v.ip = cmdVolume.Flag.String("ip", util.DetectedHostAddress(), "ip or server name")
 	v.publicUrl = cmdVolume.Flag.String("publicUrl", "", "Publicly accessible address")
-	v.bindIp = cmdVolume.Flag.String("ip.bind", "0.0.0.0", "ip address to bind to")
+	v.bindIp = cmdVolume.Flag.String("ip.bind", "", "ip address to bind to")
 	v.masters = cmdVolume.Flag.String("mserver", "localhost:9333", "comma-separated master servers")
 	v.preStopSeconds = cmdVolume.Flag.Int("preStopSeconds", 10, "number of seconds between stop send heartbeats and stop volume server")
 	// v.pulseSeconds = cmdVolume.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats, must be smaller than or equal to the master's setting")
@@ -78,7 +79,7 @@ func init() {
 	v.dataCenter = cmdVolume.Flag.String("dataCenter", "", "current volume server's data center name")
 	v.rack = cmdVolume.Flag.String("rack", "", "current volume server's rack name")
 	v.indexType = cmdVolume.Flag.String("index", "memory", "Choose [memory|leveldb|leveldbMedium|leveldbLarge] mode for memory~performance balance.")
-	v.diskType = cmdVolume.Flag.String("disk", "", "[hdd|ssd] hard drive or solid state drive")
+	v.diskType = cmdVolume.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	v.fixJpgOrientation = cmdVolume.Flag.Bool("images.fix.orientation", false, "Adjust jpg orientation when uploading.")
 	v.readRedirect = cmdVolume.Flag.Bool("read.redirect", true, "Redirect moved or non-local volumes.")
 	v.cpuProfile = cmdVolume.Flag.String("cpuprofile", "", "cpu profile output file")
@@ -88,6 +89,7 @@ func init() {
 	v.pprof = cmdVolume.Flag.Bool("pprof", false, "enable pprof http handlers. precludes --memprofile and --cpuprofile")
 	v.metricsHttpPort = cmdVolume.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	v.idxFolder = cmdVolume.Flag.String("dir.idx", "", "directory to store .idx files")
+	v.enableTcp = cmdVolume.Flag.Bool("tcp", false, "<exprimental> enable tcp port")
 }
 
 var cmdVolume = &Command{
@@ -251,6 +253,11 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		}
 	}
 
+	// starting tcp server
+	if *v.enableTcp {
+		go v.startTcpService(volumeServer)
+	}
+
 	// starting the cluster http server
 	clusterHttpServer := v.startClusterHttpService(volumeMux)
 
@@ -367,4 +374,23 @@ func (v VolumeServerOptions) startClusterHttpService(handler http.Handler) httpd
 		}
 	}()
 	return clusterHttpServer
+}
+
+func (v VolumeServerOptions) startTcpService(volumeServer *weed_server.VolumeServer) {
+	listeningAddress := *v.bindIp + ":" + strconv.Itoa(*v.port+20000)
+	glog.V(0).Infoln("Start Seaweed volume server", util.Version(), "tcp at", listeningAddress)
+	listener, e := util.NewListener(listeningAddress, 0)
+	if e != nil {
+		glog.Fatalf("Volume server listener error on %s:%v", listeningAddress, e)
+	}
+	defer listener.Close()
+
+	for {
+		c, err := listener.Accept()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		go volumeServer.HandleTcpConnection(c)
+	}
 }
