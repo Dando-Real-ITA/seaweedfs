@@ -6,7 +6,6 @@ import (
 	"net/http"
 	httppprof "net/http/pprof"
 	"os"
-	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -69,7 +68,7 @@ func init() {
 	cmdVolume.Run = runVolume // break init cycle
 	v.port = cmdVolume.Flag.Int("port", 8080, "http listen port")
 	v.publicPort = cmdVolume.Flag.Int("port.public", 0, "port opened to public")
-	v.ip = cmdVolume.Flag.String("ip", util.DetectedHostAddress(), "ip or server name")
+	v.ip = cmdVolume.Flag.String("ip", util.DetectedHostAddress(), "ip or server name, also used as identifier")
 	v.publicUrl = cmdVolume.Flag.String("publicUrl", "", "Publicly accessible address")
 	v.bindIp = cmdVolume.Flag.String("ip.bind", "", "ip address to bind to")
 	v.masters = cmdVolume.Flag.String("mserver", "localhost:9333", "comma-separated master servers")
@@ -110,8 +109,6 @@ var (
 func runVolume(cmd *Command, args []string) bool {
 
 	util.LoadConfiguration("security", false)
-
-	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// If --pprof is set we assume the caller wants to be able to collect
 	// cpu and memory profiles via go tool pprof
