@@ -15,7 +15,7 @@ require (
 	github.com/buraksezer/consistent v0.0.0-20191006190839-693edf70fd72
 	github.com/bwmarrin/snowflake v0.3.0
 	github.com/cespare/xxhash v1.1.0
-	github.com/chrislusf/raft v1.0.4
+	github.com/chrislusf/raft v1.0.6
 	github.com/coreos/go-semver v0.3.0 // indirect
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/disintegration/imaging v1.6.2
@@ -42,6 +42,7 @@ require (
 	github.com/grpc-ecosystem/go-grpc-middleware v1.0.1-0.20190118093823-f849b5445de4
 	github.com/grpc-ecosystem/grpc-gateway v1.11.0 // indirect
 	github.com/jcmturner/gofork v1.0.0 // indirect
+	github.com/jinzhu/copier v0.2.8
 	github.com/json-iterator/go v1.1.10
 	github.com/karlseguin/ccache v2.0.3+incompatible // indirect
 	github.com/karlseguin/ccache/v2 v2.0.7
@@ -61,7 +62,7 @@ require (
 	github.com/prometheus/client_golang v1.3.0
 	github.com/rakyll/statik v0.1.7
 	github.com/rcrowley/go-metrics v0.0.0-20190826022208-cac0b30c2563 // indirect
-	github.com/seaweedfs/fuse v1.1.3
+	github.com/seaweedfs/fuse v1.1.4
 	github.com/seaweedfs/goexif v1.0.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
