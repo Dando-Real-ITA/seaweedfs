@@ -31,11 +31,11 @@ func (dir *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (f
 
 	glog.V(4).Infof("Link: %v/%v -> %v/%v", oldFile.dir.FullPath(), oldFile.Name, dir.FullPath(), req.NewName)
 
-	if _, err := oldFile.maybeLoadEntry(ctx); err != nil {
+	oldEntry, err := oldFile.maybeLoadEntry(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	oldEntry := oldFile.getEntry()
 	if oldEntry == nil {
 		return nil, fuse.EIO
 	}
@@ -68,7 +68,7 @@ func (dir *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (f
 	}
 
 	// apply changes to the filer, and also apply to local metaCache
-	err := dir.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	err = dir.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 
 		dir.wfs.mapPbIdFromLocalToFiler(request.Entry)
 		defer dir.wfs.mapPbIdFromFilerToLocal(request.Entry)
@@ -93,11 +93,8 @@ func (dir *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (f
 	}
 
 	// create new file node
-	newNode := dir.newFile(req.NewName, request.Entry)
+	newNode := dir.newFile(req.NewName)
 	newFile := newNode.(*File)
-	if _, err := newFile.maybeLoadEntry(ctx); err != nil {
-		return nil, err
-	}
 
 	return newFile, err
 
@@ -139,7 +136,7 @@ func (dir *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node,
 		return nil
 	})
 
-	symlink := dir.newFile(req.NewName, request.Entry)
+	symlink := dir.newFile(req.NewName)
 
 	return symlink, err
 

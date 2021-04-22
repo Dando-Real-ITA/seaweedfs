@@ -120,6 +120,9 @@ connection_max_idle = 2
 connection_max_open = 100
 connection_max_lifetime_seconds = 0
 interpolateParams = false
+# if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
+enableUpsert = true
+upsertQuery = """INSERT INTO ` + "`%s`" + ` (dirhash,name,directory,meta) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE meta = VALUES(meta)"""
 
 [mysql2]  # or memsql, tidb
 enabled = false
@@ -141,6 +144,9 @@ connection_max_idle = 2
 connection_max_open = 100
 connection_max_lifetime_seconds = 0
 interpolateParams = false
+# if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
+enableUpsert = true
+upsertQuery = """INSERT INTO ` + "`%s`" + ` (dirhash,name,directory,meta) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE meta = VALUES(meta)"""
 
 [postgres] # or cockroachdb, YugabyteDB
 # CREATE TABLE IF NOT EXISTS filemeta (
@@ -161,6 +167,9 @@ sslmode = "disable"
 connection_max_idle = 100
 connection_max_open = 100
 connection_max_lifetime_seconds = 0
+# if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
+enableUpsert = true
+upsertQuery = """INSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4) ON CONFLICT (dirhash,name) DO UPDATE SET meta = EXCLUDED.meta WHERE "%[1]s".meta != EXCLUDED.meta"""
 
 [postgres2]
 enabled = false
@@ -183,6 +192,9 @@ sslmode = "disable"
 connection_max_idle = 100
 connection_max_open = 100
 connection_max_lifetime_seconds = 0
+# if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
+enableUpsert = true
+upsertQuery = """INSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4) ON CONFLICT (dirhash,name) DO UPDATE SET meta = EXCLUDED.meta WHERE "%[1]s".meta != EXCLUDED.meta"""
 
 [cassandra]
 # CREATE TABLE filemeta (
@@ -269,7 +281,7 @@ index.max_result_window = 10000
 #     Make sure they are not the same if using the same store type!
 # 4. Set enabled to true
 #
-# The following is just using cassandra as an example
+# The following is just using redis as an example
 ##########################
 [redis2.tmp]
 enabled = false

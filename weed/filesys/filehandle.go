@@ -20,9 +20,11 @@ import (
 
 type FileHandle struct {
 	// cache file has been written to
-	dirtyPages  *ContinuousDirtyPages
-	contentType string
-	handle      uint64
+	dirtyPages     *ContinuousDirtyPages
+	entryViewCache []filer.VisibleInterval
+	reader         io.ReaderAt
+	contentType    string
+	handle         uint64
 	sync.Mutex
 
 	f         *File
@@ -125,20 +127,20 @@ func (fh *FileHandle) readFromChunks(buff []byte, offset int64) (int64, error) {
 	}
 
 	var chunkResolveErr error
-	if fh.f.entryViewCache == nil {
-		fh.f.entryViewCache, chunkResolveErr = filer.NonOverlappingVisibleIntervals(fh.f.wfs.LookupFn(), entry.Chunks)
+	if fh.entryViewCache == nil {
+		fh.entryViewCache, chunkResolveErr = filer.NonOverlappingVisibleIntervals(fh.f.wfs.LookupFn(), entry.Chunks)
 		if chunkResolveErr != nil {
 			return 0, fmt.Errorf("fail to resolve chunk manifest: %v", chunkResolveErr)
 		}
-		fh.f.setReader(nil)
+		fh.reader = nil
 	}
 
-	reader := fh.f.reader
+	reader := fh.reader
 	if reader == nil {
-		chunkViews := filer.ViewFromVisibleIntervals(fh.f.entryViewCache, 0, math.MaxInt64)
+		chunkViews := filer.ViewFromVisibleIntervals(fh.entryViewCache, 0, math.MaxInt64)
 		reader = filer.NewChunkReaderAtFromClient(fh.f.wfs.LookupFn(), chunkViews, fh.f.wfs.chunkCache, fileSize)
 	}
-	fh.f.setReader(reader)
+	fh.reader = reader
 
 	totalRead, err := reader.ReadAt(buff, offset)
 
@@ -191,23 +193,25 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 
 func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 
-	glog.V(4).Infof("Release %v fh %d", fh.f.fullpath(), fh.handle)
+	glog.V(4).Infof("Release %v fh %d open=%d", fh.f.fullpath(), fh.handle, fh.f.isOpen)
 
 	fh.Lock()
 	defer fh.Unlock()
 
+	fh.f.isOpen--
+
 	if fh.f.isOpen <= 0 {
+		fh.f.entry = nil
+		fh.entryViewCache = nil
+		fh.reader = nil
+
+		fh.f.wfs.ReleaseHandle(fh.f.fullpath(), fuse.HandleID(fh.handle))
+	}
+
+	if fh.f.isOpen < 0 {
 		glog.V(0).Infof("Release reset %s open count %d => %d", fh.f.Name, fh.f.isOpen, 0)
 		fh.f.isOpen = 0
 		return nil
-	}
-
-	if fh.f.isOpen == 1 {
-
-		fh.f.isOpen--
-
-		fh.f.wfs.ReleaseHandle(fh.f.fullpath(), fuse.HandleID(fh.handle))
-		fh.f.setReader(nil)
 	}
 
 	return nil
