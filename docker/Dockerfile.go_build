@@ -1,4 +1,4 @@
-# 2021-01-29 07:56:36
+# 2021-05-10 10:56:27
 FROM amd64/golang:1.16-alpine as builder
 RUN apk add git go g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
@@ -67,7 +67,7 @@ RUN chmod +x /start.sh
 ENTRYPOINT ["/start.sh"]
 
 FROM pre_final AS final
-COPY --from=builder /root/go/bin/weed /usr/bin/
+COPY --from=builder /go/bin/weed /usr/bin/
 
 FROM pre_final AS final_large
-COPY --from=builder_large /root/go/bin/weed /usr/bin/
+COPY --from=builder_large /go/bin/weed /usr/bin/
