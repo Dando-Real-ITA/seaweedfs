@@ -1,5 +1,5 @@
 # 2021-01-29 07:56:36
-FROM frolvlad/alpine-glibc as builder
+FROM amd64/golang:1.16-alpine as builder
 RUN apk add git go g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
 WORKDIR /go/src/github.com/chrislusf/
@@ -33,7 +33,7 @@ RUN ln -sfnv fusermount3 fusermount
 WORKDIR /
 
 LABEL author="Chris Lu"
-LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
+COPY --from=builder /go/bin/weed /usr/bin/
 RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/entrypoint.sh /entrypoint.sh

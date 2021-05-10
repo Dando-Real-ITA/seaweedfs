@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
@@ -21,19 +22,14 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/util"
 
 	"github.com/gorilla/mux"
-	statik "github.com/rakyll/statik/fs"
-
-	_ "github.com/chrislusf/seaweedfs/weed/statik"
 )
 
 var serverStats *stats.ServerStats
 var startTime = time.Now()
-var statikFS http.FileSystem
 
 func init() {
 	serverStats = stats.NewServerStats()
 	go serverStats.Start()
-	statikFS, _ = statik.New()
 }
 
 func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) (err error) {
@@ -212,14 +208,16 @@ func statsMemoryHandler(w http.ResponseWriter, r *http.Request) {
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
 
+var StaticFS fs.FS
+
 func handleStaticResources(defaultMux *http.ServeMux) {
-	defaultMux.Handle("/favicon.ico", http.FileServer(statikFS))
-	defaultMux.Handle("/seaweedfsstatic/", http.StripPrefix("/seaweedfsstatic", http.FileServer(statikFS)))
+	defaultMux.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
+	defaultMux.Handle("/seaweedfsstatic/", http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
 }
 
 func handleStaticResources2(r *mux.Router) {
-	r.Handle("/favicon.ico", http.FileServer(statikFS))
-	r.PathPrefix("/seaweedfsstatic/").Handler(http.StripPrefix("/seaweedfsstatic", http.FileServer(statikFS)))
+	r.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
+	r.PathPrefix("/seaweedfsstatic/").Handler(http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
 }
 
 func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, filename string) {
@@ -234,12 +232,12 @@ func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, file
 	}
 }
 
-func processRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64, mimeType string, writeFn func(writer io.Writer, offset int64, size int64) error) {
+func processRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64, mimeType string, writeFn func(writer io.Writer, offset int64, size int64, httpStatusCode int) error) {
 	rangeReq := r.Header.Get("Range")
 
 	if rangeReq == "" {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
-		if err := writeFn(w, 0, totalSize); err != nil {
+		if err := writeFn(w, 0, totalSize, 0); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -279,7 +277,7 @@ func processRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 		w.Header().Set("Content-Length", strconv.FormatInt(ra.length, 10))
 		w.Header().Set("Content-Range", ra.contentRange(totalSize))
 
-		err = writeFn(w, ra.start, ra.length)
+		err = writeFn(w, ra.start, ra.length, http.StatusPartialContent)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -307,7 +305,7 @@ func processRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 				pw.CloseWithError(e)
 				return
 			}
-			if e = writeFn(part, ra.start, ra.length); e != nil {
+			if e = writeFn(part, ra.start, ra.length, 0); e != nil {
 				pw.CloseWithError(e)
 				return
 			}
