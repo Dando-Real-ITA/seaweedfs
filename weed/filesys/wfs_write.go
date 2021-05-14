@@ -68,9 +68,9 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath, writeOnly bool) filer.Sa
 			return nil, "", "", fmt.Errorf("upload result: %v", uploadResult.Error)
 		}
 
-		// if !writeOnly {
-		wfs.chunkCache.SetChunk(fileId, data)
-		// }
+		if !writeOnly {
+			wfs.chunkCache.SetChunk(fileId, data)
+		}
 
 		chunk = uploadResult.ToPbFileChunk(fileId, offset)
 		return chunk, collection, replication, nil
