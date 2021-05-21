@@ -7,6 +7,7 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"github.com/chrislusf/seaweedfs/weed/wdclient"
 	"math"
+	"math/rand"
 	"os"
 	"path"
 	"sync"
@@ -28,8 +29,9 @@ import (
 
 type Option struct {
 	MountDirectory     string
-	FilerAddress       string
-	FilerGrpcAddress   string
+	FilerAddresses     []string
+	filerIndex         int
+	FilerGrpcAddresses []string
 	GrpcDialOption     grpc.DialOption
 	FilerMountRootPath string
 	Collection         string
@@ -95,7 +97,8 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		},
 		signature: util.RandomInt32(),
 	}
-	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + option.FilerGrpcAddress + option.FilerMountRootPath + util.Version()))[0:8]
+	wfs.option.filerIndex = rand.Intn(len(option.FilerAddresses))
+	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + option.FilerGrpcAddresses[0] + option.FilerMountRootPath + util.Version()))[0:8]
 	cacheDir := path.Join(option.CacheDir, cacheUniqueId)
 	if option.CacheSizeMB > 0 {
 		os.MkdirAll(cacheDir, os.FileMode(0777)&^option.Umask)
@@ -259,11 +262,13 @@ func (wfs *WFS) mapPbIdFromLocalToFiler(entry *filer_pb.Entry) {
 func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {
 	if wfs.option.VolumeServerAccess == "filerProxy" {
 		return func(fileId string) (targetUrls []string, err error) {
-			return []string{"http://" + wfs.option.FilerAddress + "/?proxyChunkId=" + fileId}, nil
+			return []string{"http://" + wfs.getCurrentFiler() + "/?proxyChunkId=" + fileId}, nil
 		}
 	}
 	return filer.LookupFn(wfs)
-
+}
+func (wfs *WFS) getCurrentFiler() string {
+	return wfs.option.FilerAddresses[wfs.option.filerIndex]
 }
 
 type NodeWithId uint64
