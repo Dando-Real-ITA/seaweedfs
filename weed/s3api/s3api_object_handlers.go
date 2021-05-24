@@ -6,12 +6,14 @@ import (
 	"encoding/xml"
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/pquerna/cachecontrol/cacheobject"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
 
@@ -46,6 +48,20 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if r.Header.Get("Cache-Control") != "" {
+		if _, err = cacheobject.ParseRequestCacheControl(r.Header.Get("Cache-Control")); err != nil {
+			writeErrorResponse(w, s3err.ErrInvalidDigest, r.URL)
+			return
+		}
+	}
+
+	if r.Header.Get("Expires") != "" {
+		if _, err = time.Parse(http.TimeFormat, r.Header.Get("Expires")); err != nil {
+			writeErrorResponse(w, s3err.ErrInvalidDigest, r.URL)
+			return
+		}
+	}
+
 	dataReader := r.Body
 	if s3a.iam.isEnabled() {
 		rAuthType := getRequestAuthType(r)
@@ -60,6 +76,12 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 		}
 		if s3ErrCode != s3err.ErrNone {
 			writeErrorResponse(w, s3ErrCode, r.URL)
+			return
+		}
+	} else {
+		rAuthType := getRequestAuthType(r)
+		if authTypeAnonymous != rAuthType {
+			writeErrorResponse(w, s3err.ErrAuthNotSetup, r.URL)
 			return
 		}
 	}
@@ -326,7 +348,11 @@ func passThroughResponse(proxyResponse *http.Response, w http.ResponseWriter) {
 	for k, v := range proxyResponse.Header {
 		w.Header()[k] = v
 	}
-	w.WriteHeader(proxyResponse.StatusCode)
+	if proxyResponse.Header.Get("Content-Range") != "" && proxyResponse.StatusCode == 200 {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(proxyResponse.StatusCode)
+	}
 	io.Copy(w, proxyResponse.Body)
 }
 
