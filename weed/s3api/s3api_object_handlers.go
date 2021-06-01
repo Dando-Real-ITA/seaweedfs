@@ -63,8 +63,8 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	dataReader := r.Body
+	rAuthType := getRequestAuthType(r)
 	if s3a.iam.isEnabled() {
-		rAuthType := getRequestAuthType(r)
 		var s3ErrCode s3err.ErrorCode
 		switch rAuthType {
 		case authTypeStreamingSigned:
@@ -79,8 +79,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	} else {
-		rAuthType := getRequestAuthType(r)
-		if authTypeAnonymous != rAuthType {
+		if authTypeStreamingSigned == rAuthType {
 			writeErrorResponse(w, s3err.ErrAuthNotSetup, r.URL)
 			return
 		}
@@ -332,6 +331,11 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 		return
 	}
 	defer util.CloseResponse(resp)
+
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		writeErrorResponse(w, s3err.ErrPreconditionFailed, r.URL)
+		return
+	}
 
 	if (resp.ContentLength == -1 || resp.StatusCode == 404) && resp.StatusCode != 304 {
 		if r.Method != "DELETE" {
