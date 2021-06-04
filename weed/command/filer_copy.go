@@ -3,7 +3,6 @@ package command
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chrislusf/seaweedfs/weed/filer"
 
 	"google.golang.org/grpc"
 
@@ -384,7 +385,7 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 			return fmt.Errorf("Failed to assign from %v: %v\n", worker.options.masters, err)
 		}
 
-		targetUrl := "http://" + assignResult.Url + "/" + assignResult.FileId
+		targetUrl := "http://" + assignResult.PublicUrl + "/" + assignResult.FileId
 
 		uploadResult, err := operation.UploadData(targetUrl, fileName, worker.options.cipher, data, false, mimeType, nil, security.EncodedJwt(assignResult.Auth))
 		if err != nil {
@@ -483,7 +484,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 				fmt.Printf("Failed to assign from %v: %v\n", worker.options.masters, err)
 			}
 
-			targetUrl := "http://" + assignResult.Url + "/" + assignResult.FileId
+			targetUrl := "http://" + assignResult.PublicUrl + "/" + assignResult.FileId
 			if collection == "" {
 				collection = assignResult.Collection
 			}
