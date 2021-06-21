@@ -23,6 +23,7 @@ type VirtualFilerStore interface {
 	AddPathSpecificStore(path string, storeId string, store FilerStore)
 	OnBucketCreation(bucket string)
 	OnBucketDeletion(bucket string)
+	CanDropWholeBucket() bool
 }
 
 type FilerStoreWrapper struct {
@@ -40,6 +41,13 @@ func NewFilerStoreWrapper(store FilerStore) *FilerStoreWrapper {
 		pathToStore:    ptrie.New(),
 		storeIdToStore: make(map[string]FilerStore),
 	}
+}
+
+func (fsw *FilerStoreWrapper) CanDropWholeBucket() bool {
+	if ba, ok := fsw.defaultStore.(BucketAware); ok {
+		return ba.CanDropWholeBucket()
+	}
+	return false
 }
 
 func (fsw *FilerStoreWrapper) OnBucketCreation(bucket string) {
@@ -205,7 +213,7 @@ func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry 
 	return actualStore.DeleteEntry(ctx, existingEntry.FullPath)
 }
 
-func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.FullPath) (err error) {
+func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.FullPath, limit int64) (err error) {
 	actualStore := fsw.getActualStore(fp + "/")
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "deleteFolderChildren").Inc()
 	start := time.Now()
@@ -214,7 +222,7 @@ func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.
 	}()
 
 	glog.V(4).Infof("DeleteFolderChildren %s", fp)
-	return actualStore.DeleteFolderChildren(ctx, fp)
+	return actualStore.DeleteFolderChildren(ctx, fp, limit)
 }
 
 func (fsw *FilerStoreWrapper) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc ListEachEntryFunc) (string, error) {
