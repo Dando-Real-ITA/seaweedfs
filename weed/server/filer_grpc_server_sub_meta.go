@@ -30,38 +30,49 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	eachLogEntryFn := eachLogEntryFn(eachEventNotificationFn)
 
 	var processedTsNs int64
-	var err error
+	var readPersistedLogErr error
+	var readInMemoryLogErr error
 
 	for {
 
-		processedTsNs, err = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
-		if err != nil {
-			return fmt.Errorf("reading from persisted logs: %v", err)
+		glog.V(4).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+
+		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
+		if readPersistedLogErr != nil {
+			return fmt.Errorf("reading from persisted logs: %v", readPersistedLogErr)
 		}
 
 		if processedTsNs != 0 {
 			lastReadTime = time.Unix(0, processedTsNs)
+		} else {
+			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
+				time.Sleep(1127 * time.Millisecond)
+				continue
+			}
 		}
 
-		lastReadTime, err = fs.filer.MetaAggregator.MetaLogBuffer.LoopProcessLogData(lastReadTime, func() bool {
+		glog.V(4).Infof("read in memory %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+
+		lastReadTime, readInMemoryLogErr = fs.filer.MetaAggregator.MetaLogBuffer.LoopProcessLogData("aggMeta:"+clientName, lastReadTime, func() bool {
 			fs.filer.MetaAggregator.ListenersLock.Lock()
 			fs.filer.MetaAggregator.ListenersCond.Wait()
 			fs.filer.MetaAggregator.ListenersLock.Unlock()
 			return true
 		}, eachLogEntryFn)
-		if err != nil {
-			if err == log_buffer.ResumeFromDiskError {
+		if readInMemoryLogErr != nil {
+			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				continue
 			}
-			glog.Errorf("processed to %v: %v", lastReadTime, err)
-			time.Sleep(3127 * time.Millisecond)
-			if err != log_buffer.ResumeError {
+			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
+			if readInMemoryLogErr != log_buffer.ResumeError {
 				break
 			}
 		}
+
+		time.Sleep(1127 * time.Millisecond)
 	}
 
-	return err
+	return readInMemoryLogErr
 
 }
 
@@ -81,41 +92,47 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	eachLogEntryFn := eachLogEntryFn(eachEventNotificationFn)
 
 	var processedTsNs int64
-	var err error
+	var readPersistedLogErr error
+	var readInMemoryLogErr error
 
 	for {
 		// println("reading from persisted logs ...")
-		processedTsNs, err = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
-		if err != nil {
-			return fmt.Errorf("reading from persisted logs: %v", err)
+		glog.V(0).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
+		if readPersistedLogErr != nil {
+			return fmt.Errorf("reading from persisted logs: %v", readPersistedLogErr)
 		}
 
 		if processedTsNs != 0 {
 			lastReadTime = time.Unix(0, processedTsNs)
+		} else {
+			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
+				time.Sleep(1127 * time.Millisecond)
+				continue
+			}
 		}
-		// glog.V(0).Infof("after local log reads, %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
-		// println("reading from in memory logs ...")
+		glog.V(0).Infof("read in memory %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
-		lastReadTime, err = fs.filer.LocalMetaLogBuffer.LoopProcessLogData(lastReadTime, func() bool {
+		lastReadTime, readInMemoryLogErr = fs.filer.LocalMetaLogBuffer.LoopProcessLogData("localMeta:"+clientName, lastReadTime, func() bool {
 			fs.listenersLock.Lock()
 			fs.listenersCond.Wait()
 			fs.listenersLock.Unlock()
 			return true
 		}, eachLogEntryFn)
-		if err != nil {
-			if err == log_buffer.ResumeFromDiskError {
+		if readInMemoryLogErr != nil {
+			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				continue
 			}
-			glog.Errorf("processed to %v: %v", lastReadTime, err)
-			time.Sleep(3127 * time.Millisecond)
-			if err != log_buffer.ResumeError {
+			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
+			time.Sleep(1127 * time.Millisecond)
+			if readInMemoryLogErr != log_buffer.ResumeError {
 				break
 			}
 		}
 	}
 
-	return err
+	return readInMemoryLogErr
 
 }
 
