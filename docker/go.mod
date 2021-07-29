@@ -14,7 +14,6 @@ require (
 	github.com/cespare/xxhash v1.1.0
 	github.com/chrislusf/raft v1.0.7
 	github.com/coreos/go-semver v0.3.0 // indirect
-	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/disintegration/imaging v1.6.2
 	github.com/dustin/go-humanize v1.0.0
 	github.com/eapache/go-resiliency v1.2.0 // indirect
@@ -30,6 +29,7 @@ require (
 	github.com/go-sql-driver/mysql v1.5.0
 	github.com/gocql/gocql v0.0.0-20190829130954-e163eff7a8c6
 	github.com/gogo/protobuf v1.2.2-0.20190730201129-28a6bbf47e48 // indirect
+	github.com/golang-jwt/jwt v3.2.1+incompatible
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e
 	github.com/golang/protobuf v1.4.3
 	github.com/google/btree v1.0.0
@@ -66,8 +66,8 @@ require (
 	github.com/stretchr/testify v1.6.1
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/tecbot/gorocksdb v0.0.0-20191217155057-f0fad39f321c
-	github.com/tidwall/gjson v1.3.2
-	github.com/tidwall/match v1.0.1
+	github.com/tidwall/gjson v1.8.1
+	github.com/tidwall/match v1.0.3
 	github.com/tsuna/gohbase v0.0.0-20201125011725-348991136365
 	github.com/valyala/bytebufferpool v1.0.0
 	github.com/viant/assertly v0.5.4 // indirect
@@ -76,7 +76,7 @@ require (
 	github.com/willf/bitset v1.1.10 // indirect
 	github.com/willf/bloom v2.0.3+incompatible
 	go.etcd.io/etcd v3.3.15+incompatible
-	go.mongodb.org/mongo-driver v1.3.2
+	go.mongodb.org/mongo-driver v1.7.0
 	gocloud.dev v0.20.0
 	gocloud.dev/pubsub/natspubsub v0.20.0
 	gocloud.dev/pubsub/rabbitpubsub v0.20.0
