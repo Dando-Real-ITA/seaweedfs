@@ -124,7 +124,7 @@ func (store *CassandraStore) FindEntry(ctx context.Context, fullpath util.FullPa
 	var data []byte
 	if err := store.session.Query(
 		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Consistency(gocql.One).Scan(&data); err != nil {
+		dir, name).Scan(&data); err != nil {
 		if err != gocql.ErrNotFound {
 			return nil, filer_pb.ErrNotFound
 		}
@@ -161,7 +161,7 @@ func (store *CassandraStore) DeleteEntry(ctx context.Context, fullpath util.Full
 	return nil
 }
 
-func (store *CassandraStore) DeleteFolderChildren(ctx context.Context, fullpath util.FullPath, limit int64) error {
+func (store *CassandraStore) DeleteFolderChildren(ctx context.Context, fullpath util.FullPath) error {
 	if _, ok := store.isSuperLargeDirectory(string(fullpath)); ok {
 		return nil // filer.ErrUnsupportedSuperLargeDirectoryListing
 	}
