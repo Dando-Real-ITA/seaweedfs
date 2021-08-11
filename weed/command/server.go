@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/util/grace"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ import (
 type ServerOptions struct {
 	cpuprofile *string
 	memprofile *string
+	debug      *bool
+	debugPort  *int
 	v          VolumeServerOptions
 }
 
@@ -78,6 +81,8 @@ var (
 func init() {
 	serverOptions.cpuprofile = cmdServer.Flag.String("cpuprofile", "", "cpu profile output file")
 	serverOptions.memprofile = cmdServer.Flag.String("memprofile", "", "memory profile output file")
+	serverOptions.debug = cmdServer.Flag.Bool("debug", false, "serves runtime profiling data, e.g., http://localhost:6060/debug/pprof/goroutine?debug=2")
+	serverOptions.debugPort = cmdServer.Flag.Int("debug.port", 6060, "http port for debugging")
 
 	masterOptions.port = cmdServer.Flag.Int("master.port", 9333, "master server http listen port")
 	masterOptions.metaFolder = cmdServer.Flag.String("master.dir", "", "data directory to store meta data, default to same as -dir specified")
@@ -111,6 +116,7 @@ func init() {
 	serverOptions.v.compactionMBPerSecond = cmdServer.Flag.Int("volume.compactionMBps", 0, "limit compaction speed in mega bytes per second")
 	serverOptions.v.fileSizeLimitMB = cmdServer.Flag.Int("volume.fileSizeLimitMB", 256, "limit file size to avoid out of memory")
 	serverOptions.v.concurrentUploadLimitMB = cmdServer.Flag.Int("volume.concurrentUploadLimitMB", 64, "limit total concurrent upload size")
+	serverOptions.v.concurrentDownloadLimitMB = cmdServer.Flag.Int("volume.concurrentDownloadLimitMB", 64, "limit total concurrent download size")
 	serverOptions.v.publicUrl = cmdServer.Flag.String("volume.publicUrl", "", "publicly accessible address")
 	serverOptions.v.preStopSeconds = cmdServer.Flag.Int("volume.preStopSeconds", 10, "number of seconds between stop send heartbeats and stop volume server")
 	serverOptions.v.pprof = cmdServer.Flag.Bool("volume.pprof", false, "enable pprof http handlers. precludes --memprofile and --cpuprofile")
@@ -138,6 +144,10 @@ func init() {
 }
 
 func runServer(cmd *Command, args []string) bool {
+
+	if *serverOptions.debug {
+		go http.ListenAndServe(fmt.Sprintf(":%d", *serverOptions.debugPort), nil)
+	}
 
 	util.LoadConfiguration("security", false)
 	util.LoadConfiguration("master", false)

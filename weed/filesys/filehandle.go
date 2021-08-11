@@ -114,6 +114,16 @@ func (fh *FileHandle) readFromChunks(buff []byte, offset int64) (int64, error) {
 		return 0, io.EOF
 	}
 
+	if entry.IsInRemoteOnly() {
+		glog.V(4).Infof("download remote entry %s", fh.f.fullpath())
+		newEntry, err := fh.f.downloadRemoteEntry(entry)
+		if err != nil {
+			glog.V(1).Infof("download remote entry %s: %v", fh.f.fullpath(), err)
+			return 0, err
+		}
+		entry = newEntry
+	}
+
 	fileSize := int64(filer.FileSize(entry))
 	fileFullPath := fh.f.fullpath()
 
@@ -200,7 +210,9 @@ func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) err
 	fh.Lock()
 	defer fh.Unlock()
 
+	fh.f.wfs.handlesLock.Lock()
 	fh.f.isOpen--
+	fh.f.wfs.handlesLock.Unlock()
 
 	if fh.f.isOpen <= 0 {
 		fh.f.entry = nil

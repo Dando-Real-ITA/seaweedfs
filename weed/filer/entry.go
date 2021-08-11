@@ -42,7 +42,7 @@ type Entry struct {
 	HardLinkId      HardLinkId
 	HardLinkCounter int32
 	Content         []byte
-	Remote          *filer_pb.Entry_Remote
+	Remote          *filer_pb.RemoteEntry
 }
 
 func (entry *Entry) Size() uint64 {
@@ -55,6 +55,23 @@ func (entry *Entry) Timestamp() time.Time {
 	} else {
 		return entry.Mtime
 	}
+}
+
+func (entry *Entry) ShallowClone() *Entry {
+	if entry == nil {
+		return nil
+	}
+	newEntry := &Entry{}
+	newEntry.FullPath = entry.FullPath
+	newEntry.Attr = entry.Attr
+	newEntry.Chunks = entry.Chunks
+	newEntry.Extended = entry.Extended
+	newEntry.HardLinkId = entry.HardLinkId
+	newEntry.HardLinkCounter = entry.HardLinkCounter
+	newEntry.Content = entry.Content
+	newEntry.Remote = entry.Remote
+
+	return newEntry
 }
 
 func (entry *Entry) ToProtoEntry() *filer_pb.Entry {
@@ -78,7 +95,7 @@ func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
 	message.HardLinkId = entry.HardLinkId
 	message.HardLinkCounter = entry.HardLinkCounter
 	message.Content = entry.Content
-	message.Remote = entry.Remote
+	message.RemoteEntry = entry.Remote
 }
 
 func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
@@ -88,7 +105,7 @@ func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
 	fsEntry.HardLinkId = HardLinkId(message.HardLinkId)
 	fsEntry.HardLinkCounter = message.HardLinkCounter
 	fsEntry.Content = message.Content
-	fsEntry.Remote = message.Remote
+	fsEntry.Remote = message.RemoteEntry
 }
 
 func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {

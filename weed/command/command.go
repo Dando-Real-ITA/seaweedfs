@@ -8,6 +8,8 @@ import (
 )
 
 var Commands = []*Command{
+	cmdAutocomplete,
+	cmdUnautocomplete,
 	cmdBackup,
 	cmdBenchmark,
 	cmdCompact,
@@ -19,6 +21,7 @@ var Commands = []*Command{
 	cmdFilerCopy,
 	cmdFilerMetaBackup,
 	cmdFilerMetaTail,
+	cmdFilerRemoteSynchronize,
 	cmdFilerReplicate,
 	cmdFilerSynchronize,
 	cmdFix,

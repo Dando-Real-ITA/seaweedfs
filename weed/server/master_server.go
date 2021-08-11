@@ -26,8 +26,8 @@ import (
 )
 
 const (
-	SequencerType     = "master.sequencer.type"
-	SequencerEtcdUrls = "master.sequencer.sequencer_etcd_urls"
+	SequencerType        = "master.sequencer.type"
+	SequencerEtcdUrls    = "master.sequencer.sequencer_etcd_urls"
 	SequencerSnowflakeId = "master.sequencer.sequencer_snowflake_id"
 )
 
@@ -228,6 +228,7 @@ func (ms *MasterServer) startAdminScripts() {
 	shellOptions.Masters = &masterAddress
 
 	shellOptions.FilerHost, shellOptions.FilerPort, err = util.ParseHostPort(filerHostPort)
+	shellOptions.FilerAddress = filerHostPort
 	shellOptions.Directory = "/"
 	if err != nil {
 		glog.V(0).Infof("failed to parse master.filer.default = %s : %v\n", filerHostPort, err)

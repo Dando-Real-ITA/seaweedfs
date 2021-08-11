@@ -160,7 +160,7 @@ func (c *commandVolumeFixReplication) fixUnderReplicatedVolumes(commandEnv *Comm
 	for _, vid := range underReplicatedVolumeIds {
 		for i := 0; i < retryCount+1; i++ {
 			if err = c.fixOneUnderReplicatedVolume(commandEnv, writer, takeAction, volumeReplicas, vid, allLocations); err == nil {
-				continue
+				break
 			}
 		}
 	}
@@ -195,6 +195,8 @@ func (c *commandVolumeFixReplication) fixOneUnderReplicatedVolume(commandEnv *Co
 			fmt.Fprintf(writer, "replicating volume %d %s from %s to dataNode %s ...\n", replica.info.Id, replicaPlacement, replica.location.dataNode.Id, dst.dataNode.Id)
 
 			if !takeAction {
+				// adjust free volume count
+				dst.dataNode.DiskInfos[replica.info.DiskType].FreeVolumeCount--
 				break
 			}
 
@@ -410,14 +412,14 @@ func pickOneReplicaToDelete(replicas []*VolumeReplica, replicaPlacement *super_b
 
 	sort.Slice(replicas, func(i, j int) bool {
 		a, b := replicas[i], replicas[j]
-		if a.info.CompactRevision != b.info.CompactRevision {
-			return a.info.CompactRevision < b.info.CompactRevision
+		if a.info.Size != b.info.Size {
+			return a.info.Size < b.info.Size
 		}
 		if a.info.ModifiedAtSecond != b.info.ModifiedAtSecond {
 			return a.info.ModifiedAtSecond < b.info.ModifiedAtSecond
 		}
-		if a.info.Size != b.info.Size {
-			return a.info.Size < b.info.Size
+		if a.info.CompactRevision != b.info.CompactRevision {
+			return a.info.CompactRevision < b.info.CompactRevision
 		}
 		return false
 	})
