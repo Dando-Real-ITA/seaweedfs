@@ -125,6 +125,12 @@ func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, 
 
 	err := filer_pb.TraverseBfs(filerClient, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) {
 
+		// TODO ignore folder /topics/.system/
+		if strings.Contains(string(parentPath), "/topics/.system") {
+			println("Found /topics/.system")
+			return
+		}
+
 		protoMessage := &filer_pb.FullEntry{
 			Dir:   string(parentPath),
 			Entry: entry,
