@@ -7,7 +7,6 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"io"
-	"strings"
 )
 
 func init() {
@@ -27,11 +26,17 @@ func (c *commandRemoteCache) Help() string {
 	# assume a remote storage is configured to name "cloud1"
 	remote.configure -name=cloud1 -type=s3 -access_key=xxx -secret_key=yyy
 	# mount and pull one bucket
-	remote.mount -dir=xxx -remote=cloud1/bucket
+	remote.mount -dir=/xxx -remote=cloud1/bucket
 
 	# after mount, run one of these command to cache the content of the files
-	remote.cache -dir=xxx
-	remote.cache -dir=xxx/some/sub/dir
+	remote.cache -dir=/xxx
+	remote.cache -dir=/xxx/some/sub/dir
+	remote.cache -dir=/xxx/some/sub/dir -include=*.pdf
+
+	This is designed to run regularly. So you can add it to some cronjob.
+	If a file is already synchronized with the remote copy, the file will be skipped to avoid unnecessary copy.
+
+	The actual data copying goes through volume severs.
 
 `
 }
@@ -41,42 +46,20 @@ func (c *commandRemoteCache) Do(args []string, commandEnv *CommandEnv, writer io
 	remoteMountCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 
 	dir := remoteMountCommand.String("dir", "", "a directory in filer")
+	fileFiler := newFileFilter(remoteMountCommand)
 
 	if err = remoteMountCommand.Parse(args); err != nil {
 		return nil
 	}
 
-	mappings, listErr := filer.ReadMountMappings(commandEnv.option.GrpcDialOption, commandEnv.option.FilerAddress)
-	if listErr != nil {
-		return listErr
-	}
-	if *dir == "" {
+	mappings, localMountedDir, remoteStorageMountedLocation, remoteStorageConf, detectErr := detectMountInfo(commandEnv, writer, *dir)
+	if detectErr != nil{
 		jsonPrintln(writer, mappings)
-		fmt.Fprintln(writer, "need to specify '-dir' option")
-		return nil
-	}
-
-	var localMountedDir string
-	var remoteStorageMountedLocation *filer_pb.RemoteStorageLocation
-	for k, loc := range mappings.Mappings {
-		if strings.HasPrefix(*dir, k) {
-			localMountedDir, remoteStorageMountedLocation = k, loc
-		}
-	}
-	if localMountedDir == "" {
-		jsonPrintln(writer, mappings)
-		fmt.Fprintf(writer, "%s is not mounted\n", *dir)
-		return nil
-	}
-
-	// find remote storage configuration
-	remoteStorageConf, err := filer.ReadRemoteStorageConf(commandEnv.option.GrpcDialOption, commandEnv.option.FilerAddress, remoteStorageMountedLocation.Name)
-	if err != nil {
-		return err
+		return detectErr
 	}
 
 	// pull content from remote
-	if err = c.cacheContentData(commandEnv, writer, util.FullPath(localMountedDir), remoteStorageMountedLocation, util.FullPath(*dir), remoteStorageConf); err != nil {
+	if err = c.cacheContentData(commandEnv, writer, util.FullPath(localMountedDir), remoteStorageMountedLocation, util.FullPath(*dir), fileFiler, remoteStorageConf); err != nil {
 		return fmt.Errorf("cache content data: %v", err)
 	}
 
@@ -111,7 +94,7 @@ func shouldCacheToLocal(entry *filer_pb.Entry) bool {
 	if entry.RemoteEntry == nil {
 		return false
 	}
-	if entry.RemoteEntry.LocalMtime == 0 && entry.RemoteEntry.RemoteSize > 0 {
+	if entry.RemoteEntry.LastLocalSyncTsNs == 0 && entry.RemoteEntry.RemoteSize > 0 {
 		return true
 	}
 	return false
@@ -122,19 +105,23 @@ func mayHaveCachedToLocal(entry *filer_pb.Entry) bool {
 		return false
 	}
 	if entry.RemoteEntry == nil {
-		return false
+		return false // should not uncache an entry that is not in remote
 	}
-	if entry.RemoteEntry.LocalMtime > 0 && len(entry.Chunks) > 0 {
+	if entry.RemoteEntry.LastLocalSyncTsNs > 0 && len(entry.Chunks) > 0 {
 		return true
 	}
 	return false
 }
 
-func (c *commandRemoteCache) cacheContentData(commandEnv *CommandEnv, writer io.Writer, localMountedDir util.FullPath, remoteMountedLocation *filer_pb.RemoteStorageLocation, dirToCache util.FullPath, remoteConf *filer_pb.RemoteConf) error {
+func (c *commandRemoteCache) cacheContentData(commandEnv *CommandEnv, writer io.Writer, localMountedDir util.FullPath, remoteMountedLocation *filer_pb.RemoteStorageLocation, dirToCache util.FullPath, fileFilter *FileFilter, remoteConf *filer_pb.RemoteConf) error {
 
 	return recursivelyTraverseDirectory(commandEnv, dirToCache, func(dir util.FullPath, entry *filer_pb.Entry) bool {
 		if !shouldCacheToLocal(entry) {
 			return true // true means recursive traversal should continue
+		}
+
+		if fileFilter.matches(entry) {
+			return true
 		}
 
 		println(dir, entry.Name)

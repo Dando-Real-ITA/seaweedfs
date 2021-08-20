@@ -13,6 +13,7 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/remote_storage"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"io"
+	"reflect"
 )
 
 func init() {
@@ -70,11 +71,7 @@ func (s *s3RemoteStorageClient) Traverse(remote *filer_pb.RemoteStorageLocation,
 		listErr := s.conn.ListObjectsV2Pages(listInput, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 			for _, content := range page.Contents {
 				key := *content.Key
-				if len(pathKey) == 0 {
-					key = "/" + key
-				} else {
-					key = key[len(pathKey):]
-				}
+				key = "/" + key
 				dir, name := util.FullPath(key).DirAndName()
 				if err := visitFn(dir, name, false, &filer_pb.RemoteEntry{
 					RemoteMtime: (*content.LastModified).Unix(),
@@ -149,9 +146,6 @@ func (s *s3RemoteStorageClient) WriteFile(loc *filer_pb.RemoteStorageLocation, e
 		Bucket:               aws.String(loc.Bucket),
 		Key:                  aws.String(loc.Path[1:]),
 		Body:                 reader,
-		ACL:                  aws.String("private"),
-		ServerSideEncryption: aws.String("AES256"),
-		StorageClass:         aws.String("STANDARD_IA"),
 		Tagging:              aws.String(tags),
 	})
 
@@ -194,13 +188,16 @@ func (s *s3RemoteStorageClient) readFileRemoteEntry(loc *filer_pb.RemoteStorageL
 
 }
 
-func (s *s3RemoteStorageClient) UpdateFileMetadata(loc *filer_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
-	tagging := toTagging(entry.Extended)
+func (s *s3RemoteStorageClient) UpdateFileMetadata(loc *filer_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (err error) {
+	if reflect.DeepEqual(oldEntry.Extended, newEntry.Extended) {
+		return nil
+	}
+	tagging := toTagging(newEntry.Extended)
 	if len(tagging.TagSet) > 0 {
 		_, err = s.conn.PutObjectTagging(&s3.PutObjectTaggingInput{
 			Bucket:  aws.String(loc.Bucket),
 			Key:     aws.String(loc.Path[1:]),
-			Tagging: toTagging(entry.Extended),
+			Tagging: toTagging(newEntry.Extended),
 		})
 	} else {
 		_, err = s.conn.DeleteObjectTagging(&s3.DeleteObjectTaggingInput{

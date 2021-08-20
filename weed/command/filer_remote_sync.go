@@ -11,7 +11,6 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/replication/source"
 	"github.com/chrislusf/seaweedfs/weed/security"
 	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 	"time"
 )
@@ -70,43 +69,33 @@ func runFilerRemoteSynchronize(cmd *Command, args []string) bool {
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 	remoteSyncOptions.grpcDialOption = grpcDialOption
 
+	dir := *remoteSyncOptions.dir
+	filerAddress := *remoteSyncOptions.filerAddress
+
 	// read filer remote storage mount mappings
-	mappings, readErr := filer.ReadMountMappings(grpcDialOption, *remoteSyncOptions.filerAddress)
-	if readErr != nil {
-		fmt.Printf("read mount mapping: %v", readErr)
+	_, _, remoteStorageMountLocation, storageConf, detectErr := filer.DetectMountInfo(grpcDialOption, filerAddress, dir)
+	if detectErr != nil {
+		fmt.Printf("read mount info: %v", detectErr)
 		return false
 	}
 
 	filerSource := &source.FilerSource{}
 	filerSource.DoInitialize(
-		*remoteSyncOptions.filerAddress,
-		pb.ServerToGrpcAddress(*remoteSyncOptions.filerAddress),
+		filerAddress,
+		pb.ServerToGrpcAddress(filerAddress),
 		"/", // does not matter
 		*remoteSyncOptions.readChunkFromFiler,
 	)
 
-	var found bool
-	for dir, remoteStorageMountLocation := range mappings.Mappings {
-		if *remoteSyncOptions.dir == dir {
-			found = true
-			storageConf, readErr := filer.ReadRemoteStorageConf(grpcDialOption, *remoteSyncOptions.filerAddress, remoteStorageMountLocation.Name)
-			if readErr != nil {
-				fmt.Printf("read remote storage configuration for %s: %v", dir, readErr)
-				continue
-			}
-			fmt.Printf("synchronize %s to remote storage...\n", *remoteSyncOptions.dir)
-			if err := util.Retry("filer.remote.sync "+dir, func() error {
-				return followUpdatesAndUploadToRemote(&remoteSyncOptions, filerSource, dir, storageConf, remoteStorageMountLocation)
-			}); err != nil {
-				fmt.Printf("synchronize %s: %v\n", *remoteSyncOptions.dir, err)
-			}
-			break
+	fmt.Printf("synchronize %s to remote storage...\n", dir)
+	util.RetryForever("filer.remote.sync "+dir, func() error {
+		return followUpdatesAndUploadToRemote(&remoteSyncOptions, filerSource, dir, storageConf, remoteStorageMountLocation)
+	}, func(err error) bool {
+		if err != nil {
+			glog.Errorf("synchronize %s: %v", dir, err)
 		}
-	}
-	if !found {
-		fmt.Printf("directory %s is not mounted to any remote storage\n", *remoteSyncOptions.dir)
-		return false
-	}
+		return true
+	})
 
 	return true
 }
@@ -147,19 +136,21 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 			return nil
 		}
 		if message.OldEntry == nil && message.NewEntry != nil {
-			if len(message.NewEntry.Chunks) == 0 {
+			if !filer.HasData(message.NewEntry) {
 				return nil
 			}
-			fmt.Printf("create: %+v\n", resp)
+			glog.V(2).Infof("create: %+v", resp)
 			if !shouldSendToRemote(message.NewEntry) {
-				fmt.Printf("skipping creating: %+v\n", resp)
+				glog.V(2).Infof("skipping creating: %+v", resp)
 				return nil
 			}
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(message.NewParentPath, message.NewEntry.Name), remoteStorageMountLocation)
 			if message.NewEntry.IsDirectory {
+				glog.V(0).Infof("mkdir  %s", remote_storage.FormatLocation(dest))
 				return client.WriteDirectory(dest, message.NewEntry)
 			}
-			reader := filer.NewChunkStreamReader(filerSource, message.NewEntry.Chunks)
+			glog.V(0).Infof("create %s", remote_storage.FormatLocation(dest))
+			reader := filer.NewFileReader(filerSource, message.NewEntry)
 			remoteEntry, writeErr := client.WriteFile(dest, message.NewEntry, reader)
 			if writeErr != nil {
 				return writeErr
@@ -167,31 +158,34 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 			return updateLocalEntry(&remoteSyncOptions, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 		if message.OldEntry != nil && message.NewEntry == nil {
-			fmt.Printf("delete: %+v\n", resp)
+			glog.V(2).Infof("delete: %+v", resp)
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
+			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(dest))
 			return client.DeleteFile(dest)
 		}
 		if message.OldEntry != nil && message.NewEntry != nil {
 			oldDest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(message.NewParentPath, message.NewEntry.Name), remoteStorageMountLocation)
 			if !shouldSendToRemote(message.NewEntry) {
-				fmt.Printf("skipping updating: %+v\n", resp)
+				glog.V(2).Infof("skipping updating: %+v", resp)
 				return nil
 			}
 			if message.NewEntry.IsDirectory {
 				return client.WriteDirectory(dest, message.NewEntry)
 			}
 			if resp.Directory == message.NewParentPath && message.OldEntry.Name == message.NewEntry.Name {
-				if isSameChunks(message.OldEntry.Chunks, message.NewEntry.Chunks) {
-					fmt.Printf("update meta: %+v\n", resp)
-					return client.UpdateFileMetadata(dest, message.NewEntry)
+				if filer.IsSameData(message.OldEntry, message.NewEntry) {
+					glog.V(2).Infof("update meta: %+v", resp)
+					return client.UpdateFileMetadata(dest, message.OldEntry, message.NewEntry)
 				}
 			}
-			fmt.Printf("update: %+v\n", resp)
+			glog.V(2).Infof("update: %+v", resp)
+			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(oldDest))
 			if err := client.DeleteFile(oldDest); err != nil {
 				return err
 			}
-			reader := filer.NewChunkStreamReader(filerSource, message.NewEntry.Chunks)
+			reader := filer.NewFileReader(filerSource, message.NewEntry)
+			glog.V(0).Infof("create %s", remote_storage.FormatLocation(dest))
 			remoteEntry, writeErr := client.WriteFile(dest, message.NewEntry, reader)
 			if writeErr != nil {
 				return writeErr
@@ -222,24 +216,11 @@ func toRemoteStorageLocation(mountDir, sourcePath util.FullPath, remoteMountLoca
 	}
 }
 
-func isSameChunks(a, b []*filer_pb.FileChunk) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		x, y := a[i], b[i]
-		if !proto.Equal(x, y) {
-			return false
-		}
-	}
-	return true
-}
-
 func shouldSendToRemote(entry *filer_pb.Entry) bool {
 	if entry.RemoteEntry == nil {
 		return true
 	}
-	if entry.RemoteEntry.LocalMtime < entry.Attributes.Mtime {
+	if entry.RemoteEntry.LastLocalSyncTsNs/1e9 < entry.Attributes.Mtime {
 		return true
 	}
 	return false

@@ -1,13 +1,17 @@
-name: Build Dev Binaries
+# This is a basic workflow to help you get started with Actions
+
+name: Build Versioned Releases
 
 on:
-  push:
-    branches: [ master ]
+  release:
+    types: [created]
 
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-
   build:
-    name: Build
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -19,48 +23,37 @@ jobs:
           - goarch: arm
             goos: windows
 
+    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
-
-      - name: Wait for the deletion
-        uses: jakejarvis/wait-action@master
-        with:
-          time: '30s'
-
-      - name: Set BUILD_TIME env
-        run: echo BUILD_TIME=$(date -u +%Y%m%d-%H%M) >> ${GITHUB_ENV}
-
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
       - name: Go Release Binaries
-        uses: wangyoucao577/go-release-action@v1.17
+        uses: wangyoucao577/go-release-action@v1.19
         with:
           goversion: 1.17
           github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
-          release_tag: dev
+          overwrite: true
+          pre_command: export CGO_ENABLED=0
+          # build_flags: -tags 5BytesOffset # optional, default is
+          ldflags: -extldflags -static -X github.com/chrislusf/seaweedfs/weed/util.COMMIT=${{github.sha}}
+          # Where to run `go build .`
+          project_path: weed
+          binary_name: weed
+          asset_name: "${{ matrix.goos }}_${{ matrix.goarch }}"
+      - name: Go Release Large Disk Binaries
+        uses: wangyoucao577/go-release-action@v1.19
+        with:
+          goversion: 1.17
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
           overwrite: true
           pre_command: export CGO_ENABLED=0
           build_flags: -tags 5BytesOffset # optional, default is
           ldflags: -extldflags -static -X github.com/chrislusf/seaweedfs/weed/util.COMMIT=${{github.sha}}
           # Where to run `go build .`
           project_path: weed
-          binary_name: weed-large-disk
-          asset_name: "weed-large-disk-${{ env.BUILD_TIME }}-${{ matrix.goos }}-${{ matrix.goarch }}"
-
-      - name: Go Release Binaries
-        uses: wangyoucao577/go-release-action@v1.17
-        with:
-          goversion: 1.17
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          goos: ${{ matrix.goos }}
-          goarch: ${{ matrix.goarch }}
-          release_tag: dev
-          overwrite: true
-          pre_command: export CGO_ENABLED=0
-          ldflags: -extldflags -static -X github.com/chrislusf/seaweedfs/weed/util.COMMIT=${{github.sha}}
-          # Where to run `go build .`
-          project_path: weed
           binary_name: weed
-          asset_name: "weed-${{ env.BUILD_TIME }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          asset_name: "${{ matrix.goos }}_${{ matrix.goarch }}_large_disk"

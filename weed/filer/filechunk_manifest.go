@@ -132,6 +132,49 @@ func retriedFetchChunkData(urlStrings []string, cipherKey []byte, isGzipped bool
 
 }
 
+func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int) (err error) {
+
+	var shouldRetry bool
+	var totalWritten int
+
+	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
+		for _, urlString := range urlStrings {
+			var localProcesed int
+			shouldRetry, err = util.ReadUrlAsStream(urlString+"?readDeleted=true", cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
+				if totalWritten > localProcesed {
+					toBeSkipped := totalWritten - localProcesed
+					if len(data) <= toBeSkipped {
+						localProcesed += len(data)
+						return // skip if already processed
+					}
+					data = data[toBeSkipped:]
+					localProcesed += toBeSkipped
+				}
+				writer.Write(data)
+				localProcesed += len(data)
+				totalWritten += len(data)
+			})
+			if !shouldRetry {
+				break
+			}
+			if err != nil {
+				glog.V(0).Infof("read %s failed, err: %v", urlString, err)
+			} else {
+				break
+			}
+		}
+		if err != nil && shouldRetry {
+			glog.V(0).Infof("retry reading in %v", waitTime)
+			time.Sleep(waitTime)
+		} else {
+			break
+		}
+	}
+
+	return err
+
+}
+
 func MaybeManifestize(saveFunc SaveDataAsChunkFunctionType, inputChunks []*filer_pb.FileChunk) (chunks []*filer_pb.FileChunk, err error) {
 	return doMaybeManifestize(saveFunc, inputChunks, ManifestBatch, mergeIntoManifest)
 }

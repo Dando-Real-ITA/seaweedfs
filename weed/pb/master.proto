@@ -140,14 +140,15 @@ message VolumeLocation {
 }
 
 message LookupVolumeRequest {
-    repeated string volume_ids = 1;
+    repeated string volume_or_file_ids = 1;
     string collection = 2; // optional, a bit faster if provided.
 }
 message LookupVolumeResponse {
     message VolumeIdLocation {
-        string volume_id = 1;
+        string volume_or_file_id = 1;
         repeated Location locations = 2;
         string error = 3;
+        string auth = 4;
     }
     repeated VolumeIdLocation volume_id_locations = 1;
 }
@@ -275,6 +276,8 @@ message GetMasterConfigurationResponse {
     repeated StorageBackend storage_backends = 3;
     string default_replication = 4;
     string leader = 5;
+    uint32 volume_size_limit_m_b = 6;
+    bool volume_preallocate = 7;
 }
 
 message ListMasterClientsRequest {

@@ -35,7 +35,7 @@ type MasterOption struct {
 	Host              string
 	Port              int
 	MetaFolder        string
-	VolumeSizeLimitMB uint
+	VolumeSizeLimitMB uint32
 	VolumePreallocate bool
 	// PulseSeconds            int
 	DefaultReplicaPlacement string
@@ -44,6 +44,7 @@ type MasterOption struct {
 	DisableHttp             bool
 	MetricsAddress          string
 	MetricsIntervalSec      int
+	IsFollower              bool
 }
 
 type MasterServer struct {
@@ -145,7 +146,9 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers []string) *Maste
 
 	ms.ProcessGrowRequest()
 
-	ms.startAdminScripts()
+	if !option.IsFollower {
+		ms.startAdminScripts()
+	}
 
 	return ms
 }
@@ -193,8 +196,8 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			proxy.Transport = util.Transport
 			proxy.ServeHTTP(w, r)
 		} else {
-			// drop it to the floor
-			// writeJsonError(w, r, errors.New(ms.Topo.RaftServer.Name()+" does not know Leader yet:"+ms.Topo.RaftServer.Leader()))
+			// handle requests locally
+			f(w, r)
 		}
 	}
 }

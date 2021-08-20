@@ -16,7 +16,50 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/wdclient"
 )
 
-func StreamContent(masterClient wdclient.HasLookupFileIdFunction, w io.Writer, chunks []*filer_pb.FileChunk, offset int64, size int64) error {
+func HasData(entry *filer_pb.Entry) bool {
+
+	if len(entry.Content) > 0 {
+		return true
+	}
+
+	return len(entry.Chunks) > 0
+}
+
+func IsSameData(a, b *filer_pb.Entry) bool {
+
+	if len(a.Content) > 0 || len(b.Content) > 0 {
+		return bytes.Equal(a.Content, b.Content)
+	}
+
+	return isSameChunks(a.Chunks, b.Chunks)
+}
+
+func isSameChunks(a, b []*filer_pb.FileChunk) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sort.Slice(a, func(i, j int) bool {
+		return strings.Compare(a[i].ETag, a[j].ETag) < 0
+	})
+	sort.Slice(b, func(i, j int) bool {
+		return strings.Compare(b[i].ETag, b[j].ETag) < 0
+	})
+	for i := 0; i < len(a); i++ {
+		if a[i].ETag != b[i].ETag {
+			return false
+		}
+	}
+	return true
+}
+
+func NewFileReader(filerClient filer_pb.FilerClient, entry *filer_pb.Entry) io.Reader {
+	if len(entry.Content) > 0 {
+		return bytes.NewReader(entry.Content)
+	}
+	return NewChunkStreamReader(filerClient, entry.Chunks)
+}
+
+func StreamContent(masterClient wdclient.HasLookupFileIdFunction, writer io.Writer, chunks []*filer_pb.FileChunk, offset int64, size int64) error {
 
 	glog.V(9).Infof("start to stream content for chunks: %+v\n", chunks)
 	chunkViews := ViewFromChunks(masterClient.GetLookupFileIdFunction(), chunks, offset, size)
@@ -40,17 +83,11 @@ func StreamContent(masterClient wdclient.HasLookupFileIdFunction, w io.Writer, c
 
 		urlStrings := fileId2Url[chunkView.FileId]
 		start := time.Now()
-		data, err := retriedFetchChunkData(urlStrings, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.Offset, int(chunkView.Size))
+		err := retriedStreamFetchChunkData(writer, urlStrings, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.Offset, int(chunkView.Size))
 		stats.FilerRequestHistogram.WithLabelValues("chunkDownload").Observe(time.Since(start).Seconds())
 		if err != nil {
 			stats.FilerRequestCounter.WithLabelValues("chunkDownloadError").Inc()
 			return fmt.Errorf("read chunk: %v", err)
-		}
-
-		_, err = w.Write(data)
-		if err != nil {
-			stats.FilerRequestCounter.WithLabelValues("chunkDownloadedError").Inc()
-			return fmt.Errorf("write chunk: %v", err)
 		}
 		stats.FilerRequestCounter.WithLabelValues("chunkDownload").Inc()
 	}
@@ -138,9 +175,10 @@ func NewChunkStreamReader(filerClient filer_pb.FilerClient, chunks []*filer_pb.F
 }
 
 func (c *ChunkStreamReader) ReadAt(p []byte, off int64) (n int, err error) {
-	if err = c.prepareBufferFor(c.logicOffset); err != nil {
+	if err = c.prepareBufferFor(off); err != nil {
 		return
 	}
+	c.logicOffset = off
 	return c.Read(p)
 }
 
@@ -199,10 +237,25 @@ func (c *ChunkStreamReader) prepareBufferFor(offset int64) (err error) {
 
 	// need to seek to a different chunk
 	currentChunkIndex := sort.Search(len(c.chunkViews), func(i int) bool {
-		return c.chunkViews[i].LogicOffset <= offset
+		return offset < c.chunkViews[i].LogicOffset
 	})
 	if currentChunkIndex == len(c.chunkViews) {
-		return io.EOF
+		// not found
+		if c.chunkViews[0].LogicOffset <= offset {
+			currentChunkIndex = 0
+		} else if c.chunkViews[len(c.chunkViews)-1].LogicOffset <= offset {
+			currentChunkIndex = len(c.chunkViews) -1
+		} else {
+			return io.EOF
+		}
+	} else if currentChunkIndex > 0 {
+		if c.chunkViews[currentChunkIndex-1].LogicOffset <= offset {
+			currentChunkIndex -= 1
+		} else {
+			return fmt.Errorf("unexpected1 offset %d", offset)
+		}
+	} else {
+		return fmt.Errorf("unexpected2 offset %d", offset)
 	}
 
 	// positioning within the new chunk
