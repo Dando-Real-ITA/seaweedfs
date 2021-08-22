@@ -5,13 +5,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 	"io"
 	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/operation"
@@ -145,7 +146,7 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(volumeIdToServer map[uint
 		cookie  uint32
 		path    util.FullPath
 	}
-	return doTraverseBfsAndSaving(c.env, nil, filerPath, false, func(outputChan chan interface{}) {
+	return doTraverseBfsAndSaving(c.env, nil, filerPath, false, false, func(outputChan chan interface{}) {
 		buffer := make([]byte, 16)
 		for item := range outputChan {
 			i := item.(*Item)
@@ -303,7 +304,7 @@ func (c *commandVolumeFsck) collectFilerFileIds(tempFolder string, volumeIdToSer
 		vid     uint32
 		fileKey uint64
 	}
-	return doTraverseBfsAndSaving(c.env, nil, "/", false, func(outputChan chan interface{}) {
+	return doTraverseBfsAndSaving(c.env, nil, "/", false, false, func(outputChan chan interface{}) {
 		buffer := make([]byte, 8)
 		for item := range outputChan {
 			i := item.(*Item)
