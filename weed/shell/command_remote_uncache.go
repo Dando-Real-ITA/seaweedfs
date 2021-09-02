@@ -33,6 +33,8 @@ func (c *commandRemoteUncache) Help() string {
 	remote.uncache -dir=/xxx/some/sub/dir
 	remote.uncache -dir=/xxx/some/sub/dir -include=*.pdf
 	remote.uncache -dir=/xxx/some/sub/dir -exclude=*.txt
+	remote.uncache -minSize=1024000    # uncache files larger than 100K
+	remote.uncache -minAge=3600        # uncache files older than 1 hour
 
 `
 }
@@ -72,7 +74,7 @@ func (c *commandRemoteUncache) Do(args []string, commandEnv *CommandEnv, writer 
 
 	// pull content from remote
 	if err = c.uncacheContentData(commandEnv, writer, util.FullPath(*dir), fileFiler); err != nil {
-		return fmt.Errorf("cache content data: %v", err)
+		return fmt.Errorf("uncache content data: %v", err)
 	}
 
 	return nil
@@ -81,6 +83,7 @@ func (c *commandRemoteUncache) Do(args []string, commandEnv *CommandEnv, writer 
 func (c *commandRemoteUncache) uncacheContentData(commandEnv *CommandEnv, writer io.Writer, dirToCache util.FullPath, fileFilter *FileFilter) error {
 
 	return recursivelyTraverseDirectory(commandEnv, dirToCache, func(dir util.FullPath, entry *filer_pb.Entry) bool {
+
 		if !mayHaveCachedToLocal(entry) {
 			return true // true means recursive traversal should continue
 		}
@@ -96,7 +99,7 @@ func (c *commandRemoteUncache) uncacheContentData(commandEnv *CommandEnv, writer
 		entry.RemoteEntry.LastLocalSyncTsNs = 0
 		entry.Chunks = nil
 
-		println(dir, entry.Name)
+		fmt.Fprintf(writer, "Uncache %+v ... ", dir.Child(entry.Name))
 
 		err := commandEnv.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 			_, updateErr := client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
@@ -109,6 +112,7 @@ func (c *commandRemoteUncache) uncacheContentData(commandEnv *CommandEnv, writer
 			fmt.Fprintf(writer, "uncache %+v: %v\n", dir.Child(entry.Name), err)
 			return false
 		}
+		fmt.Fprintf(writer, "Done\n")
 
 		return true
 	})

@@ -3,6 +3,7 @@ package shell
 import (
 	"flag"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/filer"
 	"io"
 	"os"
 	"path/filepath"
@@ -126,7 +127,7 @@ func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, 
 
 	err := filer_pb.TraverseBfs(filerClient, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) {
 
-		if ignoreTopics && (strings.Contains(string(parentPath), "/topics/.system") || (strings.Contains(string(parentPath), "/topics") && strings.Contains(string(entry.Name), ".system"))) {
+		if strings.HasPrefix(string(parentPath), filer.SystemLogDir) {
 			return
 		}
 
