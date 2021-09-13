@@ -3,7 +3,6 @@ package shell
 import (
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/chrislusf/seaweedfs/weed/filer"
 
 	"github.com/golang/protobuf/proto"
 
@@ -48,7 +49,6 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 
 	fsMetaSaveCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	verbose := fsMetaSaveCommand.Bool("v", false, "print out each processed files")
-	ignoreTopics := fsMetaSaveCommand.Bool("ignore", true, "Ignore /topics/.system files")
 	outputFileName := fsMetaSaveCommand.String("o", "", "output the meta data to this file")
 	isObfuscate := fsMetaSaveCommand.Bool("obfuscate", false, "obfuscate the file names")
 	// chunksFileName := fsMetaSaveCommand.String("chunks", "", "output all the chunks to this file")
@@ -79,7 +79,7 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 		cipherKey = util.GenCipherKey()
 	}
 
-	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, *ignoreTopics, func(outputChan chan interface{}) {
+	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, func(outputChan chan interface{}) {
 		sizeBuf := make([]byte, 4)
 		for item := range outputChan {
 			b := item.([]byte)
@@ -113,7 +113,7 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 
 }
 
-func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, path string, verbose bool, ignoreTopics bool, saveFn func(outputChan chan interface{}), genFn func(entry *filer_pb.FullEntry, outputChan chan interface{}) error) error {
+func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, path string, verbose bool, saveFn func(outputChan chan interface{}), genFn func(entry *filer_pb.FullEntry, outputChan chan interface{}) error) error {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
