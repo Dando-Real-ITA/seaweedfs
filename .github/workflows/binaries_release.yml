@@ -3,20 +3,22 @@
 name: "go: build versioned binaries"
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - '*'
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  build:
+
+  build-release-binaries:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, windows, darwin, freebsd, netbsd, openbsd]
-        goarch: [amd64, arm, arm64, 386]
+        goos: [linux, windows, darwin, freebsd]
+        goarch: [amd64, arm, arm64]
         exclude:
           - goarch: arm
             goos: darwin
@@ -31,7 +33,7 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
-      - name: Go Release Binaries
+      - name: Go Release Binaries Normal Volume Size
         uses: wangyoucao577/go-release-action@v1.20
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}

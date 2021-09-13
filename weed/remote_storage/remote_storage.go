@@ -6,8 +6,10 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/pb/remote_pb"
 	"github.com/golang/protobuf/proto"
 	"io"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 func ParseLocationName(remote string) (locationName string) {
@@ -57,10 +59,18 @@ func parseNoBucketLocation(remote string) (loc *remote_pb.RemoteStorageLocation)
 }
 
 func FormatLocation(loc *remote_pb.RemoteStorageLocation) string {
+	if loc.Bucket == "" {
+		return fmt.Sprintf("%s%s", loc.Name, loc.Path)
+	}
 	return fmt.Sprintf("%s/%s%s", loc.Name, loc.Bucket, loc.Path)
 }
 
 type VisitFunc func(dir string, name string, isDirectory bool, remoteEntry *filer_pb.RemoteEntry) error
+
+type Bucket struct {
+	Name      string
+	CreatedAt time.Time
+}
 
 type RemoteStorageClient interface {
 	Traverse(loc *remote_pb.RemoteStorageLocation, visitFn VisitFunc) error
@@ -70,6 +80,9 @@ type RemoteStorageClient interface {
 	WriteFile(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry, reader io.Reader) (remoteEntry *filer_pb.RemoteEntry, err error)
 	UpdateFileMetadata(loc *remote_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (err error)
 	DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error)
+	ListBuckets() ([]*Bucket, error)
+	CreateBucket(name string) (err error)
+	DeleteBucket(name string) (err error)
 }
 
 type RemoteStorageClientMaker interface {
@@ -87,6 +100,26 @@ var (
 	remoteStorageClients      = make(map[string]CachedRemoteStorageClient)
 	remoteStorageClientsLock  sync.Mutex
 )
+
+func GetAllRemoteStorageNames() string {
+	var storageNames []string
+	for k := range RemoteStorageClientMakers {
+		storageNames = append(storageNames, k)
+	}
+	sort.Strings(storageNames)
+	return strings.Join(storageNames, "|")
+}
+
+func GetRemoteStorageNamesHasBucket() string {
+	var storageNames []string
+	for k, m := range RemoteStorageClientMakers {
+		if m.HasBucket() {
+			storageNames = append(storageNames, k)
+		}
+	}
+	sort.Strings(storageNames)
+	return strings.Join(storageNames, "|")
+}
 
 func ParseRemoteLocation(remoteConfType string, remote string) (remoteStorageLocation *remote_pb.RemoteStorageLocation, err error) {
 	maker, found := RemoteStorageClientMakers[remoteConfType]

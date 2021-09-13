@@ -7,6 +7,7 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/remote_pb"
+	"github.com/chrislusf/seaweedfs/weed/remote_storage"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
@@ -34,7 +35,7 @@ func (c *commandRemoteConfigure) Help() string {
 
 	# set or update a configuration
 	remote.configure -name=cloud1 -type=s3 -s3.access_key=xxx -s3.secret_key=yyy -s3.region=us-east-2
-	remote.configure -name=cloud2 -type=gcs -gcs.appCredentialsFile=~/service-account-file.json
+	remote.configure -name=cloud2 -type=gcs -gcs.appCredentialsFile=~/service-account-file.json -gcs.projectId=yyy
 	remote.configure -name=cloud3 -type=azure -azure.account_name=xxx -azure.account_key=yyy
 	remote.configure -name=cloud4 -type=aliyun -aliyun.access_key=xxx -aliyun.secret_key=yyy -aliyun.endpoint=oss-cn-shenzhen.aliyuncs.com -aliyun.region=cn-sehnzhen
 	remote.configure -name=cloud5 -type=tencent -tencent.secret_id=xxx -tencent.secret_key=yyy -tencent.endpoint=cos.ap-guangzhou.myqcloud.com
@@ -60,7 +61,7 @@ func (c *commandRemoteConfigure) Do(args []string, commandEnv *CommandEnv, write
 	isDelete := remoteConfigureCommand.Bool("delete", false, "delete one remote storage by its name")
 
 	remoteConfigureCommand.StringVar(&conf.Name, "name", "", "a short name to identify the remote storage")
-	remoteConfigureCommand.StringVar(&conf.Type, "type", "s3", "[s3|gcs|azure|b2|aliyun|tencent|baidu|wasabi|hdfs|filebase|storj] storage type")
+	remoteConfigureCommand.StringVar(&conf.Type, "type", "s3", fmt.Sprintf("[%s] storage type", remote_storage.GetAllRemoteStorageNames()))
 
 	remoteConfigureCommand.StringVar(&conf.S3AccessKey, "s3.access_key", "", "s3 access key")
 	remoteConfigureCommand.StringVar(&conf.S3SecretKey, "s3.secret_key", "", "s3 secret key")
@@ -71,6 +72,7 @@ func (c *commandRemoteConfigure) Do(args []string, commandEnv *CommandEnv, write
 	remoteConfigureCommand.BoolVar(&conf.S3V4Signature, "s3.v4_signature", false, "s3 V4 signature")
 
 	remoteConfigureCommand.StringVar(&conf.GcsGoogleApplicationCredentials, "gcs.appCredentialsFile", "", "google cloud storage credentials file, default to use env GOOGLE_APPLICATION_CREDENTIALS")
+	remoteConfigureCommand.StringVar(&conf.GcsProjectId, "gcs.projectId", "", "google cloud storage project id, default to use env GOOGLE_CLOUD_PROJECT")
 
 	remoteConfigureCommand.StringVar(&conf.AzureAccountName, "azure.account_name", "", "azure account name, default to use env AZURE_STORAGE_ACCOUNT")
 	remoteConfigureCommand.StringVar(&conf.AzureAccountKey, "azure.account_key", "", "azure account name, default to use env AZURE_STORAGE_ACCESS_KEY")
@@ -158,7 +160,14 @@ func (c *commandRemoteConfigure) listExistingRemoteStorages(commandEnv *CommandE
 			return fmt.Errorf("unmarshal %s/%s: %v", filer.DirectoryEtcRemote, entry.Name, err)
 		}
 
+		// change secret key to stars
 		conf.S3SecretKey = strings.Repeat("*", len(conf.S3SecretKey))
+		conf.AliyunSecretKey = strings.Repeat("*", len(conf.AliyunSecretKey))
+		conf.BaiduAccessKey = strings.Repeat("*", len(conf.BaiduAccessKey))
+		conf.FilebaseSecretKey = strings.Repeat("*", len(conf.FilebaseSecretKey))
+		conf.StorjSecretKey = strings.Repeat("*", len(conf.StorjSecretKey))
+		conf.TencentSecretKey = strings.Repeat("*", len(conf.TencentSecretKey))
+		conf.WasabiSecretKey = strings.Repeat("*", len(conf.WasabiSecretKey))
 
 		m := jsonpb.Marshaler{
 			EmitDefaults: false,

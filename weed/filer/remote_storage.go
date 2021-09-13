@@ -131,56 +131,7 @@ func UnmarshalRemoteStorageMappings(oldContent []byte) (mappings *remote_pb.Remo
 	return
 }
 
-func AddRemoteStorageMapping(oldContent []byte, dir string, storageLocation *remote_pb.RemoteStorageLocation) (newContent []byte, err error) {
-	mappings, unmarshalErr := UnmarshalRemoteStorageMappings(oldContent)
-	if unmarshalErr != nil {
-		// skip
-	}
-
-	// set the new mapping
-	mappings.Mappings[dir] = storageLocation
-
-	if newContent, err = proto.Marshal(mappings); err != nil {
-		return oldContent, fmt.Errorf("marshal mappings: %v", err)
-	}
-
-	return
-}
-
-func RemoveRemoteStorageMapping(oldContent []byte, dir string) (newContent []byte, err error) {
-	mappings, unmarshalErr := UnmarshalRemoteStorageMappings(oldContent)
-	if unmarshalErr != nil {
-		return nil, unmarshalErr
-	}
-
-	// set the new mapping
-	delete(mappings.Mappings, dir)
-
-	if newContent, err = proto.Marshal(mappings); err != nil {
-		return oldContent, fmt.Errorf("marshal mappings: %v", err)
-	}
-
-	return
-}
-
-func ReadMountMappings(grpcDialOption grpc.DialOption, filerAddress string) (mappings *remote_pb.RemoteStorageMapping, readErr error) {
-	var oldContent []byte
-	if readErr = pb.WithFilerClient(filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		oldContent, readErr = ReadInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
-		return readErr
-	}); readErr != nil {
-		return nil, readErr
-	}
-
-	mappings, readErr = UnmarshalRemoteStorageMappings(oldContent)
-	if readErr != nil {
-		return nil, fmt.Errorf("unmarshal mappings: %v", readErr)
-	}
-
-	return
-}
-
-func ReadRemoteStorageConf(grpcDialOption grpc.DialOption, filerAddress string, storageName string) (conf *remote_pb.RemoteConf, readErr error) {
+func ReadRemoteStorageConf(grpcDialOption grpc.DialOption, filerAddress pb.ServerAddress, storageName string) (conf *remote_pb.RemoteConf, readErr error) {
 	var oldContent []byte
 	if readErr = pb.WithFilerClient(filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		oldContent, readErr = ReadInsideFiler(client, DirectoryEtcRemote, storageName+REMOTE_STORAGE_CONF_SUFFIX)
@@ -199,7 +150,7 @@ func ReadRemoteStorageConf(grpcDialOption grpc.DialOption, filerAddress string, 
 	return
 }
 
-func DetectMountInfo(grpcDialOption grpc.DialOption, filerAddress string, dir string) (*remote_pb.RemoteStorageMapping, string, *remote_pb.RemoteStorageLocation, *remote_pb.RemoteConf, error) {
+func DetectMountInfo(grpcDialOption grpc.DialOption, filerAddress pb.ServerAddress, dir string) (*remote_pb.RemoteStorageMapping, string, *remote_pb.RemoteStorageLocation, *remote_pb.RemoteConf, error) {
 
 	mappings, listErr := ReadMountMappings(grpcDialOption, filerAddress)
 	if listErr != nil {

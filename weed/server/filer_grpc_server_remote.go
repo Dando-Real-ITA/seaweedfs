@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/operation"
+	"github.com/chrislusf/seaweedfs/weed/pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/remote_pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
@@ -62,8 +63,7 @@ func (fs *FilerServer) DownloadToLocal(ctx context.Context, req *filer_pb.Downlo
 	}
 
 	// detect storage option
-	// replication level is set to "000" to ensure only need to ask one volume server to fetch the data.
-	so, err := fs.detectStorageOption(req.Directory, "", "000", 0, "", "", "")
+	so, err := fs.detectStorageOption(req.Directory, "", "", 0, "", "", "")
 	if err != nil {
 		return resp, err
 	}
@@ -111,14 +111,26 @@ func (fs *FilerServer) DownloadToLocal(ctx context.Context, req *filer_pb.Downlo
 				return
 			}
 
+			var replicas []*volume_server_pb.FetchAndWriteNeedleRequest_Replica
+			for _, r := range assignResult.Replicas {
+				replicas = append(replicas, &volume_server_pb.FetchAndWriteNeedleRequest_Replica{
+					Url:       r.Url,
+					PublicUrl: r.PublicUrl,
+					GrpcPort: int32(r.GrpcPort),
+				})
+			}
+
 			// tell filer to tell volume server to download into needles
-			err = operation.WithVolumeServerClient(assignResult.Url, fs.grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+			assignedServerAddress := pb.NewServerAddressWithGrpcPort(assignResult.Url, assignResult.GrpcPort)
+			err = operation.WithVolumeServerClient(assignedServerAddress, fs.grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 				_, fetchAndWriteErr := volumeServerClient.FetchAndWriteNeedle(context.Background(), &volume_server_pb.FetchAndWriteNeedleRequest{
 					VolumeId:   uint32(fileId.VolumeId),
 					NeedleId:   uint64(fileId.Key),
 					Cookie:     uint32(fileId.Cookie),
 					Offset:     localOffset,
 					Size:       size,
+					Replicas:   replicas,
+					Auth:       string(assignResult.Auth),
 					RemoteConf: storageConf,
 					RemoteLocation: &remote_pb.RemoteStorageLocation{
 						Name:   remoteStorageMountedLocation.Name,

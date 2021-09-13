@@ -3,6 +3,7 @@ package weed_server
 import (
 	"context"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/pb"
 	"github.com/chrislusf/seaweedfs/weed/storage/volume_info"
 	"io"
 	"io/ioutil"
@@ -49,6 +50,17 @@ func (vs *VolumeServer) VolumeEcShardsGenerate(ctx context.Context, req *volume_
 		return nil, fmt.Errorf("existing collection:%v unexpected input: %v", v.Collection, req.Collection)
 	}
 
+	shouldCleanup := true
+	defer func() {
+		if !shouldCleanup {
+			return
+		}
+		for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+			os.Remove(fmt.Sprintf("%s.ec%2d", baseFileName, i))
+		}
+		os.Remove(v.IndexFileName() + ".ecx")
+	}()
+
 	// write .ec00 ~ .ec13 files
 	if err := erasure_coding.WriteEcFiles(baseFileName); err != nil {
 		return nil, fmt.Errorf("WriteEcFiles %s: %v", baseFileName, err)
@@ -63,6 +75,8 @@ func (vs *VolumeServer) VolumeEcShardsGenerate(ctx context.Context, req *volume_
 	if err := volume_info.SaveVolumeInfo(baseFileName+".vif", &volume_server_pb.VolumeInfo{Version: uint32(v.Version())}); err != nil {
 		return nil, fmt.Errorf("WriteEcFiles %s: %v", baseFileName, err)
 	}
+
+	shouldCleanup = false
 
 	return &volume_server_pb.VolumeEcShardsGenerateResponse{}, nil
 }
@@ -113,7 +127,7 @@ func (vs *VolumeServer) VolumeEcShardsCopy(ctx context.Context, req *volume_serv
 	dataBaseFileName := storage.VolumeFileName(location.Directory, req.Collection, int(req.VolumeId))
 	indexBaseFileName := storage.VolumeFileName(location.IdxDirectory, req.Collection, int(req.VolumeId))
 
-	err := operation.WithVolumeServerClient(req.SourceDataNode, vs.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
+	err := operation.WithVolumeServerClient(pb.ServerAddress(req.SourceDataNode), vs.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 
 		// copy ec data slices
 		for _, shardId := range req.ShardIds {

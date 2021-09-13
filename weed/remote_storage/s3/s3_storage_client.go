@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -49,6 +50,9 @@ func (s s3RemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.R
 	if conf.S3V4Signature {
 		sess.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
 	}
+	sess.Handlers.Build.PushBack(func(r *request.Request) {
+		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+util.VERSION_NUMBER)
+	})
 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
 	client.conn = s3.New(sess)
 	return client, nil
@@ -228,5 +232,47 @@ func (s *s3RemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocation)
 		Bucket: aws.String(loc.Bucket),
 		Key:    aws.String(loc.Path[1:]),
 	})
+	return
+}
+
+func (s *s3RemoteStorageClient) ListBuckets() (buckets []*remote_storage.Bucket, err error) {
+	resp, err := s.conn.ListBuckets(&s3.ListBucketsInput{})
+	if err != nil {
+		return nil, fmt.Errorf("list buckets: %v", err)
+	}
+	for _, b := range resp.Buckets {
+		buckets = append(buckets, &remote_storage.Bucket{
+			Name:      *b.Name,
+			CreatedAt: *b.CreationDate,
+		})
+	}
+	return
+}
+
+func (s *s3RemoteStorageClient) CreateBucket(name string) (err error) {
+	_, err = s.conn.CreateBucket(&s3.CreateBucketInput{
+		ACL:                        nil,
+		Bucket:                     aws.String(name),
+		CreateBucketConfiguration:  nil,
+		GrantFullControl:           nil,
+		GrantRead:                  nil,
+		GrantReadACP:               nil,
+		GrantWrite:                 nil,
+		GrantWriteACP:              nil,
+		ObjectLockEnabledForBucket: nil,
+	})
+	if err != nil {
+		return fmt.Errorf("%s create bucket %s: %v", s.conf.Name, name, err)
+	}
+	return
+}
+
+func (s *s3RemoteStorageClient) DeleteBucket(name string) (err error) {
+	_, err = s.conn.DeleteBucket(&s3.DeleteBucketInput{
+		Bucket:                     aws.String(name),
+	})
+	if err != nil {
+		return fmt.Errorf("delete bucket %s: %v", name, err)
+	}
 	return
 }
