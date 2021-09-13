@@ -365,7 +365,7 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 				if assignResult.Error != "" {
 					return fmt.Errorf("assign volume failure %v: %v", request, assignResult.Error)
 				}
-				if assignResult.Location.Url == "" {
+				if assignResult.Location.PublicUrl == "" {
 					return fmt.Errorf("assign volume failure %v: %v", request, assignResult)
 				}
 				return nil
@@ -375,7 +375,7 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 			return fmt.Errorf("Failed to assign from %v: %v\n", worker.options.masters, err)
 		}
 
-		targetUrl := "http://" + assignResult.PublicUrl + "/" + assignResult.FileId
+		targetUrl := "http://" + assignResult.Location.PublicUrl + "/" + assignResult.FileId
 		uploadOption := &operation.UploadOption{
 			UploadUrl:         targetUrl,
 			Filename:          fileName,
@@ -482,7 +482,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 				fmt.Printf("Failed to assign from %v: %v\n", worker.options.masters, err)
 			}
 
-			targetUrl := "http://" + assignResult.PublicUrl + "/" + assignResult.FileId
+			targetUrl := "http://" + assignResult.Location.PublicUrl + "/" + assignResult.FileId
 			if collection == "" {
 				collection = assignResult.Collection
 			}
@@ -617,7 +617,7 @@ func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, off
 				return fmt.Errorf("assign volume failure %v: %v", request, resp.Error)
 			}
 
-			fileId, host, auth = resp.FileId, resp.Location.Url, security.EncodedJwt(resp.Auth)
+			fileId, host, auth = resp.FileId, resp.Location.PublicUrl, security.EncodedJwt(resp.Auth)
 			collection, replication = resp.Collection, resp.Replication
 
 			return nil
