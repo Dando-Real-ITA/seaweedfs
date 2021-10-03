@@ -64,7 +64,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 
 	// set etag
 	etag := filer.ETagEntry(entry)
-	if ifm := r.Header.Get("If-Match"); ifm != "" && (ifm != "\""+etag+"\"" && ifm != etag){
+	if ifm := r.Header.Get("If-Match"); ifm != "" && (ifm != "\""+etag+"\"" && ifm != etag) {
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
@@ -177,6 +177,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 				Directory: dir,
 				Name:      name,
 			}); err != nil {
+				glog.Errorf("DownloadToLocal %s: %v", entry.FullPath, err)
 				return fmt.Errorf("cache %s: %v", entry.FullPath, err)
 			} else {
 				chunks = resp.Entry.Chunks

@@ -13,11 +13,12 @@ import (
 	"github.com/golang/protobuf/proto"
 	"math"
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-func (option *RemoteSyncOptions) followBucketUpdatesAndUploadToRemote(filerSource *source.FilerSource) error {
+func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSource *source.FilerSource) error {
 
 	// read filer remote storage mount mappings
 	if detectErr := option.collectRemoteStorageConf(); detectErr != nil {
@@ -35,13 +36,13 @@ func (option *RemoteSyncOptions) followBucketUpdatesAndUploadToRemote(filerSourc
 		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, lastTsNs)
 	})
 
-	lastOffsetTs := collectLastSyncOffset(option, option.bucketsDir)
+	lastOffsetTs := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, *option.timeAgo)
 
 	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, "filer.remote.sync",
 		option.bucketsDir, []string{filer.DirectoryEtcRemote}, lastOffsetTs.UnixNano(), 0, processEventFnWithOffset, false)
 }
 
-func (option *RemoteSyncOptions) makeBucketedEventProcessor(filerSource *source.FilerSource) (pb.ProcessMetadataFunc, error) {
+func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *source.FilerSource) (pb.ProcessMetadataFunc, error) {
 
 	handleCreateBucket := func(entry *filer_pb.Entry) error {
 		if !entry.IsDirectory {
@@ -75,6 +76,16 @@ func (option *RemoteSyncOptions) makeBucketedEventProcessor(filerSource *source.
 		}
 
 		bucketName := strings.ToLower(entry.Name)
+		if *option.include != "" {
+			if ok, _ := filepath.Match(*option.include, entry.Name); !ok {
+				return nil
+			}
+		}
+		if *option.exclude != "" {
+			if ok, _ := filepath.Match(*option.exclude, entry.Name); ok {
+				return nil
+			}
+		}
 		if *option.createBucketRandomSuffix {
 			// https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
 			if len(bucketName)+5 > 63 {
@@ -307,7 +318,7 @@ func (option *RemoteSyncOptions) makeBucketedEventProcessor(filerSource *source.
 	return eachEntryFunc, nil
 }
 
-func (option *RemoteSyncOptions) findRemoteStorageClient(bucketName string) (client remote_storage.RemoteStorageClient, remoteStorageMountLocation *remote_pb.RemoteStorageLocation, err error) {
+func (option *RemoteGatewayOptions) findRemoteStorageClient(bucketName string) (client remote_storage.RemoteStorageClient, remoteStorageMountLocation *remote_pb.RemoteStorageLocation, err error) {
 	bucket := util.FullPath(option.bucketsDir).Child(bucketName)
 
 	var isMounted bool
@@ -327,7 +338,7 @@ func (option *RemoteSyncOptions) findRemoteStorageClient(bucketName string) (cli
 	return client, remoteStorageMountLocation, nil
 }
 
-func (option *RemoteSyncOptions) detectBucketInfo(actualDir string) (bucket util.FullPath, remoteStorageMountLocation *remote_pb.RemoteStorageLocation, remoteConf *remote_pb.RemoteConf, ok bool) {
+func (option *RemoteGatewayOptions) detectBucketInfo(actualDir string) (bucket util.FullPath, remoteStorageMountLocation *remote_pb.RemoteStorageLocation, remoteConf *remote_pb.RemoteConf, ok bool) {
 	bucket, ok = extractBucketPath(option.bucketsDir, actualDir)
 	if !ok {
 		return "", nil, nil, false
@@ -355,7 +366,7 @@ func extractBucketPath(bucketsDir, dir string) (util.FullPath, bool) {
 	return util.FullPath(bucketsDir).Child(parts[0]), true
 }
 
-func (option *RemoteSyncOptions) collectRemoteStorageConf() (err error) {
+func (option *RemoteGatewayOptions) collectRemoteStorageConf() (err error) {
 
 	if mappings, err := filer.ReadMountMappings(option.grpcDialOption, pb.ServerAddress(*option.filerAddress)); err != nil {
 		return err

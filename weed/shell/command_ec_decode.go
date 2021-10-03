@@ -37,16 +37,15 @@ func (c *commandEcDecode) Help() string {
 }
 
 func (c *commandEcDecode) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
-
-	if err = commandEnv.confirmIsLocked(); err != nil {
-		return
-	}
-
 	encodeCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	volumeId := encodeCommand.Int("volumeId", 0, "the volume id")
 	collection := encodeCommand.String("collection", "", "the collection name")
 	if err = encodeCommand.Parse(args); err != nil {
 		return nil
+	}
+
+	if err = commandEnv.confirmIsLocked(); err != nil {
+		return
 	}
 
 	vid := needle.VolumeId(*volumeId)
@@ -207,6 +206,18 @@ func collectEcShards(commandEnv *CommandEnv, nodeToEcIndexBits map[pb.ServerAddr
 
 	return targetNodeLocation, err
 
+}
+
+func lookupVolumeIds(commandEnv *CommandEnv, volumeIds []string) (volumeIdLocations []*master_pb.LookupVolumeResponse_VolumeIdLocation, err error) {
+	var resp *master_pb.LookupVolumeResponse
+	err = commandEnv.MasterClient.WithClient(func(client master_pb.SeaweedClient) error {
+		resp, err = client.LookupVolume(context.Background(), &master_pb.LookupVolumeRequest{VolumeOrFileIds: volumeIds})
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.VolumeIdLocations, nil
 }
 
 func collectTopologyInfo(commandEnv *CommandEnv) (topoInfo *master_pb.TopologyInfo, volumeSizeLimitMb uint64, err error) {
