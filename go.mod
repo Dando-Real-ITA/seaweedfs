@@ -74,6 +74,7 @@ require (
 	github.com/konsorten/go-windows-terminal-sequences v1.0.3 // indirect
 	github.com/kurin/blazer v0.5.3
 	github.com/lib/pq v1.10.0
+	github.com/linxGnu/grocksdb v1.6.38
 	github.com/magiconair/properties v1.8.1 // indirect
 	github.com/mailru/easyjson v0.7.1 // indirect
 	github.com/mattn/go-ieproxy v0.0.1 // indirect
@@ -177,18 +178,27 @@ require (
 	github.com/jcmturner/goidentity/v6 v6.0.1 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.2 // indirect
 	github.com/leodido/go-urn v1.2.0 // indirect
-	github.com/linxGnu/grocksdb v1.6.38 // indirect
 	github.com/mattn/go-runewidth v0.0.7 // indirect
 	github.com/miekg/dns v1.1.25-0.20191211073109-8ebf2e419df7 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
+	github.com/pingcap/errors v0.11.5-0.20201126102027-b0a155152ca3 // indirect
+	github.com/pingcap/failpoint v0.0.0-20210316064728-7acb0f0a3dfd // indirect
+	github.com/pingcap/kvproto v0.0.0-20210806074406-317f69fb54b4 // indirect
+	github.com/pingcap/log v0.0.0-20210317133921-96f4fcab92a4 // indirect
+	github.com/pingcap/parser v0.0.0-20210525032559-c37778aff307 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/tikv/pd v1.1.0-beta.0.20210323121136-78679e5e209d // indirect
+	github.com/twmb/murmur3 v1.1.3 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.0 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.0 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/multierr v1.7.0 // indirect
 	go.uber.org/zap v1.17.0 // indirect
+	golang.org/x/mod v0.4.2 // indirect
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c // indirect
+	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
+	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 )
 
 // replace github.com/seaweedfs/fuse => /Users/chris/go/src/github.com/seaweedfs/fuse
