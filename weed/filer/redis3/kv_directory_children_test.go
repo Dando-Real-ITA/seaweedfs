@@ -39,7 +39,7 @@ var names = []string{
 	"cassandra.bat",
 }
 
-func TestNameList(t *testing.T) {
+func yTestNameList(t *testing.T) {
 	server, err := tempredis.Start(tempredis.Config{})
 	if err != nil {
 		panic(err)
@@ -76,7 +76,7 @@ func TestNameList(t *testing.T) {
 
 }
 
-func BenchmarkNameList(b *testing.B) {
+func yBenchmarkNameList(b *testing.B) {
 
 	server, err := tempredis.Start(tempredis.Config{})
 	if err != nil {
