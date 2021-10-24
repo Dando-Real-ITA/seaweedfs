@@ -1,6 +1,6 @@
 # 2021-08-20 21:39:18
 FROM amd64/golang:1.17-alpine as builder
-RUN apk add git go g++ fuse3
+RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
 WORKDIR /go/src/github.com/chrislusf/
 COPY go.mod .
