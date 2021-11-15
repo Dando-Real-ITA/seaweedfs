@@ -45,11 +45,11 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 	glog.V(2).Info("NewMultipartUploadHandler", string(s3err.EncodeXMLResponse(response)), errCode)
 
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, errCode, r)
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
-	writeSuccessResponseXML(w, response)
+	writeSuccessResponseXML(w, r, response)
 
 }
 
@@ -69,11 +69,11 @@ func (s3a *S3ApiServer) CompleteMultipartUploadHandler(w http.ResponseWriter, r 
 	glog.V(2).Info("CompleteMultipartUploadHandler", string(s3err.EncodeXMLResponse(response)), errCode)
 
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, errCode, r)
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
-	writeSuccessResponseXML(w, response)
+	writeSuccessResponseXML(w, r, response)
 
 }
 
@@ -91,13 +91,13 @@ func (s3a *S3ApiServer) AbortMultipartUploadHandler(w http.ResponseWriter, r *ht
 	})
 
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, errCode, r)
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
 	glog.V(2).Info("AbortMultipartUploadHandler", string(s3err.EncodeXMLResponse(response)))
 
-	writeSuccessResponseXML(w, response)
+	writeSuccessResponseXML(w, r, response)
 
 }
 
@@ -107,13 +107,13 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 
 	prefix, keyMarker, uploadIDMarker, delimiter, maxUploads, encodingType := getBucketMultipartResources(r.URL.Query())
 	if maxUploads < 0 {
-		s3err.WriteErrorResponse(w, s3err.ErrInvalidMaxUploads, r)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidMaxUploads)
 		return
 	}
 	if keyMarker != "" {
 		// Marker not common with prefix is not implemented.
 		if !strings.HasPrefix(keyMarker, prefix) {
-			s3err.WriteErrorResponse(w, s3err.ErrNotImplemented, r)
+			s3err.WriteErrorResponse(w, r, s3err.ErrNotImplemented)
 			return
 		}
 	}
@@ -128,16 +128,16 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		UploadIdMarker: aws.String(uploadIDMarker),
 	})
 
-	glog.V(2).Info("ListMultipartUploadsHandler", string(s3err.EncodeXMLResponse(response)), errCode)
+	glog.V(2).Infof("ListMultipartUploadsHandler %s errCode=%d", string(s3err.EncodeXMLResponse(response)), errCode)
 
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, errCode, r)
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
 	// TODO handle encodingType
 
-	writeSuccessResponseXML(w, response)
+	writeSuccessResponseXML(w, r, response)
 }
 
 // ListObjectPartsHandler - Lists object parts in a multipart upload.
@@ -146,11 +146,11 @@ func (s3a *S3ApiServer) ListObjectPartsHandler(w http.ResponseWriter, r *http.Re
 
 	uploadID, partNumberMarker, maxParts, _ := getObjectResources(r.URL.Query())
 	if partNumberMarker < 0 {
-		s3err.WriteErrorResponse(w, s3err.ErrInvalidPartNumberMarker, r)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPartNumberMarker)
 		return
 	}
 	if maxParts < 0 {
-		s3err.WriteErrorResponse(w, s3err.ErrInvalidMaxParts, r)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidMaxParts)
 		return
 	}
 
@@ -162,14 +162,14 @@ func (s3a *S3ApiServer) ListObjectPartsHandler(w http.ResponseWriter, r *http.Re
 		UploadId:         aws.String(uploadID),
 	})
 
-	glog.V(2).Info("ListObjectPartsHandler", string(s3err.EncodeXMLResponse(response)), errCode)
+	glog.V(2).Infof("ListObjectPartsHandler %s count=%d", string(s3err.EncodeXMLResponse(response)), len(response.Part))
 
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, errCode, r)
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
-	writeSuccessResponseXML(w, response)
+	writeSuccessResponseXML(w, r, response)
 
 }
 
@@ -180,18 +180,18 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 	uploadID := r.URL.Query().Get("uploadId")
 	exists, err := s3a.exists(s3a.genUploadsFolder(bucket), uploadID, true)
 	if !exists {
-		s3err.WriteErrorResponse(w, s3err.ErrNoSuchUpload, r)
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchUpload)
 		return
 	}
 
 	partIDString := r.URL.Query().Get("partNumber")
 	partID, err := strconv.Atoi(partIDString)
 	if err != nil {
-		s3err.WriteErrorResponse(w, s3err.ErrInvalidPart, r)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
 		return
 	}
 	if partID > globalMaxPartID {
-		s3err.WriteErrorResponse(w, s3err.ErrInvalidMaxParts, r)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidMaxParts)
 		return
 	}
 
@@ -208,11 +208,13 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 			_, s3ErrCode = s3a.iam.reqSignatureV4Verify(r)
 		}
 		if s3ErrCode != s3err.ErrNone {
-			s3err.WriteErrorResponse(w, s3ErrCode, r)
+			s3err.WriteErrorResponse(w, r, s3ErrCode)
 			return
 		}
 	}
 	defer dataReader.Close()
+
+	glog.V(2).Infof("PutObjectPartHandler %s %s %04d", bucket, uploadID, partID)
 
 	uploadUrl := fmt.Sprintf("http://%s%s/%s/%04d.part?collection=%s",
 		s3a.option.Filer.ToHttpAddress(), s3a.genUploadsFolder(bucket), uploadID, partID, bucket)
@@ -223,13 +225,13 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 
 	etag, errCode := s3a.putToFiler(r, uploadUrl, dataReader)
 	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, errCode, r)
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
 	setEtag(w, etag)
 
-	writeSuccessResponseEmpty(w)
+	writeSuccessResponseEmpty(w, r)
 
 }
 
