@@ -42,21 +42,11 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 		glog.V(4).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
 		if readPersistedLogErr != nil {
-			glog.V(0).Infof("read on disk %v subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
-			glog.Errorf("reading from persisted logs: %v", readPersistedLogErr)
-			time.Sleep(1127 * time.Millisecond)
-			// Ensure progression
-			lastReadTime = lastReadTime.Add(1127 * time.Millisecond)
-			continue
+			glog.V(4).Infof("read on disk %v subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
 		}
 
 		if processedTsNs != 0 {
 			lastReadTime = time.Unix(0, processedTsNs)
-		} else {
-			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				time.Sleep(1127 * time.Millisecond)
-				continue
-			}
 		}
 
 		glog.V(4).Infof("read in memory %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
@@ -109,21 +99,11 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		glog.V(4).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
 		if readPersistedLogErr != nil {
-			glog.V(0).Infof("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
-			glog.Errorf("reading from persisted logs: %v", readPersistedLogErr)
-			time.Sleep(1127 * time.Millisecond)
-			// Ensure progression
-			lastReadTime = lastReadTime.Add(1127 * time.Millisecond)
-			continue
+			glog.V(4).Infof("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
 		}
 
 		if processedTsNs != 0 {
 			lastReadTime = time.Unix(0, processedTsNs)
-		} else {
-			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				time.Sleep(1127 * time.Millisecond)
-				continue
-			}
 		}
 
 		glog.V(4).Infof("read in memory %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
