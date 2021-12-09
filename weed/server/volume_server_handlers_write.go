@@ -179,3 +179,32 @@ func getEtag(resp *http.Response) (etag string) {
 	}
 	return
 }
+
+func setCache(w http.ResponseWriter, ext string) {
+	if len(ext) > 0 {
+		ext = strings.ToLower(ext)
+	}
+	// if etag != "" {
+	// 	if strings.HasPrefix(etag, "\"") {
+	// 		w.Header().Set("ETag", etag)
+	// 	} else {
+	// 		w.Header().Set("ETag", "\""+etag+"\"")
+	// 	}
+	// }
+
+	// TODO cache rules
+	// Se ext e' "", avere un default di x minuti
+	// if ext := filepath.Ext(entry.Name()); ext != "" {
+	// 	mimeType = mime.TypeByExtension(ext)
+	// }
+	// "Pragma: Public"
+	// Cache-Control public, max-age=300
+	// Create function like etag to set it depending on file extension
+	// , immutable
+	// , stale-while-revalidate=86400
+	// # /assets/*
+	// Cache-Control: max-age=31536000, immutable
+	// .ts: 3600*12
+	// .m3u8: 6
+
+}
