@@ -202,6 +202,6 @@ func setCache(w http.ResponseWriter, ext string) {
 	}
 
 	w.Header().Set("Pragma", "public")
-	w.Header().Set("Cache-Control", cacheHeader)
+	w.Header().Set("Cache-Control", "\""+cacheHeader+"\"")
 
 }
