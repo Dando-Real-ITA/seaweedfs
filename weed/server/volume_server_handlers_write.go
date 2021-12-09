@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -184,27 +185,23 @@ func setCache(w http.ResponseWriter, ext string) {
 	if len(ext) > 0 {
 		ext = strings.ToLower(ext)
 	}
-	// if etag != "" {
-	// 	if strings.HasPrefix(etag, "\"") {
-	// 		w.Header().Set("ETag", etag)
-	// 	} else {
-	// 		w.Header().Set("ETag", "\""+etag+"\"")
-	// 	}
-	// }
+	maxAge := "31536000"
+	staleTime := "86400"
+	immutable := false
 
-	// TODO cache rules
-	// Se ext e' "", avere un default di x minuti
-	// if ext := filepath.Ext(entry.Name()); ext != "" {
-	// 	mimeType = mime.TypeByExtension(ext)
-	// }
-	// "Pragma: Public"
-	// Cache-Control public, max-age=300
-	// Create function like etag to set it depending on file extension
-	// , immutable
-	// , stale-while-revalidate=86400
-	// # /assets/*
-	// Cache-Control: max-age=31536000, immutable
-	// .ts: 3600*12
-	// .m3u8: 6
+	if ext == ".m3u8" {
+		maxAge = "6"
+		staleTime = "3"
+	} else if match, _ := regexp.MatchString("\\.(?:css(\\.map)?|js(\\.map)?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4[as]|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv|ts)", ext); match {
+		immutable = true
+	}
+
+	cacheHeader := "public, max-age=" + maxAge + ", stale-while-revalidate=" + staleTime
+	if immutable {
+		cacheHeader += ", immutable"
+	}
+
+	w.Header().Set("Pragma", "public")
+	w.Header().Set("Cache-Control", cacheHeader)
 
 }
