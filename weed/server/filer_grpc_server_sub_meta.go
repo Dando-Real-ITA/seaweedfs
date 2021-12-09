@@ -58,8 +58,8 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			return true
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
+			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				time.Sleep(1127 * time.Millisecond)
 				continue
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
@@ -120,20 +120,22 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		if readInMemoryLogErr != nil {
 			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				time.Sleep(1127 * time.Millisecond)
 				continue
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
-				time.Sleep(1127 * time.Millisecond)
-				break
+				// Force a progression to avoid infinite loop
+				time.Sleep(10 * time.Millisecond)
+				lastReadTime = lastReadTime.Add(10 * time.Millisecond)
+				continue
 			}
 		}
 
 		time.Sleep(1127 * time.Millisecond)
 	}
 
-	return readInMemoryLogErr
+	// Don't close connection to avoid multiple parallel reconnections
+	// return readInMemoryLogErr
 
 }
 
