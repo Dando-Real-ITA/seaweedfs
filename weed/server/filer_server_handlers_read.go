@@ -132,7 +132,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 	setCache(w, ext)
 	setEtag(w, etag)
 
-	adjustHeaderContentDisposition(w, r, filename)
+	adjustPassthroughHeaders(w, r, filename)
 
 	totalSize := int64(entry.Size())
 
