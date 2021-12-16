@@ -34,6 +34,7 @@ require (
 	github.com/facebookgo/stats v0.0.0-20151006221625-1b76add642e4
 	github.com/facebookgo/subset v0.0.0-20200203212716-c811ad88dec4 // indirect
 	github.com/fclairamb/ftpserverlib v0.8.0
+	github.com/fluent/fluent-logger-golang v1.8.0
 	github.com/frankban/quicktest v1.7.2 // indirect
 	github.com/fsnotify/fsnotify v1.4.9 // indirect
 	github.com/go-errors/errors v1.1.1 // indirect
@@ -166,7 +167,6 @@ require (
 require (
 	cloud.google.com/go/kms v1.0.0 // indirect
 	github.com/d4l3k/messagediff v1.2.1 // indirect
-	github.com/fluent/fluent-logger-golang v1.8.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect

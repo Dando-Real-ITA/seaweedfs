@@ -39,10 +39,10 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	var readInMemoryLogErr error
 
 	for {
-		glog.V(4).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+		glog.V(0).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
 		if readPersistedLogErr != nil {
-			glog.V(4).Infof("read on disk %v subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
+			glog.Errorf("read on disk %v subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
 		}
 
 		if processedTsNs != 0 {
@@ -64,18 +64,21 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
-				// Force a progression to avoid infinite loop
-				time.Sleep(10 * time.Millisecond)
-				lastReadTime = lastReadTime.Add(10 * time.Millisecond)
-				continue
+				break
+				/*
+					// Force a progression to avoid infinite loop
+					time.Sleep(10 * time.Millisecond)
+					lastReadTime = lastReadTime.Add(10 * time.Millisecond)
+					continue
+				*/
 			}
 		}
 
 		time.Sleep(1127 * time.Millisecond)
 	}
 
-	// Don't close connection to avoid multiple parallel reconnections
-	// return readInMemoryLogErr
+	time.Sleep(1127 * time.Millisecond)
+	return readInMemoryLogErr
 
 }
 
@@ -99,10 +102,10 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	var readInMemoryLogErr error
 
 	for {
-		glog.V(4).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+		glog.V(0).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
 		if readPersistedLogErr != nil {
-			glog.V(4).Infof("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
+			glog.Errorf("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
 		}
 
 		if processedTsNs != 0 {
@@ -124,18 +127,21 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
-				// Force a progression to avoid infinite loop
-				time.Sleep(10 * time.Millisecond)
-				lastReadTime = lastReadTime.Add(10 * time.Millisecond)
-				continue
+				break
+				/*
+					// Force a progression to avoid infinite loop
+					time.Sleep(10 * time.Millisecond)
+					lastReadTime = lastReadTime.Add(10 * time.Millisecond)
+					continue
+				*/
 			}
 		}
 
 		time.Sleep(1127 * time.Millisecond)
 	}
 
-	// Don't close connection to avoid multiple parallel reconnections
-	// return readInMemoryLogErr
+	time.Sleep(1127 * time.Millisecond)
+	return readInMemoryLogErr
 
 }
 
