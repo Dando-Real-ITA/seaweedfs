@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2021-01-13 15:53:48
+# 2021-12-16 13:21:58
 
 ########################################################################################################################################################################################################################
 
@@ -91,6 +91,10 @@ fi
 # If there is a public url, add it to the parameters
 if ! [ -z "$PUBLIC_URL" ]; then
   ARGS=${ARGS:+${ARGS} }"-publicUrl=$PUBLIC_URL"
+
+  echo "Setting Host IP from Public Url"
+  HOST=$(expr "$ADDR" : '\(.*\):')
+  ARGS=${ARGS:+${ARGS} }"-ip=${HOST}"
 
   # If there is a tld, use it to extract rack and datacenter
   # gpu01.dal1.llnw.katapy.io with tld=katapy.io -> -rack=dal1 -dataCenter=llnw
