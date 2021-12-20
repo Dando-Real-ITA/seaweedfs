@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2021-12-16 13:39:05
+# 2021-12-20 22:16:42
 
 ########################################################################################################################################################################################################################
 
@@ -72,8 +72,20 @@ for ARG in $@; do
 
     # Detect an ip command
     elif [[ $ARG == *"ip="* ]]; then
-      # Save the IP as a fallback
-      IP=$ARG
+      OPTION=$(expr "$ARG" : '\(.*=\)')
+      HOST=$(expr "$ARG" : '.*=\(.*\)')
+
+      echo "Detected ${OPTION} with host ${HOST}"
+
+      tips=$(dig @127.0.0.11 +short tasks.${HOST})
+      for tip in $tips; do
+        cip=$(grep ${tip} /etc/hosts | awk '{print $1}' | head -1)
+        if [[ -n "$cip" ]]; then
+          echo "Found current ip: ${cip}"
+          IP="-ip=${cip}"
+        fi
+      done
+
       # Not writing the ip for now
       ARG=""
     fi
@@ -86,15 +98,15 @@ if ! [ -z "$CIP" ]; then
   ARGS=${ARGS:+${ARGS} }$CIP
 elif ! [ -z "$IP" ]; then
   ARGS=${ARGS:+${ARGS} }$IP
+elif ! [ -z "$PUBLIC_URL" ]; then
+  echo "Setting Host IP from Public Url"
+  HOST=$(expr "$PUBLIC_URL" : '\(.*\):')
+  ARGS=${ARGS:+${ARGS} }"-ip=${HOST}"
 fi
 
 # If there is a public url, add it to the parameters
 if ! [ -z "$PUBLIC_URL" ]; then
   ARGS=${ARGS:+${ARGS} }"-publicUrl=$PUBLIC_URL"
-
-  echo "Setting Host IP from Public Url"
-  HOST=$(expr "$PUBLIC_URL" : '\(.*\):')
-  ARGS=${ARGS:+${ARGS} }"-ip=${HOST}"
 
   # If there is a tld, use it to extract rack and datacenter
   # gpu01.dal1.llnw.katapy.io with tld=katapy.io -> -rack=dal1 -dataCenter=llnw
