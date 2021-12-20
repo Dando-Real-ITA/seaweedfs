@@ -3,6 +3,7 @@ package filesys
 import (
 	"context"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/filesys/page_writer"
 	"io"
 	"math"
 	"net/http"
@@ -20,7 +21,7 @@ import (
 
 type FileHandle struct {
 	// cache file has been written to
-	dirtyPages     DirtyPages
+	dirtyPages     page_writer.DirtyPages
 	entryViewCache []filer.VisibleInterval
 	reader         io.ReaderAt
 	contentType    string
@@ -62,9 +63,10 @@ var _ = fs.HandleReleaser(&FileHandle{})
 
 func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 
-	glog.V(4).Infof("%s read fh %d: [%d,%d) size %d resp.Data cap=%d", fh.f.fullpath(), fh.handle, req.Offset, req.Offset+int64(req.Size), req.Size, cap(resp.Data))
 	fh.Lock()
 	defer fh.Unlock()
+
+	glog.V(4).Infof("%s read fh %d: [%d,%d) size %d resp.Data cap=%d", fh.f.fullpath(), fh.handle, req.Offset, req.Offset+int64(req.Size), req.Size, cap(resp.Data))
 
 	if req.Size <= 0 {
 		return nil
@@ -173,7 +175,7 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 
 	// write the request to volume servers
 	data := req.Data
-	if len(data) <= 512 {
+	if len(data) <= 512 && req.Offset == 0 {
 		// fuse message cacheable size
 		data = make([]byte, len(req.Data))
 		copy(data, req.Data)
