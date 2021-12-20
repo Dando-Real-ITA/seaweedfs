@@ -1,5 +1,5 @@
-# 2021-08-20 21:39:18
-FROM amd64/golang:1.17-alpine as builder
+# 2021-12-20 23:26:18
+FROM registry.hub.docker.com/amd64/golang:1.17-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
 WORKDIR /go/src/github.com/chrislusf/
@@ -23,7 +23,7 @@ RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev
 
   ###########################################################################
 
-FROM alpine AS pre_final
+FROM registry.hub.docker.com/library/alpine AS pre_final
 RUN \
   apk add --no-cache --update bind-tools bash fuse3 && \
   rm -rf /tmp/*
