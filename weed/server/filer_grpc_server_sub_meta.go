@@ -39,7 +39,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	var readInMemoryLogErr error
 
 	for {
-		glog.V(0).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+		glog.V(1).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
 		if readPersistedLogErr != nil {
 			glog.Errorf("read on disk %v subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
@@ -60,17 +60,14 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 		if readInMemoryLogErr != nil {
 			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				continue
+				// // Force a progression to avoid infinite loop
+				// lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
+				// continue
+				break
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
 				break
-				/*
-					// Force a progression to avoid infinite loop
-					time.Sleep(10 * time.Millisecond)
-					lastReadTime = lastReadTime.Add(10 * time.Millisecond)
-					continue
-				*/
 			}
 		}
 
@@ -102,7 +99,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	var readInMemoryLogErr error
 
 	for {
-		glog.V(0).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+		glog.V(1).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
 		if readPersistedLogErr != nil {
 			glog.Errorf("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
@@ -123,17 +120,14 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		if readInMemoryLogErr != nil {
 			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				continue
+				// // Force a progression to avoid infinite loop
+				// lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
+				// continue
+				break
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
 				break
-				/*
-					// Force a progression to avoid infinite loop
-					time.Sleep(10 * time.Millisecond)
-					lastReadTime = lastReadTime.Add(10 * time.Millisecond)
-					continue
-				*/
 			}
 		}
 

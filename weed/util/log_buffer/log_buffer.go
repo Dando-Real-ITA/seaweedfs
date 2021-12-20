@@ -210,7 +210,7 @@ func (m *LogBuffer) ReadFromBuffer(lastReadTime time.Time) (bufferCopy *bytes.Bu
 		return nil, nil
 	} else if lastReadTime.Before(tsMemory) { // case 2.3
 		if !m.lastFlushTime.IsZero() {
-			glog.V(0).Infof("resume with last flush time: %v", m.lastFlushTime)
+			glog.V(1).Infof("resume with last flush time: %v", m.lastFlushTime)
 			return nil, ResumeFromDiskError
 		}
 	}
