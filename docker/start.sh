@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2021-12-20 22:16:42
+# 2021-12-20 23:04:44
 
 ########################################################################################################################################################################################################################
 
@@ -99,8 +99,8 @@ if ! [ -z "$CIP" ]; then
 elif ! [ -z "$IP" ]; then
   ARGS=${ARGS:+${ARGS} }$IP
 elif ! [ -z "$PUBLIC_URL" ]; then
-  echo "Setting Host IP from Public Url"
   HOST=$(expr "$PUBLIC_URL" : '\(.*\):')
+  echo "Setting Host IP from Public Url: ${HOST}"
   ARGS=${ARGS:+${ARGS} }"-ip=${HOST}"
 fi
 
