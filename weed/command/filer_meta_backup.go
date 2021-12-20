@@ -3,12 +3,13 @@ package command
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"time"
+
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
-	"reflect"
-	"time"
 
 	"github.com/chrislusf/seaweedfs/weed/pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
@@ -164,25 +165,25 @@ func (metaBackup *FilerMetaBackupOptions) streamMetadataBackup() error {
 			return nil
 		}
 		if message.OldEntry == nil && message.NewEntry != nil {
-			println("+", util.FullPath(message.NewParentPath).Child(message.NewEntry.Name))
+			println("+", util.FullPath(message.NewParentPath).Child(message.NewEntry.Name), resp.TsNs)
 			entry := filer.FromPbEntry(message.NewParentPath, message.NewEntry)
 			return store.InsertEntry(ctx, entry)
 		}
 		if message.OldEntry != nil && message.NewEntry == nil {
-			println("-", util.FullPath(resp.Directory).Child(message.OldEntry.Name))
+			println("-", util.FullPath(resp.Directory).Child(message.OldEntry.Name), resp.TsNs)
 			return store.DeleteEntry(ctx, util.FullPath(resp.Directory).Child(message.OldEntry.Name))
 		}
 		if message.OldEntry != nil && message.NewEntry != nil {
 			if resp.Directory == message.NewParentPath && message.OldEntry.Name == message.NewEntry.Name {
-				println("~", util.FullPath(message.NewParentPath).Child(message.NewEntry.Name))
+				println("~", util.FullPath(message.NewParentPath).Child(message.NewEntry.Name), resp.TsNs)
 				entry := filer.FromPbEntry(message.NewParentPath, message.NewEntry)
 				return store.UpdateEntry(ctx, entry)
 			}
-			println("-", util.FullPath(resp.Directory).Child(message.OldEntry.Name))
+			println("-", util.FullPath(resp.Directory).Child(message.OldEntry.Name), resp.TsNs)
 			if err := store.DeleteEntry(ctx, util.FullPath(resp.Directory).Child(message.OldEntry.Name)); err != nil {
 				return err
 			}
-			println("+", util.FullPath(message.NewParentPath).Child(message.NewEntry.Name))
+			println("+", util.FullPath(message.NewParentPath).Child(message.NewEntry.Name), resp.TsNs)
 			return store.InsertEntry(ctx, filer.FromPbEntry(message.NewParentPath, message.NewEntry))
 		}
 
