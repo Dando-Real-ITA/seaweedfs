@@ -10,7 +10,7 @@ import (
 )
 
 func (vs *VolumeServer) statusHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+util.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+util.Version())
 	m := make(map[string]interface{})
 	m["Version"] = util.Version()
 	var ds []*volume_server_pb.DiskStatus
@@ -27,7 +27,7 @@ func (vs *VolumeServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (vs *VolumeServer) statsDiskHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+util.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+util.Version())
 	m := make(map[string]interface{})
 	m["Version"] = util.Version()
 	var ds []*volume_server_pb.DiskStatus
