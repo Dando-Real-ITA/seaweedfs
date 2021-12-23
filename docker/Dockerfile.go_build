@@ -1,4 +1,4 @@
-# 2021-12-20 23:26:18
+# 2021-12-23 14:07:38
 FROM registry.hub.docker.com/amd64/golang:1.17-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
@@ -11,14 +11,14 @@ ADD https://api.github.com/repos/Dando-Real-ITA/seaweedfs/git/refs/heads/master 
 RUN git clone --depth 1 https://github.com/Dando-Real-ITA/seaweedfs -b master --recurse-submodules --shallow-submodules seaweedfs
 WORKDIR seaweedfs/weed
 
-RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" && \
+RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
   go install -ldflags "${LDFLAGS}"
 
   ###########################################################################
 
 FROM builder as builder_large
 
-RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" && \
+RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
   go install -tags 5BytesOffset -ldflags "${LDFLAGS}"
 
   ###########################################################################
