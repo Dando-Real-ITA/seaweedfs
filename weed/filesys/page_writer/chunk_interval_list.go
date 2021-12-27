@@ -4,18 +4,14 @@ import "math"
 
 // ChunkWrittenInterval mark one written interval within one page chunk
 type ChunkWrittenInterval struct {
-	StartOffset int64
+	startOffset int64
 	stopOffset  int64
 	prev        *ChunkWrittenInterval
 	next        *ChunkWrittenInterval
 }
 
 func (interval *ChunkWrittenInterval) Size() int64 {
-	return interval.stopOffset - interval.StartOffset
-}
-
-func (interval *ChunkWrittenInterval) isComplete(chunkSize int64) bool {
-	return interval.stopOffset-interval.StartOffset == chunkSize
+	return interval.stopOffset - interval.startOffset
 }
 
 // ChunkWrittenIntervalList mark written intervals within one page chunk
@@ -27,11 +23,11 @@ type ChunkWrittenIntervalList struct {
 func newChunkWrittenIntervalList() *ChunkWrittenIntervalList {
 	list := &ChunkWrittenIntervalList{
 		head: &ChunkWrittenInterval{
-			StartOffset: -1,
+			startOffset: -1,
 			stopOffset:  -1,
 		},
 		tail: &ChunkWrittenInterval{
-			StartOffset: math.MaxInt64,
+			startOffset: math.MaxInt64,
 			stopOffset:  math.MaxInt64,
 		},
 	}
@@ -42,40 +38,35 @@ func newChunkWrittenIntervalList() *ChunkWrittenIntervalList {
 
 func (list *ChunkWrittenIntervalList) MarkWritten(startOffset, stopOffset int64) {
 	interval := &ChunkWrittenInterval{
-		StartOffset: startOffset,
+		startOffset: startOffset,
 		stopOffset:  stopOffset,
 	}
 	list.addInterval(interval)
 }
-
-func (list *ChunkWrittenIntervalList) IsComplete(chunkSize int64) bool {
-	return list.size() == 1 && list.head.next.isComplete(chunkSize)
-}
-
 func (list *ChunkWrittenIntervalList) addInterval(interval *ChunkWrittenInterval) {
 
 	p := list.head
-	for ; p.next != nil && p.next.StartOffset <= interval.StartOffset; p = p.next {
+	for ; p.next != nil && p.next.startOffset <= interval.startOffset; p = p.next {
 	}
 	q := list.tail
 	for ; q.prev != nil && q.prev.stopOffset >= interval.stopOffset; q = q.prev {
 	}
 
-	if interval.StartOffset <= p.stopOffset && q.StartOffset <= interval.stopOffset {
+	if interval.startOffset <= p.stopOffset && q.startOffset <= interval.stopOffset {
 		// merge p and q together
 		p.stopOffset = q.stopOffset
 		unlinkNodesBetween(p, q.next)
 		return
 	}
-	if interval.StartOffset <= p.stopOffset {
+	if interval.startOffset <= p.stopOffset {
 		// merge new interval into p
 		p.stopOffset = interval.stopOffset
 		unlinkNodesBetween(p, q)
 		return
 	}
-	if q.StartOffset <= interval.stopOffset {
+	if q.startOffset <= interval.stopOffset {
 		// merge new interval into q
-		q.StartOffset = interval.StartOffset
+		q.startOffset = interval.startOffset
 		unlinkNodesBetween(p, q)
 		return
 	}

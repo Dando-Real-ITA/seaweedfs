@@ -4,17 +4,19 @@ type WriterPattern struct {
 	isStreaming     bool
 	lastWriteOffset int64
 	chunkSize       int64
+	fileName        string
 }
 
 // For streaming write: only cache the first chunk
 // For random write: fall back to temp file approach
 // writes can only change from streaming mode to non-streaming mode
 
-func NewWriterPattern(chunkSize int64) *WriterPattern {
+func NewWriterPattern(fileName string, chunkSize int64) *WriterPattern {
 	return &WriterPattern{
 		isStreaming:     true,
 		lastWriteOffset: -1,
 		chunkSize:       chunkSize,
+		fileName:        fileName,
 	}
 }
 
@@ -36,9 +38,4 @@ func (rp *WriterPattern) IsStreamingMode() bool {
 
 func (rp *WriterPattern) IsRandomMode() bool {
 	return !rp.isStreaming
-}
-
-func (rp *WriterPattern) Reset() {
-	rp.isStreaming = true
-	rp.lastWriteOffset = -1
 }
