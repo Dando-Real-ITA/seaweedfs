@@ -127,23 +127,12 @@ func (pages *ContinuousDirtyPages) saveToStorage(reader io.Reader, offset int64,
 	}
 }
 
-func max(x, y int64) int64 {
-	if x > y {
-		return x
-	}
-	return y
-}
-func min(x, y int64) int64 {
-	if x < y {
-		return x
-	}
-	return y
-}
-
 func (pages *ContinuousDirtyPages) ReadDirtyDataAt(data []byte, startOffset int64) (maxStop int64) {
 	return pages.intervals.ReadDataAt(data, startOffset)
 }
 
 func (pages *ContinuousDirtyPages) GetStorageOptions() (collection, replication string) {
 	return pages.collection, pages.replication
+}
+func (pages ContinuousDirtyPages) Destroy() {
 }
