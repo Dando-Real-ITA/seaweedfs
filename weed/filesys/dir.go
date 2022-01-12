@@ -103,7 +103,7 @@ func (dir *Dir) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 func (dir *Dir) newFile(name string) fs.Node {
 
 	fileFullPath := util.NewFullPath(dir.FullPath(), name)
-	fileId := fileFullPath.AsInode()
+	fileId := fileFullPath.AsInode(false)
 	dir.wfs.handlesLock.Lock()
 	existingHandle, found := dir.wfs.handles[fileId]
 	dir.wfs.handlesLock.Unlock()
@@ -122,12 +122,16 @@ func (dir *Dir) newFile(name string) fs.Node {
 
 func (dir *Dir) newDirectory(fullpath util.FullPath) fs.Node {
 
-	return &Dir{name: fullpath.Name(), wfs: dir.wfs, parent: dir, id: fullpath.AsInode()}
+	return &Dir{name: fullpath.Name(), wfs: dir.wfs, parent: dir, id: fullpath.AsInode(true)}
 
 }
 
 func (dir *Dir) Create(ctx context.Context, req *fuse.CreateRequest,
 	resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+
+	if err := checkName(req.Name); err != nil {
+		return nil, nil, err
+	}
 
 	exclusive := req.Flags&fuse.OpenExclusive != 0
 	isDirectory := req.Mode&os.ModeDir > 0
@@ -167,6 +171,12 @@ func (dir *Dir) Create(ctx context.Context, req *fuse.CreateRequest,
 }
 
 func (dir *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error) {
+
+	if err := checkName(req.Name); err != nil {
+		return nil, err
+	}
+
+	glog.V(3).Infof("dir %s Mknod %+v", dir.FullPath(), req)
 
 	_, err := dir.doCreateEntry(req.Name, req.Mode, req.Uid, req.Gid, false)
 
@@ -226,6 +236,10 @@ func (dir *Dir) doCreateEntry(name string, mode os.FileMode, uid, gid uint32, ex
 
 func (dir *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 
+	if err := checkName(req.Name); err != nil {
+		return nil, err
+	}
+
 	glog.V(4).Infof("mkdir %s: %s", dir.FullPath(), req.Name)
 
 	newEntry := &filer_pb.Entry{
@@ -280,6 +294,10 @@ func (dir *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, err
 
 func (dir *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (node fs.Node, err error) {
 
+	if err := checkName(req.Name); err != nil {
+		return nil, err
+	}
+
 	dirPath := util.FullPath(dir.FullPath())
 	// glog.V(4).Infof("dir Lookup %s: %s by %s", dirPath, req.Name, req.Header.String())
 
@@ -314,7 +332,6 @@ func (dir *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.
 		}
 
 		// resp.EntryValid = time.Second
-		resp.Attr.Inode = fullFilePath.AsInode()
 		resp.Attr.Valid = time.Second
 		resp.Attr.Size = localEntry.FileSize
 		resp.Attr.Mtime = localEntry.Attr.Mtime
@@ -340,10 +357,10 @@ func (dir *Dir) ReadDirAll(ctx context.Context) (ret []fuse.Dirent, err error) {
 
 	processEachEntryFn := func(entry *filer.Entry, isLast bool) {
 		if entry.IsDirectory() {
-			dirent := fuse.Dirent{Name: entry.Name(), Type: fuse.DT_Dir, Inode: dirPath.Child(entry.Name()).AsInode()}
+			dirent := fuse.Dirent{Name: entry.Name(), Type: fuse.DT_Dir, Inode: dirPath.Child(entry.Name()).AsInode(true)}
 			ret = append(ret, dirent)
 		} else {
-			dirent := fuse.Dirent{Name: entry.Name(), Type: findFileType(uint16(entry.Attr.Mode)), Inode: dirPath.Child(entry.Name()).AsInode()}
+			dirent := fuse.Dirent{Name: entry.Name(), Type: findFileType(uint16(entry.Attr.Mode)), Inode: dirPath.Child(entry.Name()).AsInode(false)}
 			ret = append(ret, dirent)
 		}
 	}
@@ -363,7 +380,7 @@ func (dir *Dir) ReadDirAll(ctx context.Context) (ret []fuse.Dirent, err error) {
 
 	// create proper . and .. directories
 	ret = append(ret, fuse.Dirent{
-		Inode: dirPath.AsInode(),
+		Inode: dirPath.AsInode(true),
 		Name:  ".",
 		Type:  fuse.DT_Dir,
 	})
@@ -373,7 +390,7 @@ func (dir *Dir) ReadDirAll(ctx context.Context) (ret []fuse.Dirent, err error) {
 	if string(dirPath) == dir.wfs.option.FilerMountRootPath {
 		inode = dir.wfs.option.MountParentInode
 	} else {
-		inode = util.FullPath(dir.parent.FullPath()).AsInode()
+		inode = util.FullPath(dir.parent.FullPath()).AsInode(true)
 	}
 
 	ret = append(ret, fuse.Dirent{
@@ -442,7 +459,7 @@ func (dir *Dir) removeOneFile(req *fuse.RemoveRequest) error {
 	// remove current file handle if any
 	dir.wfs.handlesLock.Lock()
 	defer dir.wfs.handlesLock.Unlock()
-	inodeId := filePath.AsInode()
+	inodeId := filePath.AsInode(false)
 	if fh, ok := dir.wfs.handles[inodeId]; ok {
 		delete(dir.wfs.handles, inodeId)
 		fh.isDeleted = true
@@ -475,7 +492,7 @@ func (dir *Dir) removeFolder(req *fuse.RemoveRequest) error {
 
 func (dir *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 
-	glog.V(4).Infof("%v dir setattr %+v", dir.FullPath(), req)
+	glog.V(4).Infof("%v dir setattr %+v mode=%d", dir.FullPath(), req, req.Mode)
 
 	entry, err := dir.maybeLoadEntry()
 	if err != nil {

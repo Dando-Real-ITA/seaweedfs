@@ -110,7 +110,7 @@ func (file *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.Op
 
 func (file *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
 
-	glog.V(4).Infof("%v file setattr %+v", file.fullpath(), req)
+	glog.V(4).Infof("%v file setattr %+v mode=%d", file.fullpath(), req, req.Mode)
 
 	entry, err := file.maybeLoadEntry(ctx)
 	if err != nil {
@@ -248,17 +248,18 @@ func (file *File) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, res
 }
 
 func (file *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	// fsync works at OS level
+
 	// write the file chunks to the filerGrpcAddress
 	glog.V(4).Infof("%s/%s fsync file %+v", file.dir.FullPath(), file.Name, req)
 
-	return nil
+	return file.wfs.Fsync(file, req.Header)
+
 }
 
 func (file *File) Forget() {
 	t := util.NewFullPath(file.dir.FullPath(), file.Name)
 	glog.V(4).Infof("Forget file %s", t)
-	file.wfs.ReleaseHandle(t, fuse.HandleID(t.AsInode()))
+	file.wfs.ReleaseHandle(t, fuse.HandleID(t.AsInode(false)))
 }
 
 func (file *File) maybeLoadEntry(ctx context.Context) (entry *filer_pb.Entry, err error) {

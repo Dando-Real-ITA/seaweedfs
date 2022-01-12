@@ -109,15 +109,15 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		wfs.chunkCache = chunk_cache.NewTieredChunkCache(256, option.getUniqueCacheDir(), option.CacheSizeMB, 1024*1024)
 	}
 
-	wfs.metaCache = meta_cache.NewMetaCache(path.Join(option.getUniqueCacheDir(), "meta"), util.FullPath(option.FilerMountRootPath), option.UidGidMapper, func(filePath util.FullPath) {
+	wfs.metaCache = meta_cache.NewMetaCache(path.Join(option.getUniqueCacheDir(), "meta"), util.FullPath(option.FilerMountRootPath), option.UidGidMapper, func(filePath util.FullPath, isDirectory bool) {
 
-		fsNode := NodeWithId(filePath.AsInode())
+		fsNode := NodeWithId(filePath.AsInode(isDirectory))
 		if err := wfs.Server.InvalidateNodeData(fsNode); err != nil {
 			glog.V(4).Infof("InvalidateNodeData %s : %v", filePath, err)
 		}
 
 		dir, name := filePath.DirAndName()
-		parent := NodeWithId(util.FullPath(dir).AsInode())
+		parent := NodeWithId(util.FullPath(dir).AsInode(true))
 		if dir == option.FilerMountRootPath {
 			parent = NodeWithId(1)
 		}
@@ -177,6 +177,28 @@ func (wfs *WFS) AcquireHandle(file *File, uid, gid uint32) (fileHandle *FileHand
 
 	glog.V(4).Infof("Acquired new Handle %s open %d", fullpath, file.isOpen)
 	return
+}
+
+func (wfs *WFS) Fsync(file *File, header fuse.Header) error {
+
+	inodeId := file.Id()
+
+	wfs.handlesLock.Lock()
+	existingHandle, found := wfs.handles[inodeId]
+	wfs.handlesLock.Unlock()
+
+	if found && existingHandle != nil && existingHandle.f.isOpen > 0 {
+
+		existingHandle.Add(1)
+		defer existingHandle.Done()
+
+		existingHandle.Lock()
+		defer existingHandle.Unlock()
+
+		return existingHandle.doFlush(context.Background(), header)
+	}
+
+	return nil
 }
 
 func (wfs *WFS) ReleaseHandle(fullpath util.FullPath, handleId fuse.HandleID) {

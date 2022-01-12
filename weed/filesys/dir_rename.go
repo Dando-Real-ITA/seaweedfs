@@ -3,16 +3,23 @@ package filesys
 import (
 	"context"
 	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/seaweedfs/fuse"
-	"github.com/seaweedfs/fuse/fs"
-	"io"
-
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
+	"io"
+	"strings"
 )
 
 func (dir *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDirectory fs.Node) error {
+
+	if err := checkName(req.NewName); err != nil {
+		return err
+	}
+	if err := checkName(req.OldName); err != nil {
+		return err
+	}
 
 	newDir := newDirectory.(*Dir)
 
@@ -37,7 +44,7 @@ func (dir *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDirector
 		stream, err := client.StreamRenameEntry(ctx, request)
 		if err != nil {
 			glog.Errorf("dir AtomicRenameEntry %s => %s : %v", oldPath, newPath, err)
-			return fuse.EXDEV
+			return fuse.EIO
 		}
 
 		for {
@@ -46,11 +53,19 @@ func (dir *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDirector
 				if recvErr == io.EOF {
 					break
 				} else {
+					glog.V(0).Infof("dir Rename %s => %s receive: %v", oldPath, newPath, recvErr)
+					if strings.Contains(recvErr.Error(), "not empty") {
+						return fuse.EEXIST
+					}
+					if strings.Contains(recvErr.Error(), "not directory") {
+						return fuse.ENOTDIR
+					}
 					return recvErr
 				}
 			}
 
 			if err = dir.handleRenameResponse(ctx, resp); err != nil {
+				glog.V(0).Infof("dir Rename %s => %s : %v", oldPath, newPath, err)
 				return err
 			}
 
@@ -59,12 +74,8 @@ func (dir *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDirector
 		return nil
 
 	})
-	if err != nil {
-		glog.V(0).Infof("dir Rename %s => %s : %v", oldPath, newPath, err)
-		return fuse.EIO
-	}
 
-	return nil
+	return err
 }
 
 func (dir *Dir) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamRenameEntryResponse) error {
@@ -80,11 +91,13 @@ func (dir *Dir) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamR
 		oldParent, newParent := util.FullPath(resp.Directory), util.FullPath(resp.EventNotification.NewParentPath)
 		oldName, newName := resp.EventNotification.OldEntry.Name, resp.EventNotification.NewEntry.Name
 
+		isDirectory := newEntry.IsDirectory()
+
 		oldPath := oldParent.Child(oldName)
 		newPath := newParent.Child(newName)
-		oldFsNode := NodeWithId(oldPath.AsInode())
-		newFsNode := NodeWithId(newPath.AsInode())
-		newDirNode, found := dir.wfs.Server.FindInternalNode(NodeWithId(newParent.AsInode()))
+		oldFsNode := NodeWithId(oldPath.AsInode(isDirectory))
+		newFsNode := NodeWithId(newPath.AsInode(isDirectory))
+		newDirNode, found := dir.wfs.Server.FindInternalNode(NodeWithId(newParent.AsInode(true)))
 		var newDir *Dir
 		if found {
 			newDir = newDirNode.(*Dir)
@@ -109,15 +122,19 @@ func (dir *Dir) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamR
 		})
 
 		// change file handle
-		inodeId := oldPath.AsInode()
-		dir.wfs.handlesLock.Lock()
-		if existingHandle, found := dir.wfs.handles[inodeId]; found && existingHandle != nil {
-			glog.V(4).Infof("opened file handle %s => %s", oldPath, newPath)
-			delete(dir.wfs.handles, inodeId)
-			existingHandle.f.entry.Name = newName
-			dir.wfs.handles[newPath.AsInode()] = existingHandle
+		if !isDirectory {
+			inodeId := oldPath.AsInode(isDirectory)
+			dir.wfs.handlesLock.Lock()
+			if existingHandle, found := dir.wfs.handles[inodeId]; found && existingHandle != nil {
+				glog.V(4).Infof("opened file handle %s => %s", oldPath, newPath)
+				delete(dir.wfs.handles, inodeId)
+				existingHandle.handle = newPath.AsInode(isDirectory)
+				existingHandle.f.entry.Name = newName
+				existingHandle.f.id = newPath.AsInode(isDirectory)
+				dir.wfs.handles[newPath.AsInode(isDirectory)] = existingHandle
+			}
+			dir.wfs.handlesLock.Unlock()
 		}
-		dir.wfs.handlesLock.Unlock()
 
 	} else if resp.EventNotification.OldEntry != nil {
 		// without new entry, only old entry name exists. This is the second step to delete old entry
