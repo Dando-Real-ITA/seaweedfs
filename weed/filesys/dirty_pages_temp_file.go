@@ -104,3 +104,9 @@ func (pages *TempFileDirtyPages) saveChunkedFileIntevalToStorage(reader io.Reade
 func (pages TempFileDirtyPages) Destroy() {
 	pages.chunkedFile.Reset()
 }
+
+func (pages *TempFileDirtyPages) LockForRead(startOffset, stopOffset int64) {
+}
+
+func (pages *TempFileDirtyPages) UnlockForRead(startOffset, stopOffset int64) {
+}

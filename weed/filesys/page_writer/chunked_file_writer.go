@@ -7,7 +7,6 @@ import (
 	"sync"
 )
 
-type LogicChunkIndex int
 type ActualChunkIndex int
 
 // ChunkedFileWriter assumes the write requests will come in within chunks

@@ -68,6 +68,7 @@ func (file *File) Attr(ctx context.Context, attr *fuse.Attr) (err error) {
 		glog.V(4).Infof("file Attr %s, open:%v, size: %d", file.fullpath(), file.isOpen, attr.Size)
 	}
 	attr.Crtime = time.Unix(entry.Attributes.Crtime, 0)
+	attr.Ctime = time.Unix(entry.Attributes.Mtime, 0)
 	attr.Mtime = time.Unix(entry.Attributes.Mtime, 0)
 	attr.Gid = entry.Attributes.Gid
 	attr.Uid = entry.Attributes.Uid
@@ -139,29 +140,42 @@ func (file *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *f
 					}
 				}
 			}
+			// set the new chunks and reset entry cache
 			entry.Chunks = chunks
+			file.wfs.handlesLock.Lock()
+			existingHandle, found := file.wfs.handles[file.Id()]
+			file.wfs.handlesLock.Unlock()
+			if found {
+				existingHandle.entryViewCache = nil
+			}
+
 		}
+		entry.Attributes.Mtime = time.Now().Unix()
 		entry.Attributes.FileSize = req.Size
 		file.dirtyMetadata = true
 	}
 
 	if req.Valid.Mode() && entry.Attributes.FileMode != uint32(req.Mode) {
 		entry.Attributes.FileMode = uint32(req.Mode)
+		entry.Attributes.Mtime = time.Now().Unix()
 		file.dirtyMetadata = true
 	}
 
 	if req.Valid.Uid() && entry.Attributes.Uid != req.Uid {
 		entry.Attributes.Uid = req.Uid
+		entry.Attributes.Mtime = time.Now().Unix()
 		file.dirtyMetadata = true
 	}
 
 	if req.Valid.Gid() && entry.Attributes.Gid != req.Gid {
 		entry.Attributes.Gid = req.Gid
+		entry.Attributes.Mtime = time.Now().Unix()
 		file.dirtyMetadata = true
 	}
 
 	if req.Valid.Crtime() {
 		entry.Attributes.Crtime = req.Crtime.Unix()
+		entry.Attributes.Mtime = time.Now().Unix()
 		file.dirtyMetadata = true
 	}
 
@@ -259,7 +273,8 @@ func (file *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 func (file *File) Forget() {
 	t := util.NewFullPath(file.dir.FullPath(), file.Name)
 	glog.V(4).Infof("Forget file %s", t)
-	file.wfs.ReleaseHandle(t, fuse.HandleID(t.AsInode(false)))
+	file.wfs.ReleaseHandle(t, fuse.HandleID(t.AsInode(file.entry.FileMode())))
+
 }
 
 func (file *File) maybeLoadEntry(ctx context.Context) (entry *filer_pb.Entry, err error) {
