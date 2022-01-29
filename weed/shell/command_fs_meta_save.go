@@ -79,15 +79,7 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 		cipherKey = util.GenCipherKey()
 	}
 
-	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, func(outputChan chan interface{}) {
-		sizeBuf := make([]byte, 4)
-		for item := range outputChan {
-			b := item.([]byte)
-			util.Uint32toBytes(sizeBuf, uint32(len(b)))
-			dst.Write(sizeBuf)
-			dst.Write(b)
-		}
-	}, func(entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
+	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, func(entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
 		if !entry.Entry.IsDirectory {
 			ext := filepath.Ext(entry.Entry.Name)
 			if encrypted, encErr := util.Encrypt([]byte(entry.Entry.Name), cipherKey); encErr == nil {
@@ -103,6 +95,14 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 
 		outputChan <- bytes
 		return nil
+	}, func(outputChan chan interface{}) {
+		sizeBuf := make([]byte, 4)
+		for item := range outputChan {
+			b := item.([]byte)
+			util.Uint32toBytes(sizeBuf, uint32(len(b)))
+			dst.Write(sizeBuf)
+			dst.Write(b)
+		}
 	})
 
 	if err == nil {
@@ -113,7 +113,7 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 
 }
 
-func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, path string, verbose bool, saveFn func(outputChan chan interface{}), genFn func(entry *filer_pb.FullEntry, outputChan chan interface{}) error) error {
+func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, path string, verbose bool, genFn func(entry *filer_pb.FullEntry, outputChan chan interface{}) error, saveFn func(outputChan chan interface{})) error {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
