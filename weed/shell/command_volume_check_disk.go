@@ -58,7 +58,7 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 	c.env = commandEnv
 
 	// collect topology information
-	topologyInfo, _, err := collectTopologyInfo(commandEnv)
+	topologyInfo, _, err := collectTopologyInfo(commandEnv, 0)
 	if err != nil {
 		return err
 	}
@@ -138,9 +138,9 @@ func (c *commandVolumeCheckDisk) doVolumeCheckDisk(minuend, subtrahend *needle_m
 	// hash join, can be more efficient
 	var missingNeedles []needle_map.NeedleValue
 	var counter int
-	subtrahend.AscendingVisit(func(value needle_map.NeedleValue) error {
+	minuend.AscendingVisit(func(value needle_map.NeedleValue) error {
 		counter++
-		if _, found := minuend.Get(value.Key); !found {
+		if _, found := subtrahend.Get(value.Key); !found {
 			missingNeedles = append(missingNeedles, value)
 		}
 		return nil
