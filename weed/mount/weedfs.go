@@ -16,7 +16,6 @@ import (
 	"math/rand"
 	"os"
 	"path"
-	"path/filepath"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -50,8 +49,7 @@ type Option struct {
 	Cipher             bool   // whether encrypt data on volume server
 	UidGidMapper       *meta_cache.UidGidMapper
 
-	uniqueCacheDir         string
-	uniqueCacheTempPageDir string
+	uniqueCacheDir string
 }
 
 type WFS struct {
@@ -61,12 +59,12 @@ type WFS struct {
 	option            *Option
 	metaCache         *meta_cache.MetaCache
 	stats             statsCache
-	root              Directory
 	chunkCache        *chunk_cache.TieredChunkCache
 	signature         int32
 	concurrentWriters *util.LimitedConcurrentExecutor
 	inodeToPath       *InodeToPath
 	fhmap             *FileHandleToInode
+	dhmap             *DirectoryHandleToInode
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -76,13 +74,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		signature:     util.RandomInt32(),
 		inodeToPath:   NewInodeToPath(),
 		fhmap:         NewFileHandleToInode(),
-	}
-
-	wfs.root = Directory{
-		name:   "/",
-		wfs:    wfs,
-		entry:  nil,
-		parent: nil,
+		dhmap:         NewDirectoryHandleToInode(),
 	}
 
 	wfs.option.filerIndex = rand.Intn(len(option.FilerAddresses))
@@ -99,6 +91,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 	})
 	grace.OnInterrupt(func() {
 		wfs.metaCache.Shutdown()
+		os.RemoveAll(option.getUniqueCacheDir())
 	})
 
 	if wfs.option.ConcurrentWriters > 0 {
@@ -112,16 +105,15 @@ func (wfs *WFS) StartBackgroundTasks() {
 	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano())
 }
 
-func (wfs *WFS) Root() *Directory {
-	return &wfs.root
-}
-
 func (wfs *WFS) String() string {
 	return "seaweedfs"
 }
 
 func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle, entry *filer_pb.Entry, status fuse.Status) {
-	path = wfs.inodeToPath.GetPath(inode)
+	path, status = wfs.inodeToPath.GetPath(inode)
+	if status != fuse.OK {
+		return
+	}
 	var found bool
 	if fh, found = wfs.fhmap.FindFileHandle(inode); found {
 		return path, fh, fh.entry, fuse.OK
@@ -151,7 +143,7 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 	}
 
 	// read from async meta cache
-	meta_cache.EnsureVisited(wfs.metaCache, wfs, util.FullPath(dir))
+	meta_cache.EnsureVisited(wfs.metaCache, wfs, util.FullPath(dir), nil)
 	cachedEntry, cacheErr := wfs.metaCache.FindEntry(context.Background(), fullpath)
 	if cacheErr == filer_pb.ErrNotFound {
 		return nil, fuse.ENOENT
@@ -175,13 +167,9 @@ func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
 func (option *Option) setupUniqueCacheDirectory() {
 	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + string(option.FilerAddresses[0]) + option.FilerMountRootPath + util.Version()))[0:8]
 	option.uniqueCacheDir = path.Join(option.CacheDir, cacheUniqueId)
-	option.uniqueCacheTempPageDir = filepath.Join(option.uniqueCacheDir, "sw")
-	os.MkdirAll(option.uniqueCacheTempPageDir, os.FileMode(0777)&^option.Umask)
+	os.MkdirAll(option.uniqueCacheDir, os.FileMode(0777)&^option.Umask)
 }
 
-func (option *Option) getTempFilePageDir() string {
-	return option.uniqueCacheTempPageDir
-}
 func (option *Option) getUniqueCacheDir() string {
 	return option.uniqueCacheDir
 }

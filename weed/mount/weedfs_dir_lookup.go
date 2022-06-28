@@ -20,11 +20,14 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		return s
 	}
 
-	dirPath := wfs.inodeToPath.GetPath(header.NodeId)
+	dirPath, code := wfs.inodeToPath.GetPath(header.NodeId)
+	if code != fuse.OK {
+		return
+	}
 
 	fullFilePath := dirPath.Child(name)
 
-	visitErr := meta_cache.EnsureVisited(wfs.metaCache, wfs, dirPath)
+	visitErr := meta_cache.EnsureVisited(wfs.metaCache, wfs, dirPath, nil)
 	if visitErr != nil {
 		glog.Errorf("dir Lookup %s: %v", dirPath, visitErr)
 		return fuse.EIO
@@ -50,7 +53,7 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		return fuse.ENOENT
 	}
 
-	inode := wfs.inodeToPath.Lookup(fullFilePath, localEntry.IsDirectory())
+	inode := wfs.inodeToPath.Lookup(fullFilePath, localEntry.IsDirectory(), true)
 
 	wfs.outputFilerEntry(out, inode, localEntry)
 

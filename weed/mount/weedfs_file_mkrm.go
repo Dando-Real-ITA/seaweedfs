@@ -45,7 +45,7 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 		Attributes: &filer_pb.FuseAttributes{
 			Mtime:       time.Now().Unix(),
 			Crtime:      time.Now().Unix(),
-			FileMode:    uint32(toFileMode(in.Mode) &^ wfs.option.Umask),
+			FileMode:    uint32(toFileMode(in.Mode)),
 			Uid:         in.Uid,
 			Gid:         in.Gid,
 			Collection:  wfs.option.Collection,
@@ -54,7 +54,10 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 		},
 	}
 
-	dirFullPath := wfs.inodeToPath.GetPath(in.NodeId)
+	dirFullPath, code := wfs.inodeToPath.GetPath(in.NodeId)
+	if code != fuse.OK {
+		return
+	}
 
 	entryFullPath := dirFullPath.Child(name)
 
@@ -82,13 +85,13 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 		return nil
 	})
 
-	glog.V(0).Infof("mknod %s: %v", entryFullPath, err)
+	glog.V(3).Infof("mknod %s: %v", entryFullPath, err)
 
 	if err != nil {
 		return fuse.EIO
 	}
 
-	inode := wfs.inodeToPath.Lookup(entryFullPath, false)
+	inode := wfs.inodeToPath.Lookup(entryFullPath, false, true)
 
 	wfs.outputPbEntry(out, inode, newEntry)
 
@@ -99,12 +102,21 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 /** Remove a file */
 func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) (code fuse.Status) {
 
-	dirFullPath := wfs.inodeToPath.GetPath(header.NodeId)
+	dirFullPath, code := wfs.inodeToPath.GetPath(header.NodeId)
+	if code != fuse.OK {
+		if code == fuse.ENOENT {
+			return fuse.OK
+		}
+		return code
+	}
 	entryFullPath := dirFullPath.Child(name)
 
-	entry, status := wfs.maybeLoadEntry(entryFullPath)
-	if status != fuse.OK {
-		return status
+	entry, code := wfs.maybeLoadEntry(entryFullPath)
+	if code != fuse.OK {
+		if code == fuse.ENOENT {
+			return fuse.OK
+		}
+		return code
 	}
 
 	// first, ensure the filer store can correctly delete
@@ -113,7 +125,7 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	err := filer_pb.Remove(wfs, string(dirFullPath), name, isDeleteData, false, false, false, []int32{wfs.signature})
 	if err != nil {
 		glog.V(0).Infof("remove %s: %v", entryFullPath, err)
-		return fuse.ENOENT
+		return fuse.OK
 	}
 
 	// then, delete meta cache

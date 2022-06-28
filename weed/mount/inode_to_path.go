@@ -3,6 +3,7 @@ package mount
 import (
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"sync"
 )
 
@@ -30,7 +31,7 @@ func NewInodeToPath() *InodeToPath {
 	return t
 }
 
-func (i *InodeToPath) Lookup(path util.FullPath, isDirectory bool) uint64 {
+func (i *InodeToPath) Lookup(path util.FullPath, isDirectory bool, isLookup bool) uint64 {
 	i.Lock()
 	defer i.Unlock()
 	inode, found := i.path2inode[path]
@@ -38,9 +39,15 @@ func (i *InodeToPath) Lookup(path util.FullPath, isDirectory bool) uint64 {
 		inode = i.nextInodeId
 		i.nextInodeId++
 		i.path2inode[path] = inode
-		i.inode2path[inode] = &InodeEntry{path, 1, isDirectory, false}
+		if !isLookup {
+			i.inode2path[inode] = &InodeEntry{path, 0, isDirectory, false}
+		} else {
+			i.inode2path[inode] = &InodeEntry{path, 1, isDirectory, false}
+		}
 	} else {
-		i.inode2path[inode].nlookup++
+		if isLookup {
+			i.inode2path[inode].nlookup++
+		}
 	}
 	return inode
 }
@@ -59,14 +66,14 @@ func (i *InodeToPath) GetInode(path util.FullPath) uint64 {
 	return inode
 }
 
-func (i *InodeToPath) GetPath(inode uint64) util.FullPath {
+func (i *InodeToPath) GetPath(inode uint64) (util.FullPath, fuse.Status) {
 	i.RLock()
 	defer i.RUnlock()
 	path, found := i.inode2path[inode]
 	if !found {
-		glog.Fatalf("not found inode %d", inode)
+		return "", fuse.ENOENT
 	}
-	return path.FullPath
+	return path.FullPath, fuse.OK
 }
 
 func (i *InodeToPath) HasPath(path util.FullPath) bool {

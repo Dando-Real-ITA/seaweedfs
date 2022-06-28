@@ -1,3 +1,6 @@
+//go:build linux || darwin
+// +build linux darwin
+
 package command
 
 import (
@@ -152,7 +155,7 @@ func RunMount2(option *Mount2Options, umask os.FileMode) bool {
 		Name:                     "seaweedfs",
 		SingleThreaded:           false,
 		DisableXAttrs:            false,
-		Debug:                    false,
+		Debug:                    *option.debug,
 		EnableLocks:              false,
 		ExplicitDataCacheControl: false,
 		// SyncRead:                 false, // set to false to enable the FUSE_CAP_ASYNC_READ capability
