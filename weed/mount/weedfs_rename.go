@@ -214,10 +214,12 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 func (wfs *WFS) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamRenameEntryResponse) error {
 	// comes from filer StreamRenameEntry, can only be create or delete entry
 
+	glog.V(4).Infof("dir Rename %+v", resp.EventNotification)
+
 	if resp.EventNotification.NewEntry != nil {
 		// with new entry, the old entry name also exists. This is the first step to create new entry
 		newEntry := filer.FromPbEntry(resp.EventNotification.NewParentPath, resp.EventNotification.NewEntry)
-		if err := wfs.metaCache.AtomicUpdateEntryFromFiler(ctx, "", newEntry); err != nil {
+		if err := wfs.metaCache.AtomicUpdateEntryFromFiler(ctx, "", newEntry, false); err != nil {
 			return err
 		}
 
@@ -227,11 +229,15 @@ func (wfs *WFS) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamR
 		oldPath := oldParent.Child(oldName)
 		newPath := newParent.Child(newName)
 
-		wfs.inodeToPath.MovePath(oldPath, newPath)
+		replacedInode := wfs.inodeToPath.MovePath(oldPath, newPath)
+		// invalidate attr and data
+		if replacedInode > 0 {
+			wfs.fuseServer.InodeNotify(replacedInode, 0, -1)
+		}
 
 	} else if resp.EventNotification.OldEntry != nil {
 		// without new entry, only old entry name exists. This is the second step to delete old entry
-		if err := wfs.metaCache.AtomicUpdateEntryFromFiler(ctx, util.NewFullPath(resp.Directory, resp.EventNotification.OldEntry.Name), nil); err != nil {
+		if err := wfs.metaCache.AtomicUpdateEntryFromFiler(ctx, util.NewFullPath(resp.Directory, resp.EventNotification.OldEntry.Name), nil, resp.EventNotification.DeleteChunks); err != nil {
 			return err
 		}
 	}

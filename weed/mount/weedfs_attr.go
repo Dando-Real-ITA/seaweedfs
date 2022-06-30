@@ -17,13 +17,20 @@ func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 	}
 
 	_, _, entry, status := wfs.maybeReadEntry(input.NodeId)
-	if status != fuse.OK {
+	if status == fuse.OK {
+		out.AttrValid = 1
+		wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry)
 		return status
+	} else {
+		if fh, found := wfs.fhmap.FindFileHandle(input.NodeId); found {
+			out.AttrValid = 1
+			wfs.setAttrByPbEntry(&out.Attr, input.NodeId, fh.entry)
+			out.Nlink = 0
+			return fuse.OK
+		}
 	}
-	out.AttrValid = 1
-	wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry)
 
-	return fuse.OK
+	return status
 }
 
 func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
@@ -66,7 +73,8 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	}
 
 	if mode, ok := input.GetMode(); ok {
-		entry.Attributes.FileMode = mode & 07777
+		// glog.V(4).Infof("setAttr mode %o", mode)
+		entry.Attributes.FileMode = chmod(entry.Attributes.FileMode, mode)
 	}
 
 	if uid, ok := input.GetUID(); ok {
@@ -108,7 +116,7 @@ func (wfs *WFS) setRootAttr(out *fuse.AttrOut) {
 	out.Mtime = now
 	out.Ctime = now
 	out.Atime = now
-	out.Mode = toSystemType(os.ModeDir) | uint32(wfs.option.MountMode)
+	out.Mode = toSyscallType(os.ModeDir) | uint32(wfs.option.MountMode)
 	out.Nlink = 1
 }
 
@@ -120,7 +128,7 @@ func (wfs *WFS) setAttrByPbEntry(out *fuse.Attr, inode uint64, entry *filer_pb.E
 	out.Mtime = uint64(entry.Attributes.Mtime)
 	out.Ctime = uint64(entry.Attributes.Mtime)
 	out.Atime = uint64(entry.Attributes.Mtime)
-	out.Mode = toSystemMode(os.FileMode(entry.Attributes.FileMode))
+	out.Mode = toSyscallMode(os.FileMode(entry.Attributes.FileMode))
 	if entry.HardLinkCounter > 0 {
 		out.Nlink = uint32(entry.HardLinkCounter)
 	} else {
@@ -128,6 +136,7 @@ func (wfs *WFS) setAttrByPbEntry(out *fuse.Attr, inode uint64, entry *filer_pb.E
 	}
 	out.Uid = entry.Attributes.Uid
 	out.Gid = entry.Attributes.Gid
+	out.Rdev = entry.Attributes.Rdev
 }
 
 func (wfs *WFS) setAttrByFilerEntry(out *fuse.Attr, inode uint64, entry *filer.Entry) {
@@ -138,7 +147,7 @@ func (wfs *WFS) setAttrByFilerEntry(out *fuse.Attr, inode uint64, entry *filer.E
 	out.Atime = uint64(entry.Attr.Mtime.Unix())
 	out.Mtime = uint64(entry.Attr.Mtime.Unix())
 	out.Ctime = uint64(entry.Attr.Mtime.Unix())
-	out.Mode = toSystemMode(entry.Attr.Mode)
+	out.Mode = toSyscallMode(entry.Attr.Mode)
 	if entry.HardLinkCounter > 0 {
 		out.Nlink = uint32(entry.HardLinkCounter)
 	} else {
@@ -146,6 +155,7 @@ func (wfs *WFS) setAttrByFilerEntry(out *fuse.Attr, inode uint64, entry *filer.E
 	}
 	out.Uid = entry.Attr.Uid
 	out.Gid = entry.Attr.Gid
+	out.Rdev = entry.Attr.Rdev
 }
 
 func (wfs *WFS) outputPbEntry(out *fuse.EntryOut, inode uint64, entry *filer_pb.Entry) {
@@ -164,11 +174,15 @@ func (wfs *WFS) outputFilerEntry(out *fuse.EntryOut, inode uint64, entry *filer.
 	wfs.setAttrByFilerEntry(&out.Attr, inode, entry)
 }
 
-func toSystemMode(mode os.FileMode) uint32 {
-	return toSystemType(mode) | uint32(mode)
+func chmod(existing uint32, mode uint32) uint32 {
+	return existing&^07777 | mode&07777
 }
 
-func toSystemType(mode os.FileMode) uint32 {
+func toSyscallMode(mode os.FileMode) uint32 {
+	return toSyscallType(mode) | uint32(mode)
+}
+
+func toSyscallType(mode os.FileMode) uint32 {
 	switch mode & os.ModeType {
 	case os.ModeDir:
 		return syscall.S_IFDIR
@@ -187,7 +201,7 @@ func toSystemType(mode os.FileMode) uint32 {
 	}
 }
 
-func toFileType(mode uint32) os.FileMode {
+func toOsFileType(mode uint32) os.FileMode {
 	switch mode & (syscall.S_IFMT & 0xffff) {
 	case syscall.S_IFDIR:
 		return os.ModeDir
@@ -206,6 +220,6 @@ func toFileType(mode uint32) os.FileMode {
 	}
 }
 
-func toFileMode(mode uint32) os.FileMode {
-	return toFileType(mode) | os.FileMode(mode&07777)
+func toOsFileMode(mode uint32) os.FileMode {
+	return toOsFileType(mode) | os.FileMode(mode&07777)
 }

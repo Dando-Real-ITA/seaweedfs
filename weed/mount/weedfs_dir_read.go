@@ -160,21 +160,25 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out *fuse.DirEntryList, isPl
 
 	processEachEntryFn := func(entry *filer.Entry, isLast bool) bool {
 		dirEntry.Name = entry.Name()
-		dirEntry.Mode = toSystemMode(entry.Mode)
+		dirEntry.Mode = toSyscallMode(entry.Mode)
 		if !isPlusMode {
-			inode := wfs.inodeToPath.Lookup(dirPath.Child(dirEntry.Name), entry.IsDirectory(), false)
+			inode := wfs.inodeToPath.Lookup(dirPath.Child(dirEntry.Name), entry.Mode, false, entry.Inode, false)
 			dirEntry.Ino = inode
 			if !out.AddDirEntry(dirEntry) {
 				isEarlyTerminated = true
 				return false
 			}
 		} else {
-			inode := wfs.inodeToPath.Lookup(dirPath.Child(dirEntry.Name), entry.IsDirectory(), true)
+			inode := wfs.inodeToPath.Lookup(dirPath.Child(dirEntry.Name), entry.Mode, false, entry.Inode, true)
 			dirEntry.Ino = inode
 			entryOut := out.AddDirLookupEntry(dirEntry)
 			if entryOut == nil {
 				isEarlyTerminated = true
 				return false
+			}
+			if fh, found := wfs.fhmap.FindFileHandle(inode); found {
+				glog.V(4).Infof("readdir opened file %s", dirPath.Child(dirEntry.Name))
+				entry = filer.FromPbEntry(string(dirPath), fh.entry)
 			}
 			wfs.outputFilerEntry(entryOut, inode, entry)
 		}
