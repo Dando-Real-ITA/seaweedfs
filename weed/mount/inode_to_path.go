@@ -21,28 +21,30 @@ type InodeEntry struct {
 	isChildrenCached bool
 }
 
-func NewInodeToPath() *InodeToPath {
+func NewInodeToPath(root util.FullPath) *InodeToPath {
 	t := &InodeToPath{
 		inode2path: make(map[uint64]*InodeEntry),
 		path2inode: make(map[util.FullPath]uint64),
 	}
-	t.inode2path[1] = &InodeEntry{"/", 1, true, false}
-	t.path2inode["/"] = 1
+	t.inode2path[1] = &InodeEntry{root, 1, true, false}
+	t.path2inode[root] = 1
 	return t
 }
 
-func (i *InodeToPath) Lookup(path util.FullPath, mode os.FileMode, isCreate bool, possibleInode uint64, isLookup bool) uint64 {
+func (i *InodeToPath) Lookup(path util.FullPath, mode os.FileMode, isHardlink bool, possibleInode uint64, isLookup bool) uint64 {
 	i.Lock()
 	defer i.Unlock()
 	inode, found := i.path2inode[path]
 	if !found {
 		if possibleInode == 0 {
 			inode = path.AsInode(mode)
+		} else {
+			inode = possibleInode
+		}
+		if !isHardlink {
 			for _, found := i.inode2path[inode]; found; inode++ {
 				_, found = i.inode2path[inode]
 			}
-		} else {
-			inode = possibleInode
 		}
 	}
 	i.path2inode[path] = inode
@@ -59,6 +61,19 @@ func (i *InodeToPath) Lookup(path util.FullPath, mode os.FileMode, isCreate bool
 		}
 	}
 
+	return inode
+}
+
+func (i *InodeToPath) AllocateInode(path util.FullPath, mode os.FileMode) uint64 {
+	if path == "/" {
+		return 1
+	}
+	i.Lock()
+	defer i.Unlock()
+	inode := path.AsInode(mode)
+	for _, found := i.inode2path[inode]; found; inode++ {
+		_, found = i.inode2path[inode]
+	}
 	return inode
 }
 
@@ -172,7 +187,8 @@ func (i *InodeToPath) Forget(inode, nlookup uint64, onForgetDir func(dir util.Fu
 	}
 	i.Unlock()
 	if found {
-		if path.isDirectory && onForgetDir != nil {
+		if path.isDirectory && path.nlookup <= 0 && onForgetDir != nil {
+			path.isChildrenCached = false
 			onForgetDir(path.FullPath)
 		}
 	}
