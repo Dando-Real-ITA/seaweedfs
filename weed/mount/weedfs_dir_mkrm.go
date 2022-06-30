@@ -21,6 +21,10 @@ import (
  * */
 func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out *fuse.EntryOut) (code fuse.Status) {
 
+	if wfs.IsOverQuota {
+		return fuse.Status(syscall.ENOSPC)
+	}
+
 	if s := checkName(name); s != fuse.OK {
 		return s
 	}

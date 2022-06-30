@@ -131,6 +131,10 @@ const (
 )
 
 func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string, newName string) (code fuse.Status) {
+	if wfs.IsOverQuota {
+		return fuse.Status(syscall.ENOSPC)
+	}
+
 	if s := checkName(newName); s != fuse.OK {
 		return s
 	}

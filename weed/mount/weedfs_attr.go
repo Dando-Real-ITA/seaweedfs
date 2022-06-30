@@ -35,6 +35,10 @@ func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 
 func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
 
+	if wfs.IsOverQuota {
+		return fuse.Status(syscall.ENOSPC)
+	}
+
 	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
 	if status != fuse.OK {
 		return status

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/chrislusf/seaweedfs/weed/util/mem"
 	"io"
 	"mime"
 	"net/http"
@@ -101,7 +103,9 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 				}
 			}
 			w.WriteHeader(response.StatusCode)
-			io.Copy(w, response.Body)
+			buf := mem.Allocate(128 * 1024)
+			defer mem.Free(buf)
+			io.CopyBuffer(w, response.Body, buf)
 			return
 		} else {
 			// redirect

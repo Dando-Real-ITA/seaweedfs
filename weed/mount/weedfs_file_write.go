@@ -3,6 +3,7 @@ package mount
 import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"net/http"
+	"syscall"
 )
 
 /**
@@ -32,6 +33,10 @@ import (
  * @param fi file information
  */
 func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (written uint32, code fuse.Status) {
+
+	if wfs.IsOverQuota {
+		return 0, fuse.Status(syscall.ENOSPC)
+	}
 
 	fh := wfs.GetHandle(FileHandleId(in.Fh))
 	if fh == nil {
