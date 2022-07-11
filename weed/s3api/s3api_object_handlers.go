@@ -27,17 +27,6 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
-var (
-	client *http.Client
-)
-
-func init() {
-	client = &http.Client{Transport: &http.Transport{
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 1024,
-	}}
-}
-
 func mimeDetect(r *http.Request, dataReader io.Reader) io.ReadCloser {
 	mimeBuffer := make([]byte, 512)
 	size, _ := dataReader.Read(mimeBuffer)
@@ -105,8 +94,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	} else {
-		uploadUrl := fmt.Sprintf("http://%s%s/%s%s", s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, urlPathEscape(object))
-
+		uploadUrl := s3a.toFilerUrl(bucket, object)
 		if r.Header.Get("Content-Type") == "" {
 			dataReader = mimeDetect(r, dataReader)
 		}
@@ -132,6 +120,12 @@ func urlPathEscape(object string) string {
 	return strings.Join(escapedParts, "/")
 }
 
+func (s3a *S3ApiServer) toFilerUrl(bucket, object string) string {
+	destUrl := fmt.Sprintf("http://%s%s/%s%s",
+		s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, urlPathEscape(object))
+	return destUrl
+}
+
 func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request) {
 
 	bucket, object := xhttp.GetBucketAndObject(r)
@@ -142,8 +136,7 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	destUrl := fmt.Sprintf("http://%s%s/%s%s",
-		s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, urlPathEscape(object))
+	destUrl := s3a.toFilerUrl(bucket, object)
 
 	s3a.proxyToFiler(w, r, destUrl, false, passThroughResponse)
 }
@@ -153,8 +146,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 	bucket, object := xhttp.GetBucketAndObject(r)
 	glog.V(3).Infof("HeadObjectHandler %s %s", bucket, object)
 
-	destUrl := fmt.Sprintf("http://%s%s/%s%s",
-		s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, urlPathEscape(object))
+	destUrl := s3a.toFilerUrl(bucket, object)
 
 	s3a.proxyToFiler(w, r, destUrl, false, passThroughResponse)
 }
@@ -164,8 +156,7 @@ func (s3a *S3ApiServer) DeleteObjectHandler(w http.ResponseWriter, r *http.Reque
 	bucket, object := xhttp.GetBucketAndObject(r)
 	glog.V(3).Infof("DeleteObjectHandler %s %s", bucket, object)
 
-	destUrl := fmt.Sprintf("http://%s%s/%s%s?recursive=true",
-		s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, urlPathEscape(object))
+	destUrl := s3a.toFilerUrl(bucket, object)
 
 	s3a.proxyToFiler(w, r, destUrl, true, func(proxyResponse *http.Response, w http.ResponseWriter) (statusCode int) {
 		statusCode = http.StatusNoContent
@@ -333,7 +324,7 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 	// ensure that the Authorization header is overriding any previous
 	// Authorization header which might be already present in proxyReq
 	s3a.maybeAddFilerJwtAuthorization(proxyReq, isWrite)
-	resp, postErr := client.Do(proxyReq)
+	resp, postErr := s3a.client.Do(proxyReq)
 
 	if postErr != nil {
 		glog.Errorf("post to filer: %v", postErr)
@@ -399,7 +390,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, uploadUrl string, dataReader
 	// ensure that the Authorization header is overriding any previous
 	// Authorization header which might be already present in proxyReq
 	s3a.maybeAddFilerJwtAuthorization(proxyReq, true)
-	resp, postErr := client.Do(proxyReq)
+	resp, postErr := s3a.client.Do(proxyReq)
 
 	if postErr != nil {
 		glog.Errorf("post to filer: %v", postErr)

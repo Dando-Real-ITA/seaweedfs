@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"path/filepath"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -50,10 +51,12 @@ type Option struct {
 	Cipher             bool   // whether encrypt data on volume server
 	UidGidMapper       *meta_cache.UidGidMapper
 
-	uniqueCacheDir string
+	uniqueCacheDir         string
+	uniqueCacheTempPageDir string
 }
 
 type WFS struct {
+	// https://dl.acm.org/doi/fullHtml/10.1145/3310148
 	// follow https://github.com/hanwen/go-fuse/blob/master/fuse/api.go
 	fuse.RawFileSystem
 	fs.Inode
@@ -177,7 +180,12 @@ func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
 func (option *Option) setupUniqueCacheDirectory() {
 	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + string(option.FilerAddresses[0]) + option.FilerMountRootPath + util.Version()))[0:8]
 	option.uniqueCacheDir = path.Join(option.CacheDir, cacheUniqueId)
-	os.MkdirAll(option.uniqueCacheDir, os.FileMode(0777)&^option.Umask)
+	option.uniqueCacheTempPageDir = filepath.Join(option.uniqueCacheDir, "swap")
+	os.MkdirAll(option.uniqueCacheTempPageDir, os.FileMode(0777)&^option.Umask)
+}
+
+func (option *Option) getTempFilePageDir() string {
+	return option.uniqueCacheTempPageDir
 }
 
 func (option *Option) getUniqueCacheDir() string {

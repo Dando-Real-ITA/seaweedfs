@@ -55,7 +55,7 @@ var cmdServer = &Command{
 
 var (
 	serverIp                  = cmdServer.Flag.String("ip", util.DetectedHostAddress(), "ip or server name, also used as identifier")
-	serverBindIp              = cmdServer.Flag.String("ip.bind", "", "ip address to bind to")
+	serverBindIp              = cmdServer.Flag.String("ip.bind", "", "ip address to bind to. If empty, default to same as -ip option.")
 	serverTimeout             = cmdServer.Flag.Int("idleTimeout", 30, "connection idle seconds")
 	serverDataCenter          = cmdServer.Flag.String("dataCenter", "", "current volume server's data center name")
 	serverRack                = cmdServer.Flag.String("rack", "", "current volume server's rack name")
@@ -112,6 +112,7 @@ func init() {
 	filerOptions.cipher = cmdServer.Flag.Bool("filer.encryptVolumeData", false, "encrypt data on volume servers")
 	filerOptions.saveToFilerLimit = cmdServer.Flag.Int("filer.saveToFilerLimit", 0, "Small files smaller than this limit can be cached in filer store.")
 	filerOptions.concurrentUploadLimitMB = cmdServer.Flag.Int("filer.concurrentUploadLimitMB", 64, "limit total concurrent upload size")
+	filerOptions.localSocket = cmdServer.Flag.String("filer.localSocket", "", "default to /tmp/seaweedfs-filer-<port>.sock")
 
 	serverOptions.v.port = cmdServer.Flag.Int("volume.port", 8080, "volume server http listen port")
 	serverOptions.v.portGrpc = cmdServer.Flag.Int("volume.port.grpc", 0, "volume server grpc listen port")
@@ -183,6 +184,10 @@ func runServer(cmd *Command, args []string) bool {
 		masterOptions.peers = &peers
 	}
 
+	if *serverBindIp == "" {
+		serverBindIp = serverIp
+	}
+
 	// ip address
 	masterOptions.ip = serverIp
 	masterOptions.ipBind = serverBindIp
@@ -245,6 +250,7 @@ func runServer(cmd *Command, args []string) bool {
 	if *isStartingS3 {
 		go func() {
 			time.Sleep(2 * time.Second)
+			s3Options.localFilerSocket = filerOptions.localSocket
 			s3Options.startS3Server()
 		}()
 	}

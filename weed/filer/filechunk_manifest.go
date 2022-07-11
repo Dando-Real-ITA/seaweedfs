@@ -68,12 +68,12 @@ func ResolveChunkManifest(lookupFileIdFn wdclient.LookupFileIdFunctionType, chun
 
 		manifestChunks = append(manifestChunks, chunk)
 		// recursive
-		dchunks, mchunks, subErr := ResolveChunkManifest(lookupFileIdFn, resolvedChunks, startOffset, stopOffset)
+		dataChunks, manifestChunks, subErr := ResolveChunkManifest(lookupFileIdFn, resolvedChunks, startOffset, stopOffset)
 		if subErr != nil {
 			return chunks, nil, subErr
 		}
-		dataChunks = append(dataChunks, dchunks...)
-		manifestChunks = append(manifestChunks, mchunks...)
+		dataChunks = append(dataChunks, dataChunks...)
+		manifestChunks = append(manifestChunks, manifestChunks...)
 	}
 	return
 }
@@ -113,6 +113,15 @@ func fetchWholeChunk(bytesBuffer *bytes.Buffer, lookupFileIdFn wdclient.LookupFi
 		return err
 	}
 	return nil
+}
+
+func fetchChunkRange(buffer []byte, lookupFileIdFn wdclient.LookupFileIdFunctionType, fileId string, cipherKey []byte, isGzipped bool, offset int64) (int, error) {
+	urlStrings, err := lookupFileIdFn(fileId)
+	if err != nil {
+		glog.Errorf("operation LookupFileId %s failed, err: %v", fileId, err)
+		return 0, err
+	}
+	return retriedFetchChunkData(buffer, urlStrings, cipherKey, isGzipped, false, offset)
 }
 
 func retriedFetchChunkData(buffer []byte, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64) (n int, err error) {
