@@ -1,15 +1,17 @@
 package command
 
 import (
-	"github.com/chrislusf/raft/protobuf"
-	stats_collect "github.com/chrislusf/seaweedfs/weed/stats"
-	"github.com/gorilla/mux"
-	"google.golang.org/grpc/reflection"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/chrislusf/raft/protobuf"
+	stats_collect "github.com/chrislusf/seaweedfs/weed/stats"
+	"github.com/gorilla/mux"
+	"github.com/spf13/viper"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/chrislusf/seaweedfs/weed/util/grace"
 
@@ -17,7 +19,7 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
 	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/server"
+	weed_server "github.com/chrislusf/seaweedfs/weed/server"
 	"github.com/chrislusf/seaweedfs/weed/storage/backend"
 	"github.com/chrislusf/seaweedfs/weed/util"
 )
@@ -125,7 +127,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		*masterOption.portGrpc = 10000 + *masterOption.port
 	}
 	if *masterOption.ipBind == "" {
-		*masterOption.ipBind = "localhost"
+		*masterOption.ipBind = *masterOption.ip
 	}
 
 	myMasterAddress, peers := checkPeers(*masterOption.ip, *masterOption.port, *masterOption.portGrpc, *masterOption.peers)
@@ -134,10 +136,11 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	ms := weed_server.NewMasterServer(r, masterOption.toMasterOption(masterWhiteList), peers)
 	listeningAddress := util.JoinHostPort(*masterOption.ipBind, *masterOption.port)
 	glog.V(0).Infof("Start Seaweed Master %s at %s", util.Version(), listeningAddress)
-	masterListener, e := util.NewListener(listeningAddress, 0)
+	masterListener, masterLocalListner, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0)
 	if e != nil {
 		glog.Fatalf("Master startup error: %v", e)
 	}
+
 	// start raftServer
 	raftServerOption := &weed_server.RaftServerOption{
 		GrpcDialOption:    security.LoadClientTLS(util.GetViper(), "grpc.master"),
@@ -157,7 +160,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	r.HandleFunc("/cluster/status", raftServer.StatusHandler).Methods("GET")
 	// starting grpc server
 	grpcPort := *masterOption.portGrpc
-	grpcL, err := util.NewListener(util.JoinHostPort(*masterOption.ipBind, grpcPort), 0)
+	grpcL, grpcLocalL, err := util.NewIpAndLocalListeners(*masterOption.ipBind, grpcPort, 0)
 	if err != nil {
 		glog.Fatalf("master failed to listen on grpc port %d: %v", grpcPort, err)
 	}
@@ -166,6 +169,9 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	protobuf.RegisterRaftServer(grpcS, raftServer)
 	reflection.Register(grpcS)
 	glog.V(0).Infof("Start Seaweed Master %s grpc server at %s:%d", util.Version(), *masterOption.ipBind, grpcPort)
+	if grpcLocalL != nil {
+		go grpcS.Serve(grpcLocalL)
+	}
 	go grpcS.Serve(grpcL)
 
 	go func() {
@@ -180,8 +186,39 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	go ms.MasterClient.KeepConnectedToMaster()
 
 	// start http server
+	var (
+		clientCertFile,
+		certFile,
+		keyFile string
+	)
+	useTLS := false
+	useMTLS := false
+
+	if viper.GetString("https.master.key") != "" {
+		useTLS = true
+		certFile = viper.GetString("https.master.cert")
+		keyFile = viper.GetString("https.master.key")
+	}
+
+	if viper.GetString("https.master.ca") != "" {
+		useMTLS = true
+		clientCertFile = viper.GetString("https.master.ca")
+	}
+
 	httpS := &http.Server{Handler: r}
-	go httpS.Serve(masterListener)
+	if masterLocalListner != nil {
+		go httpS.Serve(masterLocalListner)
+	}
+
+	if useMTLS {
+		httpS.TLSConfig = security.LoadClientTLSHTTP(clientCertFile)
+	}
+
+	if useTLS {
+		go httpS.ServeTLS(masterListener, certFile, keyFile)
+	} else {
+		go httpS.Serve(masterListener)
+	}
 
 	select {}
 }
