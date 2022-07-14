@@ -29,6 +29,8 @@ type MountOptions struct {
 	readOnly           *bool
 	debug              *bool
 	debugPort          *int
+	localSocket        *string
+	disableXAttr       *bool
 }
 
 var (
@@ -63,6 +65,8 @@ func init() {
 	mountOptions.readOnly = cmdMount.Flag.Bool("readOnly", false, "read only")
 	mountOptions.debug = cmdMount.Flag.Bool("debug", false, "serves runtime profiling data, e.g., http://localhost:<debug.port>/debug/pprof/goroutine?debug=2")
 	mountOptions.debugPort = cmdMount.Flag.Int("debug.port", 6061, "http port for debugging")
+	mountOptions.localSocket = cmdMount.Flag.String("localSocket", "", "default to /tmp/seaweedfs-mount-<mount_dir_hash>.sock")
+	mountOptions.disableXAttr = cmdMount.Flag.Bool("disableXAttr", false, "disable xattr")
 
 	mountCpuProfile = cmdMount.Flag.String("cpuprofile", "", "cpu profile output file")
 	mountMemProfile = cmdMount.Flag.String("memprofile", "", "memory profile output file")
@@ -82,7 +86,7 @@ var cmdMount = &Command{
   This uses github.com/seaweedfs/fuse, which enables writing FUSE file systems on
   Linux, and OS X.
 
-  On OS X, it requires OSXFUSE (http://osxfuse.github.com/).
+  On OS X, it requires OSXFUSE (https://osxfuse.github.io/).
 
   `,
 }

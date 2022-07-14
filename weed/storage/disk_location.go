@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,10 +16,12 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 	"github.com/chrislusf/seaweedfs/weed/storage/types"
 	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/google/uuid"
 )
 
 type DiskLocation struct {
 	Directory              string
+	DirectoryUuid          string
 	IdxDirectory           string
 	DiskType               types.DiskType
 	MaxVolumeCount         int
@@ -33,6 +37,27 @@ type DiskLocation struct {
 	isDiskSpaceLow bool
 }
 
+func GenerateDirUuid(dir string) (dirUuidString string, err error) {
+	glog.V(1).Infof("Getting uuid of volume directory:%s", dir)
+	dirUuidString = ""
+	fileName := dir + "/vol_dir.uuid"
+	if !util.FileExists(fileName) {
+		dirUuid, _ := uuid.NewRandom()
+		dirUuidString = dirUuid.String()
+		writeErr := util.WriteFile(fileName, []byte(dirUuidString), 0644)
+		if writeErr != nil {
+			return "", fmt.Errorf("failed to write uuid to %s : %v", fileName, writeErr)
+		}
+	} else {
+		uuidData, readErr := os.ReadFile(fileName)
+		if readErr != nil {
+			return "", fmt.Errorf("failed to read uuid from %s : %v", fileName, readErr)
+		}
+		dirUuidString = string(uuidData)
+	}
+	return dirUuidString, nil
+}
+
 func NewDiskLocation(dir string, maxVolumeCount int, minFreeSpace util.MinFreeSpace, idxDir string, diskType types.DiskType) *DiskLocation {
 	dir = util.ResolvePath(dir)
 	if idxDir == "" {
@@ -40,8 +65,13 @@ func NewDiskLocation(dir string, maxVolumeCount int, minFreeSpace util.MinFreeSp
 	} else {
 		idxDir = util.ResolvePath(idxDir)
 	}
+	dirUuid, err := GenerateDirUuid(dir)
+	if err != nil {
+		glog.Fatalf("cannot generate uuid of dir %s: %v", dir, err)
+	}
 	location := &DiskLocation{
 		Directory:              dir,
+		DirectoryUuid:          dirUuid,
 		IdxDirectory:           idxDir,
 		DiskType:               diskType,
 		MaxVolumeCount:         maxVolumeCount,
@@ -178,7 +208,21 @@ func (l *DiskLocation) concurrentLoadingVolumes(needleMapKind NeedleMapKind, con
 
 func (l *DiskLocation) loadExistingVolumes(needleMapKind NeedleMapKind) {
 
-	l.concurrentLoadingVolumes(needleMapKind, 10)
+	workerNum := runtime.NumCPU()
+	val, ok := os.LookupEnv("GOMAXPROCS")
+	if ok {
+		num, err := strconv.Atoi(val)
+		if err != nil || num < 1 {
+			num = 10
+			glog.Warningf("failed to set worker number from GOMAXPROCS , set to default:10")
+		}
+		workerNum = num
+	} else {
+		if workerNum <= 10 {
+			workerNum = 10
+		}
+	}
+	l.concurrentLoadingVolumes(needleMapKind, workerNum)
 	glog.V(0).Infof("Store started on dir: %s with %d volumes max %d", l.Directory, len(l.volumes), l.MaxVolumeCount)
 
 	l.loadAllEcShards()
@@ -283,7 +327,7 @@ func (l *DiskLocation) UnloadVolume(vid needle.VolumeId) error {
 func (l *DiskLocation) unmountVolumeByCollection(collectionName string) map[needle.VolumeId]*Volume {
 	deltaVols := make(map[needle.VolumeId]*Volume, 0)
 	for k, v := range l.volumes {
-		if v.Collection == collectionName && !v.isCompacting {
+		if v.Collection == collectionName && !v.isCompacting && !v.isCommitCompacting {
 			deltaVols[k] = v
 		}
 	}

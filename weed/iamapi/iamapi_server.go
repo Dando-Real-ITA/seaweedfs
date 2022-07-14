@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+
 	"github.com/chrislusf/seaweedfs/weed/filer"
 	"github.com/chrislusf/seaweedfs/weed/pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
@@ -17,7 +19,6 @@ import (
 	"github.com/chrislusf/seaweedfs/weed/wdclient"
 	"github.com/gorilla/mux"
 	"google.golang.org/grpc"
-	"net/http"
 )
 
 type IamS3ApiConfig interface {
@@ -33,7 +34,7 @@ type IamS3ApiConfigure struct {
 }
 
 type IamServerOption struct {
-	Masters        []pb.ServerAddress
+	Masters        map[string]pb.ServerAddress
 	Filer          pb.ServerAddress
 	Port           int
 	GrpcDialOption grpc.DialOption
@@ -49,7 +50,7 @@ var s3ApiConfigure IamS3ApiConfig
 func NewIamApiServer(router *mux.Router, option *IamServerOption) (iamApiServer *IamApiServer, err error) {
 	s3ApiConfigure = IamS3ApiConfigure{
 		option:       option,
-		masterClient: wdclient.NewMasterClient(option.GrpcDialOption, "iam", "", "", option.Masters),
+		masterClient: wdclient.NewMasterClient(option.GrpcDialOption, "", "iam", "", "", option.Masters),
 	}
 	s3Option := s3api.S3ApiServerOption{Filer: option.Filer}
 	iamApiServer = &IamApiServer{
@@ -117,10 +118,10 @@ func (iam IamS3ApiConfigure) GetPolicies(policies *Policies) (err error) {
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && err != filer_pb.ErrNotFound {
 		return err
 	}
-	if buf.Len() == 0 {
+	if err == filer_pb.ErrNotFound || buf.Len() == 0 {
 		policies.Policies = make(map[string]PolicyDocument)
 		return nil
 	}

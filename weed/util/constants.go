@@ -5,7 +5,7 @@ import (
 )
 
 var (
-	VERSION_NUMBER  = fmt.Sprintf("%.02f", 2.95)
+	VERSION_NUMBER  = fmt.Sprintf("%.02f", 3.15)
 	VERSION         = sizeLimit + " " + VERSION_NUMBER
 	COMMIT          = ""
 	PRIVATE         = "Katapy"

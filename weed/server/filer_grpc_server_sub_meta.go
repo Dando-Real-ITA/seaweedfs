@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/stats"
 	"strings"
 	"time"
 
@@ -39,13 +40,19 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	var processedTsNs int64
 	var readPersistedLogErr error
 	var readInMemoryLogErr error
+	var isDone bool
 
 	for {
-		glog.V(1).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
-		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
+
+		glog.V(4).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+
+		processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, req.UntilNs, eachLogEntryFn)
 		if readPersistedLogErr != nil {
 			glog.Errorf("read on disk %v subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
 			return fmt.Errorf("reading from persisted logs: %v", readPersistedLogErr)
+		}
+		if isDone {
+			return nil
 		}
 
 		if processedTsNs != 0 {
@@ -54,7 +61,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 
 		glog.V(4).Infof("read in memory %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
-		lastReadTime, readInMemoryLogErr = fs.filer.MetaAggregator.MetaLogBuffer.LoopProcessLogData("aggMeta:"+clientName, lastReadTime, func() bool {
+		lastReadTime, isDone, readInMemoryLogErr = fs.filer.MetaAggregator.MetaLogBuffer.LoopProcessLogData("aggMeta:"+clientName, lastReadTime, req.UntilNs, func() bool {
 			fs.filer.MetaAggregator.ListenersLock.Lock()
 			fs.filer.MetaAggregator.ListenersCond.Wait()
 			fs.filer.MetaAggregator.ListenersLock.Unlock()
@@ -63,8 +70,6 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 		if readInMemoryLogErr != nil {
 			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				// // Force a progression to avoid infinite loop
-				// lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
 				continue
 				// break
 			}
@@ -72,6 +77,9 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			if readInMemoryLogErr != log_buffer.ResumeError {
 				break
 			}
+		}
+		if isDone {
+			return nil
 		}
 
 		time.Sleep(1127 * time.Millisecond)
@@ -85,6 +93,9 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeLocalMetadataServer) error {
 
 	peerAddress := findClientAddress(stream.Context(), 0)
+
+	// use negative client id to differentiate from addClient()/deleteClient() used in SubscribeMetadata()
+	req.ClientId = -req.ClientId
 
 	alreadyKnown, clientName := fs.addClient(req.ClientName, peerAddress, req.ClientId)
 	if alreadyKnown {
@@ -102,13 +113,18 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	var processedTsNs int64
 	var readPersistedLogErr error
 	var readInMemoryLogErr error
+	var isDone bool
 
 	for {
-		glog.V(1).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
-		processedTsNs, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, eachLogEntryFn)
+		// println("reading from persisted logs ...")
+		glog.V(0).Infof("read on disk %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
+		processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, req.UntilNs, eachLogEntryFn)
 		if readPersistedLogErr != nil {
 			glog.Errorf("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
 			return fmt.Errorf("reading from persisted logs: %v", readPersistedLogErr)
+		}
+		if isDone {
+			return nil
 		}
 
 		if processedTsNs != 0 {
@@ -122,14 +138,13 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 
 		glog.V(4).Infof("read in memory %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
-		lastReadTime, readInMemoryLogErr = fs.filer.LocalMetaLogBuffer.LoopProcessLogData("localMeta:"+clientName, lastReadTime, func() bool {
+		lastReadTime, isDone, readInMemoryLogErr = fs.filer.LocalMetaLogBuffer.LoopProcessLogData("localMeta:"+clientName, lastReadTime, req.UntilNs, func() bool {
 			fs.listenersLock.Lock()
 			fs.listenersCond.Wait()
 			fs.listenersLock.Unlock()
 			return true
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
-			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				// // Force a progression to avoid infinite loop
 				// lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
@@ -141,8 +156,9 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 				break
 			}
 		}
-
-		//time.Sleep(1127 * time.Millisecond)
+		if isDone {
+			return nil
+		}
 	}
 
 	//time.Sleep(1127 * time.Millisecond)
@@ -225,6 +241,9 @@ func (fs *FilerServer) eachEventNotificationFn(req *filer_pb.SubscribeMetadataRe
 			}
 		}
 
+		// collect timestamps for path
+		stats.FilerServerLastSendTsOfSubscribeGauge.WithLabelValues(fs.option.Host.String(), req.ClientName, req.PathPrefix).Set(float64(tsNs))
+
 		message := &filer_pb.SubscribeMetadataResponse{
 			Directory:         dirPath,
 			EventNotification: eventNotification,
@@ -255,6 +274,9 @@ func (fs *FilerServer) addClient(clientType string, clientAddress string, client
 	if clientId != 0 {
 		fs.knownListenersLock.Lock()
 		_, alreadyKnown = fs.knownListeners[clientId]
+		if !alreadyKnown {
+			fs.knownListeners[clientId] = struct{}{}
+		}
 		fs.knownListenersLock.Unlock()
 	}
 	return

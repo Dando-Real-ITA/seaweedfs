@@ -1,5 +1,5 @@
-# 2021-12-23 14:07:38
-FROM registry.hub.docker.com/amd64/golang:1.17-alpine as builder
+# 2022-07-14 23:06:44
+FROM registry.hub.docker.com/amd64/golang:1.18-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
 WORKDIR /go/src/github.com/chrislusf/

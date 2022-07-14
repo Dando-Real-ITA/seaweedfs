@@ -152,11 +152,15 @@ func (i *InodeToPath) RemovePath(path util.FullPath) {
 	}
 }
 
-func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (replacedInode uint64) {
+func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (sourceInode, targetInode uint64) {
 	i.Lock()
 	defer i.Unlock()
 	sourceInode, sourceFound := i.path2inode[sourcePath]
 	targetInode, targetFound := i.path2inode[targetPath]
+	if targetFound {
+		delete(i.inode2path, targetInode)
+		delete(i.path2inode, targetPath)
+	}
 	if sourceFound {
 		delete(i.path2inode, sourcePath)
 		i.path2inode[targetPath] = sourceInode
@@ -165,13 +169,16 @@ func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (replacedIn
 		// so no need to worry about their source inodes
 		return
 	}
-	i.inode2path[sourceInode].FullPath = targetPath
-	if targetFound {
-		delete(i.inode2path, targetInode)
+	if entry, entryFound := i.inode2path[sourceInode]; entryFound {
+		entry.FullPath = targetPath
+		entry.isChildrenCached = false
+		if !targetFound {
+			entry.nlookup++
+		}
 	} else {
-		i.inode2path[sourceInode].nlookup++
+		glog.Errorf("MovePath %s to %s: sourceInode %d not found", sourcePath, targetPath, sourceInode)
 	}
-	return targetInode
+	return
 }
 
 func (i *InodeToPath) Forget(inode, nlookup uint64, onForgetDir func(dir util.FullPath)) {

@@ -440,8 +440,11 @@ func (vl *VolumeLayout) SetVolumeCapacityFull(vid needle.VolumeId) bool {
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
 
-	glog.V(0).Infof("Volume %d reaches full capacity.", vid)
-	return vl.removeFromWritable(vid)
+	wasWritable := vl.removeFromWritable(vid)
+	if wasWritable {
+		glog.V(0).Infof("Volume %d reaches full capacity.", vid)
+	}
+	return wasWritable
 }
 
 func (vl *VolumeLayout) removeFromCrowded(vid needle.VolumeId) {
@@ -490,9 +493,9 @@ func (vl *VolumeLayout) Stats() *VolumeLayoutStats {
 	for vid, vll := range vl.vid2location {
 		size, fileCount := vll.Stats(vid, freshThreshold)
 		ret.FileCount += uint64(fileCount)
-		ret.UsedSize += size
+		ret.UsedSize += size * uint64(vll.Length())
 		if vl.readonlyVolumes.IsTrue(vid) {
-			ret.TotalSize += size
+			ret.TotalSize += size * uint64(vll.Length())
 		} else {
 			ret.TotalSize += vl.volumeSizeLimit * uint64(vll.Length())
 		}

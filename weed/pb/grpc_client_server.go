@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
 	"math/rand"
 	"net/http"
@@ -47,6 +48,7 @@ func NewGrpcServer(opts ...grpc.ServerOption) *grpc.Server {
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    10 * time.Second, // wait time before ping if no activity
 			Timeout: 20 * time.Second, // ping timeout
+			// MaxConnectionAge: 10 * time.Hour,
 		}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             60 * time.Second, // min time a client should wait before sending a ping
@@ -206,7 +208,15 @@ func WithMasterClient(streamingMode bool, master ServerAddress, grpcDialOption g
 
 }
 
-func WithOneOfGrpcMasterClients(streamingMode bool, masterGrpcAddresses []ServerAddress, grpcDialOption grpc.DialOption, fn func(client master_pb.SeaweedClient) error) (err error) {
+func WithVolumeServerClient(streamingMode bool, volumeServer ServerAddress, grpcDialOption grpc.DialOption, fn func(client volume_server_pb.VolumeServerClient) error) error {
+	return WithGrpcClient(streamingMode, func(grpcConnection *grpc.ClientConn) error {
+		client := volume_server_pb.NewVolumeServerClient(grpcConnection)
+		return fn(client)
+	}, volumeServer.ToGrpcAddress(), grpcDialOption)
+
+}
+
+func WithOneOfGrpcMasterClients(streamingMode bool, masterGrpcAddresses map[string]ServerAddress, grpcDialOption grpc.DialOption, fn func(client master_pb.SeaweedClient) error) (err error) {
 
 	for _, masterGrpcAddress := range masterGrpcAddresses {
 		err = WithGrpcClient(streamingMode, func(grpcConnection *grpc.ClientConn) error {

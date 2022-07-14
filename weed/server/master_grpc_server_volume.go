@@ -52,8 +52,13 @@ func (ms *MasterServer) ProcessGrowRequest() {
 				go func() {
 					glog.V(1).Infoln("starting automatic volume grow")
 					start := time.Now()
-					_, err := ms.vg.AutomaticGrowByType(req.Option, ms.grpcDialOption, ms.Topo, req.Count)
+					newVidLocations, err := ms.vg.AutomaticGrowByType(req.Option, ms.grpcDialOption, ms.Topo, req.Count)
 					glog.V(1).Infoln("finished automatic volume grow, cost ", time.Now().Sub(start))
+					if err == nil {
+						for _, newVidLocation := range newVidLocations {
+							ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: newVidLocation})
+						}
+					}
 					vl.DoneGrowRequest()
 
 					if req.ErrCh != nil {
@@ -204,8 +209,9 @@ func (ms *MasterServer) Statistics(ctx context.Context, req *master_pb.Statistic
 
 	volumeLayout := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, ttl, types.ToDiskType(req.DiskType))
 	stats := volumeLayout.Stats()
+	totalSize := ms.Topo.GetDiskUsages().GetMaxVolumeCount() * int64(ms.option.VolumeSizeLimitMB) * 1024 * 1024
 	resp := &master_pb.StatisticsResponse{
-		TotalSize: stats.TotalSize,
+		TotalSize: uint64(totalSize),
 		UsedSize:  stats.UsedSize,
 		FileCount: stats.FileCount,
 	}
@@ -268,7 +274,7 @@ func (ms *MasterServer) VacuumVolume(ctx context.Context, req *master_pb.VacuumV
 
 	resp := &master_pb.VacuumVolumeResponse{}
 
-	ms.Topo.Vacuum(ms.grpcDialOption, float64(req.GarbageThreshold), ms.preallocateSize)
+	ms.Topo.Vacuum(ms.grpcDialOption, float64(req.GarbageThreshold), req.VolumeId, req.Collection, ms.preallocateSize)
 
 	return resp, nil
 }
