@@ -125,7 +125,7 @@ func (wfs *WFS) Init(server *fuse.Server) {
 	wfs.fuseServer = server
 }
 
-func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle, entry *filer_pb.Entry, status fuse.Status) {
+func (wfs *WFS) maybeReadEntry(inode uint64, followSymLink bool) (path util.FullPath, fh *FileHandle, entry *filer_pb.Entry, targetInode uint64, status fuse.Status) {
 	path, status = wfs.inodeToPath.GetPath(inode)
 	if status != fuse.OK {
 		return
@@ -136,9 +136,17 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 		if entry != nil && fh.entry.Attributes == nil {
 			entry.Attributes = &filer_pb.FuseAttributes{}
 		}
-		return path, fh, entry, fuse.OK
+	} else {
+		entry, status = wfs.maybeLoadEntry(path)
 	}
-	entry, status = wfs.maybeLoadEntry(path)
+	targetInode = inode
+	if status == fuse.OK && followSymLink && entry.FileMode()&os.ModeSymlink != 0 {
+		if entry != nil && entry.Attributes != nil && entry.Attributes.Inode != 0 {
+			targetInode = entry.Attributes.Inode
+		}
+		target := filepath.Join(string(path), "../"+entry.Attributes.SymlinkTarget)
+		entry, status = wfs.maybeLoadEntry(util.FullPath(target))
+	}
 	return
 }
 

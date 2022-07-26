@@ -28,8 +28,9 @@ type FilerMetaBackupOptions struct {
 	restart           *bool
 	backupFilerConfig *string
 
-	store    filer.FilerStore
-	clientId int32
+	store       filer.FilerStore
+	clientId    int32
+	clientEpoch int32
 }
 
 func init() {
@@ -195,7 +196,8 @@ func (metaBackup *FilerMetaBackupOptions) streamMetadataBackup() error {
 		return metaBackup.setOffset(lastTime)
 	})
 
-	return pb.FollowMetadata(pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, "meta_backup", metaBackup.clientId,
+	metaBackup.clientEpoch++
+	return pb.FollowMetadata(pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, "meta_backup", metaBackup.clientId, metaBackup.clientEpoch,
 		*metaBackup.filerDirectory, nil, startTime.UnixNano(), 0, 0, processEventFnWithOffset, pb.TrivialOnError)
 
 }

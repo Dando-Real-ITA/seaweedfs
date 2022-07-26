@@ -36,7 +36,7 @@ func (wfs *WFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr str
 		return 0, fuse.EINVAL
 	}
 
-	_, _, entry, status := wfs.maybeReadEntry(header.NodeId)
+	_, _, entry, _, status := wfs.maybeReadEntry(header.NodeId, true)
 	if status != fuse.OK {
 		return 0, status
 	}
@@ -102,9 +102,12 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 		}
 	}
 
-	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
+	path, fh, entry, _, status := wfs.maybeReadEntry(input.NodeId, true)
 	if status != fuse.OK {
 		return status
+	}
+	if entry == nil {
+		return fuse.ENOENT
 	}
 	if fh != nil {
 		fh.entryLock.Lock()
@@ -140,7 +143,7 @@ func (wfs *WFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []
 		return 0, fuse.Status(syscall.ENOTSUP)
 	}
 
-	_, _, entry, status := wfs.maybeReadEntry(header.NodeId)
+	_, _, entry, _, status := wfs.maybeReadEntry(header.NodeId, true)
 	if status != fuse.OK {
 		return 0, status
 	}
@@ -177,9 +180,12 @@ func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr 
 	if len(attr) == 0 {
 		return fuse.EINVAL
 	}
-	path, fh, entry, status := wfs.maybeReadEntry(header.NodeId)
+	path, fh, entry, _, status := wfs.maybeReadEntry(header.NodeId, true)
 	if status != fuse.OK {
 		return status
+	}
+	if entry == nil {
+		return fuse.OK
 	}
 	if fh != nil {
 		fh.entryLock.Lock()
