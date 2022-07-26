@@ -1,9 +1,10 @@
 package weed_server
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/topology"
 	"net/http"
 	"path/filepath"
+
+	"github.com/chrislusf/seaweedfs/weed/topology"
 
 	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/chrislusf/seaweedfs/weed/stats"
@@ -11,7 +12,7 @@ import (
 )
 
 func (vs *VolumeServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+util.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+util.Version())
 	volumeInfos := vs.store.VolumeInfos()
 	for _, vinfo := range volumeInfos {
 		if len(vinfo.Collection) == 0 {
