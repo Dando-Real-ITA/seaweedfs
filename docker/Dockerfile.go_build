@@ -1,4 +1,4 @@
-# 2022-07-14 23:06:44
+# 2022-07-26 15:24:53
 FROM registry.hub.docker.com/amd64/golang:1.18-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/chrislusf/
@@ -12,14 +12,14 @@ RUN git clone --depth 1 https://github.com/Dando-Real-ITA/seaweedfs -b master --
 WORKDIR seaweedfs/weed
 
 RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
-  go install -ldflags "${LDFLAGS}"
+  go install -tags "elastic,ydb,gocdk,tikv" -ldflags "${LDFLAGS}"
 
   ###########################################################################
 
 FROM builder as builder_large
 
 RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
-  go install -tags 5BytesOffset -ldflags "${LDFLAGS}"
+  go install -tags "5BytesOffset,elastic,ydb,gocdk,tikv" -ldflags "${LDFLAGS}"
 
   ###########################################################################
 
@@ -34,7 +34,6 @@ WORKDIR /
 
 LABEL author="Chris Lu"
 LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
-COPY --from=builder /go/bin/weed /usr/bin/
 RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/entrypoint.sh /entrypoint.sh
