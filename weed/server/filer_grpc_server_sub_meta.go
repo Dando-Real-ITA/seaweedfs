@@ -2,9 +2,10 @@ package weed_server
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/stats"
 	"strings"
 	"time"
+
+	"github.com/chrislusf/seaweedfs/weed/stats"
 
 	"github.com/golang/protobuf/proto"
 
@@ -68,10 +69,8 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			return true
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
-			time.Sleep(1127 * time.Millisecond)
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				continue
-				// break
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
@@ -85,7 +84,6 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 		time.Sleep(1127 * time.Millisecond)
 	}
 
-	time.Sleep(1127 * time.Millisecond)
 	return readInMemoryLogErr
 
 }
@@ -149,10 +147,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				// // Force a progression to avoid infinite loop
-				// lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
 				continue
-				// break
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
 			if readInMemoryLogErr != log_buffer.ResumeError {
@@ -164,7 +159,6 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		}
 	}
 
-	//time.Sleep(1127 * time.Millisecond)
 	return readInMemoryLogErr
 
 }
