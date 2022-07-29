@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"

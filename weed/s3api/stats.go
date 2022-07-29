@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"time"
 
-	stats_collect "github.com/chrislusf/seaweedfs/weed/stats"
 	"github.com/chrislusf/seaweedfs/weed/util"
 )
 

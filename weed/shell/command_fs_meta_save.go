@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-
 	"github.com/golang/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
