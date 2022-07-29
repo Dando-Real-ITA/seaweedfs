@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"strings"
 	"time"
 
@@ -9,11 +10,11 @@ import (
 
 	"github.com/golang/protobuf/proto"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/chrislusf/seaweedfs/weed/util/log_buffer"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/log_buffer"
 )
 
 const (

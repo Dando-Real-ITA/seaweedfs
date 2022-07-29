@@ -1,8 +1,8 @@
 # 2022-07-26 15:24:53
 FROM registry.hub.docker.com/amd64/golang:1.18-alpine as builder
 RUN apk add git g++ fuse3
-RUN mkdir -p /go/src/github.com/chrislusf/
-WORKDIR /go/src/github.com/chrislusf/
+RUN mkdir -p /go/src/github.com/seaweedfs/
+WORKDIR /go/src/github.com/seaweedfs/
 COPY go.mod .
 COPY go.sum .
 RUN go mod download
@@ -11,14 +11,14 @@ ADD https://api.github.com/repos/Dando-Real-ITA/seaweedfs/git/refs/heads/master 
 RUN git clone --depth 1 https://github.com/Dando-Real-ITA/seaweedfs -b master --recurse-submodules --shallow-submodules seaweedfs
 WORKDIR seaweedfs/weed
 
-RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
+RUN export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/seaweedfs/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
   go install -tags "elastic,ydb,gocdk,tikv" -ldflags "${LDFLAGS}"
 
   ###########################################################################
 
 FROM builder as builder_large
 
-RUN export LDFLAGS="-X github.com/chrislusf/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
+RUN export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/seaweedfs/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
   go install -tags "5BytesOffset,elastic,ydb,gocdk,tikv" -ldflags "${LDFLAGS}"
 
   ###########################################################################
@@ -35,9 +35,9 @@ WORKDIR /
 LABEL author="Chris Lu"
 LABEL mantainer="Gaspare Iengo <gaspare@katapy.com>"
 RUN mkdir -p /etc/seaweedfs
-COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
-COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/entrypoint.sh /entrypoint.sh
-COPY --from=builder /go/src/github.com/chrislusf/seaweedfs/docker/start.sh /start.sh
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/start.sh /start.sh
 
 # volume server gprc port
 EXPOSE 18080

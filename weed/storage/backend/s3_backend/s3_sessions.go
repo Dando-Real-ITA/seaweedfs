@@ -5,7 +5,8 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"sync"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
