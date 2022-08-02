@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2021-12-20 23:04:44
+# 2022-08-02 18:52:35
 
 ########################################################################################################################################################################################################################
 
@@ -10,7 +10,54 @@ sleep 10
 ARGS=""
 IP=""
 CIP=""
+
 for ARG in $@; do
+  if [[ ${DETECT_MASTERS:-true} != "false" ]]; then
+    # Detect a -master command
+    if [[ $ARG == "-master="* || $ARG == "-mserver="* ]]; then
+      OPTION=$(expr "$ARG" : '\(.*=\)')
+      VALUE=$(expr "$ARG" : '.*=\(.*\)')
+
+      echo "Detected ${OPTION}"
+
+      # Split all masters
+      MASTERS=""
+      IFS=',' read -ra ADDRS <<< "$VALUE"
+      for ADDR in "${ADDRS[@]}"; do
+        # Get HOST:PORT
+        HOST=$(expr "$ADDR" : '\(.*\):')
+        PORT=$(expr "$ADDR" : '.*:\(.*\)')
+
+        if [[ $HOST =~ ^[0-9\.]+$ ]]; then
+          MASTERS=${MASTERS:+${MASTERS},}${HOST}:${PORT}
+        else
+          echo "Getting Task IPs for ${HOST}"
+
+          # Get all tasks ips
+          typeset -i nbt
+          nbt=0
+          SECONDS=0
+
+          echo "Waiting for the min masters count (${CLUSTER_SIZE})"
+
+          while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
+            tips=$(dig @127.0.0.11 +short tasks.${HOST})
+            nbt=$(echo $tips | wc -w)
+            [[ $SECONDS -gt 120 ]] && break
+            sleep 1
+          done
+
+          for tip in $tips; do
+            echo "Adding master: ${tip}"
+            MASTERS=${MASTERS:+${MASTERS},}${tip}:${PORT}
+          done
+
+        fi
+      done
+
+      ARG=${MASTERS:+${OPTION}${MASTERS}}
+    fi
+  fi
 
   if [[ ${DETECT_PEERS:-true} != "false" ]]; then
     # Detect a *peers command
@@ -32,7 +79,7 @@ for ARG in $@; do
         if [[ $HOST =~ ^[0-9\.]+$ ]]; then
           PEERS=${PEERS:+${PEERS},}${HOST}:${PORT}
         else
-          echo "Getting IPs for ${HOST}"
+          echo "Getting Task IPs for ${HOST}"
 
           # Get all tasks ips
           typeset -i nbt
@@ -71,7 +118,7 @@ for ARG in $@; do
       ARG=${PEERS:+${OPTION}${PEERS}}
 
     # Detect an ip command
-    elif [[ $ARG == *"ip="* ]]; then
+    elif [[ $ARG == "-ip="* ]]; then
       OPTION=$(expr "$ARG" : '\(.*=\)')
       HOST=$(expr "$ARG" : '.*=\(.*\)')
 
