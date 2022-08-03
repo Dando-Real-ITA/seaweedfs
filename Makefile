@@ -1,5 +1,5 @@
 BINARY = weed/weed
-package = github.com/chrislusf/seaweedfs/weed
+package = github.com/seaweedfs/seaweedfs/weed
 
 GO_FLAGS = #-v
 SOURCE_DIR = ./weed/
@@ -10,7 +10,7 @@ sources := $(wildcard *.go)
 
 COMMIT ?= $(shell git rev-parse --short HEAD)
 PRIVATE_VERSION ?= $(shell git describe --tags --abbrev=0)
-LDFLAGS ?= -X github.com/chrislusf/seaweedfs/weed/util.COMMIT=${COMMIT} -X github.com/chrislusf/seaweedfs/weed/util.PRIVATE_VERSION=${PRIVATE_VERSION}
+LDFLAGS ?= -X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=${COMMIT} -X github.com/seaweedfs/seaweedfs/weed/util.PRIVATE_VERSION=${PRIVATE_VERSION}
 
 build = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -ldflags "-extldflags -static $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
 tar = cd build && tar -cvzf $(1)_$(2).tar.gz $(appname)$(3) && rm $(appname)$(3)

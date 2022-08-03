@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type StatusRecorder struct {
