@@ -1,4 +1,4 @@
-# 2022-08-04 11:56:46
+# 2022-08-04 16:37:48
 FROM registry.hub.docker.com/amd64/golang:1.19-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
@@ -25,7 +25,7 @@ RUN export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev
 
 FROM registry.hub.docker.com/library/alpine AS pre_final
 RUN \
-  apk add --no-cache --update bind-tools bash fuse3 && \
+  apk add --no-cache --update bind-tools bash fuse3 ucspi-tcp && \
   rm -rf /tmp/*
 
 WORKDIR /usr/bin
@@ -39,6 +39,7 @@ COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer.toml /et
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/start.sh /start.sh
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/hosts.sh /hosts.sh
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/discover.sh /discover.sh
 
 # volume server gprc port
 EXPOSE 18080
