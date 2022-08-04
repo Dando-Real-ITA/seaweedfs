@@ -1,4 +1,4 @@
-# 2022-08-04 16:37:48
+# 2022-08-04 17:26:50
 FROM registry.hub.docker.com/amd64/golang:1.19-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
@@ -57,6 +57,8 @@ EXPOSE 9333
 EXPOSE 8333
 # webdav server http port
 EXPOSE 7333
+# Discovery service
+EXPOSE 555
 
 RUN mkdir -p /data/filerldb2
 

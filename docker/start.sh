@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-02 18:52:35
+# 2022-08-04 18:33:37
 
 ########################################################################################################################################################################################################################
 
+# Handling cleanup on stop signals
+FINISH=0;
+trap 'trap "FINISH=1" SIGTERM; kill 0; wait &> /dev/null' EXIT SIGINT SIGTERM SIGABRT
+
+########################################################################################################################################################################################################################
+
+# Give time to all servers to start and get an ip
 sleep 10
 
 # Read all commands
@@ -43,7 +50,7 @@ for ARG in $@; do
           while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
             tips=$(dig @127.0.0.11 +short tasks.${HOST})
             nbt=$(echo $tips | wc -w)
-            [[ $SECONDS -gt 120 ]] && break
+            [[ $SECONDS -gt 120 || $FINISH -eq 1 ]] && break
             sleep 1
           done
 
@@ -91,27 +98,73 @@ for ARG in $@; do
           while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
             tips=$(dig @127.0.0.11 +short tasks.${HOST})
             nbt=$(echo $tips | wc -w)
-            [[ $SECONDS -gt 120 ]] && break
+            [[ $SECONDS -gt 120 || $FINISH -eq 1 ]] && break
             sleep 1
           done
-          for tip in $tips; do
-            echo "Adding peer: ${tip}"
-            PEERS=${PEERS:+${PEERS},}${tip}:${PORT}
 
-            cip=$(grep ${tip} /etc/hosts | awk '{print $1}' | head -1)
-            if [[ -n "$cip" ]]; then
-              echo "Found current ip: ${cip}"
-              CIP="-ip=${cip}"
-            fi
-          done
+          if [[ ${USE_DISCOVER:-true} != "false" ]]; then
+            export LOCAL_HOSTNAME=$(hostname)
+            CIP="-ip=${LOCAL_HOSTNAME}"
+            # Find current ip on the network of the peers
+            for tip in $tips; do
+              cip=$(grep ${tip} /etc/hosts | awk '{print $1}' | head -1)
+              if [[ -n "$cip" ]]; then
+                echo "Found current ip: ${cip}"
+                export LOCAL_IP=$cip
 
-          # TODO handle normal hostnames correctly, in case no service is found
-          # # Get all direct ips
-          # ips=$(dig @127.0.0.11 +short ${HOST})
-          # for ip in $ips; do
-          #   echo "Adding peer: ${ip}"
-          #   PEERS=${PEERS:+${PEERS},}${ip}:${PORT}
-          # done
+                # ? Does peers order matter?
+                PEERS=${PEERS:+${PEERS},}${LOCAL_HOSTNAME}:${PORT}
+
+                # Start discovery server in background
+                tcpserver -D -H -R 0.0.0.0 555 /discover.sh &
+
+                break
+              fi
+            done
+
+            # Give time to all discovery servers to start
+            sleep 10
+
+            # Find peers hostname and add to /etc/hosts
+            for tip in $tips; do
+              if [[ "$tip" != "$cip" ]]; then
+                REMOTE_HOSTNAME=""
+                SECONDS=0
+                # Retry logic
+                while [[ -z "$REMOTE_HOSTNAME" ]]; do
+                  # Connect to tip and retrieve the remote hostname, and save in /etc/hosts
+                  REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
+                  [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
+                  sleep 1
+                done
+
+                # IF found a valid hostname, add to peer. We expect to find up to CLUSTER_SIZE
+                if [[ -n "$REMOTE_HOSTNAME" ]]; then
+                  echo "Adding peer: ${REMOTE_HOSTNAME}"
+                  PEERS=${PEERS:+${PEERS},}${REMOTE_HOSTNAME}:${PORT}
+                fi
+              fi
+            done
+          else
+            for tip in $tips; do
+              echo "Adding peer: ${tip}"
+              PEERS=${PEERS:+${PEERS},}${tip}:${PORT}
+
+              cip=$(grep ${tip} /etc/hosts | awk '{print $1}' | head -1)
+              if [[ -n "$cip" ]]; then
+                echo "Found current ip: ${cip}"
+                CIP="-ip=${cip}"
+              fi
+            done
+
+            # TODO handle normal hostnames correctly, in case no service is found
+            # # Get all direct ips
+            # ips=$(dig @127.0.0.11 +short ${HOST})
+            # for ip in $ips; do
+            #   echo "Adding peer: ${ip}"
+            #   PEERS=${PEERS:+${PEERS},}${ip}:${PORT}
+            # done
+          fi
         fi
       done
 
@@ -164,6 +217,12 @@ if ! [ -z "$PUBLIC_URL" ]; then
 
 fi
 
+echo "entrypoint called with args: $ARGS";
+
 exec /entrypoint.sh $ARGS
+
+wait &> /dev/null
+
+exit 0
 
 ########################################################################################################################################################################################################################
