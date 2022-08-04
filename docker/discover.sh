@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-04 15:46:24
+# 2022-08-04 17:08:53
 
 ########################################################################################################################################################################################################################
 
@@ -16,6 +16,9 @@ if [[ -n "$(ls /proc/$$/fd/ | grep 6)" ]]; then
 
   # Add/Update host file
   /hosts.sh add $REMOTE_IP $REMOTE_HOSTNAME >&2
+
+  # Return remote hostname to calling script
+  echo $REMOTE_HOSTNAME
 else
   # Server
 
