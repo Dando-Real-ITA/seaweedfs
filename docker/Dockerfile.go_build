@@ -1,4 +1,4 @@
-# 2022-08-03 10:10:14
+# 2022-08-04 11:56:46
 FROM registry.hub.docker.com/amd64/golang:1.19-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
@@ -38,6 +38,7 @@ RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/start.sh /start.sh
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/hosts.sh /hosts.sh
 
 # volume server gprc port
 EXPOSE 18080
@@ -61,8 +62,7 @@ RUN mkdir -p /data/filerldb2
 VOLUME /data
 WORKDIR /data
 
-RUN chmod +x /entrypoint.sh
-RUN chmod +x /start.sh
+RUN chmod +x /*.sh
 
 ENTRYPOINT ["/start.sh"]
 
