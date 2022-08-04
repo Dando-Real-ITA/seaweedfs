@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-04 14:11:08
+# 2022-08-04 16:32:48
 
 ########################################################################################################################################################################################################################
 
 # PATH TO YOUR HOSTS FILE
-ETC_HOSTS=/etc/hosts
+ETC_HOSTS="/etc/hosts"
+TMP_HOSTS="/tmp/hosts"
 
 ########################################################################################################################################################################################################################
 
@@ -24,7 +25,9 @@ remove() {
   # TESTARE CON GREP REGEX
   if [[ -n "$(grep -E "\s+$HOSTNAME$" /etc/hosts)" ]]; then
     echo "$HOSTNAME Found in $ETC_HOSTS, Removing now...";
-    try sed -i -r "/\s+$HOSTNAME/d" "$ETC_HOSTS";
+    try cp $ETC_HOSTS $TMP_HOSTS;
+    try sed -i -r "/\s+$HOSTNAME/d" "$TMP_HOSTS";
+    try cat $TMP_HOSTS > $ETC_HOSTS;
   else
     yell "$HOSTNAME was not found in your $ETC_HOSTS";
   fi
@@ -44,7 +47,9 @@ add() {
 
   if [[ -n "$(grep -E "\s+$HOSTNAME$" /etc/hosts)" ]]; then
     echo "$HOSTNAME Found in $ETC_HOSTS, Replacing now...";
-    try sed -i -r "s/^.*\s+$HOSTNAME.*$/$host_line/" "$ETC_HOSTS";
+    try cp $ETC_HOSTS $TMP_HOSTS;
+    try sed -i -r "s/^.*\s+$HOSTNAME.*$/$host_line/" "$TMP_HOSTS";
+    try cat $TMP_HOSTS > $ETC_HOSTS;
   else
     echo "Adding $HOSTNAME to $ETC_HOSTS...";
     echo "$host_line" >> /etc/hosts
