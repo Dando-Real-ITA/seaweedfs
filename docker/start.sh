@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-04 18:33:37
+# 2022-08-05 13:39:32
 
 ########################################################################################################################################################################################################################
 
@@ -54,11 +54,48 @@ for ARG in $@; do
             sleep 1
           done
 
-          for tip in $tips; do
-            echo "Adding master: ${tip}"
-            MASTERS=${MASTERS:+${MASTERS},}${tip}:${PORT}
-          done
+          if [[ ${USE_DISCOVER:-true} != "false" ]]; then
+            # * Docker 20.10.0 auto creates alias for hostname if hostname != container
+            # * For semplicity, it is assumed that the master hostname is ${HOST}_${task_slot}
+            typeset -i task_slot
+            task_slot=1
+            for tip in $tips; do
+              REMOTE_HOSTNAME="${HOST}_${task_slot}"
+              ((task_slot+=1))
+              echo $REMOTE_HOSTNAME;
 
+              echo "Adding master: ${REMOTE_HOSTNAME}"
+              MASTERS=${MASTERS:+${MASTERS},}${REMOTE_HOSTNAME}:${PORT}
+            done
+
+            # TODO Make more robust, using a first tcpclient loop on ips to load real hostnames, and then a background repeated tcpclient loop with tasks ips to keep the hosts updated,
+            # * with condition to when to make the check ( i.e. heartbeat failing)
+            # # Find peers hostname and add to /etc/hosts
+            # for tip in $tips; do
+            #   if [[ "$tip" != "$cip" ]]; then
+            #     REMOTE_HOSTNAME=""
+            #     SECONDS=0
+            #     # Retry logic
+            #     while [[ -z "$REMOTE_HOSTNAME" ]]; do
+            #       # Connect to tip and retrieve the remote hostname, and save in /etc/hosts
+            #       REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
+            #       [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
+            #       sleep 1
+            #     done
+
+            #     # IF found a valid hostname, add to peer. We expect to find up to CLUSTER_SIZE
+            #     if [[ -n "$REMOTE_HOSTNAME" ]]; then
+            #       echo "Adding peer: ${REMOTE_HOSTNAME}"
+            #       PEERS=${PEERS:+${PEERS},}${REMOTE_HOSTNAME}:${PORT}
+            #     fi
+            #   fi
+            # done
+          else
+            for tip in $tips; do
+              echo "Adding master: ${tip}"
+              MASTERS=${MASTERS:+${MASTERS},}${tip}:${PORT}
+            done
+          fi
         fi
       done
 
