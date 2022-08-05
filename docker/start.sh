@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-05 13:39:32
+# 2022-08-05 14:37:41
 
 ########################################################################################################################################################################################################################
 
@@ -223,6 +223,15 @@ for ARG in $@; do
         fi
       done
 
+      # Not writing the ip for now
+      ARG=""
+    fi
+  fi
+
+  if [[ ${USE_HOSTNAME:-true} != "false" ]]; then
+    if [[ $ARG == "-ip="* ]]; then
+      LOCAL_HOSTNAME=$(hostname)
+      IP="-ip=${LOCAL_HOSTNAME}"
       # Not writing the ip for now
       ARG=""
     fi
