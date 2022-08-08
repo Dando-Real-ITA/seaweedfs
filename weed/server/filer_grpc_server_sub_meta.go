@@ -121,7 +121,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(lastReadTime, req.UntilNs, eachLogEntryFn)
 		if readPersistedLogErr != nil {
 			glog.Errorf("read on disk %v local subscribe %s from %+v: %v", clientName, req.PathPrefix, lastReadTime, readPersistedLogErr)
-			return fmt.Errorf("reading from persisted logs: %v", readPersistedLogErr)
+			// return fmt.Errorf("reading from persisted logs: %v", readPersistedLogErr)
 		}
 		if isDone {
 			return nil
@@ -132,6 +132,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		} else {
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				time.Sleep(1127 * time.Millisecond)
+				lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
 				continue
 			}
 		}
@@ -146,6 +147,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
+				lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
 				continue
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
