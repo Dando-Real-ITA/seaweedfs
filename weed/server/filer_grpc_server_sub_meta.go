@@ -147,7 +147,6 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
-				lastReadTime = lastReadTime.Add(1 * time.Nanosecond)
 				continue
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
