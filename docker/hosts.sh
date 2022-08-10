@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-04 16:32:48
+# 2022-08-10 13:08:02
 
 ########################################################################################################################################################################################################################
 
@@ -44,6 +44,11 @@ add() {
   HOSTNAME=$2
 
   host_line="$IP $HOSTNAME"
+
+  if [[ -n "$(grep -E "$host_line" /etc/hosts)" ]]; then
+    # NO OP
+    exit 0
+  fi
 
   if [[ -n "$(grep -E "\s+$HOSTNAME$" /etc/hosts)" ]]; then
     echo "$HOSTNAME Found in $ETC_HOSTS, Replacing now...";
