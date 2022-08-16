@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-16 13:57:21
+# 2022-08-16 14:46:46
 
 ########################################################################################################################################################################################################################
 
@@ -60,7 +60,7 @@ check_peers() {
   while(true); do
     [[ $FINISH -eq 1 ]] && break
     # Random sleep
-    sleep $((300 + $RANDOM%180))
+    sleep $((60 + $RANDOM%30))
 
     # Current service ips
     tips=$(dig @127.0.0.11 +short tasks.${SERVICE})
@@ -79,7 +79,7 @@ check_peers() {
       # IF found a valid hostname, and it is not already present in the peers array,
       if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ "${REMOTE_HOSTNAME}" ]]; then
         echo "Found hostname not in peers: ${REMOTE_HOSTNAME}, restarting the container"
-        kill -s SIGKILL 1
+        reboot
       fi
     done
   done
