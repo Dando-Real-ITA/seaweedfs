@@ -1,12 +1,89 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-05 14:37:41
+# 2022-08-16 13:48:35
 
 ########################################################################################################################################################################################################################
 
 # Handling cleanup on stop signals
 FINISH=0;
 trap 'trap "FINISH=1" SIGTERM; kill 0; wait &> /dev/null' EXIT SIGINT SIGTERM SIGABRT
+
+########################################################################################################################################################################################################################
+
+check_masters() {
+  echo ""
+  # if [ -z "$1" ]; then
+  #   die "Exiting... invalid arguments";
+  # fi
+
+  # # TESTARE CON GREP REGEX
+  # if [[ -n "$(grep -E "\s+$HOSTNAME$" /etc/hosts)" ]]; then
+  #   echo "$HOSTNAME Found in $ETC_HOSTS, Removing now...";
+  #   try cp $ETC_HOSTS $TMP_HOSTS;
+  #   try sed -i -r "/\s+$HOSTNAME/d" "$TMP_HOSTS";
+  #   try cat $TMP_HOSTS > $ETC_HOSTS;
+  # else
+  #   yell "$HOSTNAME was not found in your $ETC_HOSTS";
+  # fi
+
+  # # Notify service is ready
+  # /usr/bin/env systemd-notify --ready
+
+  #   FAIL=0
+
+  #   if [[ -n "${PID}" ]]; then
+  #     check_pid || break
+  #   fi
+
+  #   check_date || FAIL=1
+
+  #   if [[ $FAIL -eq 0 ]]; then
+  #     /usr/bin/env systemd-notify WATCHDOG=1;
+  #   else
+  #     echo "Watchdog conditions fail"
+  #   fi
+
+  # sleep $(($WATCHDOG_USEC / 5000000))
+
+}
+
+check_peers() {
+  SERVICE=$1
+  PEERS=$2
+
+  # Expected by tcpclient
+  export LOCAL_HOSTNAME=$(hostname)
+  export LOCAL_IP="no_add"
+
+  echo "Started check_peers on ${LOCAL_HOSTNAME} for ${SERVICE} with peers: ${PEERS}"
+
+  while(true); do
+    [[ $FINISH -eq 1 ]] && break
+    # Random sleep
+    sleep $((300 + $RANDOM%180))
+
+    # Current service ips
+    tips=$(dig @127.0.0.11 +short tasks.${SERVICE})
+
+    for tip in $tips; do
+      REMOTE_HOSTNAME=""
+      SECONDS=0
+      # Retry logic
+      while [[ -z "${REMOTE_HOSTNAME}" ]]; do
+        # Connect to tip and retrieve the remote hostname
+        REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
+        [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
+        sleep 1
+      done
+
+      # IF found a valid hostname, and it is not already present in the peers array,
+      if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ "${REMOTE_HOSTNAME}" ]]; then
+        echo "Found hostname not in peers: ${REMOTE_HOSTNAME}, restarting the container"
+        kill -s SIGKILL 1
+      fi
+    done
+  done
+}
 
 ########################################################################################################################################################################################################################
 
@@ -50,7 +127,7 @@ for ARG in $@; do
           while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
             tips=$(dig @127.0.0.11 +short tasks.${HOST})
             nbt=$(echo $tips | wc -w)
-            [[ $SECONDS -gt 120 || $FINISH -eq 1 ]] && break
+            [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
             sleep 1
           done
 
@@ -62,7 +139,7 @@ for ARG in $@; do
             for tip in $tips; do
               REMOTE_HOSTNAME="${HOST}_${task_slot}"
               ((task_slot+=1))
-              echo $REMOTE_HOSTNAME;
+              echo ${REMOTE_HOSTNAME};
 
               echo "Adding master: ${REMOTE_HOSTNAME}"
               MASTERS=${MASTERS:+${MASTERS},}${REMOTE_HOSTNAME}:${PORT}
@@ -76,7 +153,7 @@ for ARG in $@; do
             #     REMOTE_HOSTNAME=""
             #     SECONDS=0
             #     # Retry logic
-            #     while [[ -z "$REMOTE_HOSTNAME" ]]; do
+            #     while [[ -z "${REMOTE_HOSTNAME}" ]]; do
             #       # Connect to tip and retrieve the remote hostname, and save in /etc/hosts
             #       REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
             #       [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
@@ -84,7 +161,7 @@ for ARG in $@; do
             #     done
 
             #     # IF found a valid hostname, add to peer. We expect to find up to CLUSTER_SIZE
-            #     if [[ -n "$REMOTE_HOSTNAME" ]]; then
+            #     if [[ -n "${REMOTE_HOSTNAME}" ]]; then
             #       echo "Adding peer: ${REMOTE_HOSTNAME}"
             #       PEERS=${PEERS:+${PEERS},}${REMOTE_HOSTNAME}:${PORT}
             #     fi
@@ -135,7 +212,7 @@ for ARG in $@; do
           while [[ $nbt -lt ${CLUSTER_SIZE} ]]; do
             tips=$(dig @127.0.0.11 +short tasks.${HOST})
             nbt=$(echo $tips | wc -w)
-            [[ $SECONDS -gt 120 || $FINISH -eq 1 ]] && break
+            [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
             sleep 1
           done
 
@@ -168,7 +245,7 @@ for ARG in $@; do
                 REMOTE_HOSTNAME=""
                 SECONDS=0
                 # Retry logic
-                while [[ -z "$REMOTE_HOSTNAME" ]]; do
+                while [[ -z "${REMOTE_HOSTNAME}" ]]; do
                   # Connect to tip and retrieve the remote hostname, and save in /etc/hosts
                   REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
                   [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
@@ -176,12 +253,16 @@ for ARG in $@; do
                 done
 
                 # IF found a valid hostname, add to peer. We expect to find up to CLUSTER_SIZE
-                if [[ -n "$REMOTE_HOSTNAME" ]]; then
+                if [[ -n "${REMOTE_HOSTNAME}" ]]; then
                   echo "Adding peer: ${REMOTE_HOSTNAME}"
                   PEERS=${PEERS:+${PEERS},}${REMOTE_HOSTNAME}:${PORT}
                 fi
               fi
             done
+
+            # Add check if peers change in number or hostname, and restart the process if this happens, to reload peers list
+            # * Not necessary if the process is able to dynamically add and remove peers
+            check_peers ${HOST} ${PEERS} &
           else
             for tip in $tips; do
               echo "Adding peer: ${tip}"
