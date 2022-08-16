@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-16 13:48:35
+# 2022-08-16 13:57:21
 
 ########################################################################################################################################################################################################################
 
@@ -48,14 +48,14 @@ check_masters() {
 }
 
 check_peers() {
-  SERVICE=$1
-  PEERS=$2
+  export LOCAL_IP=$1
+  SERVICE=$2
+  PEERS=$3
 
   # Expected by tcpclient
   export LOCAL_HOSTNAME=$(hostname)
-  export LOCAL_IP="no_add"
 
-  echo "Started check_peers on ${LOCAL_HOSTNAME} for ${SERVICE} with peers: ${PEERS}"
+  echo "Started check_peers on ${LOCAL_HOSTNAME} @ ${LOCAL_IP} for ${SERVICE} with peers: ${PEERS}"
 
   while(true); do
     [[ $FINISH -eq 1 ]] && break
@@ -262,7 +262,7 @@ for ARG in $@; do
 
             # Add check if peers change in number or hostname, and restart the process if this happens, to reload peers list
             # * Not necessary if the process is able to dynamically add and remove peers
-            check_peers ${HOST} ${PEERS} &
+            check_peers ${LOCAL_IP} ${HOST} ${PEERS} &
           else
             for tip in $tips; do
               echo "Adding peer: ${tip}"
