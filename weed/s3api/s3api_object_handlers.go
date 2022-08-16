@@ -130,9 +130,30 @@ func urlPathEscape(object string) string {
 	return strings.Join(escapedParts, "/")
 }
 
+func removeDuplicateSlashes(object string) string {
+	result := strings.Builder{}
+	result.Grow(len(object))
+
+	isLastSlash := false
+	for _, r := range object {
+		switch r {
+		case '/':
+			if !isLastSlash {
+				result.WriteRune(r)
+			}
+			isLastSlash = true
+		default:
+			result.WriteRune(r)
+			isLastSlash = false
+		}
+	}
+	return result.String()
+}
+
 func (s3a *S3ApiServer) toFilerUrl(bucket, object string) string {
+	object = urlPathEscape(removeDuplicateSlashes(object))
 	destUrl := fmt.Sprintf("http://%s%s/%s%s",
-		s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, urlPathEscape(object))
+		s3a.option.Filer.ToHttpAddress(), s3a.option.BucketsPath, bucket, object)
 	return destUrl
 }
 
@@ -358,9 +379,11 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 		return
 	}
 
-	if (resp.ContentLength == -1 || resp.StatusCode == 404) && resp.StatusCode != 304 {
-		if r.Method != "DELETE" {
-			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+	if r.Method == "DELETE" {
+		if resp.StatusCode == http.StatusNotFound {
+			// this is normal
+			responseStatusCode := responseFn(resp, w)
+			s3err.PostLog(r, responseStatusCode, s3err.ErrNone)
 			return
 		}
 	}
