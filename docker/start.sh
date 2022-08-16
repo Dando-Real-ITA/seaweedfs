@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-16 17:54:03
+# 2022-08-16 22:13:50
 
 ########################################################################################################################################################################################################################
 
@@ -44,8 +44,8 @@ check_masters() {
 
       # IF found a valid hostname, and it is not already present in the masters list, restart container
       if [[ -n "${REMOTE_HOSTNAME}" && ! "${MASTERS}" =~ (^|,)${REMOTE_HOSTNAME}(:|$) ]]; then
-        echo "Found hostname not in masters: ${REMOTE_HOSTNAME}, restarting the container"
         sleep $((60 + $RANDOM%30))
+        echo "Found hostname not in masters: ${REMOTE_HOSTNAME}, restarting the container"
         reboot
       fi
     done
@@ -83,8 +83,8 @@ check_peers() {
 
       # IF found a valid hostname, and it is not already present in the peers list, restart container
       if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ (^|,)${REMOTE_HOSTNAME}(:|$) ]]; then
+        sleep $((300 + $RANDOM%180))
         echo "Found hostname not in peers: ${REMOTE_HOSTNAME}, restarting the container"
-        sleep $((60 + $RANDOM%30))
         reboot
       fi
     done
