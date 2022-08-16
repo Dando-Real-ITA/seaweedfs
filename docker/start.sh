@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-16 17:11:05
+# 2022-08-16 17:54:03
 
 ########################################################################################################################################################################################################################
 
@@ -11,40 +11,45 @@ trap 'trap "FINISH=1" SIGTERM; kill 0; wait &> /dev/null' EXIT SIGINT SIGTERM SI
 ########################################################################################################################################################################################################################
 
 check_masters() {
-  echo ""
-  # if [ -z "$1" ]; then
-  #   die "Exiting... invalid arguments";
-  # fi
+  SERVICE=$1
+  MASTERS=$2
 
-  # # TESTARE CON GREP REGEX
-  # if [[ -n "$(grep -E "\s+$HOSTNAME$" /etc/hosts)" ]]; then
-  #   echo "$HOSTNAME Found in $ETC_HOSTS, Removing now...";
-  #   try cp $ETC_HOSTS $TMP_HOSTS;
-  #   try sed -i -r "/\s+$HOSTNAME/d" "$TMP_HOSTS";
-  #   try cat $TMP_HOSTS > $ETC_HOSTS;
-  # else
-  #   yell "$HOSTNAME was not found in your $ETC_HOSTS";
-# fi
+  # Expected by tcpclient
+  export LOCAL_HOSTNAME=$(hostname)
+  # The remote host will not update the hostname-ip map
+  export LOCAL_IP="no_add"
+  # Don't update locally the hostname-ip map
+  export ADD_HOST="false"
 
-  # # Notify service is ready
-  # /usr/bin/env systemd-notify --ready
+  echo "Started check_masters on ${LOCAL_HOSTNAME} for ${SERVICE} with masters: ${MASTERS}"
 
-  #   FAIL=0
+  while(true); do
+    [[ $FINISH -eq 1 ]] && break
+    # Random sleep
+    sleep $((60 + $RANDOM%30))
 
-  #   if [[ -n "${PID}" ]]; then
-  #     check_pid || break
-  #   fi
+    # Current service ips
+    tips=$(dig @127.0.0.11 +short tasks.${SERVICE})
 
-  #   check_date || FAIL=1
+    for tip in $tips; do
+      REMOTE_HOSTNAME=""
+      SECONDS=0
+      # Retry logic
+      while [[ -z "${REMOTE_HOSTNAME}" ]]; do
+        # Connect to tip and retrieve the remote hostname
+        REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
+        [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
+        sleep 1
+      done
 
-  #   if [[ $FAIL -eq 0 ]]; then
-  #     /usr/bin/env systemd-notify WATCHDOG=1;
-  #   else
-  #     echo "Watchdog conditions fail"
-  #   fi
-
-  # sleep $(($WATCHDOG_USEC / 5000000))
-
+      # IF found a valid hostname, and it is not already present in the masters list, restart container
+      if [[ -n "${REMOTE_HOSTNAME}" && ! "${MASTERS}" =~ (^|,)${REMOTE_HOSTNAME}(:|$) ]]; then
+        echo "Found hostname not in masters: ${REMOTE_HOSTNAME}, restarting the container"
+        sleep $((60 + $RANDOM%30))
+        reboot
+      fi
+    done
+  done
 }
 
 check_peers() {
@@ -76,9 +81,10 @@ check_peers() {
         sleep 1
       done
 
-      # IF found a valid hostname, and it is not already present in the peers array,
+      # IF found a valid hostname, and it is not already present in the peers list, restart container
       if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ (^|,)${REMOTE_HOSTNAME}(:|$) ]]; then
         echo "Found hostname not in peers: ${REMOTE_HOSTNAME}, restarting the container"
+        sleep $((60 + $RANDOM%30))
         reboot
       fi
     done
@@ -133,40 +139,34 @@ for ARG in $@; do
 
           if [[ ${USE_DISCOVER:-true} != "false" ]]; then
             # * Docker 20.10.0 auto creates alias for hostname if hostname != container
-            # * For semplicity, it is assumed that the master hostname is ${HOST}_${task_slot}
-            typeset -i task_slot
-            task_slot=1
+            # Find masters hostname
+            # Expected by tcpclient
+            export LOCAL_HOSTNAME=$(hostname)
+            # The remote host will not update the hostname-ip map
+            export LOCAL_IP="no_add"
+            # Don't update locally the hostname-ip map
+            export ADD_HOST="false"
             for tip in $tips; do
-              REMOTE_HOSTNAME="${HOST}_${task_slot}"
-              ((task_slot+=1))
-              echo ${REMOTE_HOSTNAME};
+              REMOTE_HOSTNAME=""
+              SECONDS=0
+              # Retry logic
+              while [[ -z "${REMOTE_HOSTNAME}" ]]; do
+                # Connect to tip and retrieve the remote hostname, and save in /etc/hosts
+                REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
+                [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
+                sleep 1
+              done
 
-              echo "Adding master: ${REMOTE_HOSTNAME}"
-              MASTERS=${MASTERS:+${MASTERS},}${REMOTE_HOSTNAME}:${PORT}
+              # IF found a valid hostname, add to master
+              if [[ -n "${REMOTE_HOSTNAME}" ]]; then
+                echo "Adding master: ${REMOTE_HOSTNAME}"
+                MASTERS=${MASTERS:+${MASTERS},}${REMOTE_HOSTNAME}:${PORT}
+              fi
             done
 
-            # TODO Make more robust, using a first tcpclient loop on ips to load real hostnames, and then a background repeated tcpclient loop with tasks ips to keep the hosts updated,
-            # * with condition to when to make the check ( i.e. heartbeat failing)
-            # # Find peers hostname and add to /etc/hosts
-            # for tip in $tips; do
-            #   if [[ "$tip" != "$cip" ]]; then
-            #     REMOTE_HOSTNAME=""
-            #     SECONDS=0
-            #     # Retry logic
-            #     while [[ -z "${REMOTE_HOSTNAME}" ]]; do
-            #       # Connect to tip and retrieve the remote hostname, and save in /etc/hosts
-            #       REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
-            #       [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
-            #       sleep 1
-            #     done
-
-            #     # IF found a valid hostname, add to peer. We expect to find up to CLUSTER_SIZE
-            #     if [[ -n "${REMOTE_HOSTNAME}" ]]; then
-            #       echo "Adding peer: ${REMOTE_HOSTNAME}"
-            #       PEERS=${PEERS:+${PEERS},}${REMOTE_HOSTNAME}:${PORT}
-            #     fi
-            #   fi
-            # done
+            # Add check if masters change in number or hostname, and restart the process if this happens, to reload masters list
+            # * Not necessary if the process is able to dynamically add and remove masters
+            check_masters ${HOST} ${MASTERS} &
           else
             for tip in $tips; do
               echo "Adding master: ${tip}"
@@ -252,7 +252,7 @@ for ARG in $@; do
                   sleep 1
                 done
 
-                # IF found a valid hostname, add to peer. We expect to find up to CLUSTER_SIZE
+                # IF found a valid hostname, add to peer
                 if [[ -n "${REMOTE_HOSTNAME}" ]]; then
                   echo "Adding peer: ${REMOTE_HOSTNAME}"
                   PEERS=${PEERS:+${PEERS},}${REMOTE_HOSTNAME}:${PORT}
