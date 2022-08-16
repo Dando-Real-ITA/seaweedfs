@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-13 10:37:41
+# 2022-08-16 12:55:26
 
 ########################################################################################################################################################################################################################
 
@@ -14,7 +14,7 @@ if [[ -n "$(ls /proc/$$/fd/ | grep 6)" ]]; then
   # Receive remote ip and hostname
   read -u 6 REMOTE_IP REMOTE_HOSTNAME
 
-  if [[ ${ADD_HOST:-true} != "false" ]]; then
+  if [[ ${ADD_HOST:-true} != "false" && ${REMOTE_IP:-no_add} != "no_add" ]]; then
     # Add/Update host file
     /hosts.sh add $REMOTE_IP $REMOTE_HOSTNAME >&2
   fi
@@ -27,7 +27,7 @@ else
   # Receive remote ip and hostname
   read -u 0 REMOTE_IP REMOTE_HOSTNAME
 
-  if [[ ${ADD_HOST:-true} != "false" ]]; then
+  if [[ ${ADD_HOST:-true} != "false" && ${REMOTE_IP:-no_add} != "no_add" ]]; then
     # Add/Update host file
     /hosts.sh add $REMOTE_IP $REMOTE_HOSTNAME >&2
   fi
