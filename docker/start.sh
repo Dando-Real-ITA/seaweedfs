@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-16 16:54:17
+# 2022-08-16 17:11:05
 
 ########################################################################################################################################################################################################################
 
@@ -24,7 +24,7 @@ check_masters() {
   #   try cat $TMP_HOSTS > $ETC_HOSTS;
   # else
   #   yell "$HOSTNAME was not found in your $ETC_HOSTS";
-  # fi
+# fi
 
   # # Notify service is ready
   # /usr/bin/env systemd-notify --ready
@@ -77,7 +77,7 @@ check_peers() {
       done
 
       # IF found a valid hostname, and it is not already present in the peers array,
-      if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ "(^|,)${REMOTE_HOSTNAME}(:|$)" ]]; then
+      if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ (^|,)${REMOTE_HOSTNAME}(:|$) ]]; then
         echo "Found hostname not in peers: ${REMOTE_HOSTNAME}, restarting the container"
         reboot
       fi
