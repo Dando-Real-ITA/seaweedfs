@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-16 22:13:50
+# 2022-08-17 13:01:29
 
 ########################################################################################################################################################################################################################
 
@@ -53,41 +53,22 @@ check_masters() {
 }
 
 check_peers() {
-  export LOCAL_IP=$1
-  SERVICE=$2
-  PEERS=$3
+  SERVICE=$1
+  PORT=$2
 
-  # Expected by tcpclient
-  export LOCAL_HOSTNAME=$(hostname)
+  # Load the current cluster ids ( which are HOST:PORT )
+  # * If it is a new cluster, weed shell will timeout and cluster will be empty
+  cluster=($(echo "cluster.raft.ps; exit" | timeout -s SIGKILL 1m /usr/bin/weed shell -master=${SERVICE}:${PORT} 2>/dev/null | awk 'NR>2{ print $2 }'))
 
-  echo "Started check_peers on ${LOCAL_HOSTNAME} @ ${LOCAL_IP} for ${SERVICE} with peers: ${PEERS}"
+  # Verify for every master if it is online
+  for id in "${cluster[@]}"; do
+    master=${id%:${PORT}}
 
-  while(true); do
-    [[ $FINISH -eq 1 ]] && break
-    # Random sleep
-    sleep $((60 + $RANDOM%30))
-
-    # Current service ips
-    tips=$(dig @127.0.0.11 +short tasks.${SERVICE})
-
-    for tip in $tips; do
-      REMOTE_HOSTNAME=""
-      SECONDS=0
-      # Retry logic
-      while [[ -z "${REMOTE_HOSTNAME}" ]]; do
-        # Connect to tip and retrieve the remote hostname
-        REMOTE_HOSTNAME=$(tcpclient -D -H -R -T 10+120 $tip 555 /discover.sh)
-        [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
-        sleep 1
-      done
-
-      # IF found a valid hostname, and it is not already present in the peers list, restart container
-      if [[ -n "${REMOTE_HOSTNAME}" && ! "${PEERS}" =~ (^|,)${REMOTE_HOSTNAME}(:|$) ]]; then
-        sleep $((300 + $RANDOM%180))
-        echo "Found hostname not in peers: ${REMOTE_HOSTNAME}, restarting the container"
-        reboot
-      fi
-    done
+    if ! ping -c1 ${master} &>/dev/null; then
+      # Remove the dead master
+      echo "Removing dead master ${master} from raft cluster ${SERVICE}"
+      echo "cluster.raft.remove -id=${master}:${PORT}; exit" | /usr/bin/weed shell -master=${SERVICE}:${PORT}
+    fi
   done
 }
 
@@ -166,7 +147,7 @@ for ARG in $@; do
 
             # Add check if masters change in number or hostname, and restart the process if this happens, to reload masters list
             # * Not necessary if the process is able to dynamically add and remove masters
-            check_masters ${HOST} ${MASTERS} &
+            # check_masters ${HOST} ${MASTERS} &
           else
             for tip in $tips; do
               echo "Adding master: ${tip}"
@@ -260,9 +241,8 @@ for ARG in $@; do
               fi
             done
 
-            # Add check if peers change in number or hostname, and restart the process if this happens, to reload peers list
-            # * Not necessary if the process is able to dynamically add and remove peers
-            check_peers ${LOCAL_IP} ${HOST} ${PEERS} &
+            # Remove unavailable peers before starting the process. Can happen if this process is a member of the cluster restarted with a different hostname
+            check_peers ${HOST} ${PORT}
           else
             for tip in $tips; do
               echo "Adding peer: ${tip}"
