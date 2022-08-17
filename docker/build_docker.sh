@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-01-06 14:12:40
+# 2022-08-17 14:30:34
 
 ########################################################################################################################################################################################################################
 
@@ -33,13 +33,13 @@ cd ../../
 echo_pretty "Building FS Docker images"
 cd ${DOCKER_FOLDER}
 
-DOCKER_BUILDKIT=1 docker build --pull \
+DOCKER_BUILDKIT=1 docker build --progress=plain --pull \
   -f Dockerfile.go_build --target final \
   -t gasparekatapy/seaweedfs:${VERSION} \
   -t gasparekatapy/seaweedfs:latest \
   .
 
-DOCKER_BUILDKIT=1 docker build --pull \
+DOCKER_BUILDKIT=1 docker build --progress=plain --pull \
   -f Dockerfile.go_build --target final_large \
   -t gasparekatapy/seaweedfs:large-${VERSION} \
   -t gasparekatapy/seaweedfs:large \

@@ -1,4 +1,4 @@
-# 2022-08-04 17:26:50
+# 2022-08-17 14:25:41
 FROM registry.hub.docker.com/amd64/golang:1.19-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
@@ -71,6 +71,8 @@ ENTRYPOINT ["/start.sh"]
 
 FROM pre_final AS final
 COPY --from=builder /go/bin/weed /usr/bin/
+RUN /usr/bin/weed version
 
 FROM pre_final AS final_large
 COPY --from=builder_large /go/bin/weed /usr/bin/
+RUN /usr/bin/weed version
