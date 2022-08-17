@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-17 13:01:29
+# 2022-08-17 16:16:45
 
 ########################################################################################################################################################################################################################
 
@@ -58,6 +58,7 @@ check_peers() {
 
   # Load the current cluster ids ( which are HOST:PORT )
   # * If it is a new cluster, weed shell will timeout and cluster will be empty
+  echo "Loading master list from raft cluster ${SERVICE}"
   cluster=($(echo "cluster.raft.ps; exit" | timeout -s SIGKILL 1m /usr/bin/weed shell -master=${SERVICE}:${PORT} 2>/dev/null | awk 'NR>2{ print $2 }'))
 
   # Verify for every master if it is online
@@ -67,7 +68,11 @@ check_peers() {
     if ! ping -c1 ${master} &>/dev/null; then
       # Remove the dead master
       echo "Removing dead master ${master} from raft cluster ${SERVICE}"
-      echo "cluster.raft.remove -id=${master}:${PORT}; exit" | /usr/bin/weed shell -master=${SERVICE}:${PORT}
+      SECONDS=0
+      while echo "cluster.raft.remove -id=${master}:${PORT}; exit" | timeout -s SIGKILL 1m /usr/bin/weed shell -master=${SERVICE}:${PORT}; do
+        [[ $SECONDS -gt 300 || $FINISH -eq 1 ]] && break
+        sleep 1
+      done
     fi
   done
 }
