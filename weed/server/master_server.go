@@ -1,8 +1,8 @@
 package weed_server
 
 import (
+	"context"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -164,6 +166,8 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 
 func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 	var raftServerName string
+
+	ms.Topo.RaftServerAccessLock.Lock()
 	if raftServer.raftServer != nil {
 		ms.Topo.RaftServer = raftServer.raftServer
 		ms.Topo.RaftServer.AddEventListener(raft.LeaderChangeEventType, func(e raft.Event) {
@@ -191,14 +195,18 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 		}()
 		raftServerName = ms.Topo.HashicorpRaft.String()
 	}
+	ms.Topo.RaftServerAccessLock.Unlock()
+
 	if ms.Topo.IsLeader() {
 		glog.V(0).Infoln("[", raftServerName, "]", "I am the leader!")
 	} else {
+		ms.Topo.RaftServerAccessLock.RLock()
 		if ms.Topo.RaftServer != nil && ms.Topo.RaftServer.Leader() != "" {
 			glog.V(0).Infoln("[", ms.Topo.RaftServer.Name(), "]", ms.Topo.RaftServer.Leader(), "is the leader.")
 		} else if ms.Topo.HashicorpRaft != nil && ms.Topo.HashicorpRaft.Leader() != "" {
 			glog.V(0).Infoln("[", ms.Topo.HashicorpRaft.String(), "]", ms.Topo.HashicorpRaft.Leader(), "is the leader.")
 		}
+		ms.Topo.RaftServerAccessLock.RUnlock()
 	}
 }
 
@@ -208,16 +216,15 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			f(w, r)
 			return
 		}
-		var raftServerLeader string
-		if ms.Topo.RaftServer != nil && ms.Topo.RaftServer.Leader() != "" {
-			raftServerLeader = ms.Topo.RaftServer.Leader()
-		} else if ms.Topo.HashicorpRaft != nil && ms.Topo.HashicorpRaft.Leader() != "" {
-			raftServerLeader = string(ms.Topo.HashicorpRaft.Leader())
-		}
+
+		// get the current raft leader
+		leaderAddr, _ := ms.Topo.MaybeLeader()
+		raftServerLeader := string(leaderAddr)
 		if raftServerLeader == "" {
 			f(w, r)
 			return
 		}
+
 		ms.boundedLeaderChan <- 1
 		defer func() { <-ms.boundedLeaderChan }()
 		targetUrl, err := url.Parse("http://" + raftServerLeader)
@@ -226,6 +233,8 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 				fmt.Errorf("Leader URL http://%s Parse Error: %v", raftServerLeader, err))
 			return
 		}
+
+		// proxy to leader
 		glog.V(4).Infoln("proxying to leader", raftServerLeader)
 		proxy := httputil.NewSingleHostReverseProxy(targetUrl)
 		director := proxy.Director
@@ -242,7 +251,6 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 }
 
 func (ms *MasterServer) startAdminScripts() {
-
 	v := util.GetViper()
 	adminScripts := v.GetString("master.maintenance.scripts")
 	if adminScripts == "" {
@@ -335,6 +343,9 @@ func (ms *MasterServer) createSequencer(option *MasterOption) sequence.Sequencer
 }
 
 func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
+	ms.Topo.RaftServerAccessLock.RLock()
+	defer ms.Topo.RaftServerAccessLock.RUnlock()
+
 	if update.NodeType != cluster.MasterType || ms.Topo.HashicorpRaft == nil {
 		return
 	}
@@ -342,8 +353,10 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 
 	peerAddress := pb.ServerAddress(update.Address)
 	peerName := string(peerAddress)
-	isLeader := ms.Topo.HashicorpRaft.State() == hashicorpRaft.Leader
-	if update.IsAdd && isLeader {
+	if ms.Topo.HashicorpRaft.State() != hashicorpRaft.Leader {
+		return
+	}
+	if update.IsAdd {
 		raftServerFound := false
 		for _, server := range ms.Topo.HashicorpRaft.GetConfiguration().Configuration().Servers {
 			if string(server.ID) == peerName {
@@ -356,5 +369,27 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 				hashicorpRaft.ServerID(peerName),
 				hashicorpRaft.ServerAddress(peerAddress.ToGrpcAddress()), 0, 0)
 		}
+	} else {
+		pb.WithMasterClient(false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {
+			ctx, cancel := context.WithTimeout(context.TODO(), 15*time.Second)
+			defer cancel()
+			if _, err := client.Ping(ctx, &master_pb.PingRequest{Target: string(peerAddress), TargetType: cluster.MasterType}); err != nil {
+				glog.V(0).Infof("master %s didn't respond to pings. remove raft server", peerName)
+				if err := ms.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
+					_, err := client.RaftRemoveServer(context.Background(), &master_pb.RaftRemoveServerRequest{
+						Id:    peerName,
+						Force: false,
+					})
+					return err
+				}); err != nil {
+					glog.Warningf("failed removing old raft server: %v", err)
+					return err
+				}
+			} else {
+				glog.V(0).Infof("master %s successfully responded to ping", peerName)
+			}
+
+			return nil
+		})
 	}
 }
