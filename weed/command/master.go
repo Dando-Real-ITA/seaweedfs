@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	hashicorpRaft "github.com/hashicorp/raft"
 	"net/http"
 	"os"
 	"path"
@@ -146,7 +147,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	ms := weed_server.NewMasterServer(r, masterOption.toMasterOption(masterWhiteList), masterPeers)
 	listeningAddress := util.JoinHostPort(*masterOption.ipBind, *masterOption.port)
 	glog.V(0).Infof("Start Seaweed Master %s at %s", util.Version(), listeningAddress)
-	masterListener, masterLocalListner, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0)
+	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0)
 	if e != nil {
 		glog.Fatalf("Master startup error: %v", e)
 	}
@@ -239,8 +240,8 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 
 	httpS := &http.Server{Handler: r}
-	if masterLocalListner != nil {
-		go httpS.Serve(masterLocalListner)
+	if masterLocalListener != nil {
+		go httpS.Serve(masterLocalListener)
 	}
 
 	if useMTLS {
@@ -253,6 +254,13 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		go httpS.Serve(masterListener)
 	}
 
+	grace.OnInterrupt(ms.Shutdown)
+	grace.OnInterrupt(grpcS.Stop)
+	grace.OnReload(func() {
+		if ms.Topo.HashicorpRaft != nil && ms.Topo.HashicorpRaft.State() == hashicorpRaft.Leader {
+			ms.Topo.HashicorpRaft.LeadershipTransfer()
+		}
+	})
 	select {}
 }
 

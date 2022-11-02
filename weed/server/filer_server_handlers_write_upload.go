@@ -52,19 +52,20 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 	var bytesBufferCounter int64
 	bytesBufferLimitCond := sync.NewCond(new(sync.Mutex))
 	var fileChunksLock sync.Mutex
+	var uploadErrLock sync.Mutex
 	for {
 
 		// need to throttle used byte buffer
 		bytesBufferLimitCond.L.Lock()
 		for atomic.LoadInt64(&bytesBufferCounter) >= 4 {
-			glog.V(4).Infof("waiting for byte buffer %d", bytesBufferCounter)
+			glog.V(4).Infof("waiting for byte buffer %d", atomic.LoadInt64(&bytesBufferCounter))
 			bytesBufferLimitCond.Wait()
 		}
 		atomic.AddInt64(&bytesBufferCounter, 1)
 		bytesBufferLimitCond.L.Unlock()
 
 		bytesBuffer := bufPool.Get().(*bytes.Buffer)
-		glog.V(4).Infof("received byte buffer %d", bytesBufferCounter)
+		glog.V(4).Infof("received byte buffer %d", atomic.LoadInt64(&bytesBufferCounter))
 
 		limitedReader := io.LimitReader(partReader, int64(chunkSize))
 
@@ -77,7 +78,9 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 			bufPool.Put(bytesBuffer)
 			atomic.AddInt64(&bytesBufferCounter, -1)
 			bytesBufferLimitCond.Signal()
+			uploadErrLock.Lock()
 			uploadErr = err
+			uploadErrLock.Unlock()
 			break
 		}
 		if chunkOffset == 0 && !isAppend {
@@ -104,15 +107,22 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 				wg.Done()
 			}()
 
-			chunk, toChunkErr := fs.dataToChunk(fileName, contentType, bytesBuffer.Bytes(), offset, so)
+			chunks, toChunkErr := fs.dataToChunk(fileName, contentType, bytesBuffer.Bytes(), offset, so)
 			if toChunkErr != nil {
-				uploadErr = toChunkErr
+				uploadErrLock.Lock()
+				if uploadErr == nil {
+					uploadErr = toChunkErr
+				}
+				uploadErrLock.Unlock()
 			}
-			if chunk != nil {
+			if chunks != nil {
 				fileChunksLock.Lock()
-				fileChunks = append(fileChunks, chunk)
+				fileChunksSize := len(fileChunks) + len(chunks)
+				for _, chunk := range chunks {
+					fileChunks = append(fileChunks, chunk)
+					glog.V(4).Infof("uploaded %s chunk %d to %s [%d,%d)", fileName, fileChunksSize, chunk.FileId, offset, offset+int64(chunk.Size))
+				}
 				fileChunksLock.Unlock()
-				glog.V(4).Infof("uploaded %s chunk %d to %s [%d,%d)", fileName, len(fileChunks), chunk.FileId, offset, offset+int64(chunk.Size))
 			}
 		}(chunkOffset)
 
@@ -161,7 +171,7 @@ func (fs *FilerServer) doUpload(urlLocation string, limitedReader io.Reader, fil
 	return uploadResult, err, data
 }
 
-func (fs *FilerServer) dataToChunk(fileName, contentType string, data []byte, chunkOffset int64, so *operation.StorageOption) (*filer_pb.FileChunk, error) {
+func (fs *FilerServer) dataToChunk(fileName, contentType string, data []byte, chunkOffset int64, so *operation.StorageOption) ([]*filer_pb.FileChunk, error) {
 	dataReader := util.NewBytesReader(data)
 
 	// retry to assign a different file id
@@ -169,6 +179,7 @@ func (fs *FilerServer) dataToChunk(fileName, contentType string, data []byte, ch
 	var auth security.EncodedJwt
 	var uploadErr error
 	var uploadResult *operation.UploadResult
+	var failedFileChunks []*filer_pb.FileChunk
 
 	err := util.Retry("filerDataToChunk", func() error {
 		// assign one file id for one chunk
@@ -183,19 +194,25 @@ func (fs *FilerServer) dataToChunk(fileName, contentType string, data []byte, ch
 		if uploadErr != nil {
 			glog.V(4).Infof("retry later due to upload error: %v", uploadErr)
 			stats.FilerRequestCounter.WithLabelValues(stats.ChunkDoUploadRetry).Inc()
+			fid, _ := filer_pb.ToFileIdObject(fileId)
+			fileChunk := filer_pb.FileChunk{
+				FileId: fileId,
+				Offset: chunkOffset,
+				Fid:    fid,
+			}
+			failedFileChunks = append(failedFileChunks, &fileChunk)
 			return uploadErr
 		}
 		return nil
 	})
 	if err != nil {
 		glog.Errorf("upload error: %v", err)
-		return nil, err
+		return failedFileChunks, err
 	}
 
 	// if last chunk exhausted the reader exactly at the border
 	if uploadResult.Size == 0 {
 		return nil, nil
 	}
-
-	return uploadResult.ToPbFileChunk(fileId, chunkOffset), nil
+	return []*filer_pb.FileChunk{uploadResult.ToPbFileChunk(fileId, chunkOffset)}, nil
 }

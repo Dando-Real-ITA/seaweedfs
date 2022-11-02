@@ -1,12 +1,16 @@
 package mount
 
 import (
+	"golang.org/x/sync/semaphore"
+	"math"
+	"sync"
+
+	"golang.org/x/exp/slices"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"golang.org/x/exp/slices"
-	"sync"
 )
 
 type FileHandleId uint64
@@ -26,17 +30,18 @@ type FileHandle struct {
 	reader         *filer.ChunkReadAt
 	contentType    string
 	handle         uint64
-	sync.Mutex
+	orderedMutex   *semaphore.Weighted
 
 	isDeleted bool
 }
 
 func newFileHandle(wfs *WFS, handleId FileHandleId, inode uint64, entry *filer_pb.Entry) *FileHandle {
 	fh := &FileHandle{
-		fh:      handleId,
-		counter: 1,
-		inode:   inode,
-		wfs:     wfs,
+		fh:           handleId,
+		counter:      1,
+		inode:        inode,
+		wfs:          wfs,
+		orderedMutex: semaphore.NewWeighted(int64(math.MaxInt64)),
 	}
 	// dirtyPages: newContinuousDirtyPages(file, writeOnly),
 	fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
@@ -57,15 +62,27 @@ func (fh *FileHandle) GetEntry() *filer_pb.Entry {
 	defer fh.entryLock.Unlock()
 	return fh.entry
 }
+
 func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
 	fh.entry = entry
 }
 
+func (fh *FileHandle) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Entry {
+	fh.entryLock.Lock()
+	defer fh.entryLock.Unlock()
+	fn(fh.entry)
+	return fh.entry
+}
+
 func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
+
+	if fh.entry == nil {
+		return
+	}
 
 	// find the earliest incoming chunk
 	newChunks := chunks
@@ -74,10 +91,6 @@ func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
 		if lessThan(earliestChunk, newChunks[i]) {
 			earliestChunk = newChunks[i]
 		}
-	}
-
-	if fh.entry == nil {
-		return
 	}
 
 	// pick out-of-order chunks from existing chunks
@@ -100,7 +113,8 @@ func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
 
 func (fh *FileHandle) CloseReader() {
 	if fh.reader != nil {
-		fh.reader.Close()
+		_ = fh.reader.Close()
+		fh.reader = nil
 	}
 }
 
@@ -110,8 +124,8 @@ func (fh *FileHandle) Release() {
 }
 
 func lessThan(a, b *filer_pb.FileChunk) bool {
-	if a.Mtime == b.Mtime {
+	if a.ModifiedTsNs == b.ModifiedTsNs {
 		return a.Fid.FileKey < b.Fid.FileKey
 	}
-	return a.Mtime < b.Mtime
+	return a.ModifiedTsNs < b.ModifiedTsNs
 }

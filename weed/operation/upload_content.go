@@ -30,6 +30,7 @@ type UploadOption struct {
 	PairMap           map[string]string
 	Jwt               security.EncodedJwt
 	RetryForever      bool
+	Md5               string
 }
 
 type UploadResult struct {
@@ -50,7 +51,7 @@ func (uploadResult *UploadResult) ToPbFileChunk(fileId string, offset int64) *fi
 		FileId:       fileId,
 		Offset:       offset,
 		Size:         uint64(uploadResult.Size),
-		Mtime:        time.Now().UnixNano(),
+		ModifiedTsNs: time.Now().UnixNano(),
 		ETag:         uploadResult.ContentMd5,
 		CipherKey:    uploadResult.CipherKey,
 		IsCompressed: uploadResult.Gzip > 0,
@@ -156,14 +157,15 @@ func doUpload(reader io.Reader, option *UploadOption) (uploadResult *UploadResul
 
 func retriedUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
 	for i := 0; i < 3; i++ {
+		if i > 0 {
+			time.Sleep(time.Millisecond * time.Duration(237*(i+1)))
+		}
 		uploadResult, err = doUploadData(data, option)
 		if err == nil {
 			uploadResult.RetryCount = i
 			return
-		} else {
-			glog.Warningf("uploading %d to %s: %v", i, option.UploadUrl, err)
 		}
-		time.Sleep(time.Millisecond * time.Duration(237*(i+1)))
+		glog.Warningf("uploading %d to %s: %v", i, option.UploadUrl, err)
 	}
 	return
 }
@@ -253,6 +255,7 @@ func doUploadData(data []byte, option *UploadOption) (uploadResult *UploadResult
 			MimeType:          option.MimeType,
 			PairMap:           option.PairMap,
 			Jwt:               option.Jwt,
+			Md5:               option.Md5,
 		})
 		if uploadResult == nil {
 			return
@@ -282,6 +285,9 @@ func upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize
 	}
 	if option.IsInputCompressed {
 		h.Set("Content-Encoding", "gzip")
+	}
+	if option.Md5 != "" {
+		h.Set("Content-MD5", option.Md5)
 	}
 
 	file_writer, cp_err := body_writer.CreatePart(h)
@@ -313,19 +319,20 @@ func upload_content(fillBufferFunction func(w io.Writer) error, originalDataSize
 	}
 	// print("+")
 	resp, post_err := HttpClient.Do(req)
+	defer util.CloseResponse(resp)
 	if post_err != nil {
 		if strings.Contains(post_err.Error(), "connection reset by peer") ||
 			strings.Contains(post_err.Error(), "use of closed network connection") {
 			glog.V(1).Infof("repeat error upload request %s: %v", option.UploadUrl, postErr)
 			stats.FilerRequestCounter.WithLabelValues(stats.RepeatErrorUploadContent).Inc()
 			resp, post_err = HttpClient.Do(req)
+			defer util.CloseResponse(resp)
 		}
 	}
 	if post_err != nil {
 		return nil, fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)
 	}
 	// print("-")
-	defer util.CloseResponse(resp)
 
 	var ret UploadResult
 	etag := getEtag(resp)

@@ -6,10 +6,13 @@ package weed_server
 import (
 	"fmt"
 	transport "github.com/Jille/raft-grpc-transport"
+	"github.com/armon/go-metrics"
+	"github.com/armon/go-metrics/prometheus"
 	"github.com/hashicorp/raft"
-	boltdb "github.com/hashicorp/raft-boltdb"
+	boltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"google.golang.org/grpc"
 	"math/rand"
 	"os"
@@ -75,7 +78,7 @@ func (s *RaftServer) UpdatePeers() {
 					s.RaftHashicorp.AddVoter(
 						raft.ServerID(peerName), raft.ServerAddress(peer.ToGrpcAddress()), 0, 0)
 				}
-				for peer, _ := range existsPeerName {
+				for peer := range existsPeerName {
 					if _, found := s.peers[peer]; !found {
 						glog.V(0).Infof("removing old peer: %s", peer)
 						s.RaftHashicorp.RemoveServer(raft.ServerID(peer), 0, 0)
@@ -154,9 +157,9 @@ func NewHashicorpRaftServer(option *RaftServerOption) (*RaftServer, error) {
 		cfg := s.AddPeersConfiguration()
 		// Need to get lock, in case all servers do this at the same time.
 		peerIdx := getPeerIdx(s.serverAddr, s.peers)
-		timeSpeep := time.Duration(float64(c.LeaderLeaseTimeout) * (rand.Float64()*0.25 + 1) * float64(peerIdx))
-		glog.V(0).Infof("Bootstrapping idx: %d sleep: %v new cluster: %+v", peerIdx, timeSpeep, cfg)
-		time.Sleep(timeSpeep)
+		timeSleep := time.Duration(float64(c.LeaderLeaseTimeout) * (rand.Float64()*0.25 + 1) * float64(peerIdx))
+		glog.V(0).Infof("Bootstrapping idx: %d sleep: %v new cluster: %+v", peerIdx, timeSleep, cfg)
+		time.Sleep(timeSleep)
 		f := s.RaftHashicorp.BootstrapCluster(cfg)
 		if err := f.Error(); err != nil {
 			return nil, fmt.Errorf("raft.Raft.BootstrapCluster: %v", err)
@@ -180,6 +183,19 @@ func NewHashicorpRaftServer(option *RaftServerOption) (*RaftServer, error) {
 				}
 			}
 		}()
+	}
+
+	// Configure a prometheus sink as the raft metrics sink
+	if sink, err := prometheus.NewPrometheusSinkFrom(prometheus.PrometheusOpts{
+		Registerer: stats.Gather,
+	}); err != nil {
+		return nil, fmt.Errorf("NewPrometheusSink: %v", err)
+	} else {
+		metricsConf := metrics.DefaultConfig(stats.Namespace)
+		metricsConf.EnableRuntimeMetrics = false
+		if _, err = metrics.NewGlobal(metricsConf, sink); err != nil {
+			return nil, fmt.Errorf("metrics.NewGlobal: %v", err)
+		}
 	}
 
 	return s, nil

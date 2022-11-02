@@ -1,4 +1,4 @@
-# 2022-08-17 14:25:41
+# 2022-11-02 06:01:53
 FROM registry.hub.docker.com/amd64/golang:1.19-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
@@ -25,7 +25,7 @@ RUN export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev
 
 FROM registry.hub.docker.com/library/alpine AS pre_final
 RUN \
-  apk add --no-cache --update bind-tools bash fuse3 ucspi-tcp && \
+  apk add --no-cache --update bind-tools bash curl fuse3 ucspi-tcp && \
   rm -rf /tmp/*
 
 WORKDIR /usr/bin

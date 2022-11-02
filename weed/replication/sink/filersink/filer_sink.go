@@ -32,6 +32,7 @@ type FilerSink struct {
 	address           string
 	writeChunkByFiler bool
 	isIncremental     bool
+	executor          *util.LimitedConcurrentExecutor
 }
 
 func init() {
@@ -83,6 +84,7 @@ func (fs *FilerSink) DoInitialize(address, grpcAddress string, dir string,
 	fs.diskType = diskType
 	fs.grpcDialOption = grpcDialOption
 	fs.writeChunkByFiler = writeChunkByFiler
+	fs.executor = util.NewLimitedConcurrentExecutor(32)
 	return nil
 }
 
@@ -133,6 +135,7 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 				Name:        name,
 				IsDirectory: entry.IsDirectory,
 				Attributes:  entry.Attributes,
+				Extended:    entry.Extended,
 				Chunks:      replicatedChunks,
 				Content:     entry.Content,
 				RemoteEntry: entry.RemoteEntry,
@@ -186,15 +189,11 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		// skip if already changed
 		// this usually happens when the messages are not ordered
 		glog.V(2).Infof("late updates %s", key)
-	} else if filer.ETag(newEntry) == filer.ETag(existingEntry) {
-		// skip if no change
-		// this usually happens when retrying the replication
-		glog.V(3).Infof("already replicated %s", key)
 	} else {
 		// find out what changed
 		deletedChunks, newChunks, err := compareChunks(filer.LookupFn(fs), oldEntry, newEntry)
 		if err != nil {
-			return true, fmt.Errorf("replicte %s compare chunks error: %v", key, err)
+			return true, fmt.Errorf("replicate %s compare chunks error: %v", key, err)
 		}
 
 		// delete the chunks that are deleted from the source
@@ -206,7 +205,7 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		// replicate the chunks that are new in the source
 		replicatedChunks, err := fs.replicateChunks(newChunks, key)
 		if err != nil {
-			return true, fmt.Errorf("replicte %s chunks error: %v", key, err)
+			return true, fmt.Errorf("replicate %s chunks error: %v", key, err)
 		}
 		existingEntry.Chunks = append(existingEntry.Chunks, replicatedChunks...)
 		existingEntry.Attributes = newEntry.Attributes

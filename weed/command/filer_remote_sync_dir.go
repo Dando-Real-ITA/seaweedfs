@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"os"
 	"strings"
 	"time"
@@ -36,6 +37,16 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 
 	var lastLogTsNs = time.Now().UnixNano()
 	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.EventNotification.NewEntry != nil {
+			if *option.storageClass == "" {
+				if _, ok := resp.EventNotification.NewEntry.Extended[s3_constants.AmzStorageClass]; ok {
+					delete(resp.EventNotification.NewEntry.Extended, s3_constants.AmzStorageClass)
+				}
+			} else {
+				resp.EventNotification.NewEntry.Extended[s3_constants.AmzStorageClass] = []byte(*option.storageClass)
+			}
+		}
+
 		processor.AddSyncJob(resp)
 		return nil
 	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
@@ -107,6 +118,9 @@ func makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, 
 			return nil
 		}
 		if filer_pb.IsCreate(resp) {
+			if isMultipartUploadFile(message.NewParentPath, message.NewEntry.Name) {
+				return nil
+			}
 			if !filer.HasData(message.NewEntry) {
 				return nil
 			}
@@ -156,7 +170,9 @@ func makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, 
 			glog.V(2).Infof("update: %+v", resp)
 			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(oldDest))
 			if err := client.DeleteFile(oldDest); err != nil {
-				return err
+				if isMultipartUploadFile(resp.Directory, message.OldEntry.Name) {
+					return nil
+				}
 			}
 			remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewEntry, dest)
 			if writeErr != nil {
@@ -246,4 +262,10 @@ func updateLocalEntry(filerClient filer_pb.FilerClient, dir string, entry *filer
 		})
 		return err
 	})
+}
+
+func isMultipartUploadFile(dir string, name string) bool {
+	return strings.HasPrefix(dir, "/buckets/") &&
+		strings.Contains(dir, "/"+s3_constants.MultipartUploadsFolder+"/") &&
+		strings.HasSuffix(name, ".part")
 }

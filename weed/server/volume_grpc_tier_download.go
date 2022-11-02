@@ -42,7 +42,7 @@ func (vs *VolumeServer) VolumeTierMoveDatFromRemote(req *volume_server_pb.Volume
 		for key := range backend.BackendStorages {
 			keys = append(keys, key)
 		}
-		return fmt.Errorf("remote storage %s not found from suppported: %v", storageName, keys)
+		return fmt.Errorf("remote storage %s not found from supported: %v", storageName, keys)
 	}
 
 	startTime := time.Now()
@@ -69,13 +69,13 @@ func (vs *VolumeServer) VolumeTierMoveDatFromRemote(req *volume_server_pb.Volume
 
 	// remove remote file
 	if err := backendStorage.DeleteFile(storageKey); err != nil {
-		return fmt.Errorf("volume %d fail to delete remote file %s: %v", v.Id, storageKey, err)
+		return fmt.Errorf("volume %d failed to delete remote file %s: %v", v.Id, storageKey, err)
 	}
 
 	// forget remote file
 	v.GetVolumeInfo().Files = v.GetVolumeInfo().Files[1:]
 	if err := v.SaveVolumeInfo(); err != nil {
-		return fmt.Errorf("volume %d fail to save remote file info: %v", v.Id, err)
+		return fmt.Errorf("volume %d failed to save remote file info: %v", v.Id, err)
 	}
 
 	v.DataBackend.Close()

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"golang.org/x/exp/slices"
@@ -29,7 +30,7 @@ func (c *commandVolumeBalance) Name() string {
 func (c *commandVolumeBalance) Help() string {
 	return `balance all volumes among volume servers
 
-	volume.balance [-collection ALL|EACH_COLLECTION|<collection_name>] [-force] [-dataCenter=<data_center_name>]
+	volume.balance [-collection ALL_COLLECTIONS|EACH_COLLECTION|<collection_name>] [-force] [-dataCenter=<data_center_name>]
 
 	Algorithm:
 
@@ -64,7 +65,7 @@ func (c *commandVolumeBalance) Help() string {
 func (c *commandVolumeBalance) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	balanceCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
-	collection := balanceCommand.String("collection", "EACH_COLLECTION", "collection name, or use \"ALL_COLLECTIONS\" across collections, \"EACH_COLLECTION\" for each collection")
+	collection := balanceCommand.String("collection", "ALL_COLLECTIONS", "collection name, or use \"ALL_COLLECTIONS\" across collections, \"EACH_COLLECTION\" for each collection")
 	dc := balanceCommand.String("dataCenter", "", "only apply the balancing for this dataCenter")
 	applyBalancing := balanceCommand.Bool("force", false, "apply the balancing plan.")
 	if err = balanceCommand.Parse(args); err != nil {
@@ -132,7 +133,7 @@ func balanceVolumeServersByDiskType(commandEnv *CommandEnv, diskType types.DiskT
 			return v.DiskType == string(diskType)
 		})
 	}
-	if err := balanceSelectedVolume(commandEnv, diskType, volumeReplicas, nodes, capacityByMaxVolumeCount(diskType), sortWritableVolumes, applyBalancing); err != nil {
+	if err := balanceSelectedVolume(commandEnv, diskType, volumeReplicas, nodes, sortWritableVolumes, applyBalancing); err != nil {
 		return err
 	}
 
@@ -183,34 +184,50 @@ type Node struct {
 	rack            string
 }
 
-type CapacityFunc func(*master_pb.DataNodeInfo) int
+type CapacityFunc func(*master_pb.DataNodeInfo) float64
 
 func capacityByMaxVolumeCount(diskType types.DiskType) CapacityFunc {
-	return func(info *master_pb.DataNodeInfo) int {
+	return func(info *master_pb.DataNodeInfo) float64 {
 		diskInfo, found := info.DiskInfos[string(diskType)]
 		if !found {
 			return 0
 		}
-		return int(diskInfo.MaxVolumeCount)
+		return float64(diskInfo.MaxVolumeCount)
 	}
 }
 
 func capacityByFreeVolumeCount(diskType types.DiskType) CapacityFunc {
-	return func(info *master_pb.DataNodeInfo) int {
+	return func(info *master_pb.DataNodeInfo) float64 {
 		diskInfo, found := info.DiskInfos[string(diskType)]
 		if !found {
 			return 0
 		}
-		return int(diskInfo.MaxVolumeCount - diskInfo.VolumeCount)
+		var ecShardCount int
+		for _, ecShardInfo := range diskInfo.EcShardInfos {
+			ecShardCount += erasure_coding.ShardBits(ecShardInfo.EcIndexBits).ShardIdCount()
+		}
+		return float64(diskInfo.MaxVolumeCount-diskInfo.VolumeCount) - float64(ecShardCount)/erasure_coding.DataShardsCount
 	}
 }
 
 func (n *Node) localVolumeRatio(capacityFunc CapacityFunc) float64 {
-	return divide(len(n.selectedVolumes), capacityFunc(n.info))
+	return float64(len(n.selectedVolumes)) / capacityFunc(n.info)
 }
 
 func (n *Node) localVolumeNextRatio(capacityFunc CapacityFunc) float64 {
-	return divide(len(n.selectedVolumes)+1, capacityFunc(n.info))
+	return float64(len(n.selectedVolumes)+1) / capacityFunc(n.info)
+}
+
+func (n *Node) isOneVolumeOnly() bool {
+	if len(n.selectedVolumes) != 1 {
+		return false
+	}
+	for _, disk := range n.info.DiskInfos {
+		if disk.VolumeCount == 1 && disk.MaxVolumeCount == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) selectVolumes(fn func(v *master_pb.VolumeInformationMessage) bool) {
@@ -230,15 +247,10 @@ func sortWritableVolumes(volumes []*master_pb.VolumeInformationMessage) {
 	})
 }
 
-func sortReadOnlyVolumes(volumes []*master_pb.VolumeInformationMessage) {
-	slices.SortFunc(volumes, func(a, b *master_pb.VolumeInformationMessage) bool {
-		return a.Id < b.Id
-	})
-}
-
-func balanceSelectedVolume(commandEnv *CommandEnv, diskType types.DiskType, volumeReplicas map[uint32][]*VolumeReplica, nodes []*Node, capacityFunc CapacityFunc, sortCandidatesFn func(volumes []*master_pb.VolumeInformationMessage), applyBalancing bool) (err error) {
-	selectedVolumeCount, volumeMaxCount := 0, 0
+func balanceSelectedVolume(commandEnv *CommandEnv, diskType types.DiskType, volumeReplicas map[uint32][]*VolumeReplica, nodes []*Node, sortCandidatesFn func(volumes []*master_pb.VolumeInformationMessage), applyBalancing bool) (err error) {
+	selectedVolumeCount, volumeMaxCount := 0, float64(0)
 	var nodesWithCapacity []*Node
+	capacityFunc := capacityByMaxVolumeCount(diskType)
 	for _, dn := range nodes {
 		selectedVolumeCount += len(dn.selectedVolumes)
 		capacity := capacityFunc(dn.info)
@@ -248,7 +260,7 @@ func balanceSelectedVolume(commandEnv *CommandEnv, diskType types.DiskType, volu
 		volumeMaxCount += capacity
 	}
 
-	idealVolumeRatio := divide(selectedVolumeCount, volumeMaxCount)
+	idealVolumeRatio := float64(selectedVolumeCount) / volumeMaxCount
 
 	hasMoved := true
 
@@ -263,7 +275,14 @@ func balanceSelectedVolume(commandEnv *CommandEnv, diskType types.DiskType, volu
 			fmt.Printf("no volume server found with capacity for %s", diskType.ReadableString())
 			return nil
 		}
-		fullNode := nodesWithCapacity[len(nodesWithCapacity)-1]
+
+		var fullNode *Node
+		for fullNodeIndex := len(nodesWithCapacity) - 1; fullNodeIndex >= 0; fullNodeIndex-- {
+			fullNode = nodesWithCapacity[fullNodeIndex]
+			if !fullNode.isOneVolumeOnly() {
+				break
+			}
+		}
 		var candidateVolumes []*master_pb.VolumeInformationMessage
 		for _, v := range fullNode.selectedVolumes {
 			candidateVolumes = append(candidateVolumes, v)
@@ -389,6 +408,18 @@ func adjustAfterMove(v *master_pb.VolumeInformationMessage, volumeReplicas map[u
 			replica.location.dc == fullNode.dc {
 			loc := newLocation(emptyNode.dc, emptyNode.rack, emptyNode.info)
 			replica.location = &loc
+			for diskType, diskInfo := range fullNode.info.DiskInfos {
+				if diskType == v.DiskType {
+					diskInfo.VolumeCount--
+					diskInfo.FreeVolumeCount++
+				}
+			}
+			for diskType, diskInfo := range emptyNode.info.DiskInfos {
+				if diskType == v.DiskType {
+					diskInfo.VolumeCount++
+					diskInfo.FreeVolumeCount--
+				}
+			}
 			return
 		}
 	}

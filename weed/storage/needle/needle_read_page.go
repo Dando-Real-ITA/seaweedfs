@@ -9,36 +9,6 @@ import (
 	"io"
 )
 
-// ReadNeedleDataInto uses a needle without n.Data to read the content into an io.Writer
-func (n *Needle) ReadNeedleDataInto(r backend.BackendStorageFile, volumeOffset int64, buf []byte, writer io.Writer, needleOffset int64, size int64) (err error) {
-	crc := CRC(0)
-	for x := needleOffset; x < needleOffset+size; x += int64(len(buf)) {
-		count, err := n.ReadNeedleData(r, volumeOffset, buf, x)
-		toWrite := min(int64(count), needleOffset+size-x)
-		if toWrite > 0 {
-			crc = crc.Update(buf[0:toWrite])
-			if _, err = writer.Write(buf[0:toWrite]); err != nil {
-				return fmt.Errorf("ReadNeedleData write: %v", err)
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				err = nil
-				break
-			}
-			return fmt.Errorf("ReadNeedleData: %v", err)
-		}
-		if count <= 0 {
-			break
-		}
-	}
-	if needleOffset == 0 && size == int64(n.DataSize) && (n.Checksum != crc && uint32(n.Checksum) != crc.Value()) {
-		// the crc.Value() function is to be deprecated. this double checking is for backward compatible.
-		return fmt.Errorf("ReadNeedleData checksum %v expected %v", crc, n.Checksum)
-	}
-	return nil
-}
-
 // ReadNeedleData uses a needle without n.Data to read the content
 // volumeOffset: the offset within the volume
 // needleOffset: the offset within the needle Data
@@ -61,6 +31,11 @@ func (n *Needle) ReadNeedleData(r backend.BackendStorageFile, volumeOffset int64
 
 // ReadNeedleMeta fills all metadata except the n.Data
 func (n *Needle) ReadNeedleMeta(r backend.BackendStorageFile, offset int64, size Size, version Version) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic occurred: %+v", r)
+		}
+	}()
 
 	bytes := make([]byte, NeedleHeaderSize+DataSizeSize)
 
@@ -74,10 +49,11 @@ func (n *Needle) ReadNeedleMeta(r backend.BackendStorageFile, offset int64, size
 			return ErrorSizeMismatch
 		}
 	}
-
 	n.DataSize = util.BytesToUint32(bytes[NeedleHeaderSize : NeedleHeaderSize+DataSizeSize])
-
-	startOffset := offset + NeedleHeaderSize + DataSizeSize + int64(n.DataSize)
+	startOffset := offset + NeedleHeaderSize
+	if size.IsValid() {
+		startOffset = offset + NeedleHeaderSize + DataSizeSize + int64(n.DataSize)
+	}
 	dataSize := GetActualSize(size, version)
 	stopOffset := offset + dataSize
 	metaSize := stopOffset - startOffset
@@ -90,15 +66,12 @@ func (n *Needle) ReadNeedleMeta(r backend.BackendStorageFile, offset int64, size
 	if err != nil {
 		return err
 	}
-
 	var index int
 	index, err = n.readNeedleDataVersion2NonData(metaSlice)
-
 	n.Checksum = CRC(util.BytesToUint32(metaSlice[index : index+NeedleChecksumSize]))
 	if version == Version3 {
 		n.AppendAtNs = util.BytesToUint64(metaSlice[index+NeedleChecksumSize : index+NeedleChecksumSize+TimestampSize])
 	}
-
 	return err
 
 }

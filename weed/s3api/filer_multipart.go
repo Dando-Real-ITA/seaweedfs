@@ -105,12 +105,12 @@ func (s3a *S3ApiServer) completeMultipartUpload(input *s3.CompleteMultipartUploa
 			}
 			for _, chunk := range entry.Chunks {
 				p := &filer_pb.FileChunk{
-					FileId:    chunk.GetFileIdString(),
-					Offset:    offset,
-					Size:      chunk.Size,
-					Mtime:     chunk.Mtime,
-					CipherKey: chunk.CipherKey,
-					ETag:      chunk.ETag,
+					FileId:       chunk.GetFileIdString(),
+					Offset:       offset,
+					Size:         chunk.Size,
+					ModifiedTsNs: chunk.ModifiedTsNs,
+					CipherKey:    chunk.CipherKey,
+					ETag:         chunk.ETag,
 				}
 				finalParts = append(finalParts, p)
 				offset += int64(chunk.Size)
@@ -147,6 +147,7 @@ func (s3a *S3ApiServer) completeMultipartUpload(input *s3.CompleteMultipartUploa
 		} else if mime != "" {
 			entry.Attributes.Mime = mime
 		}
+		entry.Attributes.FileSize = uint64(offset)
 	})
 
 	if err != nil {
@@ -156,7 +157,7 @@ func (s3a *S3ApiServer) completeMultipartUpload(input *s3.CompleteMultipartUploa
 
 	output = &CompleteMultipartUploadResult{
 		CompleteMultipartUploadOutput: s3.CompleteMultipartUploadOutput{
-			Location: aws.String(fmt.Sprintf("http://%s%s/%s", s3a.option.Filer.ToHttpAddress(), urlPathEscape(dirName), urlPathEscape(entryName))),
+			Location: aws.String(fmt.Sprintf("http://%s%s/%s", s3a.option.Filer.ToHttpAddress(), urlEscapeObject(dirName), urlPathEscape(entryName))),
 			Bucket:   input.Bucket,
 			ETag:     aws.String("\"" + filer.ETagChunks(finalParts) + "\""),
 			Key:      objectKey(input.Key),
@@ -244,6 +245,7 @@ func (s3a *S3ApiServer) listMultipartUploads(input *s3.ListMultipartUploadsInput
 		KeyMarker:    input.KeyMarker,
 		MaxUploads:   input.MaxUploads,
 		Prefix:       input.Prefix,
+		IsTruncated:  aws.Bool(false),
 	}
 
 	entries, _, err := s3a.list(s3a.genUploadsFolder(*input.Bucket), "", *input.UploadIdMarker, false, math.MaxInt32)

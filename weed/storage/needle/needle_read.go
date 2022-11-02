@@ -24,6 +24,7 @@ const (
 )
 
 var ErrorSizeMismatch = errors.New("size mismatch")
+var ErrorSizeInvalid = errors.New("size invalid")
 
 func (n *Needle) DiskSize(version Version) int64 {
 	return GetActualSize(n.Size, version)
@@ -209,8 +210,8 @@ func NeedleBodyLength(needleSize Size, version Version) int64 {
 	return int64(needleSize) + NeedleChecksumSize + int64(PaddingLength(needleSize, version))
 }
 
-//n should be a needle already read the header
-//the input stream will read until next file entry
+// n should be a needle already read the header
+// the input stream will read until next file entry
 func (n *Needle) ReadNeedleBody(r backend.BackendStorageFile, version Version, offset int64, bodyLength int64) (bytes []byte, err error) {
 
 	if bodyLength <= 0 {

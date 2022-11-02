@@ -58,8 +58,8 @@ func init() {
 	copy.ttl = cmdFilerCopy.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
 	copy.diskType = cmdFilerCopy.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	copy.maxMB = cmdFilerCopy.Flag.Int("maxMB", 4, "split files larger than the limit")
-	copy.concurrenctFiles = cmdFilerCopy.Flag.Int("c", 8, "concurrent file copy goroutines")
-	copy.concurrenctChunks = cmdFilerCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
+	copy.concurrentFiles = cmdFilerCopy.Flag.Int("c", 8, "concurrent file copy goroutines")
+	copy.concurrentChunks = cmdFilerCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
 	copy.checkSize = cmdFilerCopy.Flag.Bool("check.size", false, "copy when the target file size is different from the source file")
 	copy.verbose = cmdFilerCopy.Flag.Bool("verbose", false, "print out details during copying")
 	copy.volumeServerAccess = cmdFilerCopy.Flag.String("volumeServerAccess", "publicUrl", "access volume servers by [direct|publicUrl]")
@@ -143,7 +143,7 @@ func runCopy(cmd *Command, args []string) bool {
 		grace.SetupProfiling("filer.copy.cpu.pprof", "filer.copy.mem.pprof")
 	}
 
-	fileCopyTaskChan := make(chan FileCopyTask, *copy.concurrenctFiles)
+	fileCopyTaskChan := make(chan FileCopyTask, *copy.concurrentFiles)
 
 	go func() {
 		defer close(fileCopyTaskChan)
@@ -154,7 +154,7 @@ func runCopy(cmd *Command, args []string) bool {
 			}
 		}
 	}()
-	for i := 0; i < *copy.concurrenctFiles; i++ {
+	for i := 0; i < *copy.concurrentFiles; i++ {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
@@ -407,7 +407,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 
 	chunksChan := make(chan *filer_pb.FileChunk, chunkCount)
 
-	concurrentChunks := make(chan struct{}, *worker.options.concurrenctChunks)
+	concurrentChunks := make(chan struct{}, *worker.options.concurrentChunks)
 	var wg sync.WaitGroup
 	var uploadError error
 

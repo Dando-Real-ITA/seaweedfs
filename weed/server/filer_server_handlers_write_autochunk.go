@@ -3,6 +3,7 @@ package weed_server
 import (
 	"context"
 	"fmt"
+	//"github.com/seaweedfs/seaweedfs/weed/s3api"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"io"
 	"net/http"
@@ -46,7 +47,7 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 		reply, md5bytes, err = fs.doPutAutoChunk(ctx, w, r, chunkSize, contentLength, so)
 	}
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "read input:") {
+		if strings.HasPrefix(err.Error(), "read input:") || err.Error() == io.ErrUnexpectedEOF.Error() {
 			writeJsonError(w, r, 499, err)
 		} else if strings.HasSuffix(err.Error(), "is a file") {
 			writeJsonError(w, r, http.StatusConflict, err)
@@ -372,6 +373,18 @@ func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool
 				metadata[header] = []byte(value)
 			}
 		}
+	}
+
+	//acp-owner
+	acpOwner := r.Header.Get(s3_constants.ExtAmzOwnerKey)
+	if len(acpOwner) > 0 {
+		metadata[s3_constants.ExtAmzOwnerKey] = []byte(acpOwner)
+	}
+
+	//acp-grants
+	acpGrants := r.Header.Get(s3_constants.ExtAmzAclKey)
+	if len(acpOwner) > 0 {
+		metadata[s3_constants.ExtAmzAclKey] = []byte(acpGrants)
 	}
 
 	return

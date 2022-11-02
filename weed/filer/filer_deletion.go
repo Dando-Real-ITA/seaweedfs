@@ -1,6 +1,7 @@
 package filer
 
 import (
+	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"math"
 	"strings"
 	"time"
@@ -54,11 +55,11 @@ func (f *Filer) loopProcessingDeletion() {
 				deletionCount = len(toDeleteFileIds)
 				_, err := operation.DeleteFilesWithLookupVolumeId(f.GrpcDialOption, toDeleteFileIds, lookupFunc)
 				if err != nil {
-					if !strings.Contains(err.Error(), "already deleted") {
+					if !strings.Contains(err.Error(), storage.ErrorDeleted.Error()) {
 						glog.V(0).Infof("deleting fileIds len=%d error: %v", deletionCount, err)
 					}
 				} else {
-					glog.V(1).Infof("deleting fileIds len=%d", deletionCount)
+					glog.V(2).Infof("deleting fileIds %+v", toDeleteFileIds)
 				}
 			}
 		})
@@ -86,7 +87,7 @@ func (f *Filer) doDeleteFileIds(fileIds []string) {
 		deletionCount := len(toDeleteFileIds)
 		_, err := operation.DeleteFilesWithLookupVolumeId(f.GrpcDialOption, toDeleteFileIds, lookupFunc)
 		if err != nil {
-			if !strings.Contains(err.Error(), "already deleted") {
+			if !strings.Contains(err.Error(), storage.ErrorDeleted.Error()) {
 				glog.V(0).Infof("deleting fileIds len=%d error: %v", deletionCount, err)
 			}
 		}
@@ -94,10 +95,10 @@ func (f *Filer) doDeleteFileIds(fileIds []string) {
 }
 
 func (f *Filer) DirectDeleteChunks(chunks []*filer_pb.FileChunk) {
-	var fildIdsToDelete []string
+	var fileIdsToDelete []string
 	for _, chunk := range chunks {
 		if !chunk.IsChunkManifest {
-			fildIdsToDelete = append(fildIdsToDelete, chunk.GetFileIdString())
+			fileIdsToDelete = append(fileIdsToDelete, chunk.GetFileIdString())
 			continue
 		}
 		dataChunks, manifestResolveErr := ResolveOneChunkManifest(f.MasterClient.LookupFileId, chunk)
@@ -105,12 +106,12 @@ func (f *Filer) DirectDeleteChunks(chunks []*filer_pb.FileChunk) {
 			glog.V(0).Infof("failed to resolve manifest %s: %v", chunk.FileId, manifestResolveErr)
 		}
 		for _, dChunk := range dataChunks {
-			fildIdsToDelete = append(fildIdsToDelete, dChunk.GetFileIdString())
+			fileIdsToDelete = append(fileIdsToDelete, dChunk.GetFileIdString())
 		}
-		fildIdsToDelete = append(fildIdsToDelete, chunk.GetFileIdString())
+		fileIdsToDelete = append(fileIdsToDelete, chunk.GetFileIdString())
 	}
 
-	f.doDeleteFileIds(fildIdsToDelete)
+	f.doDeleteFileIds(fileIdsToDelete)
 }
 
 func (f *Filer) DeleteChunks(chunks []*filer_pb.FileChunk) {

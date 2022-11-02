@@ -46,7 +46,7 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 					mc.invalidateFunc(newKey, message.NewEntry)
 				}
 			} else if filer_pb.IsCreate(resp) {
-				// no need to invaalidate
+				// no need to invalidate
 			} else if filer_pb.IsDelete(resp) {
 				oldKey := util.NewFullPath(resp.Directory, message.OldEntry.Name)
 				mc.invalidateFunc(oldKey, message.OldEntry)
@@ -60,7 +60,7 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 	var clientEpoch int32
 	util.RetryForever("followMetaUpdates", func() error {
 		clientEpoch++
-		return pb.WithFilerClientFollowMetadata(client, "mount", selfSignature, clientEpoch, dir, &lastTsNs, 0, selfSignature, processEventFn, pb.FatalOnError)
+		return pb.WithFilerClientFollowMetadata(client, "mount", selfSignature, clientEpoch, dir, nil, &lastTsNs, 0, selfSignature, processEventFn, pb.FatalOnError)
 	}, func(err error) bool {
 		glog.Errorf("follow metadata updates: %v", err)
 		return true

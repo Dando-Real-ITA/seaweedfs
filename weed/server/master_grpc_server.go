@@ -68,15 +68,11 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 				glog.V(0).Infof("disconnect phantom volume server %s:%d remaining %d", dn.Ip, dn.Port, dn.Counter)
 				return
 			}
-			// if the volume server disconnects and reconnects quickly
-			//  the unregister and register can race with each other
-			ms.Topo.UnRegisterDataNode(dn)
-			glog.V(0).Infof("unregister disconnected volume server %s:%d", dn.Ip, dn.Port)
-			ms.UnRegisterUuids(dn.Ip, dn.Port)
 
 			message := &master_pb.VolumeLocation{
-				Url:       dn.Url(),
-				PublicUrl: dn.PublicUrl,
+				DataCenter: dn.GetDataCenterId(),
+				Url:        dn.Url(),
+				PublicUrl:  dn.PublicUrl,
 			}
 			for _, v := range dn.GetVolumes() {
 				message.DeletedVids = append(message.DeletedVids, uint32(v.Id))
@@ -84,6 +80,12 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			for _, s := range dn.GetEcShards() {
 				message.DeletedVids = append(message.DeletedVids, uint32(s.VolumeId))
 			}
+
+			// if the volume server disconnects and reconnects quickly
+			//  the unregister and register can race with each other
+			ms.Topo.UnRegisterDataNode(dn)
+			glog.V(0).Infof("unregister disconnected volume server %s:%d", dn.Ip, dn.Port)
+			ms.UnRegisterUuids(dn.Ip, dn.Port)
 
 			if len(message.DeletedVids) > 0 {
 				ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: message})
@@ -103,9 +105,32 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			return err
 		}
 
-		ms.Topo.Sequence.SetMax(heartbeat.MaxFileKey)
+		if !ms.Topo.IsLeader() {
+			// tell the volume servers about the leader
+			newLeader, err := ms.Topo.Leader()
+			if err != nil {
+				glog.Warningf("SendHeartbeat find leader: %v", err)
+				return err
+			}
+			if err := stream.Send(&master_pb.HeartbeatResponse{
+				Leader: string(newLeader),
+			}); err != nil {
+				if dn != nil {
+					glog.Warningf("SendHeartbeat.Send response to %s:%d %v", dn.Ip, dn.Port, err)
+				} else {
+					glog.Warningf("SendHeartbeat.Send response %v", err)
+				}
+				return err
+			}
+			continue
+		}
 
+		ms.Topo.Sequence.SetMax(heartbeat.MaxFileKey)
 		if dn == nil {
+			// Skip delta heartbeat for volume server versions  better than 3.28 https://github.com/seaweedfs/seaweedfs/pull/3630
+			if heartbeat.Ip == "" {
+				continue
+			} // ToDo must be removed after update major version
 			dcName, rackName := ms.Topo.Configuration.Locate(heartbeat.Ip, heartbeat.DataCenter, heartbeat.Rack)
 			dc := ms.Topo.GetOrCreateDataCenter(dcName)
 			rack := dc.GetOrCreateRack(rackName)
@@ -161,8 +186,10 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 		}
 
 		if len(heartbeat.Volumes) > 0 || heartbeat.HasNoVolumes {
-			dcName, rackName := ms.Topo.Configuration.Locate(heartbeat.Ip, heartbeat.DataCenter, heartbeat.Rack)
-			ms.Topo.DataNodeRegistration(dcName, rackName, dn)
+			if heartbeat.Ip != "" {
+				dcName, rackName := ms.Topo.Configuration.Locate(heartbeat.Ip, heartbeat.DataCenter, heartbeat.Rack)
+				ms.Topo.DataNodeRegistration(dcName, rackName, dn)
+			}
 
 			// process heartbeat.Volumes
 			stats.MasterReceivedHeartbeatCounter.WithLabelValues("Volumes").Inc()
@@ -214,19 +241,6 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 		}
 		if len(message.NewVids) > 0 || len(message.DeletedVids) > 0 || len(message.NewEcVids) > 0 || len(message.DeletedEcVids) > 0 {
 			ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: message})
-		}
-
-		// tell the volume servers about the leader
-		newLeader, err := ms.Topo.Leader()
-		if err != nil {
-			glog.Warningf("SendHeartbeat find leader: %v", err)
-			return err
-		}
-		if err := stream.Send(&master_pb.HeartbeatResponse{
-			Leader: string(newLeader),
-		}); err != nil {
-			glog.Warningf("SendHeartbeat.Send response to to %s:%d %v", dn.Ip, dn.Port, err)
-			return err
 		}
 	}
 }
@@ -293,6 +307,8 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		case <-ticker.C:
 			if !ms.Topo.IsLeader() {
 				stats.MasterRaftIsleader.Set(0)
+				stats.MasterAdminLock.Reset()
+				stats.MasterReplicaPlacementMismatch.Reset()
 				return ms.informNewLeader(stream)
 			} else {
 				stats.MasterRaftIsleader.Set(1)

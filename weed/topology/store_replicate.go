@@ -21,7 +21,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, s *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request) (isUnchanged bool, err error) {
+func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, s *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request, contentMd5 string) (isUnchanged bool, err error) {
 
 	//check JWT
 	jwt := security.GetJwt(r)
@@ -98,8 +98,13 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 				MimeType:          string(n.Mime),
 				PairMap:           pairMap,
 				Jwt:               jwt,
+				Md5:               contentMd5,
 			}
+
 			_, err := operation.UploadData(n.Data, uploadOption)
+			if err != nil {
+				glog.Errorf("replication-UploadData, err:%v, url:%s", err, u.String())
+			}
 			return err
 		})
 		stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToReplicas).Observe(time.Since(start).Seconds())
@@ -197,7 +202,7 @@ func GetWritableRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOpt
 			}
 		}
 	} else {
-		err = fmt.Errorf("failed to lookup for %d: %v", volumeId, lookupErr)
+		err = fmt.Errorf("replicating lookup failed for %d: %v", volumeId, lookupErr)
 		return
 	}
 
@@ -205,7 +210,7 @@ func GetWritableRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOpt
 		// has one local and has remote replications
 		copyCount := v.ReplicaPlacement.GetCopyCount()
 		if len(lookupResult.Locations) < copyCount {
-			err = fmt.Errorf("replicating opetations [%d] is less than volume %d replication copy count [%d]",
+			err = fmt.Errorf("replicating operations [%d] is less than volume %d replication copy count [%d]",
 				len(lookupResult.Locations), volumeId, copyCount)
 		}
 	}

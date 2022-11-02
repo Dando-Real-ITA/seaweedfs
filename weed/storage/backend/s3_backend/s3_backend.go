@@ -2,6 +2,7 @@ package s3_backend
 
 import (
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"io"
 	"os"
 	"strings"
@@ -91,7 +92,10 @@ func (s *S3BackendStorage) CopyFile(f *os.File, fn func(progressed int64, percen
 
 	glog.V(1).Infof("copying dat file of %s to remote s3.%s as %s", f.Name(), s.id, key)
 
-	size, err = uploadToS3(s.conn, f.Name(), s.bucket, key, s.storageClass, fn)
+	util.Retry("upload to S3", func() error {
+		size, err = uploadToS3(s.conn, f.Name(), s.bucket, key, s.storageClass, fn)
+		return err
+	})
 
 	return
 }
@@ -124,8 +128,6 @@ func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n 
 
 	bytesRange := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1)
 
-	// glog.V(0).Infof("read %s %s", s3backendStorageFile.key, bytesRange)
-
 	getObjectOutput, getObjectErr := s3backendStorageFile.backendStorage.conn.GetObject(&s3.GetObjectInput{
 		Bucket: &s3backendStorageFile.backendStorage.bucket,
 		Key:    &s3backendStorageFile.key,
@@ -137,13 +139,16 @@ func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n 
 	}
 	defer getObjectOutput.Body.Close()
 
-	glog.V(4).Infof("read %s %s", s3backendStorageFile.key, bytesRange)
-	glog.V(4).Infof("content range: %s, contentLength: %d", *getObjectOutput.ContentRange, *getObjectOutput.ContentLength)
+	// glog.V(3).Infof("read %s %s", s3backendStorageFile.key, bytesRange)
+	// glog.V(3).Infof("content range: %s, contentLength: %d", *getObjectOutput.ContentRange, *getObjectOutput.ContentLength)
 
+	var readCount int
 	for {
-		if n, err = getObjectOutput.Body.Read(p); err == nil && n < len(p) {
-			p = p[n:]
-		} else {
+		p = p[readCount:]
+		readCount, err = getObjectOutput.Body.Read(p)
+		n += readCount
+
+		if err != nil {
 			break
 		}
 	}

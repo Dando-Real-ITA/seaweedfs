@@ -10,7 +10,11 @@ import (
 )
 
 func ParseS3ConfigurationFromBytes[T proto.Message](content []byte, config T) error {
-	if err := jsonpb.Unmarshal(content, config); err != nil {
+	options := &jsonpb.UnmarshalOptions{
+		DiscardUnknown: true,
+		AllowPartial:   true,
+	}
+	if err := options.Unmarshal(content, config); err != nil {
 		return err
 	}
 	return nil
@@ -43,7 +47,7 @@ func CheckDuplicateAccessKey(s3cfg *iam_pb.S3ApiConfiguration) error {
 		for _, cred := range ident.Credentials {
 			if userName, found := accessKeySet[cred.AccessKey]; !found {
 				accessKeySet[cred.AccessKey] = ident.Name
-			} else {
+			} else if userName != ident.Name {
 				return fmt.Errorf("duplicate accessKey[%s], already configured in user[%s]", cred.AccessKey, userName)
 			}
 		}
