@@ -38,8 +38,8 @@ type CopyOptions struct {
 	diskType           *string
 	maxMB              *int
 	masterClient       *wdclient.MasterClient
-	concurrenctFiles   *int
-	concurrenctChunks  *int
+	concurrentFiles    *int
+	concurrentChunks   *int
 	grpcDialOption     grpc.DialOption
 	masters            []string
 	cipher             bool
