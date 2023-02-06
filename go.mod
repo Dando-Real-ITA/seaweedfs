@@ -3,8 +3,8 @@ module github.com/seaweedfs/seaweedfs
 go 1.19
 
 require (
-	cloud.google.com/go v0.104.0 // indirect
-	cloud.google.com/go/pubsub v1.25.1
+	cloud.google.com/go v0.105.0 // indirect
+	cloud.google.com/go/pubsub v1.27.1
 	cloud.google.com/go/storage v1.27.0
 	github.com/Azure/azure-pipeline-go v0.2.3
 	github.com/Azure/azure-storage-blob-go v0.15.0
@@ -43,7 +43,7 @@ require (
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/google/uuid v1.3.0
 	github.com/google/wire v0.5.0 // indirect
-	github.com/googleapis/gax-go/v2 v2.6.0 // indirect
+	github.com/googleapis/gax-go/v2 v2.7.0 // indirect
 	github.com/gorilla/mux v1.8.0
 	github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -108,23 +108,23 @@ require (
 	github.com/youmark/pkcs8 v0.0.0-20181117223130-1be2e3e5546d // indirect
 	go.etcd.io/etcd/client/v3 v3.5.5
 	go.mongodb.org/mongo-driver v1.10.3
-	go.opencensus.io v0.23.0 // indirect
+	go.opencensus.io v0.24.0 // indirect
 	gocloud.dev v0.27.0
 	gocloud.dev/pubsub/natspubsub v0.27.0
 	gocloud.dev/pubsub/rabbitpubsub v0.27.0
 	golang.org/x/crypto v0.1.0 // indirect
 	golang.org/x/exp v0.0.0-20220414153411-bcd21879b8fd
 	golang.org/x/image v0.0.0-20200119044424-58c23975cae1
-	golang.org/x/net v0.1.0
+	golang.org/x/net v0.2.0
 	golang.org/x/oauth2 v0.0.0-20221014153046-6fdb5e3db783 // indirect
-	golang.org/x/sys v0.1.0
+	golang.org/x/sys v0.2.0
 	golang.org/x/text v0.4.0 // indirect
 	golang.org/x/tools v0.2.0
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
-	google.golang.org/api v0.101.0
+	google.golang.org/api v0.103.0
 	google.golang.org/appengine v1.6.7 // indirect
-	google.golang.org/genproto v0.0.0-20221018160656-63c7b68cfc55 // indirect
-	google.golang.org/grpc v1.50.1
+	google.golang.org/genproto v0.0.0-20221202195650-67e5cbc046fd // indirect
+	google.golang.org/grpc v1.51.0
 	google.golang.org/protobuf v1.28.1
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	modernc.org/b v1.0.0 // indirect
@@ -149,7 +149,7 @@ require (
 	github.com/hashicorp/raft v1.3.11
 	github.com/hashicorp/raft-boltdb/v2 v2.2.2
 	github.com/rabbitmq/amqp091-go v1.5.0
-	github.com/tikv/client-go/v2 v2.0.1
+	github.com/tikv/client-go/v2 v2.0.5
 	github.com/ydb-platform/ydb-go-sdk-auth-environ v0.1.2
 	github.com/ydb-platform/ydb-go-sdk/v3 v3.39.0
 	golang.org/x/sync v0.1.0
@@ -157,8 +157,9 @@ require (
 )
 
 require (
-	cloud.google.com/go/compute v1.10.0 // indirect
-	cloud.google.com/go/iam v0.3.0 // indirect
+	cloud.google.com/go/compute v1.13.0 // indirect
+	cloud.google.com/go/compute/metadata v0.2.1 // indirect
+	cloud.google.com/go/iam v0.7.0 // indirect
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect
 	github.com/aws/aws-sdk-go-v2 v1.16.8 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.15.15 // indirect
@@ -195,7 +196,7 @@ require (
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.1.1 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
-	github.com/mattn/go-runewidth v0.0.7 // indirect
+	github.com/mattn/go-runewidth v0.0.8 // indirect
 	github.com/mattn/go-sqlite3 v2.0.1+incompatible // indirect
 	github.com/montanaflynn/stats v0.6.6 // indirect
 	github.com/nats-io/nats.go v1.16.0 // indirect
@@ -207,12 +208,15 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.17 // indirect
 	github.com/pingcap/errors v0.11.5-0.20211224045212-9687c2b0f87c // indirect
 	github.com/pingcap/failpoint v0.0.0-20210918120811-547c13e3eb00 // indirect
-	github.com/pingcap/kvproto v0.0.0-20220106070556-3fa8fa04f898 // indirect
-	github.com/pingcap/log v0.0.0-20211215031037-e024ba4eb0ee // indirect
+	github.com/pingcap/kvproto v0.0.0-20230201112839-2b853bed8125 // indirect
+	github.com/pingcap/log v1.1.1-0.20221110025148-ca232912c9f3 // indirect
 	github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/stathat/consistent v1.0.0 // indirect
 	github.com/subosito/gotenv v1.4.1 // indirect
-	github.com/tikv/pd/client v0.0.0-20220216070739-26c668271201 // indirect
+	github.com/tiancaiamao/gp v0.0.0-20221230034425-4025bc8a4d4a // indirect
+	github.com/tikv/pd v1.1.0-beta.0.20230202094356-18df271ce57f // indirect
+	github.com/tikv/pd/client v0.0.0-20230202094356-18df271ce57f // indirect
 	github.com/tinylib/msgp v1.1.6 // indirect
 	github.com/twmb/murmur3 v1.1.3 // indirect
 	github.com/yandex-cloud/go-genproto v0.0.0-20211115083454-9ca41db5ed9e // indirect
@@ -222,7 +226,7 @@ require (
 	go.etcd.io/bbolt v1.3.6 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.5 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.5 // indirect
-	go.uber.org/atomic v1.9.0 // indirect
+	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
 	go.uber.org/zap v1.22.0 // indirect
 	golang.org/x/mod v0.6.0 // indirect
