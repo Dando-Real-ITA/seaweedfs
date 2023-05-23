@@ -2,15 +2,16 @@ package topology
 
 import (
 	"errors"
+	"math/rand"
+	"strings"
+	"sync"
+	"sync/atomic"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"math/rand"
-	"strings"
-	"sync"
-	"sync/atomic"
 )
 
 type NodeId string
@@ -73,7 +74,7 @@ func (n *NodeImpl) PickNodesByWeight(numberOfNodes int, option *VolumeGrowOption
 	n.RUnlock()
 	if len(candidates) < numberOfNodes {
 		glog.V(0).Infoln(n.Id(), "failed to pick", numberOfNodes, "from ", len(candidates), "node candidates")
-		return nil, nil, errors.New("No enough data node found!")
+		return nil, nil, errors.New("Not enough data nodes found!")
 	}
 
 	//pick nodes randomly by weights, the node picked earlier has higher final weights
@@ -242,6 +243,7 @@ func (n *NodeImpl) CollectDeadNodeAndFullVolumes(freshThreshHold int64, volumeSi
 	if n.IsRack() {
 		for _, c := range n.Children() {
 			dn := c.(*DataNode) //can not cast n to DataNode
+			dn.RLock()
 			for _, v := range dn.GetVolumes() {
 				if v.Size >= volumeSizeLimit {
 					//fmt.Println("volume",v.Id,"size",v.Size,">",volumeSizeLimit)
@@ -258,6 +260,7 @@ func (n *NodeImpl) CollectDeadNodeAndFullVolumes(freshThreshHold int64, volumeSi
 					}
 				}
 			}
+			dn.RUnlock()
 		}
 	} else {
 		for _, c := range n.Children() {

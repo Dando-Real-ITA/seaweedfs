@@ -2,12 +2,14 @@ package mount
 
 import (
 	"context"
+	"syscall"
+	"time"
+
 	"github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"syscall"
-	"time"
 )
 
 /*
@@ -67,12 +69,13 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 			Name:            name,
 			IsDirectory:     false,
 			Attributes:      oldEntry.Attributes,
-			Chunks:          oldEntry.Chunks,
+			Chunks:          oldEntry.GetChunks(),
 			Extended:        oldEntry.Extended,
 			HardLinkId:      oldEntry.HardLinkId,
 			HardLinkCounter: oldEntry.HardLinkCounter,
 		},
-		Signatures: []int32{wfs.signature},
+		Signatures:               []int32{wfs.signature},
+		SkipCheckParentDirectory: true,
 	}
 
 	// apply changes to the filer, and also apply to local metaCache

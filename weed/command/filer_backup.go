@@ -19,6 +19,7 @@ type FilerBackupOptions struct {
 	debug           *bool
 	proxyByFiler    *bool
 	timeAgo         *time.Duration
+	retentionDays   *int
 }
 
 var (
@@ -33,6 +34,8 @@ func init() {
 	filerBackupOptions.proxyByFiler = cmdFilerBackup.Flag.Bool("filerProxy", false, "read and write file chunks by filer instead of volume servers")
 	filerBackupOptions.debug = cmdFilerBackup.Flag.Bool("debug", false, "debug mode to print out received files")
 	filerBackupOptions.timeAgo = cmdFilerBackup.Flag.Duration("timeAgo", 0, "start time before now. \"300ms\", \"1.5h\" or \"2h45m\". Valid time units are \"ns\", \"us\" (or \"µs\"), \"ms\", \"s\", \"m\", \"h\"")
+	filerBackupOptions.retentionDays = cmdFilerBackup.Flag.Int("retentionDays", 0, "incremental backup retention days")
+
 }
 
 var cmdFilerBackup = &Command{
@@ -123,6 +126,31 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		return setOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, int32(sinkId), lastTsNs)
 	})
 
-	return pb.FollowMetadata(sourceFiler, grpcDialOption, "backup_"+dataSink.GetName(), clientId, clientEpoch, sourcePath, nil, startFrom.UnixNano(), 0, 0, processEventFnWithOffset, pb.TrivialOnError)
+	if dataSink.IsIncremental() && *filerBackupOptions.retentionDays > 0 {
+		go func() {
+			for {
+				now := time.Now()
+				time.Sleep(time.Hour * 24)
+				key := util.Join(targetPath, now.Add(-1*time.Hour*24*time.Duration(*filerBackupOptions.retentionDays)).Format("2006-01-02"))
+				_ = dataSink.DeleteEntry(util.Join(targetPath, key), true, true, nil)
+				glog.V(0).Infof("incremental backup delete directory:%s", key)
+			}
+		}()
+	}
+
+	metadataFollowOption := &pb.MetadataFollowOption{
+		ClientName:             "backup_" + dataSink.GetName(),
+		ClientId:               clientId,
+		ClientEpoch:            clientEpoch,
+		SelfSignature:          0,
+		PathPrefix:             sourcePath,
+		AdditionalPathPrefixes: nil,
+		DirectoriesToWatch:     nil,
+		StartTsNs:              startFrom.UnixNano(),
+		StopTsNs:               0,
+		EventErrorType:         pb.TrivialOnError,
+	}
+
+	return pb.FollowMetadata(sourceFiler, grpcDialOption, metadataFollowOption, processEventFnWithOffset)
 
 }

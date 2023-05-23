@@ -1,5 +1,5 @@
 # 2022-11-02 06:01:53
-FROM registry.hub.docker.com/amd64/golang:1.19-alpine as builder
+FROM registry.hub.docker.com/amd64/golang:1.20-alpine as builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
 WORKDIR /go/src/github.com/seaweedfs/
