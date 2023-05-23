@@ -174,7 +174,7 @@ func setCache(w http.ResponseWriter, ext string) {
 	immutable := false
 
 	if ext == ".m3u8" {
-		maxAge = "6"
+		maxAge = "3"
 		staleTime = "3"
 	} else if match, _ := regexp.MatchString("\\.(?:css(\\.map)?|js(\\.map)?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4[as]|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv|ts)", ext); match {
 		immutable = true
@@ -187,5 +187,12 @@ func setCache(w http.ResponseWriter, ext string) {
 
 	w.Header().Set("Pragma", "public")
 	w.Header().Set("Cache-Control", "\""+cacheHeader+"\"")
+
+	// CORS
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Methods", "*")
 
 }
