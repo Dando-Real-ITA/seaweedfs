@@ -138,6 +138,7 @@ func OptionsHandler(w http.ResponseWriter, r *http.Request, isReadOnly bool) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 }
 
 // maybeCheckJwtAuthorization returns true if access should be granted, false if it should be denied

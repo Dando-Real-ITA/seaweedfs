@@ -195,5 +195,6 @@ func setCache(w http.ResponseWriter, ext string) {
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
 	w.Header().Set("Access-Control-Allow-Methods", "*")
+	w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 
 }
