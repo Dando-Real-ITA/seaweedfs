@@ -11,6 +11,10 @@ import (
 )
 
 func TotalSize(chunks []*filer_pb.FileChunk) (size uint64) {
+	size = 0
+	if chunks == nil {
+		return
+	}
 	for _, c := range chunks {
 		t := uint64(c.Offset + int64(c.Size))
 		if size < t {
