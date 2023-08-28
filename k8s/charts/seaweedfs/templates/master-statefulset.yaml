@@ -5,10 +5,10 @@ metadata:
   name: {{ template "seaweedfs.name" . }}-master
   namespace: {{ .Release.Namespace }}
   labels:
-    app: {{ template "seaweedfs.name" . }}
-    chart: {{ template "seaweedfs.chart" . }}
-    heritage: {{ .Release.Service }}
-    release: {{ .Release.Name }}
+    app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   serviceName: {{ template "seaweedfs.name" . }}-master
   podManagementPolicy: Parallel
@@ -21,17 +21,17 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      app: {{ template "seaweedfs.name" . }}
-      chart: {{ template "seaweedfs.chart" . }}
-      release: {{ .Release.Name }}
-      component: master
+      app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+      helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: master
   template:
     metadata:
       labels:
-        app: {{ template "seaweedfs.name" . }}
-        chart: {{ template "seaweedfs.chart" . }}
-        release: {{ .Release.Name }}
-        component: master
+        app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+        helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: master
     spec:
       restartPolicy: {{ default .Values.global.restartPolicy .Values.master.restartPolicy }}
       {{- if .Values.master.affinity }}
@@ -42,15 +42,15 @@ spec:
       tolerations:
         {{ tpl .Values.master.tolerations . | nindent 8 | trim }}
       {{- end }}
-      {{- if .Values.global.imagePullSecrets }}
-      imagePullSecrets:
-        - name: {{ .Values.global.imagePullSecrets }}
-      {{- end }}
+      {{- include "seaweedfs.imagePullSecrets" . | nindent 6 }}
       terminationGracePeriodSeconds: 60
       {{- if .Values.master.priorityClassName }}
       priorityClassName: {{ .Values.master.priorityClassName | quote }}
       {{- end }}
       enableServiceLinks: false
+      {{- if .Values.master.serviceAccountName }}
+      serviceAccountName: {{ .Values.master.serviceAccountName | quote }}
+      {{- end }}
       {{- if .Values.master.initContainers }}
       initContainers:
         {{ tpl .Values.master.initContainers . | nindent 8 | trim }}
@@ -138,8 +138,10 @@ spec:
           volumeMounts:
             - name : data-{{ .Release.Namespace }}
               mountPath: /data
+            {{- if eq .Values.master.logs.type "hostPath" }}
             - name: seaweedfs-master-log-volume
               mountPath: "/logs/"
+            {{- end }}
             {{- if .Values.global.enableSecurity }}
             - name: security-config
               readOnly: true
@@ -236,7 +238,7 @@ spec:
       nodeSelector:
         {{ tpl .Values.master.nodeSelector . | indent 8 | trim }}
       {{- end }}
-  {{- $pvc_exists := include "volume.pvc_exists" . -}}
+  {{- $pvc_exists := include "master.pvc_exists" . -}}
   {{- if $pvc_exists }}
   volumeClaimTemplates:
     {{- if eq .Values.master.data.type "persistentVolumeClaim"}}

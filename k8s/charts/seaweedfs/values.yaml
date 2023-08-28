@@ -124,9 +124,14 @@ master:
   # ref: https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/
   priorityClassName: ""
 
+  # used to assign a service account.
+  # ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+  serviceAccountName: ""
+
   ingress:
     enabled: false
     className: "nginx"
+    # host: false for "*" hostname
     host: "master.seaweedfs.local"
     annotations:
       nginx.ingress.kubernetes.io/auth-type: "basic"
@@ -264,6 +269,9 @@ volume:
   # ref: https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/
   priorityClassName: ""
 
+  # used to assign a service account.
+  # ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+  serviceAccountName: ""
 
 filer:
   enabled: true
@@ -372,9 +380,14 @@ filer:
   # ref: https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/
   priorityClassName: ""
 
+  # used to assign a service account.
+  # ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+  serviceAccountName: ""
+
   ingress:
     enabled: false
     className: "nginx"
+    # host: false for "*" hostname
     host: "seaweedfs.cluster.local"
     annotations:
       nginx.ingress.kubernetes.io/backend-protocol: GRPC
@@ -490,6 +503,10 @@ s3:
   # used to assign priority to server pods
   # ref: https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/
   priorityClassName: ""
+
+  # used to assign a service account.
+  # ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+  serviceAccountName: ""
 
   logs:
     type: "hostPath"
