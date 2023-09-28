@@ -305,7 +305,7 @@ func processRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 	//mostly copy from src/pkg/net/http/fs.go
 	ranges, err := parseRange(rangeReq, totalSize)
 	if err != nil {
-		glog.Errorf("processRangeRequest, rangeReq/totalSize: %s/%d headers: Read: %+v - Write: %+v err: %v", rangeReq, totalSize, r.Header, w.Header(), err)
+		glog.Errorf("processRangeRequest, rangeReq/totalSize: %s/%s headers: Read: %+v - Write: %+v err: %v", rangeReq, strconv.FormatInt(totalSize, 10), r.Header, w.Header(), err)
 		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
 		return fmt.Errorf("processRangeRequest header: %v", err)
 	}
