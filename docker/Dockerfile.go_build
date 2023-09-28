@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# 2023-09-28 10:21:36
+# 2023-09-28 10:39:49
 
 FROM registry.hub.docker.com/amd64/golang:1.20-alpine as builder
 RUN apk add git g++ fuse3
@@ -41,7 +41,7 @@ WORKDIR /
 LABEL author="Chris Lu"
 LABEL maintainer="Gaspare Iengo <gaspare@katapy.com>"
 RUN mkdir -p /etc/seaweedfs
-COPY /etc/mime.types /etc/mime.types
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/mime.types /etc/mime.types
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/start.sh /start.sh
