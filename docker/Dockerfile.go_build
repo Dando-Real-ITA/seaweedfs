@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# 2023-09-28 10:45:49
+# 2023-11-28 14:52:14
 
 FROM registry.hub.docker.com/amd64/golang:1.21-alpine as builder
 RUN apk add git g++ fuse3
@@ -18,7 +18,7 @@ WORKDIR seaweedfs/weed
 RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/go/pkg/mod \
   export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/seaweedfs/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
-  CGO_ENABLED=0 go install -tags "elastic,ydb,gocdk,tikv" -ldflags "-s -w -extldflags -static ${LDFLAGS}"
+  CGO_ENABLED=0 go install -tags "elastic,ydb,gocdk,tikv,rclone" -ldflags "-s -w -extldflags -static ${LDFLAGS}"
 
   ###########################################################################
 
@@ -27,7 +27,7 @@ FROM builder as builder_large
 RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/go/pkg/mod \
   export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD) -X github.com/seaweedfs/seaweedfs/weed/util.PRIVATE_VERSION=$(git describe --tags --abbrev=0)" && \
-  CGO_ENABLED=0 go install -tags "5BytesOffset,elastic,ydb,gocdk,tikv" -ldflags "-s -w -extldflags -static ${LDFLAGS}"
+  CGO_ENABLED=0 go install -tags "5BytesOffset,elastic,ydb,gocdk,tikv,rclone" -ldflags "-s -w -extldflags -static ${LDFLAGS}"
 
   ###########################################################################
 
