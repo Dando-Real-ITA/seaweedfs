@@ -12,6 +12,23 @@ const (
 	LockBrokerBalancer = "broker_balancer"
 )
 
+// Balancer collects stats from all brokers.
+//
+//	When publishers wants to create topics, it picks brokers to assign the topic partitions.
+//	When consumers wants to subscribe topics, it tells which brokers are serving the topic partitions.
+//
+// When a partition needs to be split or merged, or a partition needs to be moved to another broker,
+// the balancer will let the broker tell the consumer instance to stop processing the partition.
+// The existing consumer instance will flush the internal state, and then stop processing.
+// Then the balancer will tell the brokers to start sending new messages in the new/moved partition to the consumer instances.
+//
+// Failover to standby consumer instances:
+//
+//	A consumer group can have min and max number of consumer instances.
+//	For consumer instances joined after the max number, they will be in standby mode.
+//
+//	When a consumer instance is down, the broker will notice this and inform the balancer.
+//	The balancer will then tell the broker to send the partition to another standby consumer instance.
 type Balancer struct {
 	Brokers cmap.ConcurrentMap[string, *BrokerStats]
 }
@@ -32,10 +49,8 @@ func (bs *BrokerStats) UpdateStats(stats *mq_pb.BrokerStats) {
 	for _, topicPartitionStats := range stats.Stats {
 		tps := &TopicPartitionStats{
 			TopicPartition: topic.TopicPartition{
-				Namespace:  topicPartitionStats.Topic.Namespace,
-				Topic:      topicPartitionStats.Topic.Name,
-				RangeStart: topicPartitionStats.Partition.RangeStart,
-				RangeStop:  topicPartitionStats.Partition.RangeStop,
+				Topic:     topic.Topic{Namespace: topicPartitionStats.Topic.Namespace, Name: topicPartitionStats.Topic.Name},
+				Partition: topic.Partition{RangeStart: topicPartitionStats.Partition.RangeStart, RangeStop: topicPartitionStats.Partition.RangeStop, RingSize: topicPartitionStats.Partition.RingSize},
 			},
 			ConsumerCount: topicPartitionStats.ConsumerCount,
 			IsLeader:      topicPartitionStats.IsLeader,
@@ -56,10 +71,8 @@ func (bs *BrokerStats) UpdateStats(stats *mq_pb.BrokerStats) {
 func (bs *BrokerStats) RegisterAssignment(t *mq_pb.Topic, partition *mq_pb.Partition) {
 	tps := &TopicPartitionStats{
 		TopicPartition: topic.TopicPartition{
-			Namespace:  t.Namespace,
-			Topic:      t.Name,
-			RangeStart: partition.RangeStart,
-			RangeStop:  partition.RangeStop,
+			Topic:     topic.Topic{Namespace: t.Namespace, Name: t.Name},
+			Partition: topic.Partition{RangeStart: partition.RangeStart, RangeStop: partition.RangeStop},
 		},
 		ConsumerCount: 0,
 		IsLeader:      true,

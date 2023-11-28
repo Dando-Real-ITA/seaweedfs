@@ -178,3 +178,8 @@ func (fs *FilerServer) maybeCheckJwtAuthorization(r *http.Request, isWrite bool)
 		return true
 	}
 }
+
+func (fs *FilerServer) filerHealthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Server", "SeaweedFS Filer "+util.VERSION)
+	w.WriteHeader(http.StatusOK)
+}

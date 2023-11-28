@@ -10,6 +10,14 @@ global:
   restartPolicy: Always
   loggingLevel: 1
   enableSecurity: false
+  securityConfig:
+    jwtSigning:
+      volumeWrite: true
+      volumeRead: false
+      filerWrite: false
+      filerRead: false
+  # we will use this serviceAccountName for all ClusterRoles/ClusterRoleBindings
+  serviceAccountName: "seaweedfs"
   certificates:
     alphacrds: false
   monitoring:
@@ -66,11 +74,19 @@ master:
     # Enter any extra configuration for master.toml here.
     # It may be be a multi-line string.
 
-  # can use ANY storage-class , example with local-path-provisioner
+  # You may use ANY storage-class, example with local-path-provisioner
+  # Annotations are optional.
   #  data:
   #    type: "persistentVolumeClaim"
   #    size: "24Ti"
   #    storageClass: "local-path-provisioner"
+  #    annotations:
+  #      "key": "value"
+  #
+  # You may also spacify an existing claim:
+  #  data:
+  #    type: "existingClaim"
+  #    claimName: "my-pvc"
   data:
     type: "hostPath"
     size: ""
@@ -87,6 +103,9 @@ master:
 
   extraVolumes: ""
   extraVolumeMounts: ""
+
+  ## Set podManagementPolicy
+  podManagementPolicy: Parallel
 
   # Resource requests, limits, etc. for the master cluster placement. This
   # should map directly to the value of the resources field for a PodSpec,
@@ -120,7 +139,7 @@ master:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-    beta.kubernetes.io/arch: amd64
+    kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-backend: "true"
 
@@ -153,6 +172,7 @@ master:
         sub_filter '=/' '=./';
         sub_filter '/seaweedfsstatic' './seaweedfsstatic';
         sub_filter_once off;
+    tls: []
 
   extraEnvironmentVars:
     WEED_MASTER_VOLUME_GROWTH_COPY_1: 7
@@ -208,11 +228,20 @@ volume:
   # minimum free disk space(in percents). If free disk space lower this value - all volumes marks as ReadOnly
   minFreeSpacePercent: 7
 
-# can use ANY storage-class , example with local-path-provisioner
-#  data:
-#    type: "persistentVolumeClaim"
-#    size: "24Ti"
-#    storageClass: "local-path-provisioner"
+  # You may use ANY storage-class, example with local-path-provisioner
+  # Annotations are optional.
+  #  data:
+  #    type: "persistentVolumeClaim"
+  #    size: "24Ti"
+  #    storageClass: "local-path-provisioner"
+  #    annotations:
+  #      "key": "value"
+  #
+  # You may also spacify an existing claim:
+  #  data:
+  #    type: "existingClaim"
+  #    claimName: "my-pvc"
+
   data:
     type: "hostPath"
     size: ""
@@ -263,6 +292,9 @@ volume:
   extraVolumes: ""
   extraVolumeMounts: ""
 
+  ## Set podManagementPolicy
+  podManagementPolicy: Parallel
+
   # Affinity Settings
   # Commenting out or setting as empty the affinity variable, will allow
   # deployment to single node services such as Minikube
@@ -291,7 +323,7 @@ volume:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-   beta.kubernetes.io/arch: amd64
+   kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-volume: "true"
 
@@ -373,12 +405,19 @@ filer:
   storage: 25Gi
   # storageClass is the class of storage which defaults to null (the Kube cluster will pick the default).
   storageClass: null
-
-  # can use ANY storage-class , example with local-path-provisioner
+  # You may use ANY storage-class, example with local-path-provisioner
+  # Annotations are optional.
   #  data:
   #    type: "persistentVolumeClaim"
   #    size: "24Ti"
   #    storageClass: "local-path-provisioner"
+  #    annotations:
+  #      "key": "value"
+  #
+  # You may also specify an existing claim:
+  #  data:
+  #    type: "existingClaim"
+  #    claimName: "my-pvc"
   data:
     type: "hostPath"
     size: ""
@@ -395,6 +434,9 @@ filer:
 
   extraVolumes: ""
   extraVolumeMounts: ""
+
+  ## Set podManagementPolicy
+  podManagementPolicy: Parallel
 
   # Affinity Settings
   # Commenting out or setting as empty the affinity variable, will allow
@@ -428,7 +470,7 @@ filer:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-    beta.kubernetes.io/arch: amd64
+    kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-backend: "true"
 
@@ -530,9 +572,19 @@ filer:
     # Suffix of the host name, {bucket}.{domainName}
     domainName: ""
     # enable user & permission to s3 (need to inject to all services)
-    enableAuth: false
+    enableAuth: true
     skipAuthSecretCreation: false
+    # set to the name of an existing kubernetes Secret with the s3 json config file
+    # should have a secret key called seaweedfs_s3_config with an inline json configure
+    existingConfigSecret: ""
     auditLogConfig: {}
+    # You may specify buckets to be created during the install process.
+    # Buckets may be exposed publicly by setting `anonymousRead` to `true`
+    # createBuckets:
+    #   - name: bucket-a
+    #     anonymousRead: true
+    #   - name: bucket-b
+    #     anonymousRead: false
 
 s3:
   enabled: false
@@ -552,6 +604,9 @@ s3:
   # enable user & permission to s3 (need to inject to all services)
   enableAuth: false
   skipAuthSecretCreation: false
+  # set to the name of an existing kubernetes Secret with the s3 json config file
+  # should have a secret key called seaweedfs_s3_config with an inline json config
+  existingConfigSecret: false
   auditLogConfig: {}
 
   # Suffix of the host name, {bucket}.{domainName}
@@ -577,7 +632,7 @@ s3:
   # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector
   # Example:
   nodeSelector: |
-    beta.kubernetes.io/arch: amd64
+    kubernetes.io/arch: amd64
   # nodeSelector: |
   #   sw-backend: "true"
 
@@ -621,6 +676,15 @@ s3:
     failureThreshold: 100
     timeoutSeconds: 10
 
+  ingress:
+    enabled: false
+    className: "nginx"
+    # host: false for "*" hostname
+    host: "seaweedfs.cluster.local"
+    # additional ingress annotations for the s3 endpoint
+    annotations: []
+    tls: []
+
 certificates:
   commonName: "SeaweedFS CA"
   ipAddresses: []
@@ -628,3 +692,13 @@ certificates:
   keySize: 2048
   duration: 2160h  # 90d
   renewBefore: 360h  # 15d
+  externalCertificates:
+    # This will avoid the need to use cert-manager and will rely on providing your own external certificates and CA
+    # you will need to store your provided certificates in the secret read by the different services:
+    # seaweedfs-master-cert, seaweedfs-filer-cert, etc. Can see any statefulset definition to see secret names
+    enabled: false
+
+# Labels to be added to all the created pods
+podLabels: {}
+# Annotations to be added to all the created pods
+podAnnotations: {}

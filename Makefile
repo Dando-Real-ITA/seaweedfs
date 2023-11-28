@@ -3,6 +3,7 @@ package = github.com/seaweedfs/seaweedfs/weed
 
 GO_FLAGS = #-v
 SOURCE_DIR = ./weed/
+debug ?= 0
 
 appname := weed
 
