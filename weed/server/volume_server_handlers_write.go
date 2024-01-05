@@ -177,7 +177,7 @@ func setCache(w http.ResponseWriter, ext string) {
 	if ext == ".m3u8" {
 		maxAge = "3"
 		staleTime = "3"
-	} else if match, _ := regexp.MatchString("\\.(?:css(\\.map)?|js(\\.map)?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4[as]|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv|ts)", ext); match {
+	} else if match, _ := regexp.MatchString("\\.(?:css(\\.map)?|js(\\.map)?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4[as]|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv|ts)$", ext); match {
 		immutable = true
 	}
 
