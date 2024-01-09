@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,7 @@ type FilerOption struct {
 	ShowUIDirectoryDelete bool
 	DownloadMaxBytesPs    int64
 	DiskType              string
+	AllowedOrigins        []string
 }
 
 type FilerServer struct {
@@ -106,6 +108,12 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	readSigningKey := v.GetString("jwt.filer_signing.read.key")
 	v.SetDefault("jwt.filer_signing.read.expires_after_seconds", 60)
 	readExpiresAfterSec := v.GetInt("jwt.filer_signing.read.expires_after_seconds")
+
+	v.SetDefault("cors.allowed_origins.values", "*")
+
+	allowedOrigins := v.GetString("cors.allowed_origins.values")
+	domains := strings.Split(allowedOrigins, ",")
+	option.AllowedOrigins = domains
 
 	fs = &FilerServer{
 		option:                option,
@@ -171,7 +179,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	if isFresh {
 		glog.V(0).Infof("%s bootstrap from peers %+v", option.Host, existingNodes)
 		if err := fs.filer.MaybeBootstrapFromPeers(option.Host, existingNodes, startFromTime); err != nil {
-			glog.Fatalf("%s bootstrap from %+v", option.Host, existingNodes)
+			glog.Fatalf("%s bootstrap from %+v: %v", option.Host, existingNodes, err)
 		}
 	}
 	fs.filer.AggregateFromPeers(option.Host, existingNodes, startFromTime)

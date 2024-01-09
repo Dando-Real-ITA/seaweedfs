@@ -106,6 +106,7 @@ func init() {
 	filerOptions.port = cmdServer.Flag.Int("filer.port", 8888, "filer server http listen port")
 	filerOptions.portGrpc = cmdServer.Flag.Int("filer.port.grpc", 0, "filer server grpc listen port")
 	filerOptions.publicPort = cmdServer.Flag.Int("filer.port.public", 0, "filer server public http listen port")
+	filerOptions.allowedOrigins = cmdServer.Flag.String("filer.allowedOrigins", "*", "comma separated list of allowed origins")
 	filerOptions.defaultReplicaPlacement = cmdServer.Flag.String("filer.defaultReplicaPlacement", "", "default replication type. If not specified, use master setting.")
 	filerOptions.disableDirListing = cmdServer.Flag.Bool("filer.disableDirListing", false, "turn off directory listing")
 	filerOptions.maxMB = cmdServer.Flag.Int("filer.maxMB", 4, "split files larger than the limit")
@@ -142,6 +143,7 @@ func init() {
 	s3Options.portHttps = cmdServer.Flag.Int("s3.port.https", 0, "s3 server https listen port")
 	s3Options.portGrpc = cmdServer.Flag.Int("s3.port.grpc", 0, "s3 server grpc listen port")
 	s3Options.domainName = cmdServer.Flag.String("s3.domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
+	s3Options.allowedOrigins = cmdServer.Flag.String("s3.allowedOrigins", "*", "comma separated list of allowed origins")
 	s3Options.tlsPrivateKey = cmdServer.Flag.String("s3.key.file", "", "path to the TLS private key file")
 	s3Options.tlsCertificate = cmdServer.Flag.String("s3.cert.file", "", "path to the TLS certificate file")
 	s3Options.tlsCACertificate = cmdServer.Flag.String("s3.cacert.file", "", "path to the TLS CA certificate file")
@@ -162,6 +164,7 @@ func init() {
 	webdavOptions.tlsCertificate = cmdServer.Flag.String("webdav.cert.file", "", "path to the TLS certificate file")
 	webdavOptions.cacheDir = cmdServer.Flag.String("webdav.cacheDir", os.TempDir(), "local cache directory for file chunks")
 	webdavOptions.cacheSizeMB = cmdServer.Flag.Int64("webdav.cacheCapacityMB", 0, "local cache capacity in MB")
+	webdavOptions.maxMB = cmdServer.Flag.Int("webdav.maxMB", 4, "split files larger than the limit")
 	webdavOptions.filerRootPath = cmdServer.Flag.String("webdav.filer.path", "/", "use this remote path from filer server")
 
 	mqBrokerOptions.port = cmdServer.Flag.Int("mq.broker.port", 17777, "message queue broker gRPC listen port")

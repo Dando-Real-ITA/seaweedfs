@@ -127,7 +127,8 @@ spec:
               -metrics.intervalSeconds={{ .Values.master.metricsIntervalSec }} \
               {{- end }}
               {{- end }}
-              {{- else if .Values.master.metricsPort }}
+              {{- end }}
+              {{- if .Values.master.metricsPort }}
               -metricsPort={{ .Values.master.metricsPort }} \
               {{- end }}
               -volumeSizeLimitMB={{ .Values.master.volumeSizeLimitMB }} \
@@ -212,9 +213,9 @@ spec:
           resources:
             {{ tpl .Values.master.resources . | nindent 12 | trim }}
           {{- end }}
-      {{- $hostpath_exists := include "master.hostpath_exists" . -}}
-      {{- $existing_claims := include "master.existing_claims" . -}}
-      {{- if or ($hostpath_exists) ($existing_claims) }}
+        {{- if .Values.master.sidecars }}
+        {{- include "common.tplvalues.render" (dict "value" .Values.master.sidecars "context" $) | nindent 8 }}
+        {{- end }}
       volumes:
         {{- if eq .Values.master.logs.type "hostPath" }}
         - name: seaweedfs-master-log-volume
@@ -262,7 +263,6 @@ spec:
             secretName: {{ template "seaweedfs.name" . }}-client-cert
         {{- end }}
         {{ tpl .Values.master.extraVolumes . | indent 8 | trim }}
-      {{- end }}
       {{- if .Values.master.nodeSelector }}
       nodeSelector:
         {{ tpl .Values.master.nodeSelector . | indent 8 | trim }}
