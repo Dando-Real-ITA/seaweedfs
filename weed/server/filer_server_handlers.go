@@ -3,7 +3,6 @@ package weed_server
 import (
 	"errors"
 	"net/http"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -115,7 +114,7 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 
 	start := time.Now()
 
-	os.Stdout.WriteString("Request: " + r.Method + " " + r.URL.String() + "\n")
+	glog.V(1).Infof("Request: " + r.Method + " " + r.URL.String() + "\n")
 
 	origin := r.Header.Get("Origin")
 	if origin != "" {
