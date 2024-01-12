@@ -3,6 +3,8 @@ package weed_server
 import (
 	"errors"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,7 +18,8 @@ import (
 
 func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-
+	statusRecorder := stats.NewStatusResponseWriter(w)
+	w = statusRecorder
 	origin := r.Header.Get("Origin")
 	if origin != "" {
 		if fs.option.AllowedOrigins == nil || len(fs.option.AllowedOrigins) == 0 || fs.option.AllowedOrigins[0] == "*" {
@@ -52,11 +55,16 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		fileId = r.RequestURI[len("/?proxyChunkId="):]
 	}
 	if fileId != "" {
-		stats.FilerRequestCounter.WithLabelValues(stats.ChunkProxy).Inc()
 		fs.proxyToVolumeServer(w, r, fileId)
+		stats.FilerHandlerCounter.WithLabelValues(stats.ChunkProxy).Inc()
 		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkProxy).Observe(time.Since(start).Seconds())
 		return
 	}
+
+	defer func() {
+		stats.FilerRequestCounter.WithLabelValues(r.Method, strconv.Itoa(statusRecorder.Status)).Inc()
+		stats.FilerRequestHistogram.WithLabelValues(r.Method).Observe(time.Since(start).Seconds())
+	}()
 
 	isReadHttpCall := r.Method == "GET" || r.Method == "HEAD"
 	if !fs.maybeCheckJwtAuthorization(r, !isReadHttpCall) {
@@ -64,12 +72,8 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stats.FilerRequestCounter.WithLabelValues(r.Method).Inc()
-	defer func() {
-		stats.FilerRequestHistogram.WithLabelValues(r.Method).Observe(time.Since(start).Seconds())
-	}()
-
 	w.Header().Set("Server", "SeaweedFS Filer "+util.Version())
+
 	switch r.Method {
 	case "GET":
 		fs.GetOrHeadHandler(w, r)
@@ -113,6 +117,8 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
+	statusRecorder := stats.NewStatusResponseWriter(w)
+	w = statusRecorder
 
 	glog.V(1).Infof("Request: " + r.Method + " " + r.URL.String() + "\n")
 
@@ -138,8 +144,8 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
-	stats.FilerRequestCounter.WithLabelValues(r.Method).Inc()
 	defer func() {
+		stats.FilerRequestCounter.WithLabelValues(r.Method, strconv.Itoa(statusRecorder.Status)).Inc()
 		stats.FilerRequestHistogram.WithLabelValues(r.Method).Observe(time.Since(start).Seconds())
 	}()
 	// We handle OPTIONS first because it never should be authenticated
