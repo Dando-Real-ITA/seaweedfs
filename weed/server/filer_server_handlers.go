@@ -3,7 +3,6 @@ package weed_server
 import (
 	"errors"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
