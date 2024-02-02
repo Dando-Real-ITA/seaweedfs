@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2022-08-17 16:16:45
+# 2024-01-29 21:39:14
 
 ########################################################################################################################################################################################################################
 
@@ -86,6 +86,7 @@ sleep 10
 ARGS=""
 IP=""
 CIP=""
+PORT=""
 
 for ARG in $@; do
   if [[ ${DETECT_MASTERS:-true} != "false" ]]; then
@@ -303,27 +304,45 @@ for ARG in $@; do
     fi
   fi
 
+  if [[ $ARG == "-port="* ]]; then
+    VALUE=$(expr "$ARG" : '.*=\(.*\)')
+    PORT="$VALUE"
+  fi
+
   ARGS=${ARGS:+${ARGS} }$ARG
 done
 
-if ! [ -z "$CIP" ]; then
+if [ -n "$CIP" ]; then
   ARGS=${ARGS:+${ARGS} }$CIP
-elif ! [ -z "$IP" ]; then
+elif [ -n "$IP" ]; then
   ARGS=${ARGS:+${ARGS} }$IP
-elif ! [ -z "$PUBLIC_URL" ]; then
+elif [ -n "$PUBLIC_URL" ]; then
   HOST=$(expr "$PUBLIC_URL" : '\(.*\):')
   echo "Setting Host IP from Public Url: ${HOST}"
   ARGS=${ARGS:+${ARGS} }"-ip=${HOST}"
 fi
 
 # If there is a public url, add it to the parameters
-if ! [ -z "$PUBLIC_URL" ]; then
-  ARGS=${ARGS:+${ARGS} }"-publicUrl=$PUBLIC_URL"
+if [ -n "$PUBLIC_URL" ]; then
+  ARG_PUBLIC_URL="$PUBLIC_URL"
+  PUBLIC_URL_PORT=$(expr "$PUBLIC_URL" : '.*:\(.*\)')
+  if [ -z "$PUBLIC_URL_PORT" ]; then
+    if [ -n "$PORT" ]; then
+      PUBLIC_URL_PORT=$PORT
+    else
+      PUBLIC_URL_PORT=8080
+      echo "No public url port found, assuming default: $PUBLIC_URL_PORT";
+    fi
+    ARG_PUBLIC_URL="$PUBLIC_URL:$PUBLIC_URL_PORT"
+  fi
+  ARGS=${ARGS:+${ARGS} }"-publicUrl=$ARG_PUBLIC_URL"
 
   # If there is a tld, use it to extract rack and datacenter
-  # gpu01.dal1.llnw.katapy.io with tld=katapy.io -> -rack=dal1 -dataCenter=llnw
-  if ! [ -z "$TLD" ]; then
-    IFS='.' read -a hostname_parts <<<${PUBLIC_URL%.${TLD}}
+  # [vpn.]gpu01.nash01.usa.katapy.io[:8080] with tld=katapy.io -> -rack=nash01 -dataCenter=usa
+  if [ -n "$TLD" ]; then
+    rack_url=${PUBLIC_URL#vpn.}
+    rack_url=${rack_url%:*}
+    IFS='.' read -a hostname_parts <<<"${rack_url%."${TLD}"}"
     ARGS=${ARGS:+${ARGS} }"-rack=${hostname_parts[1]} -dataCenter=${hostname_parts[2]}"
   fi
 
