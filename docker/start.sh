@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2024-01-29 21:39:14
+# 2024-02-02 08:12:02
 
 ########################################################################################################################################################################################################################
 
@@ -86,7 +86,7 @@ sleep 10
 ARGS=""
 IP=""
 CIP=""
-PORT=""
+COMMAND_PORT=""
 
 for ARG in $@; do
   if [[ ${DETECT_MASTERS:-true} != "false" ]]; then
@@ -327,8 +327,8 @@ if [ -n "$PUBLIC_URL" ]; then
   ARG_PUBLIC_URL="$PUBLIC_URL"
   PUBLIC_URL_PORT=$(expr "$PUBLIC_URL" : '.*:\(.*\)')
   if [ -z "$PUBLIC_URL_PORT" ]; then
-    if [ -n "$PORT" ]; then
-      PUBLIC_URL_PORT=$PORT
+    if [ -n "$COMMAND_PORT" ]; then
+      PUBLIC_URL_PORT=$COMMAND_PORT
     else
       PUBLIC_URL_PORT=8080
       echo "No public url port found, assuming default: $PUBLIC_URL_PORT";
