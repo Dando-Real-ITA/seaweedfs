@@ -301,7 +301,7 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 			if float64(info.Size) > float64(vl.volumeSizeLimit)*option.Threshold() {
 				shouldGrow = true
 			}
-			return vid, count, locationList, shouldGrow, nil
+			return vid, count, locationList.Copy(), shouldGrow, nil
 		}
 		return 0, 0, nil, shouldGrow, errors.New("Strangely vid " + vid.String() + " is on no machine!")
 	}
@@ -336,7 +336,7 @@ func (vl *VolumeLayout) PickForWrite(count uint64, option *VolumeGrowOption) (vi
 			return
 		}
 	}
-	return vid, count, locationList, shouldGrow, fmt.Errorf("No writable volumes in DataCenter:%v Rack:%v DataNode:%v", option.DataCenter, option.Rack, option.DataNode)
+	return vid, count, locationList, true, fmt.Errorf("No writable volumes in DataCenter:%v Rack:%v DataNode:%v", option.DataCenter, option.Rack, option.DataNode)
 }
 
 func (vl *VolumeLayout) HasGrowRequest() bool {
