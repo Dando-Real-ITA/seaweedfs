@@ -144,7 +144,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		} else {
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				time.Sleep(1127 * time.Millisecond)
-				lastReadTime = lastReadTime.Add(100 * time.Millisecond)
+				lastReadTime = log_buffer.NewMessagePosition(lastReadTime.Time.Add(100*time.Millisecond).UnixNano(), -2)
 				continue
 			}
 		}
