@@ -95,3 +95,5 @@ docker/weed
 
 # test generated files
 weed/*/*.jpg
+docker/weed_sub
+docker/weed_pub

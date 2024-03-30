@@ -3,6 +3,7 @@ package weed_server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -118,8 +119,11 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if query.Get("metadata") == "true" {
-			writeJsonQuiet(w, r, http.StatusOK, entry)
-			return
+			// Don't return directory meta if config value is set to true
+			if fs.option.ExposeDirectoryData == false {
+				writeJsonError(w, r, http.StatusForbidden, errors.New("directory listing is disabled"))
+				return
+			}
 		}
 		if entry.Attr.Mime == "" || (entry.Attr.Mime == s3_constants.FolderMimeType && r.Header.Get(s3_constants.AmzIdentityId) == "") {
 			// return index of directory for non s3 gateway
