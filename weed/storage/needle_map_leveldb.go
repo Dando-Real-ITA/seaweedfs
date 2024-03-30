@@ -23,6 +23,7 @@ import (
 
 // mark it every watermarkBatchSize operations
 const watermarkBatchSize = 10000
+const maxRetries = 10
 
 var watermarkKey = []byte("idx_entry_watermark")
 
@@ -404,15 +405,23 @@ func reloadLdb(m *LevelDbNeedleMap) (err error) {
 	if m.db != nil {
 		return nil
 	}
-	glog.V(1).Infof("reloading leveldb %s", m.dbFileName)
-	m.accessFlag = 1
-	if m.db, err = leveldb.OpenFile(m.dbFileName, m.ldbOpts); err != nil {
-		if errors.IsCorrupted(err) {
-			m.db, err = leveldb.RecoverFile(m.dbFileName, m.ldbOpts)
-		}
-		if err != nil {
-			glog.Fatalf("RecoverFile %s failed:%v", m.dbFileName, err)
-			return err
+	tryNum := 1
+	for tryNum <= maxRetries {
+		glog.V(1).Infof("reloading leveldb %s", m.dbFileName)
+		m.accessFlag = 1
+		if m.db, err = leveldb.OpenFile(m.dbFileName, m.ldbOpts); err != nil {
+			if errors.IsCorrupted(err) {
+				m.db, err = leveldb.RecoverFile(m.dbFileName, m.ldbOpts)
+			}
+			if err != nil {
+				if tryNum == maxRetries {
+					glog.Fatalf("RecoverFile %s failed:%v", m.dbFileName, err)
+					return err
+				}
+				glog.V(1).Infof("Retrying to reload leveldb %s", m.dbFileName)
+				tryNum++
+				time.Sleep(1127 * time.Millisecond)
+			}
 		}
 	}
 	return nil
