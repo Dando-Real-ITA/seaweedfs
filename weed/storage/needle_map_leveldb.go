@@ -418,9 +418,9 @@ func reloadLdb(m *LevelDbNeedleMap) (err error) {
 					glog.Fatalf("RecoverFile %s failed:%v", m.dbFileName, err)
 					return err
 				}
-				glog.V(1).Infof("Retrying to reload leveldb %s", m.dbFileName)
+				glog.V(0).Infof("Retrying to reload leveldb %s", m.dbFileName)
 				tryNum++
-				time.Sleep(1127 * time.Millisecond)
+				time.Sleep(time.Millisecond*5000 + time.Duration(1127*tryNum)*time.Millisecond)
 			}
 		}
 	}
