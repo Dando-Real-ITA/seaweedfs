@@ -91,6 +91,7 @@ type FilerServer struct {
 	secret         security.SigningKey
 	filer          *filer.Filer
 	filerGuard     *security.Guard
+	volumeGuard    *security.Guard
 	grpcDialOption grpc.DialOption
 
 	// metrics read from the master
@@ -112,6 +113,14 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	readSigningKey := v.GetString("jwt.filer_signing.read.key")
 	v.SetDefault("jwt.filer_signing.read.expires_after_seconds", 60)
 	readExpiresAfterSec := v.GetInt("jwt.filer_signing.read.expires_after_seconds")
+
+	volumeSigningKey := v.GetString("jwt.signing.key")
+	v.SetDefault("jwt.signing.expires_after_seconds", 10)
+	volumeExpiresAfterSec := v.GetInt("jwt.signing.expires_after_seconds")
+
+	volumeReadSigningKey := v.GetString("jwt.signing.read.key")
+	v.SetDefault("jwt.signing.read.expires_after_seconds", 60)
+	volumeReadExpiresAfterSec := v.GetInt("jwt.signing.read.expires_after_seconds")
 
 	v.SetDefault("cors.allowed_origins.values", "*")
 
@@ -145,6 +154,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.filer.Cipher = option.Cipher
 	// we do not support IP whitelist right now
 	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
+	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec)
 
 	fs.checkWithMaster()
 
@@ -167,7 +177,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.option.recursiveDelete = v.GetBool("filer.options.recursive_delete")
 	v.SetDefault("filer.options.buckets_folder", "/buckets")
 	fs.filer.DirBucketsPath = v.GetString("filer.options.buckets_folder")
-	// TODO deprecated, will be be removed after 2020-12-31
+	// TODO deprecated, will be removed after 2020-12-31
 	// replaced by https://github.com/seaweedfs/seaweedfs/wiki/Path-Specific-Configuration
 	// fs.filer.FsyncBuckets = v.GetStringSlice("filer.options.buckets_fsync")
 	isFresh := fs.filer.LoadConfiguration(v)
