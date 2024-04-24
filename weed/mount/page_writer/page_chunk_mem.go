@@ -40,6 +40,7 @@ func (mc *MemChunk) FreeResource() {
 
 	atomic.AddInt64(&memChunkCounter, -1)
 	mem.Free(mc.buf)
+	mc.buf = nil
 }
 
 func (mc *MemChunk) WriteDataAt(src []byte, offset int64, tsNs int64) (n int) {
