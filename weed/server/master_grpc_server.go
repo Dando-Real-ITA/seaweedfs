@@ -73,6 +73,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 				DataCenter: dn.GetDataCenterId(),
 				Url:        dn.Url(),
 				PublicUrl:  dn.PublicUrl,
+				GrpcPort:   uint32(dn.GrpcPort),
 			}
 			for _, v := range dn.GetVolumes() {
 				message.DeletedVids = append(message.DeletedVids, uint32(v.Id))
@@ -166,6 +167,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			Url:        dn.Url(),
 			PublicUrl:  dn.PublicUrl,
 			DataCenter: dn.GetDataCenterId(),
+			GrpcPort:   uint32(dn.GrpcPort),
 		}
 		if len(heartbeat.NewVolumes) > 0 {
 			stats.MasterReceivedHeartbeatCounter.WithLabelValues("newVolumes").Inc()
@@ -290,6 +292,12 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 			_, err := stream.Recv()
 			if err != nil {
 				glog.V(2).Infof("- client %v: %v", clientName, err)
+				go func() {
+					// consume message chan to avoid deadlock, go routine exit when message chan is closed
+					for range messageChan {
+						// no op
+					}
+				}()
 				close(stopChan)
 				return
 			}
@@ -297,6 +305,7 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 	}()
 
 	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case message := <-messageChan:
@@ -364,6 +373,8 @@ func (ms *MasterServer) addClient(filerGroup, clientType string, clientAddress p
 func (ms *MasterServer) deleteClient(clientName string) {
 	glog.V(0).Infof("- client %v", clientName)
 	ms.clientChansLock.Lock()
+	// close message chan, so that the KeepConnected go routine can exit
+	close(ms.clientChans[clientName])
 	delete(ms.clientChans, clientName)
 	ms.clientChansLock.Unlock()
 }
