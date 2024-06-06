@@ -105,6 +105,17 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		}, func(path util.FullPath) bool {
 			return wfs.inodeToPath.IsChildrenCached(path)
 		}, func(filePath util.FullPath, entry *filer_pb.Entry) {
+			inode := wfs.inodeToPath.GetInode(filePath)
+			if fh, found := wfs.fhmap.FindFileHandle(inode); found {
+				fhActiveLock := fh.wfs.fhLockTable.AcquireLock("invalidateFunc", fh.fh, util.ExclusiveLock)
+				defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+				fh.entryLock.Lock()
+				defer fh.entryLock.Unlock()
+
+				fh.dirtyPages.Destroy()
+				fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+			}
 		})
 	grace.OnInterrupt(func() {
 		wfs.metaCache.Shutdown()
