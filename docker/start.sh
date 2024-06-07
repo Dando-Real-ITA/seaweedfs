@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2024-06-07 00:15:26
+# 2024-06-07 00:43:26
 
 ########################################################################################################################################################################################################################
 
@@ -251,8 +251,8 @@ for ARG in $@; do
               fi
             done
 
-            # Remove unavailable peers before starting the process. Can happen if this process is a member of the cluster restarted with a different hostname
-            check_peers ${HOST} ${PORT}
+            # # Remove unavailable peers before starting the process. Can happen if this process is a member of the cluster restarted with a different hostname
+            # check_peers ${HOST} ${PORT}
           else
             for tip in $tips; do
               echo "Adding peer: ${tip}"
