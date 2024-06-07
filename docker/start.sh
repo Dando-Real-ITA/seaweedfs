@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# 2024-02-02 08:32:24
+# 2024-06-07 00:15:26
 
 ########################################################################################################################################################################################################################
 
@@ -204,7 +204,11 @@ for ARG in $@; do
           done
 
           if [[ ${USE_DISCOVER:-true} != "false" ]]; then
+            # * Docker 20.10.0 auto creates alias for hostname if hostname != container
+            # Expected by tcpclient
             export LOCAL_HOSTNAME=$(hostname)
+            # The remote host will not update the hostname-ip map
+            export ADD_HOST="false"
             CIP="-ip=${LOCAL_HOSTNAME}"
             # Find current ip on the network of the peers
             for tip in $tips; do
