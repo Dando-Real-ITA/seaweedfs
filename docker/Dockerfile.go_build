@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # 2024-07-02 13:03:42
 
-FROM registry.hub.docker.com/amd64/golang:1.22-alpine as builder
+FROM registry.hub.docker.com/amd64/golang:1.22-alpine AS builder
 RUN apk add git g++ fuse3
 RUN mkdir -p /go/src/github.com/seaweedfs/
 WORKDIR /go/src/github.com/seaweedfs/
@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
   ###########################################################################
 
-FROM builder as builder_large
+FROM builder AS builder_large
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/go/pkg/mod \

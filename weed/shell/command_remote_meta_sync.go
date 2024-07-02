@@ -130,7 +130,7 @@ func pullMetadata(commandEnv *CommandEnv, writer io.Writer, localMountedDir util
 		ctx := context.Background()
 		err = remoteStorage.Traverse(remote, func(remoteDir, name string, isDirectory bool, remoteEntry *filer_pb.RemoteEntry) error {
 			localDir := filer.MapRemoteStorageLocationPathToFullPath(localMountedDir, remoteMountedLocation, remoteDir)
-			fmt.Fprint(writer, localDir.Child(name))
+			// fmt.Fprint(writer, localDir.Child(name))
 
 			lookupResponse, lookupErr := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
 				Directory: string(localDir),
