@@ -39,7 +39,7 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 	var reply *FilerPostResult
 	var err error
 	var md5bytes []byte
-	if r.Method == "POST" {
+	if r.Method == http.MethodPost {
 		if r.Header.Get("Content-Type") == "" && strings.HasSuffix(r.URL.Path, "/") {
 			reply, err = fs.mkdir(ctx, w, r, so)
 		} else {
@@ -102,12 +102,12 @@ func (fs *FilerServer) doPostAutoChunk(ctx context.Context, w http.ResponseWrite
 	md5bytes = md5Hash.Sum(nil)
 	headerMd5 := r.Header.Get("Content-Md5")
 	if headerMd5 != "" && !(util.Base64Encode(md5bytes) == headerMd5 || fmt.Sprintf("%x", md5bytes) == headerMd5) {
-		fs.filer.DeleteChunks(fileChunks)
+		fs.filer.DeleteUncommittedChunks(fileChunks)
 		return nil, nil, errors.New("The Content-Md5 you specified did not match what we received.")
 	}
 	filerResult, replyerr = fs.saveMetaData(ctx, r, fileName, contentType, so, md5bytes, fileChunks, chunkOffset, smallContent)
 	if replyerr != nil {
-		fs.filer.DeleteChunks(fileChunks)
+		fs.filer.DeleteUncommittedChunks(fileChunks)
 	}
 
 	return
@@ -129,12 +129,12 @@ func (fs *FilerServer) doPutAutoChunk(ctx context.Context, w http.ResponseWriter
 	md5bytes = md5Hash.Sum(nil)
 	headerMd5 := r.Header.Get("Content-Md5")
 	if headerMd5 != "" && !(util.Base64Encode(md5bytes) == headerMd5 || fmt.Sprintf("%x", md5bytes) == headerMd5) {
-		fs.filer.DeleteChunks(fileChunks)
+		fs.filer.DeleteUncommittedChunks(fileChunks)
 		return nil, nil, errors.New("The Content-Md5 you specified did not match what we received.")
 	}
 	filerResult, replyerr = fs.saveMetaData(ctx, r, fileName, contentType, so, md5bytes, fileChunks, chunkOffset, smallContent)
 	if replyerr != nil {
-		fs.filer.DeleteChunks(fileChunks)
+		fs.filer.DeleteUncommittedChunks(fileChunks)
 	}
 
 	return
