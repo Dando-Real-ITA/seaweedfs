@@ -144,10 +144,10 @@ func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.Rem
 			}
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(message.NewParentPath, message.NewEntry.Name), remoteStorageMountLocation)
 			if message.NewEntry.IsDirectory {
-				glog.V(0).Infof("mkdir  %s", remote_storage.FormatLocation(dest))
+				glog.V(1).Infof("mkdir  %s", remote_storage.FormatLocation(dest))
 				return client.WriteDirectory(dest, message.NewEntry)
 			}
-			glog.V(0).Infof("create %s", remote_storage.FormatLocation(dest))
+			glog.V(1).Infof("create %s", remote_storage.FormatLocation(dest))
 			remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewEntry, dest)
 			if writeErr != nil {
 				return writeErr
@@ -158,10 +158,10 @@ func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.Rem
 			glog.V(2).Infof("delete: %+v", resp)
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
 			if message.OldEntry.IsDirectory {
-				glog.V(0).Infof("rmdir  %s", remote_storage.FormatLocation(dest))
+				glog.V(1).Infof("rmdir  %s", remote_storage.FormatLocation(dest))
 				return client.RemoveDirectory(dest)
 			}
-			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(dest))
+			glog.V(1).Infof("delete %s", remote_storage.FormatLocation(dest))
 			return client.DeleteFile(dest)
 		}
 		if message.OldEntry != nil && message.NewEntry != nil {
@@ -184,7 +184,7 @@ func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.Rem
 				}
 			}
 			glog.V(2).Infof("update: %+v", resp)
-			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(oldDest))
+			glog.V(1).Infof("delete %s", remote_storage.FormatLocation(oldDest))
 			if err := client.DeleteFile(oldDest); err != nil {
 				if isMultipartUploadFile(resp.Directory, message.OldEntry.Name) {
 					return nil
@@ -206,7 +206,7 @@ func retriedWriteFile(client remote_storage.RemoteStorageClient, filerSource *so
 	var writeErr error
 	err = util.Retry("writeFile", func() error {
 		reader := filer.NewFileReader(filerSource, newEntry)
-		glog.V(0).Infof("create %s", remote_storage.FormatLocation(dest))
+		glog.V(1).Infof("create %s", remote_storage.FormatLocation(dest))
 		remoteEntry, writeErr = client.WriteFile(dest, newEntry, reader)
 		if writeErr != nil {
 			return writeErr
