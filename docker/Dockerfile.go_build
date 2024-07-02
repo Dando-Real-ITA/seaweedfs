@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# 2024-06-05 13:16:19
+# 2024-07-02 13:03:42
 
 FROM registry.hub.docker.com/amd64/golang:1.22-alpine as builder
 RUN apk add git g++ fuse3
@@ -50,6 +50,7 @@ COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/start.sh /star
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/hosts.sh /hosts.sh
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/discover.sh /discover.sh
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/clean_log.sh /clean_log.sh
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/remotesync.sh /remotesync.sh
 
 # volume server gprc port
 EXPOSE 18080
