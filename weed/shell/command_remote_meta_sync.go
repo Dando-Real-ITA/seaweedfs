@@ -159,21 +159,21 @@ func pullMetadata(commandEnv *CommandEnv, writer io.Writer, localMountedDir util
 						RemoteEntry: remoteEntry,
 					},
 				})
-				fmt.Fprintln(writer, " (create)")
+				// fmt.Fprintln(writer, " (create)")
 				return createErr
 			} else {
 				if existingEntry.RemoteEntry == nil {
 					// this is a new local change and should not be overwritten
-					fmt.Fprintln(writer, " (skip)")
+					// fmt.Fprintln(writer, " (skip)")
 					return nil
 				}
 				if existingEntry.RemoteEntry.RemoteETag != remoteEntry.RemoteETag || existingEntry.RemoteEntry.RemoteMtime < remoteEntry.RemoteMtime {
 					// the remote version is updated, need to pull meta
-					fmt.Fprintln(writer, " (update)")
+					// fmt.Fprintln(writer, " (update)")
 					return doSaveRemoteEntry(client, string(localDir), existingEntry, remoteEntry)
 				}
 			}
-			fmt.Fprintln(writer, " (skip)")
+			// fmt.Fprintln(writer, " (skip)")
 			return nil
 		})
 		return err
