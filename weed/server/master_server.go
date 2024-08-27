@@ -29,6 +29,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/shell"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
@@ -38,10 +39,11 @@ const (
 )
 
 type MasterOption struct {
-	Master            pb.ServerAddress
-	MetaFolder        string
-	VolumeSizeLimitMB uint32
-	VolumePreallocate bool
+	Master                     pb.ServerAddress
+	MetaFolder                 string
+	VolumeSizeLimitMB          uint32
+	VolumePreallocate          bool
+	MaxParallelVacuumPerServer int
 	// PulseSeconds            int
 	DefaultReplicaPlacement string
 	GarbageThreshold        float64
@@ -92,15 +94,15 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	v.SetDefault("master.replication.treat_replication_as_minimums", false)
 	replicationAsMin := v.GetBool("master.replication.treat_replication_as_minimums")
 
-	v.SetDefault("master.volume_growth.copy_1", 7)
-	v.SetDefault("master.volume_growth.copy_2", 6)
-	v.SetDefault("master.volume_growth.copy_3", 3)
-	v.SetDefault("master.volume_growth.copy_other", 1)
-	v.SetDefault("master.volume_growth.threshold", 0.9)
-	topology.VolumeGrowStrategy.Copy1Count = v.GetInt("master.volume_growth.copy_1")
-	topology.VolumeGrowStrategy.Copy2Count = v.GetInt("master.volume_growth.copy_2")
-	topology.VolumeGrowStrategy.Copy3Count = v.GetInt("master.volume_growth.copy_3")
-	topology.VolumeGrowStrategy.CopyOtherCount = v.GetInt("master.volume_growth.copy_other")
+	v.SetDefault("master.volume_growth.copy_1", topology.VolumeGrowStrategy.Copy1Count)
+	v.SetDefault("master.volume_growth.copy_2", topology.VolumeGrowStrategy.Copy2Count)
+	v.SetDefault("master.volume_growth.copy_3", topology.VolumeGrowStrategy.Copy3Count)
+	v.SetDefault("master.volume_growth.copy_other", topology.VolumeGrowStrategy.CopyOtherCount)
+	v.SetDefault("master.volume_growth.threshold", topology.VolumeGrowStrategy.Threshold)
+	topology.VolumeGrowStrategy.Copy1Count = v.GetUint32("master.volume_growth.copy_1")
+	topology.VolumeGrowStrategy.Copy2Count = v.GetUint32("master.volume_growth.copy_2")
+	topology.VolumeGrowStrategy.Copy3Count = v.GetUint32("master.volume_growth.copy_3")
+	topology.VolumeGrowStrategy.CopyOtherCount = v.GetUint32("master.volume_growth.copy_other")
 	topology.VolumeGrowStrategy.Threshold = v.GetFloat64("master.volume_growth.threshold")
 
 	var preallocateSize int64
@@ -145,6 +147,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		r.HandleFunc("/vol/status", ms.proxyToLeader(ms.guard.WhiteList(ms.volumeStatusHandler)))
 		r.HandleFunc("/vol/vacuum", ms.proxyToLeader(ms.guard.WhiteList(ms.volumeVacuumHandler)))
 		r.HandleFunc("/submit", ms.guard.WhiteList(ms.submitFromMasterServerHandler))
+		r.HandleFunc("/collection/info", ms.guard.WhiteList(ms.collectionInfoHandler))
 		/*
 			r.HandleFunc("/stats/health", ms.guard.WhiteList(statsHealthHandler))
 			r.HandleFunc("/stats/counter", ms.guard.WhiteList(statsCounterHandler))
@@ -156,6 +159,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	ms.Topo.StartRefreshWritableVolumes(
 		ms.grpcDialOption,
 		ms.option.GarbageThreshold,
+		ms.option.MaxParallelVacuumPerServer,
 		topology.VolumeGrowStrategy.Threshold,
 		ms.preallocateSize,
 	)
@@ -185,22 +189,7 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 		raftServerName = fmt.Sprintf("[%s]", ms.Topo.RaftServer.Name())
 	} else if raftServer.RaftHashicorp != nil {
 		ms.Topo.HashicorpRaft = raftServer.RaftHashicorp
-		leaderCh := raftServer.RaftHashicorp.LeaderCh()
-		prevLeader, _ := ms.Topo.HashicorpRaft.LeaderWithID()
 		raftServerName = ms.Topo.HashicorpRaft.String()
-		go func() {
-			for {
-				select {
-				case isLeader := <-leaderCh:
-					ms.Topo.RaftServerAccessLock.RLock()
-					leader, _ := ms.Topo.HashicorpRaft.LeaderWithID()
-					ms.Topo.RaftServerAccessLock.RUnlock()
-					glog.V(0).Infof("is leader %+v change event: %+v => %+v", isLeader, prevLeader, leader)
-					stats.MasterLeaderChangeCounter.WithLabelValues(fmt.Sprintf("%+v", leader)).Inc()
-					prevLeader = leader
-				}
-			}
-		}()
 	}
 	ms.Topo.RaftServerAccessLock.Unlock()
 
@@ -256,7 +245,7 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			}
 			director(req)
 		}
-		proxy.Transport = util.Transport
+		proxy.Transport = util_http.GetGlobalHttpClient().GetClientTransport()
 		proxy.ServeHTTP(w, r)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -55,7 +56,7 @@ The backup writes to another filer store specified in a backup_filer.toml.
 
 func runFilerMetaBackup(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	metaBackup.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 
 	// load backup_filer.toml
@@ -197,12 +198,16 @@ func (metaBackup *FilerMetaBackupOptions) streamMetadataBackup() error {
 
 	metaBackup.clientEpoch++
 
+	prefix := *metaBackup.filerDirectory
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
 	metadataFollowOption := &pb.MetadataFollowOption{
 		ClientName:             "meta_backup",
 		ClientId:               metaBackup.clientId,
 		ClientEpoch:            metaBackup.clientEpoch,
 		SelfSignature:          0,
-		PathPrefix:             *metaBackup.filerDirectory,
+		PathPrefix:             prefix,
 		AdditionalPathPrefixes: nil,
 		DirectoriesToWatch:     nil,
 		StartTsNs:              startTime.UnixNano(),

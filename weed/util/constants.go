@@ -7,9 +7,11 @@ import (
 const HttpStatusCancelled = 499
 
 var (
-	VERSION_NUMBER  = fmt.Sprintf("%.02f", 3.69)
-	VERSION         = sizeLimit + " " + VERSION_NUMBER
-	COMMIT          = ""
+	MAJOR_VERSION  = int32(3)
+	MINOR_VERSION  = int32(72)
+	VERSION_NUMBER = fmt.Sprintf("%d.%02d", MAJOR_VERSION, MINOR_VERSION)
+	VERSION        = sizeLimit + " " + VERSION_NUMBER
+	COMMIT         = ""
 	PRIVATE         = "Katapy"
 	PRIVATE_VERSION = ""
 )
