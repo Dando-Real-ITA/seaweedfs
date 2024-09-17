@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"os"
 	"path"
@@ -143,10 +144,10 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 func (wfs *WFS) StartBackgroundTasks() error {
 	fn, err := wfs.subscribeFilerConfEvents()
 	if err != nil {
-		return err
+		fmt.Printf("failed to subscribe to conf events: %v\n", err)
+	} else {
+		go fn()
 	}
-
-	go fn()
 
 	startTime := time.Now()
 	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano())
