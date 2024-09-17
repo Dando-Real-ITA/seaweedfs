@@ -105,7 +105,7 @@ func (wfs *WFS) subscribeFilerConfEvents() (func(), error) {
 }
 
 func (wfs *WFS) wormEnabledForEntry(path util.FullPath, entry *filer_pb.Entry) bool {
-	if entry == nil || entry.Attributes == nil {
+	if entry == nil || entry.Attributes == nil || wfs.FilerConf == nil {
 		return false
 	}
 
