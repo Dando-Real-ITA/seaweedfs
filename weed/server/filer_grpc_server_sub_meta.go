@@ -210,6 +210,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	var isDone bool
 
 	for {
+
 		glog.V(4).Infof("read on disk %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
 		if req.ClientSupportsMetadataChunks {
@@ -485,8 +486,6 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		if !fs.hasClient(req.ClientId, req.ClientEpoch) {
 			return nil
 		}
-
-		// time.Sleep(1127 * time.Millisecond)
 	}
 
 	return readInMemoryLogErr

@@ -507,9 +507,7 @@ func (wfs *WFS) StartBackgroundTasks() error {
 
 	follower, err := wfs.subscribeFilerConfEvents()
 	if err != nil {
-		fmt.Printf("failed to subscribe to conf events: %v\n", err)
-	} else {
-		go fn()
+		return err
 	}
 
 	startTime := time.Now()
