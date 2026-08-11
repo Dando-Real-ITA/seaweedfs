@@ -32,22 +32,34 @@ type FilerConf struct {
 }
 
 func ReadFilerConf(filerGrpcAddress pb.ServerAddress, grpcDialOption grpc.DialOption, masterClient *wdclient.MasterClient) (*FilerConf, error) {
-	var buf bytes.Buffer
-	if err := pb.WithGrpcFilerClient(false, 0, filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	return ReadFilerConfFromFilers([]pb.ServerAddress{filerGrpcAddress}, grpcDialOption, masterClient)
+}
+
+// ReadFilerConfFromFilers reads filer configuration with multi-filer failover support
+func ReadFilerConfFromFilers(filerGrpcAddresses []pb.ServerAddress, grpcDialOption grpc.DialOption, masterClient *wdclient.MasterClient) (*FilerConf, error) {
+	var data []byte
+	if err := pb.WithOneOfGrpcFilerClients(false, filerGrpcAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		if masterClient != nil {
-			return ReadEntry(masterClient, client, DirectoryEtcSeaweedFS, FilerConfName, &buf)
-		} else {
-			content, err := ReadInsideFiler(client, DirectoryEtcSeaweedFS, FilerConfName)
-			buf = *bytes.NewBuffer(content)
+			var buf bytes.Buffer
+			if err := ReadEntry(masterClient, client, DirectoryEtcSeaweedFS, FilerConfName, &buf); err != nil {
+				return err
+			}
+			data = buf.Bytes()
+			return nil
+		}
+		content, err := ReadInsideFiler(context.Background(), client, DirectoryEtcSeaweedFS, FilerConfName)
+		if err != nil {
 			return err
 		}
+		data = content
+		return nil
 	}); err != nil && err != filer_pb.ErrNotFound {
 		return nil, fmt.Errorf("read %s/%s: %v", DirectoryEtcSeaweedFS, FilerConfName, err)
 	}
 
 	fc := NewFilerConf()
-	if buf.Len() > 0 {
-		if err := fc.LoadFromBytes(buf.Bytes()); err != nil {
+	if len(data) > 0 {
+		if err := fc.LoadFromBytes(data); err != nil {
 			return nil, fmt.Errorf("parse %s/%s: %v", DirectoryEtcSeaweedFS, FilerConfName, err)
 		}
 	}
@@ -148,16 +160,149 @@ func (fc *FilerConf) DeleteLocationConf(locationPrefix string) {
 		return true
 	})
 	fc.rules = rules
-	return
 }
 
+// emptyPathConf is a singleton for paths with no matching rules
+// Callers must NOT mutate the returned value
+var emptyPathConf = &filer_pb.FilerConf_PathConf{}
+
 func (fc *FilerConf) MatchStorageRule(path string) (pathConf *filer_pb.FilerConf_PathConf) {
+	// Convert once to avoid allocation in multi-match case
+	pathBytes := []byte(path)
+
+	// Fast path: check if any rules match before allocating
+	// This avoids allocation for paths with no configured rules (common case)
+	var firstMatch *filer_pb.FilerConf_PathConf
+	matchCount := 0
+
+	fc.rules.MatchPrefix(pathBytes, func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
+		matchCount++
+		if matchCount == 1 {
+			firstMatch = value
+			return true // continue to check for more matches
+		}
+		// Stop after 2 matches - we only need to know if there are multiple
+		return false
+	})
+
+	// No rules match - return singleton (callers must NOT mutate)
+	if matchCount == 0 {
+		return emptyPathConf
+	}
+
+	// Single rule matches - return directly (callers must NOT mutate)
+	if matchCount == 1 {
+		return firstMatch
+	}
+
+	// Multiple rules match - need to merge (allocate new)
 	pathConf = &filer_pb.FilerConf_PathConf{}
-	fc.rules.MatchPrefix([]byte(path), func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
+	fc.rules.MatchPrefix(pathBytes, func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
 		mergePathConf(pathConf, value)
 		return true
 	})
 	return pathConf
+}
+
+// ClonePathConf creates a mutable copy of an existing PathConf.
+// Use this when you need to modify a config (e.g., before calling SetLocationConf).
+//
+// IMPORTANT: Keep in sync with filer_pb.FilerConf_PathConf fields.
+// When adding new fields to the protobuf, update this function accordingly.
+func ClonePathConf(src *filer_pb.FilerConf_PathConf) *filer_pb.FilerConf_PathConf {
+	if src == nil {
+		return &filer_pb.FilerConf_PathConf{}
+	}
+	return &filer_pb.FilerConf_PathConf{
+		LocationPrefix:           src.LocationPrefix,
+		Collection:               src.Collection,
+		Replication:              src.Replication,
+		Ttl:                      src.Ttl,
+		DiskType:                 src.DiskType,
+		Fsync:                    src.Fsync,
+		VolumeGrowthCount:        src.VolumeGrowthCount,
+		ReadOnly:                 src.ReadOnly,
+		MaxFileNameLength:        src.MaxFileNameLength,
+		DataCenter:               src.DataCenter,
+		Rack:                     src.Rack,
+		DataNode:                 src.DataNode,
+		DisableChunkDeletion:     src.DisableChunkDeletion,
+		Worm:                     src.Worm,
+		WormGracePeriodSeconds:   src.WormGracePeriodSeconds,
+		WormRetentionTimeSeconds: src.WormRetentionTimeSeconds,
+	}
+}
+
+// ApplyBucketQuotaReadOnly sets read-only when usedSize exceeds quota and clears it
+// once back under, reporting whether the flag changed. A non-positive quota is left
+// untouched so a manually locked bucket is never reopened.
+func (fc *FilerConf) ApplyBucketQuotaReadOnly(locationPrefix string, usedSize, quota float64) (readOnly, changed bool) {
+	if quota <= 0 {
+		return fc.MatchStorageRule(locationPrefix).ReadOnly, false
+	}
+
+	locConf := ClonePathConf(fc.MatchStorageRule(locationPrefix))
+	locConf.LocationPrefix = locationPrefix
+	wasReadOnly := locConf.ReadOnly
+
+	if wasReadOnly {
+		if usedSize < quota {
+			locConf.ReadOnly = false
+		}
+	} else {
+		if usedSize > quota {
+			locConf.ReadOnly = true
+		}
+	}
+
+	if locConf.ReadOnly == wasReadOnly {
+		return wasReadOnly, false
+	}
+	fc.SetLocationConf(locConf)
+	return locConf.ReadOnly, true
+}
+
+// ClearReadOnly clears the read-only flag on the rule at exactly locationPrefix,
+// reporting whether the flag was set. This is the explicit unlock for a flag that
+// ApplyBucketQuotaReadOnly can no longer clear once the quota is gone.
+func (fc *FilerConf) ClearReadOnly(locationPrefix string) (changed bool) {
+	locConf, found := fc.GetLocationConf(locationPrefix)
+	if !found || !locConf.ReadOnly {
+		return false
+	}
+	locConf.ReadOnly = false
+	fc.SetLocationConf(locConf)
+	return true
+}
+
+// ClearBucketReadOnly lifts the read-only flag that quota enforcement may have
+// left on the bucket's path rule, saving the updated configuration back to the
+// filer. It reports whether anything was cleared.
+func ClearBucketReadOnly(ctx context.Context, client filer_pb.SeaweedFilerClient, bucketsPath, bucketName string) (changed bool, err error) {
+	data, err := ReadInsideFiler(ctx, client, DirectoryEtcSeaweedFS, FilerConfName)
+	if err == filer_pb.ErrNotFound || (err == nil && len(data) == 0) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s/%s: %v", DirectoryEtcSeaweedFS, FilerConfName, err)
+	}
+	fc := NewFilerConf()
+	if err = fc.LoadFromBytes(data); err != nil {
+		return false, fmt.Errorf("parse %s/%s: %v", DirectoryEtcSeaweedFS, FilerConfName, err)
+	}
+	// join the rule key exactly as s3.bucket.quota.enforce writes it, so the
+	// exact-match lookup finds the rule even for a non-canonical bucketsPath
+	if !fc.ClearReadOnly(bucketsPath + "/" + bucketName + "/") {
+		return false, nil
+	}
+	var buf bytes.Buffer
+	if err = fc.ToText(&buf); err != nil {
+		return false, err
+	}
+	if err = SaveInsideFiler(ctx, client, DirectoryEtcSeaweedFS, FilerConfName, buf.Bytes()); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (fc *FilerConf) GetCollectionTtls(collection string) (ttls map[string]string) {
@@ -190,6 +335,12 @@ func mergePathConf(a, b *filer_pb.FilerConf_PathConf) {
 	a.DataNode = util.Nvl(b.DataNode, a.DataNode)
 	a.DisableChunkDeletion = b.DisableChunkDeletion || a.DisableChunkDeletion
 	a.Worm = b.Worm || a.Worm
+	if b.WormRetentionTimeSeconds > 0 {
+		a.WormRetentionTimeSeconds = b.WormRetentionTimeSeconds
+	}
+	if b.WormGracePeriodSeconds > 0 {
+		a.WormGracePeriodSeconds = b.WormGracePeriodSeconds
+	}
 }
 
 func (fc *FilerConf) ToProto() *filer_pb.FilerConf {

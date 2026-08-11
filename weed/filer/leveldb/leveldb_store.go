@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
+
 	"github.com/syndtr/goleveldb/leveldb"
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
-	"io"
-	"os"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -104,6 +105,39 @@ func (store *LevelDBStore) InsertEntry(ctx context.Context, entry *filer.Entry) 
 func (store *LevelDBStore) UpdateEntry(ctx context.Context, entry *filer.Entry) (err error) {
 
 	return store.InsertEntry(ctx, entry)
+}
+
+// BatchInsertEntries inserts multiple entries in a single LevelDB batch write.
+// This is more efficient than inserting entries one by one as it reduces
+// the number of write operations and syncs to disk.
+func (store *LevelDBStore) BatchInsertEntries(ctx context.Context, entries []*filer.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	batch := new(leveldb.Batch)
+
+	for _, entry := range entries {
+		key := genKey(entry.DirAndName())
+
+		value, err := entry.EncodeAttributesAndChunks()
+		if err != nil {
+			return fmt.Errorf("encoding %s %+v: %w", entry.FullPath, entry.Attr, err)
+		}
+
+		if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
+			value = weed_util.MaybeGzipData(value)
+		}
+
+		batch.Put(key, value)
+	}
+
+	err := store.db.Write(batch, nil)
+	if err != nil {
+		return fmt.Errorf("batch write: %w", err)
+	}
+
+	return nil
 }
 
 func (store *LevelDBStore) FindEntry(ctx context.Context, fullpath weed_util.FullPath) (entry *filer.Entry, err error) {
@@ -205,10 +239,17 @@ func (store *LevelDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		}
 		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(iter.Value())); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
+			break
+		}
+
+		if !resEachEntryFunc {
 			break
 		}
 	}

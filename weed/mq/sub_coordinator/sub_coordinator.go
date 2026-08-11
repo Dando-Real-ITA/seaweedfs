@@ -2,9 +2,11 @@ package sub_coordinator
 
 import (
 	"fmt"
+
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/seaweedfs/seaweedfs/weed/filer_client"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 )
 
 type TopicConsumerGroups struct {
@@ -28,7 +30,7 @@ func NewSubCoordinator() *SubCoordinator {
 	}
 }
 
-func (c *SubCoordinator) GetTopicConsumerGroups(topic *mq_pb.Topic, createIfMissing bool) *TopicConsumerGroups {
+func (c *SubCoordinator) GetTopicConsumerGroups(topic *schema_pb.Topic, createIfMissing bool) *TopicConsumerGroups {
 	topicName := toTopicName(topic)
 	tcg, _ := c.TopicSubscribers.Get(topicName)
 	if tcg == nil && createIfMissing {
@@ -41,12 +43,12 @@ func (c *SubCoordinator) GetTopicConsumerGroups(topic *mq_pb.Topic, createIfMiss
 	}
 	return tcg
 }
-func (c *SubCoordinator) RemoveTopic(topic *mq_pb.Topic) {
+func (c *SubCoordinator) RemoveTopic(topic *schema_pb.Topic) {
 	topicName := toTopicName(topic)
 	c.TopicSubscribers.Remove(topicName)
 }
 
-func toTopicName(topic *mq_pb.Topic) string {
+func toTopicName(topic *schema_pb.Topic) string {
 	topicName := topic.Namespace + "." + topic.Name
 	return topicName
 }
@@ -96,7 +98,7 @@ func (c *SubCoordinator) RemoveSubscriber(initMessage *mq_pb.SubscriberToSubCoor
 	}
 }
 
-func (c *SubCoordinator) OnPartitionChange(topic *mq_pb.Topic, assignments []*mq_pb.BrokerPartitionAssignment) {
+func (c *SubCoordinator) OnPartitionChange(topic *schema_pb.Topic, assignments []*mq_pb.BrokerPartitionAssignment) {
 	tcg, _ := c.TopicSubscribers.Get(toTopicName(topic))
 	if tcg == nil {
 		return

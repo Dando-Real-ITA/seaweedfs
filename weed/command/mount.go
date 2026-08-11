@@ -6,33 +6,82 @@ import (
 )
 
 type MountOptions struct {
-	filer              *string
-	filerMountRootPath *string
-	dir                *string
-	dirAutoCreate      *bool
-	collection         *string
-	collectionQuota    *int
-	replication        *string
-	diskType           *string
-	ttlSec             *int
-	chunkSizeLimitMB   *int
-	concurrentWriters  *int
-	cacheDirForRead    *string
-	cacheDirForWrite   *string
-	cacheSizeMBForRead *int64
-	dataCenter         *string
-	allowOthers        *bool
-	umaskString        *string
-	nonempty           *bool
-	volumeServerAccess *string
-	uidMap             *string
-	gidMap             *string
-	readOnly           *bool
-	debug              *bool
-	debugPort          *int
-	localSocket        *string
-	disableXAttr       *bool
-	extraOptions       []string
+	filer                *string
+	filerMountRootPath   *string
+	dir                  *string
+	dirAutoCreate        *bool
+	collection           *string
+	collectionQuota      *int
+	replication          *string
+	diskType             *string
+	ttlSec               *int
+	chunkSizeLimitMB     *int
+	concurrentWriters    *int
+	concurrentReaders    *int
+	cacheMetaTtlSec      *int
+	cacheDirForRead      *string
+	cacheDirForWrite     *string
+	cacheSizeMBForRead   *int64
+	writeBufferSizeMB    *int64
+	dataCenter           *string
+	allowOthers          *bool
+	defaultPermissions   *bool
+	umaskString          *string
+	nonempty             *bool
+	volumeServerAccess   *string
+	uidMap               *string
+	gidMap               *string
+	readOnly             *bool
+	includeSystemEntries *bool
+	debug                *bool
+	debugPort            *int
+	debugFuse            *bool
+	localSocket          *string
+	disableXAttr         *bool
+	extraOptions         []string
+	fuseCommandPid       int
+
+	// Periodic metadata flush to protect against orphan chunk cleanup
+	metadataFlushSeconds *int
+
+	// RDMA acceleration options
+	rdmaEnabled       *bool
+	rdmaSidecarAddr   *string
+	rdmaFallback      *bool
+	rdmaReadOnly      *bool
+	rdmaMaxConcurrent *int
+	rdmaTimeoutMs     *int
+
+	// Peer chunk sharing options (design-weed-mount-peer-chunk-sharing.md).
+	peerEnabled      *bool
+	peerListen       *string
+	peerAdvertise    *string
+	peerDataCenter   *string
+	peerRack         *string
+
+	dirIdleEvictSec *int
+
+	// Distributed locking for cross-mount write coordination and POSIX
+	// advisory locks (flock/fcntl)
+	distributedLock *bool
+
+	// POSIX compliance options
+	posixDirNlink *bool
+
+	// FUSE performance options
+	writebackCache          *bool
+	asyncDio                *bool
+	cacheSymlink            *bool
+	fuseMaxBackground       *int
+	fuseCongestionThreshold *int
+
+	// macOS-specific FUSE options
+	novncache *bool
+
+	// if true, we assume autofs exists over current mount point. Autofs (the kernel one, used by systemd automount)
+	// is expected to be mounted as a shim between auto-mounted fs and original mount point to provide auto mount.
+	// with this option, we ignore autofs mounted on the same point.
+	hasAutofs *bool
 }
 
 var (
@@ -54,26 +103,70 @@ func init() {
 	mountOptions.diskType = cmdMount.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	mountOptions.ttlSec = cmdMount.Flag.Int("ttl", 0, "file ttl in seconds")
 	mountOptions.chunkSizeLimitMB = cmdMount.Flag.Int("chunkSizeLimitMB", 2, "local write buffer size, also chunk large files")
-	mountOptions.concurrentWriters = cmdMount.Flag.Int("concurrentWriters", 32, "limit concurrent goroutine writers")
+	mountOptions.concurrentWriters = cmdMount.Flag.Int("concurrentWriters", 128, "limit concurrent goroutine writers")
+	mountOptions.concurrentReaders = cmdMount.Flag.Int("concurrentReaders", 128, "limit concurrent chunk fetches for read operations")
 	mountOptions.cacheDirForRead = cmdMount.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks and meta data")
 	mountOptions.cacheSizeMBForRead = cmdMount.Flag.Int64("cacheCapacityMB", 128, "file chunk read cache capacity in MB")
 	mountOptions.cacheDirForWrite = cmdMount.Flag.String("cacheDirWrite", "", "buffer writes mostly for large files")
+	mountOptions.writeBufferSizeMB = cmdMount.Flag.Int64("writeBufferSizeMB", 0, "global cap on the per-mount write buffer (memory + swap) in MB, 0 means unlimited. Bounds /tmp growth when volume uploads stall")
+	mountOptions.cacheMetaTtlSec = cmdMount.Flag.Int("cacheMetaTtlSec", 60, "metadata cache validity seconds")
 	mountOptions.dataCenter = cmdMount.Flag.String("dataCenter", "", "prefer to write to the data center")
 	mountOptions.allowOthers = cmdMount.Flag.Bool("allowOthers", true, "allows other users to access the file system")
+	mountOptions.defaultPermissions = cmdMount.Flag.Bool("defaultPermissions", true, "enforce permissions by the operating system")
 	mountOptions.umaskString = cmdMount.Flag.String("umask", "022", "octal umask, e.g., 022, 0111")
 	mountOptions.nonempty = cmdMount.Flag.Bool("nonempty", false, "allows the mounting over a non-empty directory")
 	mountOptions.volumeServerAccess = cmdMount.Flag.String("volumeServerAccess", "direct", "access volume servers by [direct|publicUrl|filerProxy]")
 	mountOptions.uidMap = cmdMount.Flag.String("map.uid", "", "map local uid to uid on filer, comma-separated <local_uid>:<filer_uid>")
 	mountOptions.gidMap = cmdMount.Flag.String("map.gid", "", "map local gid to gid on filer, comma-separated <local_gid>:<filer_gid>")
 	mountOptions.readOnly = cmdMount.Flag.Bool("readOnly", false, "read only")
+	mountOptions.includeSystemEntries = cmdMount.Flag.Bool("includeSystemEntries", false, "show filer system entries (e.g. /topics, /etc) in directory listings")
 	mountOptions.debug = cmdMount.Flag.Bool("debug", false, "serves runtime profiling data, e.g., http://localhost:<debug.port>/debug/pprof/goroutine?debug=2")
 	mountOptions.debugPort = cmdMount.Flag.Int("debug.port", 6061, "http port for debugging")
+	mountOptions.debugFuse = cmdMount.Flag.Bool("debug.fuse", false, "log raw FUSE protocol requests and responses")
 	mountOptions.localSocket = cmdMount.Flag.String("localSocket", "", "default to /tmp/seaweedfs-mount-<mount_dir_hash>.sock")
 	mountOptions.disableXAttr = cmdMount.Flag.Bool("disableXAttr", false, "disable xattr")
+	mountOptions.hasAutofs = cmdMount.Flag.Bool("autofs", false, "ignore autofs mounted on the same mountpoint (useful when systemd.automount and autofs is used)")
+	mountOptions.fuseCommandPid = 0
+
+	// Periodic metadata flush to protect against orphan chunk cleanup
+	mountOptions.metadataFlushSeconds = cmdMount.Flag.Int("metadataFlushSeconds", 120, "periodically flush file metadata to filer in seconds (0 to disable). This protects chunks from being purged by volume.fsck for long-running writes")
+
+	// RDMA acceleration flags
+	mountOptions.rdmaEnabled = cmdMount.Flag.Bool("rdma.enabled", false, "enable RDMA acceleration for reads")
+	mountOptions.rdmaSidecarAddr = cmdMount.Flag.String("rdma.sidecar", "", "RDMA sidecar address (e.g., localhost:8081)")
+	mountOptions.rdmaFallback = cmdMount.Flag.Bool("rdma.fallback", true, "fallback to HTTP when RDMA fails")
+	mountOptions.rdmaReadOnly = cmdMount.Flag.Bool("rdma.readOnly", false, "use RDMA for reads only (writes use HTTP)")
+	mountOptions.rdmaMaxConcurrent = cmdMount.Flag.Int("rdma.maxConcurrent", 64, "max concurrent RDMA operations")
+	mountOptions.rdmaTimeoutMs = cmdMount.Flag.Int("rdma.timeoutMs", 5000, "RDMA operation timeout in milliseconds")
+
+	// Peer chunk sharing flags.
+	mountOptions.peerEnabled = cmdMount.Flag.Bool("peer.enable", false, "opt in to peer chunk sharing — mount serves its chunk cache to other mounts and fetches from peers instead of volume servers when available")
+	mountOptions.peerListen = cmdMount.Flag.String("peer.listen", ":18080", "bind address for peer gRPC (directory RPCs + FetchChunk streaming)")
+	mountOptions.peerAdvertise = cmdMount.Flag.String("peer.advertise", "", "externally-reachable host:port other mounts use to reach this one (defaults to autodetected host + -peer.listen port)")
+	mountOptions.peerDataCenter = cmdMount.Flag.String("peer.dataCenter", "", "optional data-center label advertised to peers; used with -peer.rack for two-level locality ranking")
+	mountOptions.peerRack = cmdMount.Flag.String("peer.rack", "", "optional rack label advertised to peers")
+
+	mountOptions.dirIdleEvictSec = cmdMount.Flag.Int("dirIdleEvictSec", 600, "seconds to evict idle cached directories (0 to disable)")
 
 	mountCpuProfile = cmdMount.Flag.String("cpuprofile", "", "cpu profile output file")
 	mountMemProfile = cmdMount.Flag.String("memprofile", "", "memory profile output file")
 	mountReadRetryTime = cmdMount.Flag.Duration("readRetryTime", 6*time.Second, "maximum read retry wait time")
+
+	// Distributed lock for cross-mount write coordination
+	mountOptions.distributedLock = cmdMount.Flag.Bool("dlm", false, "coordinate writes across mounts (only one mount writes a file at a time) and honor POSIX advisory locks (flock/fcntl) across mounts by routing them to the owner filer")
+
+	// POSIX compliance options
+	mountOptions.posixDirNlink = cmdMount.Flag.Bool("posix.dirNLink", false, "report POSIX-compliant directory nlink (2 + subdirectory count); costs one directory listing per stat")
+
+	// FUSE performance options
+	mountOptions.writebackCache = cmdMount.Flag.Bool("writebackCache", false, "enable FUSE writeback cache for improved write performance (at risk of data loss on crash)")
+	mountOptions.asyncDio = cmdMount.Flag.Bool("asyncDio", false, "enable async direct I/O for better concurrency")
+	mountOptions.cacheSymlink = cmdMount.Flag.Bool("cacheSymlink", false, "enable symlink caching to reduce metadata lookups")
+	mountOptions.fuseMaxBackground = cmdMount.Flag.Int("fuse.maxBackground", 128, "FUSE max_background: maximum in-flight asynchronous requests the kernel will queue. Heavy upload workloads may benefit from higher values (e.g. 2048). Equivalent to writing /sys/fs/fuse/connections/<id>/max_background. If -fuse.congestionThreshold is 0, the kernel derives it as 3/4 of this value.")
+	mountOptions.fuseCongestionThreshold = cmdMount.Flag.Int("fuse.congestionThreshold", 0, "FUSE congestion_threshold: in-flight async request count at which the kernel marks the FUSE bdi as congested and throttles new submissions. 0 means use the default (3/4 of -fuse.maxBackground). Equivalent to writing /sys/fs/fuse/connections/<id>/congestion_threshold. The kernel silently clamps this to -fuse.maxBackground when set higher.")
+
+	// macOS-specific FUSE options
+	mountOptions.novncache = cmdMount.Flag.Bool("sys.novncache", false, "(macOS only) disable vnode name caching to avoid stale data")
 }
 
 var cmdMount = &Command{
@@ -90,6 +183,19 @@ var cmdMount = &Command{
   Linux, and OS X.
 
   On OS X, it requires OSXFUSE (https://osxfuse.github.io/).
+
+  RDMA Acceleration:
+  For ultra-fast reads, enable RDMA acceleration with an RDMA sidecar:
+    weed mount -filer=localhost:8888 -dir=/mnt/seaweedfs \
+      -rdma.enabled=true -rdma.sidecar=localhost:8081
+
+  RDMA Options:
+    -rdma.enabled=false          Enable RDMA acceleration for reads
+    -rdma.sidecar=""             RDMA sidecar address (required if enabled)
+    -rdma.fallback=true          Fallback to HTTP when RDMA fails
+    -rdma.readOnly=false         Use RDMA for reads only (writes use HTTP)
+    -rdma.maxConcurrent=64       Max concurrent RDMA operations
+    -rdma.timeoutMs=5000         RDMA operation timeout in milliseconds
 
   `,
 }

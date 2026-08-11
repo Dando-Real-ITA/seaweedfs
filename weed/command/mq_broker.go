@@ -1,9 +1,8 @@
 package command
 
 import (
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
-
-	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mq/broker"
@@ -11,6 +10,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
 
 var (
@@ -18,15 +18,18 @@ var (
 )
 
 type MessageQueueBrokerOptions struct {
-	masters       map[string]pb.ServerAddress
-	mastersString *string
-	filerGroup    *string
-	ip            *string
-	port          *int
-	dataCenter    *string
-	rack          *string
-	cpuprofile    *string
-	memprofile    *string
+	masters          map[string]pb.ServerAddress
+	mastersString    *string
+	filerGroup       *string
+	ip               *string
+	port             *int
+	dataCenter       *string
+	rack             *string
+	cpuprofile       *string
+	memprofile       *string
+	logFlushInterval *int
+	debug            *bool
+	debugPort        *int
 }
 
 func init() {
@@ -39,6 +42,9 @@ func init() {
 	mqBrokerStandaloneOptions.rack = cmdMqBroker.Flag.String("rack", "", "prefer to write to volumes in this rack")
 	mqBrokerStandaloneOptions.cpuprofile = cmdMqBroker.Flag.String("cpuprofile", "", "cpu profile output file")
 	mqBrokerStandaloneOptions.memprofile = cmdMqBroker.Flag.String("memprofile", "", "memory profile output file")
+	mqBrokerStandaloneOptions.logFlushInterval = cmdMqBroker.Flag.Int("logFlushInterval", 5, "log buffer flush interval in seconds")
+	mqBrokerStandaloneOptions.debug = cmdMqBroker.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
+	mqBrokerStandaloneOptions.debugPort = cmdMqBroker.Flag.Int("debug.port", 6060, "http port for debugging")
 }
 
 var cmdMqBroker = &Command{
@@ -53,6 +59,9 @@ var cmdMqBroker = &Command{
 }
 
 func runMqBroker(cmd *Command, args []string) bool {
+	if *mqBrokerStandaloneOptions.debug {
+		grace.StartDebugServer(*mqBrokerStandaloneOptions.debugPort)
+	}
 
 	util.LoadSecurityConfiguration()
 
@@ -64,6 +73,8 @@ func runMqBroker(cmd *Command, args []string) bool {
 
 func (mqBrokerOpt *MessageQueueBrokerOptions) startQueueServer() bool {
 
+	*mqBrokerStandaloneOptions.cpuprofile = util.ResolvePath(*mqBrokerStandaloneOptions.cpuprofile)
+	*mqBrokerStandaloneOptions.memprofile = util.ResolvePath(*mqBrokerStandaloneOptions.memprofile)
 	grace.SetupProfiling(*mqBrokerStandaloneOptions.cpuprofile, *mqBrokerStandaloneOptions.memprofile)
 
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.msg_broker")
@@ -77,20 +88,40 @@ func (mqBrokerOpt *MessageQueueBrokerOptions) startQueueServer() bool {
 		MaxMB:              0,
 		Ip:                 *mqBrokerOpt.ip,
 		Port:               *mqBrokerOpt.port,
+		LogFlushInterval:   *mqBrokerOpt.logFlushInterval,
 	}, grpcDialOption)
 	if err != nil {
 		glog.Fatalf("failed to create new message broker for queue server: %v", err)
 	}
 
 	// start grpc listener
-	grpcL, _, err := util.NewIpAndLocalListeners("", *mqBrokerOpt.port, 0)
+	grpcL, localL, err := util.NewIpAndLocalListeners("", *mqBrokerOpt.port, 0)
 	if err != nil {
 		glog.Fatalf("failed to listen on grpc port %d: %v", *mqBrokerOpt.port, err)
 	}
+
+	// Create main gRPC server
 	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.msg_broker"))
 	mq_pb.RegisterSeaweedMessagingServer(grpcS, qs)
 	reflection.Register(grpcS)
-	grpcS.Serve(grpcL)
+
+	// Start localhost listener if available
+	if localL != nil {
+		localGrpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.msg_broker"))
+		mq_pb.RegisterSeaweedMessagingServer(localGrpcS, qs)
+		reflection.Register(localGrpcS)
+		go func() {
+			glog.V(0).Infof("MQ Broker listening on localhost:%d", *mqBrokerOpt.port)
+			if err := localGrpcS.Serve(localL); err != nil && err != grpc.ErrServerStopped {
+				glog.Errorf("MQ Broker localhost listener error: %v", err)
+			}
+		}()
+	}
+
+	glog.V(0).Infof("MQ Broker listening on %s:%d", *mqBrokerOpt.ip, *mqBrokerOpt.port)
+	if err := grpcS.Serve(grpcL); err != nil && err != grpc.ErrServerStopped {
+		glog.Errorf("Failed to serve MQ Broker: %v", err)
+	}
 
 	return true
 

@@ -5,26 +5,36 @@ all: gen
 gen: dev
 
 cgo ?= 0
+ldflags_extra ?= -extldflags -static
+
 binary:
 	export SWCOMMIT=$(shell git rev-parse --short HEAD)
-	export SWLDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(SWCOMMIT)"
-	cd ../weed && CGO_ENABLED=$(cgo) GOOS=linux go build $(options) -tags "$(tags)" -ldflags "-s -w -extldflags -static $(SWLDFLAGS)" && mv weed ../docker/
-	cd ../weed/mq/client/cmd/weed_pub_kv && CGO_ENABLED=$(cgo) GOOS=linux go build && mv weed_pub_kv ../../../../../docker/
-	cd ../weed/mq/client/cmd/weed_pub_record && CGO_ENABLED=$(cgo) GOOS=linux go build && mv weed_pub_record ../../../../../docker/
-	cd ../weed/mq/client/cmd/weed_sub_kv && CGO_ENABLED=$(cgo) GOOS=linux go build && mv weed_sub_kv ../../../../../docker/
-	cd ../weed/mq/client/cmd/weed_sub_record && CGO_ENABLED=$(cgo) GOOS=linux go build && mv weed_sub_record ../../../../../docker/
+	export SWLDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$(SWCOMMIT)"
+	cd ../weed && CGO_ENABLED=$(cgo) GOOS=linux go build $(options) -tags "$(tags)" -ldflags "-s -w $(ldflags_extra) $(SWLDFLAGS)" -o weed_binary && mv weed_binary ../docker/weed
+	cd ../other/mq_client_example/agent_pub_record && CGO_ENABLED=$(cgo) GOOS=linux go build && mv agent_pub_record ../../../docker/
+	cd ../other/mq_client_example/agent_sub_record && CGO_ENABLED=$(cgo) GOOS=linux go build && mv agent_sub_record ../../../docker/
 
+# Race detector requires CGO and dynamic linking - don't use -static
 binary_race: options = -race
 binary_race: cgo = 1
+binary_race: ldflags_extra =
 binary_race: binary
 
 build: binary
 	docker build --no-cache -t chrislusf/seaweedfs:local -f Dockerfile.local .
 
 build_e2e: binary_race
-	docker build --no-cache -t chrislusf/seaweedfs:e2e -f Dockerfile.e2e .
+	docker buildx build \
+		--cache-from=type=local,src=/tmp/.buildx-cache \
+		--cache-to=type=local,dest=/tmp/.buildx-cache-new,mode=max \
+		--load \
+		-t chrislusf/seaweedfs:e2e \
+		-f Dockerfile.e2e .
+	# Move cache to avoid growing cache size
+	rm -rf /tmp/.buildx-cache || true
+	mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
 
-go_build: # make go_build tags=elastic,ydb,gocdk,hdfs,5BytesOffset
+go_build: # make go_build tags=elastic,ydb,gocdk,hdfs,5BytesOffset,tarantool
 	docker build --build-arg TAGS=$(tags) --no-cache -t chrislusf/seaweedfs:go_build -f Dockerfile.go_build .
 
 go_build_large_disk:
@@ -38,6 +48,9 @@ build_rocksdb_local: build_rocksdb_dev_env
 
 build_rocksdb:
 	docker build --no-cache -t chrislusf/seaweedfs:rocksdb -f Dockerfile.rocksdb_large .
+
+build_tarantool_dev_env:
+	docker build --no-cache -t chrislusf/tarantool_dev_env -f Dockerfile.tarantool.dev_env .
 
 s3tests_build:
 	docker build --no-cache -t chrislusf/ceph-s3-tests:local -f Dockerfile.s3tests .
@@ -97,6 +110,9 @@ s3tests: build s3tests_build
 brokers: build
 	docker compose -f compose/local-brokers-compose.yml -p seaweedfs up
 
+agent: build
+	docker compose -f compose/local-mq-test.yml -p seaweedfs up
+
 filer_etcd: build
 	docker stack deploy -c compose/swarm-etcd.yml fs
 
@@ -105,8 +121,14 @@ test_etcd: build
 
 test_ydb: tags = ydb
 test_ydb: build
-	export
 	docker compose -f compose/test-ydb-filer.yml -p seaweedfs up
+
+test_tarantool: tags = tarantool
+test_tarantool: build_tarantool_dev_env build
+	docker compose -f compose/test-tarantool-filer.yml -p seaweedfs up
+
+test_keycloak_s3: build
+	docker compose -f compose/test-keycloak-s3.yml -p seaweedfs up
 
 clean:
 	rm ./weed

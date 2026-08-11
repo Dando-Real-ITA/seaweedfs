@@ -1,27 +1,28 @@
-FROM golang:1.22 as builder
+FROM golang:1.25 AS builder
 
 RUN apt-get update
 RUN apt-get install -y build-essential libsnappy-dev zlib1g-dev libbz2-dev libgflags-dev liblz4-dev libzstd-dev
 
-ENV ROCKSDB_VERSION v8.10.0
+ARG ROCKSDB_VERSION=v10.10.1
+ENV ROCKSDB_VERSION=${ROCKSDB_VERSION}
 
 # build RocksDB
 RUN cd /tmp && \
     git clone https://github.com/facebook/rocksdb.git /tmp/rocksdb --depth 1 --single-branch --branch $ROCKSDB_VERSION && \
     cd rocksdb && \
-    PORTABLE=1 make static_lib && \
+    PORTABLE=1 make -j"$(nproc)" static_lib && \
     make install-static
 
-ENV CGO_CFLAGS "-I/tmp/rocksdb/include"
-ENV CGO_LDFLAGS "-L/tmp/rocksdb -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd"
+ENV CGO_CFLAGS="-I/tmp/rocksdb/include"
+ENV CGO_LDFLAGS="-L/tmp/rocksdb -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd"
 
 # build SeaweedFS
 RUN mkdir -p /go/src/github.com/seaweedfs/
 RUN git clone https://github.com/seaweedfs/seaweedfs /go/src/github.com/seaweedfs/seaweedfs
-ARG BRANCH=${BRANCH:-master}
+ARG BRANCH=master
 RUN cd /go/src/github.com/seaweedfs/seaweedfs && git checkout $BRANCH
 RUN cd /go/src/github.com/seaweedfs/seaweedfs/weed \
-  && export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" \
+  && export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$(git rev-parse --short HEAD)" \
   && go install -tags "5BytesOffset rocksdb" -ldflags "-extldflags -static ${LDFLAGS}"
 
 
@@ -31,7 +32,12 @@ COPY --from=builder /go/bin/weed /usr/bin/
 RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer_rocksdb.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
-RUN apk add fuse snappy gflags
+
+# Install dependencies and create non-root user
+RUN apk upgrade --no-cache && \
+    apk add --no-cache fuse snappy gflags curl su-exec && \
+    addgroup -g 1000 seaweed && \
+    adduser -D -u 1000 -G seaweed seaweed
 
 # volume server gprc port
 EXPOSE 18080
@@ -50,12 +56,20 @@ EXPOSE 8333
 # webdav server http port
 EXPOSE 7333
 
-RUN mkdir -p /data/filer_rocksdb
+# Create data directory and set proper ownership for seaweed user
+RUN mkdir -p /data/filer_rocksdb && \
+    chown -R seaweed:seaweed /data && \
+    chown -R seaweed:seaweed /etc/seaweedfs && \
+    chmod 755 /entrypoint.sh
 
 VOLUME /data
 
 WORKDIR /data
 
-RUN chmod +x /entrypoint.sh
-
+# Entrypoint will handle permission fixes and user switching
 ENTRYPOINT ["/entrypoint.sh"]
+# Default to a complete single-process cluster (master+volume+filer+S3+admin)
+# so the image is usable out of the box — including in environments like
+# GitHub Actions service containers that cannot pass arguments to the entrypoint.
+# Override with any other subcommand at `docker run` / compose time.
+CMD ["mini", "-dir=/data"]

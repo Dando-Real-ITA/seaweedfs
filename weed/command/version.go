@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 var cmdVersion = &Command{
@@ -19,6 +19,9 @@ func runVersion(cmd *Command, args []string) bool {
 		cmd.Usage()
 	}
 
-	fmt.Printf("version %s %s %s\n", util.Version(), runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("version %s %s %s\n", version.Version(), runtime.GOOS, runtime.GOARCH)
+	println()
+	println("For enterprise users, please visit https://seaweedfs.com for the SeaweedFS Enterprise Edition,")
+	println("which has advanced features, including data recovery, self-healing storage, customizable erasure coding, EC vacuum and repair, etc.")
 	return true
 }

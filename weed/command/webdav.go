@@ -2,12 +2,15 @@ package command
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
 	"os/user"
 	"strconv"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -23,6 +26,7 @@ var (
 
 type WebDavOption struct {
 	filer          *string
+	ipBind         *string
 	filerRootPath  *string
 	port           *int
 	collection     *string
@@ -33,11 +37,16 @@ type WebDavOption struct {
 	cacheDir       *string
 	cacheSizeMB    *int64
 	maxMB          *int
+	// shutdownCtx, when non-nil, tells startWebDav to gracefully shut down the
+	// HTTP server once the ctx is cancelled. Used by weed mini; nil for
+	// standalone weed webdav.
+	shutdownCtx context.Context
 }
 
 func init() {
 	cmdWebDav.Run = runWebDav // break init cycle
 	webDavStandaloneOptions.filer = cmdWebDav.Flag.String("filer", "localhost:8888", "filer server address")
+	webDavStandaloneOptions.ipBind = cmdWebDav.Flag.String("ip.bind", "", "ip address to bind to. Default listen to all.")
 	webDavStandaloneOptions.port = cmdWebDav.Flag.Int("port", 7333, "webdav server http listen port")
 	webDavStandaloneOptions.collection = cmdWebDav.Flag.String("collection", "", "collection to create the files")
 	webDavStandaloneOptions.replication = cmdWebDav.Flag.String("replication", "", "replication to create the files")
@@ -60,15 +69,27 @@ var cmdWebDav = &Command{
 
 func runWebDav(cmd *Command, args []string) bool {
 
+	webDavStandaloneOptions.resolvePaths()
 	util.LoadSecurityConfiguration()
 
-	glog.V(0).Infof("Starting Seaweed WebDav Server %s at https port %d", util.Version(), *webDavStandaloneOptions.port)
+	listenAddress := fmt.Sprintf("%s:%d", *webDavStandaloneOptions.ipBind, *webDavStandaloneOptions.port)
+	glog.V(0).Infof("Starting Seaweed WebDav Server %s at %s", version.Version(), listenAddress)
 
 	return webDavStandaloneOptions.startWebDav()
 
 }
 
+// resolvePaths expands "~" in every user-supplied path flag.
+// Idempotent — safe to call from any entry point.
+func (wo *WebDavOption) resolvePaths() {
+	*wo.cacheDir = util.ResolvePath(*wo.cacheDir)
+	*wo.tlsCertificate = util.ResolvePath(*wo.tlsCertificate)
+	*wo.tlsPrivateKey = util.ResolvePath(*wo.tlsPrivateKey)
+}
+
 func (wo *WebDavOption) startWebDav() bool {
+
+	util.SetOutboundLocalIP(*wo.ipBind)
 
 	// detect current user
 	uid, gid := uint32(0), uint32(0)
@@ -98,7 +119,7 @@ func (wo *WebDavOption) startWebDav() bool {
 			return nil
 		})
 		if err != nil {
-			glog.V(0).Infof("wait to connect to filer %s grpc address %s", *wo.filer, filerAddress.ToGrpcAddress())
+			glog.V(2).Infof("wait to connect to filer %s grpc address %s", *wo.filer, filerAddress.ToGrpcAddress())
 			time.Sleep(time.Second)
 		} else {
 			glog.V(0).Infof("connected to filer %s grpc address %s", *wo.filer, filerAddress.ToGrpcAddress())
@@ -116,7 +137,7 @@ func (wo *WebDavOption) startWebDav() bool {
 		Uid:            uid,
 		Gid:            gid,
 		Cipher:         cipher,
-		CacheDir:       util.ResolvePath(*wo.cacheDir),
+		CacheDir:       *wo.cacheDir,
 		CacheSizeMB:    *wo.cacheSizeMB,
 		MaxMB:          *wo.maxMB,
 	})
@@ -126,20 +147,33 @@ func (wo *WebDavOption) startWebDav() bool {
 
 	httpS := &http.Server{Handler: ws.Handler}
 
-	listenAddress := fmt.Sprintf(":%d", *wo.port)
+	listenAddress := fmt.Sprintf("%s:%d", *wo.ipBind, *wo.port)
 	webDavListener, err := util.NewListener(listenAddress, time.Duration(10)*time.Second)
 	if err != nil {
 		glog.Fatalf("WebDav Server listener on %s error: %v", listenAddress, err)
 	}
 
+	if wo.shutdownCtx != nil {
+		go func() {
+			<-wo.shutdownCtx.Done()
+			httpS.Shutdown(context.Background())
+		}()
+	}
+
 	if *wo.tlsPrivateKey != "" {
-		glog.V(0).Infof("Start Seaweed WebDav Server %s at https port %d", util.Version(), *wo.port)
-		if err = httpS.ServeTLS(webDavListener, *wo.tlsCertificate, *wo.tlsPrivateKey); err != nil {
+		glog.V(0).Infof("Start Seaweed WebDav Server %s at https %s", version.Version(), listenAddress)
+		getCert, certProvider, err := security.NewReloadingServerCertificate(*wo.tlsCertificate, *wo.tlsPrivateKey)
+		if err != nil {
+			glog.Fatalf("WebDav Server failed to load TLS certificate: %v", err)
+		}
+		defer certProvider.Close()
+		httpS.TLSConfig = &tls.Config{GetCertificate: getCert}
+		if err = httpS.ServeTLS(webDavListener, "", ""); err != nil && err != http.ErrServerClosed {
 			glog.Fatalf("WebDav Server Fail to serve: %v", err)
 		}
 	} else {
-		glog.V(0).Infof("Start Seaweed WebDav Server %s at http port %d", util.Version(), *wo.port)
-		if err = httpS.Serve(webDavListener); err != nil {
+		glog.V(0).Infof("Start Seaweed WebDav Server %s at http %s", version.Version(), listenAddress)
+		if err = httpS.Serve(webDavListener); err != nil && err != http.ErrServerClosed {
 			glog.Fatalf("WebDav Server Fail to serve: %v", err)
 		}
 	}

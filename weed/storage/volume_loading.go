@@ -16,15 +16,124 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind) (v *Volume, err error) {
+// Per-DB caps on goleveldb's open SST file cache. The library default is 500
+// per DB, but a volume server hosts one DB per volume — easily thousands —
+// so the per-DB default sums into FD exhaustion (`open .../00000N.log: too
+// many open files`) even with generous ulimits, especially when leveldb is
+// rotating its WAL.
+//
+// The trade-off: a larger cache lowers re-open overhead on cold reads, a
+// smaller cache bounds total FD usage. CompactionTableSizeMultiplier=10
+// already keeps SST counts low (~10x larger SSTs => ~10x fewer files), so
+// even the small-volume cap is enough to keep the working set hot while
+// leaving headroom for thousands of co-resident DBs.
+const (
+	LevelDbOpenFilesCacheCapacity       = 16
+	LevelDbMediumOpenFilesCacheCapacity = 32
+	LevelDbLargeOpenFilesCacheCapacity  = 64
+)
+
+func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, ver needle.Version) (v *Volume, err error) {
 	v = &Volume{dir: dirname, Collection: collection, Id: id}
 	v.SuperBlock = super_block.SuperBlock{}
 	v.needleMapKind = needleMapKind
-	err = v.load(false, false, needleMapKind, 0)
+	err = v.load(false, false, needleMapKind, 0, ver)
 	return
 }
 
-func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64) (err error) {
+func loadVolumeWithoutWorker(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, ldbTimeout int64) (v *Volume, err error) {
+	v = &Volume{
+		dir:           dirname,
+		dirIdx:        dirIdx,
+		Collection:    collection,
+		Id:            id,
+		needleMapKind: needleMapKind,
+		ldbTimeout:    ldbTimeout,
+	}
+	v.SuperBlock = super_block.SuperBlock{}
+	err = v.load(true, false, needleMapKind, 0, needle.GetCurrentVersion())
+	return
+}
+
+// reopenIdxForWrite swaps the read-only SortedFileNeedleMap (loaded when the
+// volume booted with .vif ReadOnly=true) for the writable needle map matching
+// v.needleMapKind. Without this, MarkVolumeWritable flips noWriteOrDelete back
+// to false but leaves .idx opened O_RDONLY and v.nm as a SortedFileNeedleMap
+// whose Put returns os.ErrInvalid, so subsequent writes still fail.
+//
+// No-op when v.nm is already a writable form.
+func (v *Volume) reopenIdxForWrite() error {
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
+
+	oldNm, isSorted := v.nm.(*SortedFileNeedleMap)
+	if !isSorted {
+		return nil
+	}
+
+	indexFile, err := os.OpenFile(v.FileName(".idx"), os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen %s read-write: %v", v.FileName(".idx"), err)
+	}
+
+	// Build the replacement first; only swap once we have a live writable
+	// map. A construction failure must leave v.nm pointing at the original
+	// SortedFileNeedleMap so the caller (MarkVolumeWritable) can roll back
+	// cleanly instead of stranding the volume with v.nm == nil.
+	var newNm NeedleMapper
+	switch v.needleMapKind {
+	case NeedleMapInMemory:
+		if newNm, err = LoadCompactNeedleMap(indexFile, v.Version()); err != nil {
+			indexFile.Close()
+			return fmt.Errorf("rebuild memory needle map for volume %d: %v", v.Id, err)
+		}
+	case NeedleMapLevelDb:
+		opts := &opt.Options{
+			BlockCacheCapacity:            2 * 1024 * 1024,
+			WriteBuffer:                   1 * 1024 * 1024,
+			CompactionTableSizeMultiplier: 10,
+			OpenFilesCacheCapacity:        LevelDbOpenFilesCacheCapacity,
+		}
+		if newNm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout, v.Version()); err != nil {
+			indexFile.Close()
+			return fmt.Errorf("rebuild leveldb needle map for volume %d: %v", v.Id, err)
+		}
+	case NeedleMapLevelDbMedium:
+		opts := &opt.Options{
+			BlockCacheCapacity:            4 * 1024 * 1024,
+			WriteBuffer:                   2 * 1024 * 1024,
+			CompactionTableSizeMultiplier: 10,
+			OpenFilesCacheCapacity:        LevelDbMediumOpenFilesCacheCapacity,
+		}
+		if newNm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout, v.Version()); err != nil {
+			indexFile.Close()
+			return fmt.Errorf("rebuild leveldb medium needle map for volume %d: %v", v.Id, err)
+		}
+	case NeedleMapLevelDbLarge:
+		opts := &opt.Options{
+			BlockCacheCapacity:            8 * 1024 * 1024,
+			WriteBuffer:                   4 * 1024 * 1024,
+			CompactionTableSizeMultiplier: 10,
+			OpenFilesCacheCapacity:        LevelDbLargeOpenFilesCacheCapacity,
+		}
+		if newNm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout, v.Version()); err != nil {
+			indexFile.Close()
+			return fmt.Errorf("rebuild leveldb large needle map for volume %d: %v", v.Id, err)
+		}
+	default:
+		indexFile.Close()
+		return fmt.Errorf("unsupported needle map kind %v for volume %d", v.needleMapKind, v.Id)
+	}
+
+	if err := oldNm.Sync(); err != nil {
+		glog.Warningf("volume %d: sync sorted needle map before reopen: %v", v.Id, err)
+	}
+	oldNm.Close() // closes the O_RDONLY .idx handle held inside
+	v.nm = newNm
+	return nil
+}
+
+func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64, ver needle.Version) (err error) {
 	alreadyHasSuperBlock := false
 
 	hasLoadedVolume := false
@@ -52,7 +161,25 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		v.noWriteCanDelete = true
 		v.noWriteOrDelete = false
 		glog.V(0).Infof("loading volume %d from remote %v", v.Id, v.volumeInfo)
-		v.LoadRemoteFile()
+		// loadRemoteFileLocked, not LoadRemoteFile: load() is reached from
+		// CommitCompact with dataFileAccessLock already held, and the locking
+		// variant would deadlock re-entering it.
+		if err := v.loadRemoteFileLocked(); err != nil {
+			return fmt.Errorf("load remote file %v: %w", v.volumeInfo, err)
+		}
+		// Set lastModifiedTsSeconds from remote file to prevent premature expiry on startup
+		if len(v.volumeInfo.GetFiles()) > 0 {
+			remoteFileModifiedTime := v.volumeInfo.GetFiles()[0].GetModifiedTime()
+			if remoteFileModifiedTime > 0 {
+				v.lastModifiedTsSeconds = remoteFileModifiedTime
+			} else {
+				// Fallback: use .vif file's modification time
+				if exists, _, _, modifiedTime, _ := util.CheckFile(v.FileName(".vif")); exists {
+					v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
+				}
+			}
+			glog.V(1).Infof("volume %d remote file lastModifiedTsSeconds set to %d", v.Id, v.lastModifiedTsSeconds)
+		}
 		alreadyHasSuperBlock = true
 	} else if exists, canRead, canWrite, modifiedTime, fileSize := util.CheckFile(v.FileName(".dat")); exists {
 		// open dat file
@@ -91,9 +218,12 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 	if alreadyHasSuperBlock {
 		err = v.readSuperBlock()
 		if err == nil {
+			if !needle.IsSupportedVersion(v.SuperBlock.Version) {
+				glog.Fatalf("Unsupported volume %d version %v", v.Id, v.SuperBlock.Version)
+			}
 			v.volumeInfo.Version = uint32(v.SuperBlock.Version)
 		}
-		glog.V(0).Infof("readSuperBlock volume %d version %v", v.Id, v.SuperBlock.Version)
+		glog.V(2).Infof("readSuperBlock volume %d version %v", v.Id, v.SuperBlock.Version)
 		if v.HasRemoteFile() {
 			// maybe temporary network problem
 			glog.Errorf("readSuperBlock remote volume %d: %v", v.Id, err)
@@ -103,7 +233,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		if !v.SuperBlock.Initialized() {
 			return fmt.Errorf("volume %s not initialized", v.FileName(".dat"))
 		}
-		err = v.maybeWriteSuperBlock()
+		err = v.maybeWriteSuperBlock(ver)
 	}
 	if err == nil && alsoLoadIndex {
 		// adjust for existing volumes with .idx together with .dat files
@@ -114,6 +244,12 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		}
 		// check volume idx files
 		if err := v.checkIdxFile(); err != nil {
+			// A remote-tiered volume with a stray .vif but no .idx must not
+			// take the whole server down; skip just this volume.
+			if v.HasRemoteFile() {
+				glog.Errorf("skip remote volume %d (idx: %s): %v", v.Id, v.FileName(".idx"), err)
+				return fmt.Errorf("check volume idx file %s: %w", v.FileName(".idx"), err)
+			}
 			glog.Fatalf("check volume idx file %s: %v", v.FileName(".idx"), err)
 		}
 		var indexFile *os.File
@@ -134,73 +270,111 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		// storage tier, and download to local storage, which may cause the
 		// capactiy overloading.
 		if !v.HasRemoteFile() {
-			glog.V(0).Infof("checking volume data integrity for volume %d", v.Id)
+			glog.V(2).Infof("checking volume data integrity for volume %d", v.Id)
 			if v.lastAppendAtNs, err = CheckVolumeDataIntegrity(v, indexFile); err != nil {
 				v.noWriteOrDelete = true
 				glog.V(0).Infof("volumeDataIntegrityChecking failed %v", err)
 			}
 		}
 
+		// The post-load structural check below uses the in-memory needle map
+		// to verify that no .idx entry references bytes past the end of .dat
+		// (issue #8928). The check piggybacks on MaxNeedleEnd, which the load
+		// walks below populate without a second linear scan.
+
+		// Loaders can return a typed-nil pointer with err set; assigning that
+		// to v.nm yields a non-nil interface over a nil receiver. Clear v.nm
+		// and close indexFile so the defer cleanup keys off v.nm cleanly.
 		if v.noWriteOrDelete || v.noWriteCanDelete {
-			if v.nm, err = NewSortedFileNeedleMap(v.IndexFileName(), indexFile); err != nil {
+			if v.nm, err = NewSortedFileNeedleMap(v.IndexFileName(), indexFile, v.Version()); err != nil {
 				glog.V(0).Infof("loading sorted db %s error: %v", v.FileName(".sdx"), err)
+				v.nm = nil
+				indexFile.Close()
 			}
 		} else {
 			switch needleMapKind {
 			case NeedleMapInMemory:
 				if v.tmpNm != nil {
-					glog.V(0).Infof("updating memory compact index %s ", v.FileName(".idx"))
+					glog.V(2).Infof("updating memory compact index %s ", v.FileName(".idx"))
 					err = v.tmpNm.UpdateNeedleMap(v, indexFile, nil, 0)
 				} else {
-					glog.V(0).Infoln("loading memory index", v.FileName(".idx"), "to memory")
-					if v.nm, err = LoadCompactNeedleMap(indexFile); err != nil {
+					glog.V(2).Infoln("loading memory index", v.FileName(".idx"), "to memory")
+					if v.nm, err = LoadCompactNeedleMap(indexFile, v.Version()); err != nil {
 						glog.V(0).Infof("loading index %s to memory error: %v", v.FileName(".idx"), err)
+						v.nm = nil
+						indexFile.Close()
 					}
 				}
 			case NeedleMapLevelDb:
 				opts := &opt.Options{
-					BlockCacheCapacity:            2 * 1024 * 1024, // default value is 8MiB
-					WriteBuffer:                   1 * 1024 * 1024, // default value is 4MiB
-					CompactionTableSizeMultiplier: 10,              // default value is 1
+					BlockCacheCapacity:            2 * 1024 * 1024,               // default value is 8MiB
+					WriteBuffer:                   1 * 1024 * 1024,               // default value is 4MiB
+					CompactionTableSizeMultiplier: 10,                            // default value is 1
+					OpenFilesCacheCapacity:        LevelDbOpenFilesCacheCapacity, // see package-level docs
 				}
 				if v.tmpNm != nil {
 					glog.V(0).Infoln("updating leveldb index", v.FileName(".ldb"))
 					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts, v.ldbTimeout)
 				} else {
 					glog.V(0).Infoln("loading leveldb index", v.FileName(".ldb"))
-					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout); err != nil {
+					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout, v.Version()); err != nil {
 						glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
+						v.nm = nil
+						indexFile.Close()
 					}
 				}
 			case NeedleMapLevelDbMedium:
 				opts := &opt.Options{
-					BlockCacheCapacity:            4 * 1024 * 1024, // default value is 8MiB
-					WriteBuffer:                   2 * 1024 * 1024, // default value is 4MiB
-					CompactionTableSizeMultiplier: 10,              // default value is 1
+					BlockCacheCapacity:            4 * 1024 * 1024,                     // default value is 8MiB
+					WriteBuffer:                   2 * 1024 * 1024,                     // default value is 4MiB
+					CompactionTableSizeMultiplier: 10,                                  // default value is 1
+					OpenFilesCacheCapacity:        LevelDbMediumOpenFilesCacheCapacity, // see package-level docs
 				}
 				if v.tmpNm != nil {
 					glog.V(0).Infoln("updating leveldb medium index", v.FileName(".ldb"))
 					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts, v.ldbTimeout)
 				} else {
 					glog.V(0).Infoln("loading leveldb medium index", v.FileName(".ldb"))
-					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout); err != nil {
+					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout, v.Version()); err != nil {
 						glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
+						v.nm = nil
+						indexFile.Close()
 					}
 				}
 			case NeedleMapLevelDbLarge:
 				opts := &opt.Options{
-					BlockCacheCapacity:            8 * 1024 * 1024, // default value is 8MiB
-					WriteBuffer:                   4 * 1024 * 1024, // default value is 4MiB
-					CompactionTableSizeMultiplier: 10,              // default value is 1
+					BlockCacheCapacity:            8 * 1024 * 1024,                    // default value is 8MiB
+					WriteBuffer:                   4 * 1024 * 1024,                    // default value is 4MiB
+					CompactionTableSizeMultiplier: 10,                                 // default value is 1
+					OpenFilesCacheCapacity:        LevelDbLargeOpenFilesCacheCapacity, // see package-level docs
 				}
 				if v.tmpNm != nil {
 					glog.V(0).Infoln("updating leveldb large index", v.FileName(".ldb"))
 					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts, v.ldbTimeout)
 				} else {
 					glog.V(0).Infoln("loading leveldb large index", v.FileName(".ldb"))
-					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout); err != nil {
+					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout, v.Version()); err != nil {
 						glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
+						v.nm = nil
+						indexFile.Close()
 					}
+				}
+			}
+		}
+
+		// Structural check: no .idx entry may reference bytes past the end of
+		// the .dat. The needle map's load walk above already populated
+		// MaximumNeedleEnd, so this is just a numeric comparison — no extra
+		// disk I/O. A violation marks the volume read-only so a corrupt
+		// .idx left over from a crashed batched write does not silently
+		// power vacuum to drop reachable data. See issue #8928. err == nil
+		// guards against a partial-walk MaximumNeedleEnd.
+		if err == nil && !v.HasRemoteFile() && v.nm != nil && v.DataBackend != nil {
+			if datSize, _, statErr := v.DataBackend.GetStat(); statErr == nil && datSize > 0 {
+				if maxEnd := v.nm.MaxNeedleEnd(); maxEnd > datSize {
+					v.noWriteOrDelete = true
+					glog.V(0).Infof("volume %d: idx references end=%d but .dat is %d bytes; marking readonly",
+						v.Id, maxEnd, datSize)
 				}
 			}
 		}

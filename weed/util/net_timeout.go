@@ -1,9 +1,11 @@
 package util
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"net"
+	"sync"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
@@ -12,8 +14,7 @@ import (
 // parameters. On Accept, it will wrap the net.Conn with our own Conn for us.
 type Listener struct {
 	net.Listener
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	Timeout time.Duration
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
@@ -23,51 +24,107 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 	stats.ConnectionOpen()
 	tc := &Conn{
-		Conn:         c,
-		ReadTimeout:  l.ReadTimeout,
-		WriteTimeout: l.WriteTimeout,
+		Conn:    c,
+		Timeout: l.Timeout,
 	}
 	return tc, nil
 }
 
-// Conn wraps a net.Conn, and sets a deadline for every read
-// and write operation.
+// Conn wraps a net.Conn and implements a "no activity timeout".
+// Any activity (read or write) resets the deadline, so the connection
+// only times out when there's no activity in either direction.
+//
+// Callers may also set deadlines directly — net/http's server does this
+// to interrupt a blocked read (abortPendingRead sets a deadline in the
+// past) and to enforce its own Read/Write timeouts. The activity
+// extension must never overwrite such an externally-set deadline, or the
+// interrupt is lost and the read stays blocked until the activity
+// timeout fires (wedging connection drain on shutdown for up to the full
+// idle timeout). mu serializes deadline updates, and while an external
+// deadline is in force on a direction the activity extension for that
+// direction is suspended; it resumes once the caller clears the deadline
+// (sets the zero time).
 type Conn struct {
 	net.Conn
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	isClosed     bool
-	bytesRead    int64
-	bytesWritten int64
+	Timeout  time.Duration
+	isClosed bool
+
+	mu                    sync.Mutex
+	externalReadDeadline  bool
+	externalWriteDeadline bool
+}
+
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.externalReadDeadline = !t.IsZero()
+	c.externalWriteDeadline = !t.IsZero()
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.externalReadDeadline = !t.IsZero()
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.externalWriteDeadline = !t.IsZero()
+	return c.Conn.SetWriteDeadline(t)
+}
+
+// extendDeadline extends the connection deadline from now.
+// This implements "no activity timeout" - any activity keeps the
+// connection alive in both directions (a long write-only response must
+// keep the read deadline alive too, or net/http's background read would
+// time out and cancel the in-flight request). Each direction is extended
+// independently: an externally-managed deadline on one side (e.g. a
+// server WriteTimeout) must not leave the other side's deadline stale.
+func (c *Conn) extendDeadline() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Timeout <= 0 {
+		return nil
+	}
+	if !c.externalReadDeadline && !c.externalWriteDeadline {
+		return c.Conn.SetDeadline(time.Now().Add(c.Timeout))
+	}
+	if !c.externalReadDeadline {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.Timeout)); err != nil {
+			return err
+		}
+	}
+	if !c.externalWriteDeadline {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.Timeout)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Conn) Read(b []byte) (count int, e error) {
-	if c.ReadTimeout != 0 {
-		err := c.Conn.SetReadDeadline(time.Now().Add(c.ReadTimeout * time.Duration(c.bytesRead/40000+1)))
-		if err != nil {
-			return 0, err
-		}
+	// Extend deadline before reading - any activity keeps connection alive
+	if err := c.extendDeadline(); err != nil {
+		return 0, err
 	}
 	count, e = c.Conn.Read(b)
 	if e == nil {
 		stats.BytesIn(int64(count))
-		c.bytesRead += int64(count)
 	}
 	return
 }
 
 func (c *Conn) Write(b []byte) (count int, e error) {
-	if c.WriteTimeout != 0 {
-		// minimum 4KB/s
-		err := c.Conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout * time.Duration(c.bytesWritten/40000+1)))
-		if err != nil {
-			return 0, err
-		}
+	// Extend deadline before writing - any activity keeps connection alive
+	if err := c.extendDeadline(); err != nil {
+		return 0, err
 	}
 	count, e = c.Conn.Write(b)
 	if e == nil {
 		stats.BytesOut(int64(count))
-		c.bytesWritten += int64(count)
 	}
 	return
 }
@@ -90,9 +147,8 @@ func NewListener(addr string, timeout time.Duration) (ipListener net.Listener, e
 	}
 
 	ipListener = &Listener{
-		Listener:     listener,
-		ReadTimeout:  timeout,
-		WriteTimeout: timeout,
+		Listener: listener,
+		Timeout:  timeout,
 	}
 
 	return
@@ -105,9 +161,8 @@ func NewIpAndLocalListeners(host string, port int, timeout time.Duration) (ipLis
 	}
 
 	ipListener = &Listener{
-		Listener:     listener,
-		ReadTimeout:  timeout,
-		WriteTimeout: timeout,
+		Listener: listener,
+		Timeout:  timeout,
 	}
 
 	if host != "localhost" && host != "" && host != "0.0.0.0" && host != "127.0.0.1" && host != "[::]" && host != "[::1]" {
@@ -118,9 +173,8 @@ func NewIpAndLocalListeners(host string, port int, timeout time.Duration) (ipLis
 		}
 
 		localListener = &Listener{
-			Listener:     listener,
-			ReadTimeout:  timeout,
-			WriteTimeout: timeout,
+			Listener: listener,
+			Timeout:  timeout,
 		}
 	}
 

@@ -26,11 +26,13 @@ func (v *Volume) GetVolumeSyncStatus() *volume_server_pb.VolumeSyncStatusRespons
 	if datSize, _, err := v.DataBackend.GetStat(); err == nil {
 		syncStatus.TailOffset = uint64(datSize)
 	}
+	syncStatus.VolumeId = uint32(v.Id)
 	syncStatus.Collection = v.Collection
 	syncStatus.IdxFileSize = v.nm.IndexFileSize()
 	syncStatus.CompactRevision = uint32(v.SuperBlock.CompactionRevision)
 	syncStatus.Ttl = v.SuperBlock.Ttl.String()
 	syncStatus.Replication = v.SuperBlock.ReplicaPlacement.String()
+	syncStatus.Version = uint32(v.SuperBlock.Version)
 	return syncStatus
 }
 
@@ -227,7 +229,7 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 
 		mNs, nsReadErr := v.readAppendAtNs(offset)
 		if nsReadErr != nil {
-			err = fmt.Errorf("read entry %d offset %d: %v", m, offset, nsReadErr)
+			err = fmt.Errorf("read entry %d offset %d: %v", m, offset.ToActualOffset(), nsReadErr)
 			return
 		}
 

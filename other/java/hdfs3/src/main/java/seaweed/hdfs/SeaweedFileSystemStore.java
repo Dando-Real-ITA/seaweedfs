@@ -27,8 +27,8 @@ public class SeaweedFileSystemStore {
     private FilerClient filerClient;
     private Configuration conf;
 
-    public SeaweedFileSystemStore(String host, int port, int grpcPort, Configuration conf) {
-        filerClient = new FilerClient(host, port, grpcPort);
+    public SeaweedFileSystemStore(String host, int port, int grpcPort, String cn, Configuration conf) {
+        filerClient = new FilerClient(host, port, grpcPort, cn);
         this.conf = conf;
         String volumeServerAccessMode = this.conf.get(FS_SEAWEED_VOLUME_SERVER_ACCESS, "direct");
         if (volumeServerAccessMode.equals("publicUrl")) {
@@ -36,7 +36,6 @@ public class SeaweedFileSystemStore {
         } else if (volumeServerAccessMode.equals("filerProxy")) {
             filerClient.setAccessVolumeServerByFilerProxy();
         }
-
     }
 
     public void close() {
@@ -60,19 +59,18 @@ public class SeaweedFileSystemStore {
     }
 
     public boolean createDirectory(final Path path, UserGroupInformation currentUser,
-                                   final FsPermission permission, final FsPermission umask) {
+            final FsPermission permission, final FsPermission umask) {
 
         LOG.debug("createDirectory path: {} permission: {} umask: {}",
-            path,
-            permission,
-            umask);
+                path,
+                permission,
+                umask);
 
         return filerClient.mkdirs(
-            path.toUri().getPath(),
-            permissionToMode(permission, true),
-            currentUser.getUserName(),
-            currentUser.getGroupNames()
-        );
+                path.toUri().getPath(),
+                permissionToMode(permission, true),
+                currentUser.getUserName(),
+                currentUser.getGroupNames());
     }
 
     public FileStatus[] listEntries(final Path path) throws IOException {
@@ -85,7 +83,7 @@ public class SeaweedFileSystemStore {
         }
 
         if (!pathStatus.isDirectory()) {
-            return new FileStatus[]{pathStatus};
+            return new FileStatus[] { pathStatus };
         }
 
         List<FileStatus> fileStatuses = new ArrayList<FileStatus>();
@@ -117,9 +115,9 @@ public class SeaweedFileSystemStore {
 
     public boolean deleteEntries(final Path path, boolean isDirectory, boolean recursive) {
         LOG.debug("deleteEntries path: {} isDirectory {} recursive: {}",
-            path,
-            String.valueOf(isDirectory),
-            String.valueOf(recursive));
+                path,
+                String.valueOf(isDirectory),
+                String.valueOf(recursive));
 
         if (path.isRoot()) {
             return true;
@@ -147,7 +145,7 @@ public class SeaweedFileSystemStore {
         String owner = attributes.getUserName();
         String group = attributes.getGroupNameCount() > 0 ? attributes.getGroupName(0) : "";
         return new FileStatus(length, isDir, block_replication, blocksize,
-            modification_time, access_time, permission, owner, group, null, path);
+                modification_time, access_time, permission, owner, group, null, path);
     }
 
     public FilerProto.Entry lookupEntry(Path path) {
@@ -163,27 +161,29 @@ public class SeaweedFileSystemStore {
         if (source.isRoot()) {
             return;
         }
-        LOG.info("rename source: {} destination:{}", source, destination);
+
         FilerProto.Entry entry = lookupEntry(source);
         if (entry == null) {
             LOG.warn("rename non-existing source: {}", source);
             return;
         }
+
         filerClient.mv(source.toUri().getPath(), destination.toUri().getPath());
     }
 
     public OutputStream createFile(final Path path,
-                                   final boolean overwrite,
-                                   FsPermission permission,
-                                   int bufferSize,
-                                   String replication) throws IOException {
+            final boolean overwrite,
+            FsPermission permission,
+            int bufferSize,
+            String replication) throws IOException {
 
         permission = permission == null ? FsPermission.getFileDefault() : permission;
 
+        
         LOG.debug("createFile path: {} overwrite: {} permission: {}",
-            path,
-            overwrite,
-            permission.toString());
+                path,
+                overwrite,
+                permission.toString());
 
         UserGroupInformation userGroupInformation = UserGroupInformation.getCurrentUser();
         long now = System.currentTimeMillis() / 1000L;
@@ -204,20 +204,21 @@ public class SeaweedFileSystemStore {
         }
         if (entry == null) {
             entry = FilerProto.Entry.newBuilder()
-                .setName(path.getName())
-                .setIsDirectory(false)
-                .setAttributes(FilerProto.FuseAttributes.newBuilder()
-                    .setFileMode(permissionToMode(permission, false))
-                    .setCrtime(now)
-                    .setMtime(now)
-                    .setUserName(userGroupInformation.getUserName())
-                    .clearGroupName()
-                    .addAllGroupName(Arrays.asList(userGroupInformation.getGroupNames()))
-                );
+                    .setName(path.getName())
+                    .setIsDirectory(false)
+                    .setAttributes(FilerProto.FuseAttributes.newBuilder()
+                            .setFileMode(permissionToMode(permission, false))
+                            .setCrtime(now)
+                            .setMtime(now)
+                            .setUserName(userGroupInformation.getUserName())
+                            .clearGroupName()
+                            .addAllGroupName(Arrays.asList(userGroupInformation.getGroupNames())));
             SeaweedWrite.writeMeta(filerClient, getParentDirectory(path), entry);
         }
 
-        return new SeaweedHadoopOutputStream(filerClient, path.toString(), entry, writePosition, bufferSize, replication);
+        
+        return new SeaweedHadoopOutputStream(filerClient, path.toString(), entry, writePosition, bufferSize,
+                replication);
 
     }
 
@@ -232,9 +233,9 @@ public class SeaweedFileSystemStore {
         }
 
         return new SeaweedHadoopInputStream(filerClient,
-            statistics,
-            path.toUri().getPath(),
-            entry);
+                statistics,
+                path.toUri().getPath(),
+                entry);
     }
 
     public void setOwner(Path path, String owner, String group) {

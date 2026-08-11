@@ -1,10 +1,10 @@
 package topology
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"google.golang.org/grpc"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,9 +21,15 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"google.golang.org/grpc"
 )
 
-func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, s *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request, contentMd5 string) (isUnchanged bool, err error) {
+// ReplicatedWrite writes a needle to the local volume and fans it out to all
+// remote replica locations. When type=replicate is set, the request is itself
+// a forwarded replication and no further remote lookups are performed.
+// Returns isUnchanged=true when the local write determined the needle content
+// was already present.
+func ReplicatedWrite(ctx context.Context, masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, s *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request, contentMd5 string) (isUnchanged bool, err error) {
 
 	//check JWT
 	jwt := security.GetJwt(r)
@@ -45,21 +51,43 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 		fsync = true
 	}
 
+	replicaCount := len(remoteLocations)
+
+	if replicaCount > 0 {
+		// Record replication duration histogram for the overall write operation
+		defer func(t time.Time) {
+			stats.VolumeServerReplicationHistogram.WithLabelValues(stats.ReplicationOpWrite).Observe(time.Since(t).Seconds())
+		}(time.Now())
+	}
+
 	if s.GetVolume(volumeId) != nil {
 		start := time.Now()
+
+		inFlightGauge := stats.VolumeServerInFlightRequestsGauge.WithLabelValues(stats.WriteToLocalDisk)
+		inFlightGauge.Inc()
+		defer inFlightGauge.Dec()
+
 		isUnchanged, err = s.WriteVolumeNeedle(volumeId, n, true, fsync)
 		stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToLocalDisk).Observe(time.Since(start).Seconds())
 		if err != nil {
 			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorWriteToLocalDisk).Inc()
-			err = fmt.Errorf("failed to write to local disk: %v", err)
+			err = fmt.Errorf("failed to write to local disk: %w", err)
 			glog.V(0).Infoln(err)
 			return
 		}
 	}
 
-	if len(remoteLocations) > 0 { //send to other replica locations
+	// Observe replication targets histogram for all operations (including zero)
+	stats.VolumeServerReplicationTargets.Observe(float64(replicaCount))
+
+	if replicaCount > 0 { //send to other replica locations
 		start := time.Now()
-		err = DistributedOperation(remoteLocations, func(location operation.Location) error {
+
+		inFlightGauge := stats.VolumeServerInFlightRequestsGauge.WithLabelValues(stats.WriteToReplicas)
+		inFlightGauge.Inc()
+		defer inFlightGauge.Dec()
+
+		err = DistributedOperation(ctx, remoteLocations, func(ctx context.Context, location operation.Location) error {
 			u := url.URL{
 				Scheme: "http",
 				Host:   location.Url,
@@ -99,11 +127,13 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 				Filename:          string(n.Name),
 				Cipher:            false,
 				IsInputCompressed: n.IsCompressed(),
+				IsReplication:     true,
 				MimeType:          string(n.Mime),
 				PairMap:           pairMap,
 				Jwt:               jwt,
 				Md5:               contentMd5,
 				BytesBuffer:       bytesBuffer,
+				MaxAttempts:       1, // fail fast on a dead replica; the client write retries
 			}
 
 			uploader, err := operation.NewUploader()
@@ -111,7 +141,7 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 				glog.Errorf("replication-UploadData, err:%v, url:%s", err, u.String())
 				return err
 			}
-			_, err = uploader.UploadData(n.Data, uploadOption)
+			_, err = uploader.UploadData(ctx, n.Data, uploadOption)
 			if err != nil {
 				glog.Errorf("replication-UploadData, err:%v, url:%s", err, u.String())
 			}
@@ -120,14 +150,22 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 		stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToReplicas).Observe(time.Since(start).Seconds())
 		if err != nil {
 			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorWriteToReplicas).Inc()
+			stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpWrite, stats.ReplicationFailure).Inc()
+			reason := classifyReplicationError(err)
+			stats.VolumeServerReplicationFailures.WithLabelValues(stats.ReplicationOpWrite, reason).Inc()
 			err = fmt.Errorf("failed to write to replicas for volume %d: %v", volumeId, err)
 			glog.V(0).Infoln(err)
 			return false, err
 		}
+		stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpWrite, stats.ReplicationSuccess).Inc()
 	}
 	return
 }
 
+// ReplicatedDelete deletes a needle from the local volume and sends delete
+// requests to all remote replica locations. Replica deletes use
+// context.Background() so that a client disconnect does not orphan replica
+// deletes.
 func ReplicatedDelete(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, store *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request) (size types.Size, err error) {
 
 	//check JWT
@@ -142,16 +180,36 @@ func ReplicatedDelete(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOp
 		}
 	}
 
+	replicaCount := len(remoteLocations)
+
+	if replicaCount > 0 {
+		// Record replication duration and operation counter for delete
+		defer func(t time.Time) {
+			stats.VolumeServerReplicationHistogram.WithLabelValues(stats.ReplicationOpDelete).Observe(time.Since(t).Seconds())
+			if err != nil {
+				stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpDelete, stats.ReplicationFailure).Inc()
+			} else {
+				stats.VolumeServerReplicationCounter.WithLabelValues(stats.ReplicationOpDelete, stats.ReplicationSuccess).Inc()
+			}
+		}(time.Now())
+	}
+
 	size, err = store.DeleteVolumeNeedle(volumeId, n)
 	if err != nil {
 		glog.V(0).Infoln("delete error:", err)
 		return
 	}
 
-	if len(remoteLocations) > 0 { //send to other replica locations
-		if err = DistributedOperation(remoteLocations, func(location operation.Location) error {
+	// Observe replication targets histogram for all operations (including zero)
+	stats.VolumeServerReplicationTargets.Observe(float64(replicaCount))
+
+	if replicaCount > 0 { //send to other replica locations
+		// background, not r.Context(): a client disconnect must not orphan replica deletes
+		if err = DistributedOperation(context.Background(), remoteLocations, func(ctx context.Context, location operation.Location) error {
 			return util_http.Delete("http://"+location.Url+r.URL.Path+"?type=replicate", string(jwt))
 		}); err != nil {
+			reason := classifyReplicationError(err)
+			stats.VolumeServerReplicationFailures.WithLabelValues(stats.ReplicationOpDelete, reason).Inc()
 			size = 0
 		}
 	}
@@ -178,20 +236,34 @@ type RemoteResult struct {
 	Error error
 }
 
-func DistributedOperation(locations []operation.Location, op func(location operation.Location) error) error {
+func DistributedOperation(ctx context.Context, locations []operation.Location, op func(ctx context.Context, location operation.Location) error) error {
 	length := len(locations)
-	results := make(chan RemoteResult)
-	for _, location := range locations {
-		go func(location operation.Location, results chan RemoteResult) {
-			results <- RemoteResult{location.Url, op(location)}
-		}(location, results)
-	}
-	ret := DistributedOperationResult(make(map[string]error))
-	for i := 0; i < length; i++ {
-		result := <-results
-		ret[result.Host] = result.Error
+	if length == 0 {
+		return nil
 	}
 
+	// cancel outstanding replica ops once the outcome is decided
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// buffered so a straggler (e.g. a replica stalled on a TCP dial timeout) can
+	// still deliver its result and exit after we have already returned.
+	resultCh := make(chan RemoteResult, length)
+	for _, location := range locations {
+		go func(location operation.Location) {
+			resultCh <- RemoteResult{location.Url, op(ctx, location)}
+		}(location)
+	}
+
+	ret := DistributedOperationResult(make(map[string]error))
+	for i := 0; i < length; i++ {
+		result := <-resultCh
+		ret[result.Host] = result.Error
+		if result.Error != nil {
+			// fail fast on the first error instead of waiting for slow replicas
+			return ret.Error()
+		}
+	}
 	return ret.Error()
 }
 
@@ -220,10 +292,32 @@ func GetWritableRemoteReplications(s *storage.Store, grpcDialOption grpc.DialOpt
 		// has one local and has remote replications
 		copyCount := v.ReplicaPlacement.GetCopyCount()
 		if len(lookupResult.Locations) < copyCount {
+			// drop the stale cache so the next write re-queries the master once it re-registers the missing replica
+			operation.InvalidateVolumeIdLocationCache(volumeId.String())
 			err = fmt.Errorf("replicating operations [%d] is less than volume %d replication copy count [%d]",
 				len(lookupResult.Locations), volumeId, copyCount)
 		}
 	}
 
 	return
+}
+
+// classifyReplicationError maps a Go error to a bounded-cardinality failure
+// reason label for the replication_failures_total metric. Returns an empty
+// string for nil errors.
+func classifyReplicationError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return stats.FailureTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return stats.FailureContextCancelled
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, "connection refused") {
+		return stats.FailureConnectionRefused
+	}
+	return stats.FailureServerError
 }

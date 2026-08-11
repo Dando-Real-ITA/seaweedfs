@@ -3,12 +3,15 @@ package broker
 import (
 	"context"
 	"fmt"
+	"sync"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mq/logstore"
 	"github.com/seaweedfs/seaweedfs/weed/mq/pub_balancer"
 	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
-	"sync"
+	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 )
 
 // AssignTopicPartitions Runs on the assigned broker, to execute the topic partition assignment
@@ -26,8 +29,13 @@ func (b *MessageQueueBroker) AssignTopicPartitions(c context.Context, request *m
 		} else {
 			var localPartition *topic.LocalPartition
 			if localPartition = b.localTopicManager.GetLocalPartition(t, partition); localPartition == nil {
-				localPartition = topic.NewLocalPartition(partition, b.genLogFlushFunc(t, assignment.Partition), b.genLogOnDiskReadFunc(t, assignment.Partition))
+				localPartition = topic.NewLocalPartition(partition, b.option.LogFlushInterval, b.genLogFlushFunc(t, partition), logstore.GenMergedReadFunc(b, t, partition))
+
+				// Initialize offset from existing data to ensure continuity on restart
+				b.initializePartitionOffsetFromExistingData(localPartition, t, partition)
+
 				b.localTopicManager.AddLocalPartition(t, localPartition)
+			} else {
 			}
 		}
 		b.accessLock.Unlock()
@@ -48,13 +56,12 @@ func (b *MessageQueueBroker) AssignTopicPartitions(c context.Context, request *m
 		}
 	}
 
-	glog.V(0).Infof("AssignTopicPartitions: topic %s partition assignments: %v", request.Topic, request.BrokerPartitionAssignments)
 	return ret, nil
 }
 
 // called by broker leader to drain existing partitions.
 // new/updated partitions will be detected by broker from the filer
-func (b *MessageQueueBroker) assignTopicPartitionsToBrokers(ctx context.Context, t *mq_pb.Topic, assignments []*mq_pb.BrokerPartitionAssignment, isAdd bool) error {
+func (b *MessageQueueBroker) assignTopicPartitionsToBrokers(ctx context.Context, t *schema_pb.Topic, assignments []*mq_pb.BrokerPartitionAssignment, isAdd bool) error {
 	// notify the brokers to create the topic partitions in parallel
 	var wg sync.WaitGroup
 	for _, bpa := range assignments {

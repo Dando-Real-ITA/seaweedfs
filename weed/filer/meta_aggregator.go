@@ -2,14 +2,16 @@ package filer
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -29,8 +31,9 @@ type MetaAggregator struct {
 	peerChans      map[pb.ServerAddress]chan struct{}
 	peerChansLock  sync.Mutex
 	// notifying clients
-	ListenersLock sync.Mutex
-	ListenersCond *sync.Cond
+	ListenersLock  sync.Mutex
+	ListenersWaits int64 // Atomic counter
+	ListenersCond  *sync.Cond
 }
 
 // MetaAggregator only aggregates data "on the fly". The logs are not re-persisted to disk.
@@ -44,7 +47,9 @@ func NewMetaAggregator(filer *Filer, self pb.ServerAddress, grpcDialOption grpc.
 	}
 	t.ListenersCond = sync.NewCond(&t.ListenersLock)
 	t.MetaLogBuffer = log_buffer.NewLogBuffer("aggr", LogFlushInterval, nil, nil, func() {
-		t.ListenersCond.Broadcast()
+		if atomic.LoadInt64(&t.ListenersWaits) > 0 {
+			t.ListenersCond.Broadcast()
+		}
 	})
 	return t
 }
@@ -68,6 +73,35 @@ func (ma *MetaAggregator) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, star
 			delete(ma.peerChans, address)
 		}
 	}
+}
+
+func (ma *MetaAggregator) HasRemotePeers() bool {
+	ma.peerChansLock.Lock()
+	defer ma.peerChansLock.Unlock()
+
+	for address := range ma.peerChans {
+		if address != ma.self {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPeer reports whether address is currently a tracked filer peer (or this
+// filer's own address). Callers use this to gate operations on known cluster
+// members.
+func (ma *MetaAggregator) HasPeer(address pb.ServerAddress) bool {
+	if address == ma.self || address.Equals(ma.self) {
+		return true
+	}
+	ma.peerChansLock.Lock()
+	defer ma.peerChansLock.Unlock()
+	for peer := range ma.peerChans {
+		if peer == address || peer.Equals(address) {
+			return true
+		}
+	}
+	return false
 }
 
 func (ma *MetaAggregator) loopSubscribeToOneFiler(f *Filer, self pb.ServerAddress, peer pb.ServerAddress, startFrom time.Time, stopChan chan struct{}) {
@@ -123,16 +157,37 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 	if peerSignature != f.Signature {
 		if prevTsNs, err := ma.readOffset(f, peer, peerSignature); err == nil {
 			lastTsNs = prevTsNs
-			defer func(prevTsNs int64) {
-				if lastTsNs != prevTsNs && lastTsNs != lastPersistTime.UnixNano() {
-					if err := ma.updateOffset(f, peer, peerSignature, lastTsNs); err == nil {
-						glog.V(0).Infof("last sync time with %s at %v (%d)", peer, time.Unix(0, lastTsNs), lastTsNs)
-					} else {
-						glog.Errorf("failed to save last sync time with %s at %v (%d)", peer, time.Unix(0, lastTsNs), lastTsNs)
-					}
-				}
-			}(prevTsNs)
+		} else if errors.Is(err, ErrKvNotFound) {
+			// No stored offset — this is the first time connecting to this peer.
+			// Traverse the peer's full metadata tree so we get pre-existing data.
+			// Record time before traversal and subtract a safety margin to
+			// account for clock skew between this filer and the peer. Any
+			// duplicate events replayed during the overlap are harmless since
+			// Replay does upserts. We use wall-clock time (same domain as the
+			// metadata stream TsNs) rather than entry Mtime which is a
+			// different concept and can be set to arbitrary values.
+			preTraverseTime := time.Now()
+			glog.V(0).Infof("no previous offset for peer %s, starting full metadata sync", peer)
+			if traverseErr := ma.traversePeerMetadata(f, peer); traverseErr != nil {
+				return lastTsNs, fmt.Errorf("initial metadata sync from %s: %v", peer, traverseErr)
+			}
+			lastTsNs = preTraverseTime.Add(-time.Minute).UnixNano()
+			if err := ma.updateOffset(f, peer, peerSignature, lastTsNs); err != nil {
+				return lastTsNs, fmt.Errorf("save bootstrap offset for peer %s: %w", peer, err)
+			}
+			glog.V(0).Infof("completed full metadata sync from peer %s, will stream changes from %v", peer, time.Unix(0, lastTsNs))
+		} else {
+			return lastTsNs, fmt.Errorf("read offset for peer %s: %w", peer, err)
 		}
+		defer func(prevTsNs int64) {
+			if lastTsNs != prevTsNs && lastTsNs != lastPersistTime.UnixNano() {
+				if err := ma.updateOffset(f, peer, peerSignature, lastTsNs); err == nil {
+					glog.V(0).Infof("last sync time with %s at %v (%d)", peer, time.Unix(0, lastTsNs), lastTsNs)
+				} else {
+					glog.Errorf("failed to save last sync time with %s at %v (%d)", peer, time.Unix(0, lastTsNs), lastTsNs)
+				}
+			}
+		}(lastTsNs)
 
 		glog.V(0).Infof("follow peer: %v, last %v (%d)", peer, time.Unix(0, lastTsNs), lastTsNs)
 		var counter int64
@@ -168,7 +223,10 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 		}
 		dir := event.Directory
 		// println("received meta change", dir, "size", len(data))
-		ma.MetaLogBuffer.AddDataToBuffer([]byte(dir), data, event.TsNs)
+		if err := ma.MetaLogBuffer.AddDataToBuffer([]byte(dir), data, event.TsNs); err != nil {
+			glog.Errorf("failed to add data to log buffer for %s: %v", dir, err)
+			return err
+		}
 		if maybeReplicateMetadataChange != nil {
 			maybeReplicateMetadataChange(event)
 		}
@@ -180,17 +238,37 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		atomic.AddInt32(&ma.filer.UniqueFilerEpoch, 1)
+		// Construct a log file reader that reads chunks via the peer filer's LookupVolume.
+		lookupFn := LookupFn(filerClient{client})
+		logFileReaderFn := func(chunks []*filer_pb.FileChunk) (io.ReadCloser, error) {
+			return NewChunkStreamReaderFromLookup(ctx, lookupFn, chunks), nil
+		}
+
 		stream, err := client.SubscribeLocalMetadata(ctx, &filer_pb.SubscribeMetadataRequest{
-			ClientName:  "filer:" + string(self),
-			PathPrefix:  "/",
-			SinceNs:     lastTsNs,
-			ClientId:    ma.filer.UniqueFilerId,
-			ClientEpoch: atomic.LoadInt32(&ma.filer.UniqueFilerEpoch),
+			ClientName:                   "filer:" + string(self),
+			PathPrefix:                   "/",
+			SinceNs:                      lastTsNs,
+			ClientId:                     ma.filer.UniqueFilerId,
+			ClientEpoch:                  atomic.LoadInt32(&ma.filer.UniqueFilerEpoch),
+			ClientSupportsBatching:       true,
+			ClientSupportsMetadataChunks: true,
 		})
 		if err != nil {
 			glog.V(0).Infof("SubscribeLocalMetadata %v: %v", peer, err)
-			return fmt.Errorf("subscribe: %v", err)
+			return fmt.Errorf("subscribe: %w", err)
 		}
+
+		processOne := func(event *filer_pb.SubscribeMetadataResponse) error {
+			if err := processEventFn(event); err != nil {
+				glog.V(0).Infof("SubscribeLocalMetadata process %v: %v", event, err)
+				return fmt.Errorf("process %v: %w", event, err)
+			}
+			f.onMetadataChangeEvent(event)
+			lastTsNs = event.TsNs
+			return nil
+		}
+
+		var pendingRefs []*filer_pb.LogFileChunkRef
 
 		for {
 			resp, listenErr := stream.Recv()
@@ -202,16 +280,100 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 				return listenErr
 			}
 
-			if err := processEventFn(resp); err != nil {
-				glog.V(0).Infof("SubscribeLocalMetadata process %v: %v", resp, err)
-				return fmt.Errorf("process %v: %v", resp, err)
+			// Accumulate log file chunk references
+			if len(resp.LogFileRefs) > 0 {
+				pendingRefs = append(pendingRefs, resp.LogFileRefs...)
+				continue
 			}
 
-			f.onMetadataChangeEvent(resp)
-			lastTsNs = resp.TsNs
+			// Process accumulated refs (transition from disk to in-memory)
+			if len(pendingRefs) > 0 {
+				lastTs, readErr := pb.ReadLogFileRefs(pendingRefs, logFileReaderFn,
+					lastTsNs, 0, pb.PathFilter{PathPrefix: "/"},
+					func(event *filer_pb.SubscribeMetadataResponse) error {
+						return processOne(event)
+					})
+				if readErr != nil {
+					return fmt.Errorf("read log file refs from %s: %w", peer, readErr)
+				}
+				if lastTs > 0 {
+					lastTsNs = lastTs
+				}
+				pendingRefs = nil
+			}
+
+			if resp.EventNotification != nil {
+				if err := processOne(resp); err != nil {
+					return err
+				}
+			}
+			// Process any additional batched events. Mirror the envelope's nil
+			// guard: the server can fold a freshness signal (nil EventNotification)
+			// into the batched tail, and processOne dereferences it.
+			for _, batchedEvent := range resp.Events {
+				if batchedEvent.EventNotification == nil {
+					continue
+				}
+				if err := processOne(batchedEvent); err != nil {
+					return err
+				}
+			}
 		}
 	})
 	return lastTsNs, err
+}
+
+// traversePeerMetadata does a full BFS traversal of a peer filer's metadata
+// and inserts all entries into the local store. This is used when a filer
+// connects to a peer for the first time and needs to bootstrap pre-existing data.
+func (ma *MetaAggregator) traversePeerMetadata(f *Filer, peer pb.ServerAddress) error {
+	return pb.WithFilerClient(true, 0, peer, ma.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		stream, err := client.TraverseBfsMetadata(ctx, &filer_pb.TraverseBfsMetadataRequest{
+			Directory:        "/",
+			ExcludedPrefixes: []string{SystemLogDir},
+		})
+		if err != nil {
+			return fmt.Errorf("traverse bfs metadata: %w", err)
+		}
+		var count int64
+		for {
+			resp, recvErr := stream.Recv()
+			if recvErr == io.EOF {
+				break
+			}
+			if recvErr != nil {
+				return fmt.Errorf("traverse bfs metadata recv: %w", recvErr)
+			}
+			if resp.Entry == nil {
+				continue
+			}
+			fullpath := util.Join(resp.Directory, resp.Entry.Name)
+			entry := FromPbEntry(resp.Directory, resp.Entry)
+			if insertErr := f.Store.InsertEntry(context.Background(), entry); insertErr != nil {
+				// Entry may already exist (root dir, or partial previous bootstrap).
+				existing, findErr := f.Store.FindEntry(context.Background(), entry.FullPath)
+				if findErr != nil {
+					return fmt.Errorf("insert entry %s: %w", fullpath, insertErr)
+				}
+				// Only overwrite if the peer's entry is newer.
+				if entry.Attr.Mtime.After(existing.Attr.Mtime) {
+					if updateErr := f.Store.UpdateEntry(context.Background(), entry); updateErr != nil {
+						return fmt.Errorf("update entry %s: %w", fullpath, updateErr)
+					}
+				} else {
+					glog.V(1).Infof("skip older peer entry %s (peer mtime %v <= local mtime %v)", fullpath, entry.Attr.Mtime, existing.Attr.Mtime)
+				}
+			}
+			count++
+			if count%10000 == 0 {
+				glog.V(0).Infof("synced %d entries from peer %s", count, peer)
+			}
+		}
+		glog.V(0).Infof("synced %d entries total from peer %s", count, peer)
+		return nil
+	})
 }
 
 func (ma *MetaAggregator) readFilerStoreSignature(peer pb.ServerAddress) (sig int32, err error) {
@@ -243,7 +405,7 @@ func (ma *MetaAggregator) readOffset(f *Filer, peer pb.ServerAddress, peerSignat
 	value, err := f.Store.KvGet(context.Background(), key)
 
 	if err != nil {
-		return 0, fmt.Errorf("readOffset %s : %v", peer, err)
+		return 0, fmt.Errorf("readOffset %s : %w", peer, err)
 	}
 
 	lastTsNs = int64(util.BytesToUint64(value))
@@ -269,4 +431,23 @@ func (ma *MetaAggregator) updateOffset(f *Filer, peer pb.ServerAddress, peerSign
 	glog.V(4).Infof("updateOffset %s : %d", peer, lastTsNs)
 
 	return
+}
+
+// filerClient adapts a SeaweedFilerClient to the FilerClient interface
+// for use with LookupFn. Used by MetaAggregator to resolve volume IDs
+// on peer filers.
+type filerClient struct {
+	client filer_pb.SeaweedFilerClient
+}
+
+func (fc filerClient) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+	return fn(fc.client)
+}
+
+func (fc filerClient) AdjustedUrl(location *filer_pb.Location) string {
+	return location.Url
+}
+
+func (fc filerClient) GetDataCenter() string {
+	return ""
 }

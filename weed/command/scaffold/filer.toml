@@ -13,6 +13,9 @@
 # recursive_delete will delete all sub folders and files, similar to "rm -Rf"
 recursive_delete = false
 #max_file_name_length = 255
+# for S3: how long to wait before deleting an empty folder.
+# increase this if using tools like Spark that create temporary directories.
+#s3.empty_folder_cleanup_delay = "2m"
 
 ####################################################
 # The following are filer store options
@@ -54,17 +57,28 @@ enabled = false
 # dsn will take priority over "hostname, port, username, password, database".
 # [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
 dsn = "root@tcp(localhost:3306)/seaweedfs?collation=utf8mb4_bin"
+enable_tls = false
+ca_crt = ""                       # path to CA cert (PEM) — optional; if empty, the system trust store is used
+client_crt = ""                   # path to client cert (PEM) — only when server requires mTLS; must be set together with client_key
+client_key = ""                   # path to client key (PEM)  — only when server requires mTLS; must be set together with client_crt
+tls_insecure_skip_verify = false  # skip server cert verification (use only for testing or with self-signed certs)
+tls_server_name = ""              # override SNI / cert hostname; leave empty to use `hostname` above
 hostname = "localhost"
 port = 3306
 username = "root"
 password = ""
 database = ""              # create or use an existing database
-connection_max_idle = 2
-connection_max_open = 100
-connection_max_lifetime_seconds = 0
+connection_max_idle = 10
+connection_max_open = 50
+connection_max_lifetime_seconds = 300
 interpolateParams = false
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
+# Default uses the row-alias form (`AS new`) added in MySQL 8.0.19 and is the
+# preferred syntax there. For MariaDB (any version) and MySQL 5.7, override
+# with the form below — MariaDB does not support row aliases in
+# INSERT ... ON DUPLICATE KEY UPDATE:
+# upsertQuery = """INSERT INTO `%s` (`dirhash`,`name`,`directory`,`meta`) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE `meta` = VALUES(`meta`)"""
 upsertQuery = """INSERT INTO `%s` (`dirhash`,`name`,`directory`,`meta`) VALUES (?,?,?,?) AS `new` ON DUPLICATE KEY UPDATE `meta` = `new`.`meta`"""
 
 [mysql2]  # or memsql, tidb
@@ -83,9 +97,9 @@ port = 3306
 username = "root"
 password = ""
 database = ""              # create or use an existing database
-connection_max_idle = 2
-connection_max_open = 100
-connection_max_lifetime_seconds = 0
+connection_max_idle = 10
+connection_max_open = 50
+connection_max_lifetime_seconds = 300
 interpolateParams = false
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
@@ -107,12 +121,26 @@ password = ""
 database = "postgres"          # create or use an existing database
 schema = ""
 sslmode = "disable"
-connection_max_idle = 100
-connection_max_open = 100
-connection_max_lifetime_seconds = 0
+# SSL certificate options for secure connections
+# For sslmode=verify-full, uncomment and configure the following:
+# sslcert = "/path/to/client.crt"     # client certificate file
+# sslkey = "/path/to/client.key"      # client private key file
+# sslrootcert = "/path/to/ca.crt"     # CA certificate file
+# sslcrl = "/path/to/client.crl"      # Certificate Revocation List (CRL) (optional)
+connection_max_idle = 10
+connection_max_open = 50
+connection_max_lifetime_seconds = 300
+# Set to true when using PgBouncer connection pooler
+pgbouncer_compatible = false
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
-upsertQuery = """UPSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4)"""
+upsertQuery = """
+  INSERT INTO "%[1]s" (dirhash, name, directory, meta)
+    VALUES($1, $2, $3, $4)
+    ON CONFLICT (dirhash, name) DO UPDATE SET
+      directory=EXCLUDED.directory,
+      meta=EXCLUDED.meta
+"""
 
 [postgres2]
 enabled = false
@@ -132,19 +160,34 @@ password = ""
 database = "postgres"          # create or use an existing database
 schema = ""
 sslmode = "disable"
-connection_max_idle = 100
-connection_max_open = 100
-connection_max_lifetime_seconds = 0
+# SSL certificate options for secure connections
+# For sslmode=verify-full, uncomment and configure the following:
+# sslcert = "/path/to/client.crt"     # client certificate file
+# sslkey = "/path/to/client.key"      # client private key file
+# sslrootcert = "/path/to/ca.crt"     # CA certificate file
+# sslcrl = "/path/to/client.crl"      # Certificate Revocation List (CRL) (optional)
+connection_max_idle = 10
+connection_max_open = 50
+connection_max_lifetime_seconds = 300
+# Set to true when using PgBouncer connection pooler
+pgbouncer_compatible = false
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
-upsertQuery = """UPSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4)"""
+upsertQuery = """
+  INSERT INTO "%[1]s" (dirhash, name, directory, meta)
+    VALUES($1, $2, $3, $4)
+    ON CONFLICT (dirhash, name) DO UPDATE SET
+      directory=EXCLUDED.directory,
+      meta=EXCLUDED.meta
+"""
 
-[cassandra]
+[cassandra2]
 # CREATE TABLE filemeta (
+#    dirhash bigint,
 #    directory varchar,
 #    name varchar,
 #    meta blob,
-#    PRIMARY KEY (directory, name)
+#    PRIMARY KEY ((dirhash, directory), name)
 # ) WITH CLUSTERING ORDER BY (name ASC);
 enabled = false
 keyspace = "seaweedfs"
@@ -153,6 +196,14 @@ hosts = [
 ]
 username = ""
 password = ""
+# Set the CA certificate path
+ssl_ca_path = ""
+# Set the client certificate path
+ssl_cert_path = ""
+# Set the client private key path
+ssl_key_path = ""
+# Check host name in the certificate
+ssl_enable_host_verification = true
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 # Name of the datacenter local to this filer, used as host selection fallback.
@@ -168,8 +219,15 @@ table = "seaweedfs"
 [redis2]
 enabled = false
 address = "localhost:6379"
+username = ""
 password = ""
 database = 0
+# prefix for filer redis keys
+keyPrefix = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
@@ -180,6 +238,12 @@ masterName = "master"
 username = ""
 password = ""
 database = 0
+# prefix for filer redis keys
+keyPrefix = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 
 [redis_cluster2]
 enabled = false
@@ -191,7 +255,14 @@ addresses = [
     "localhost:30005",
     "localhost:30006",
 ]
+username = ""
 password = ""
+# prefix for filer redis keys
+keyPrefix = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # allows reads from slave servers or the master, but all writes still go to the master
 readOnly = false
 # automatically use the closest Redis server for reads
@@ -199,11 +270,19 @@ routeByLatency = false
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
+# The following lua redis stores uses lua to ensure atomicity
 [redis_lua]
 enabled = false
 address = "localhost:6379"
+username = ""
 password = ""
 database = 0
+# prefix for filer redis keys
+keyPrefix = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
@@ -214,6 +293,12 @@ masterName = "master"
 username = ""
 password = ""
 database = 0
+# prefix for filer redis keys
+keyPrefix = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 
 [redis_lua_cluster]
 enabled = false
@@ -225,43 +310,20 @@ addresses = [
     "localhost:30005",
     "localhost:30006",
 ]
+username = ""
 password = ""
+# prefix for filer redis keys
+keyPrefix = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # allows reads from slave servers or the master, but all writes still go to the master
 readOnly = false
 # automatically use the closest Redis server for reads
 routeByLatency = false
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
-
-[redis3] # beta
-enabled = false
-address = "localhost:6379"
-password = ""
-database = 0
-
-[redis3_sentinel]
-enabled = false
-addresses = ["172.22.12.7:26379","172.22.12.8:26379","172.22.12.9:26379"]
-masterName = "master"
-username = ""
-password = ""
-database = 0
-
-[redis_cluster3] # beta
-enabled = false
-addresses = [
-    "localhost:30001",
-    "localhost:30002",
-    "localhost:30003",
-    "localhost:30004",
-    "localhost:30005",
-    "localhost:30006",
-]
-password = ""
-# allows reads from slave servers or the master, but all writes still go to the master
-readOnly = false
-# automatically use the closest Redis server for reads
-routeByLatency = false
 
 [etcd]
 enabled = false
@@ -304,6 +366,21 @@ healthcheck_enabled = false
 # increase the value is recommend, be sure the value in Elastic is greater or equal here
 index.max_result_window = 10000
 
+# for Elasticsearch 8.x clusters
+[elastic8]
+enabled = false
+servers = [
+    "http://localhost1:9200",
+    "http://localhost2:9200",
+    "http://localhost3:9200",
+]
+username = ""
+password = ""
+sniff_enabled = false
+healthcheck_enabled = false
+# increase the value is recommend, be sure the value in Elastic is greater or equal here
+index.max_result_window = 10000
+
 
 [arangodb] # in development dont use it
 enabled = false
@@ -333,7 +410,7 @@ dialTimeOut = 10
 ##########################
 # To add path-specific filer store:
 #
-# 1. Add a name following the store type separated by a dot ".". E.g., cassandra.tmp
+# 1. Add a name following the store type separated by a dot ".". E.g., cassandra2.tmp
 # 2. Add a location configuration. E.g., location = "/tmp/"
 # 3. Copy and customize all other configurations.
 #     Make sure they are not the same if using the same store type!
@@ -345,18 +422,23 @@ dialTimeOut = 10
 enabled = false
 location = "/tmp/"
 address = "localhost:6379"
+username = ""
 password = ""
 database = 1
+keyPrefix = ""
 
 [tikv]
 enabled = false
 # If you have many pd address, use ',' split then:
 #   pdaddrs = "pdhost1:2379, pdhost2:2379, pdhost3:2379"
 pdaddrs = "localhost:2379"
-# Concurrency for TiKV delete range
-deleterange_concurrency = 1
+# prefix for filer TiKV keys, useful for sharing a TiKV cluster with multiple seaweedfs clusters
+keyPrefix = ""
 # Enable 1PC
 enable_1pc = false
+# batch delete count, default 10000 in code
+#batchdelete_count = 20000
+
 # Set the CA certificate path
 ca_path=""
 # Set the certificate path
@@ -365,3 +447,22 @@ cert_path=""
 key_path=""
 # The name list used to verify the cn name
 verify_cn=""
+
+[foundationdb]
+# FoundationDB provides ACID transactions and horizontal scalability.
+# Requires: go build -tags foundationdb
+enabled = false
+cluster_file = "/etc/foundationdb/fdb.cluster"
+# api_version = 740
+# timeout = "5s"
+# directory_prefix = "seaweedfs"
+# For bulk ingestion, enable batching: batch_enabled = true
+
+[tarantool]
+address = "localhost:3301"
+user = "guest"
+password = ""
+timeout = "5s"
+maxReconnects = 1000
+
+

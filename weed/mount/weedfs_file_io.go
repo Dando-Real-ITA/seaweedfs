@@ -1,7 +1,10 @@
 package mount
 
 import (
-	"github.com/hanwen/go-fuse/v2/fuse"
+	"context"
+
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 /**
@@ -65,8 +68,16 @@ func (wfs *WFS) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut)
 	fileHandle, status = wfs.AcquireHandle(in.NodeId, in.Flags, in.Uid, in.Gid)
 	if status == fuse.OK {
 		out.Fh = uint64(fileHandle.fh)
-		out.OpenFlags = in.Flags
-		// TODO https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h#L64
+		out.OpenFlags = 0
+
+		// For read-only opens, set FOPEN_KEEP_CACHE when the file's mtime
+		// has not changed since the last open.  This tells the kernel to
+		// preserve its existing page cache, avoiding redundant reads.
+		if in.Flags&fuse.O_ANYWRITE == 0 {
+			if entry := fileHandle.GetEntry(); entry != nil && entry.Attributes != nil {
+				wfs.applyKeepCacheFlag(in.NodeId, entry, out)
+			}
+		}
 	}
 	return status
 }
@@ -96,6 +107,52 @@ func (wfs *WFS) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut)
  * @param ino the inode number
  * @param fi file information
  */
+const openMtimeCacheMaxSize = 8192
+
+// applyKeepCacheFlag compares the entry's mtime (seconds + nanoseconds) against
+// the last-seen value and sets FOPEN_KEEP_CACHE when unchanged.
+func (wfs *WFS) applyKeepCacheFlag(inode uint64, entry *LockedEntry, out *fuse.OpenOut) {
+	currentMtime := [2]int64{entry.Attributes.Mtime, int64(entry.Attributes.MtimeNs)}
+	wfs.openMtimeMu.Lock()
+	prev, loaded := wfs.openMtimeCache[inode]
+	if loaded && prev == currentMtime {
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	} else {
+		if len(wfs.openMtimeCache) >= openMtimeCacheMaxSize {
+			for k := range wfs.openMtimeCache {
+				delete(wfs.openMtimeCache, k)
+				break
+			}
+		}
+		wfs.openMtimeCache[inode] = currentMtime
+	}
+	wfs.openMtimeMu.Unlock()
+}
+
+// invalidateOpenMtimeCache removes an inode's cached mtime so the next Open
+// does not set FOPEN_KEEP_CACHE with stale kernel page cache data.
+func (wfs *WFS) invalidateOpenMtimeCache(inode uint64) {
+	wfs.openMtimeMu.Lock()
+	delete(wfs.openMtimeCache, inode)
+	wfs.openMtimeMu.Unlock()
+}
+
 func (wfs *WFS) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
+	// Flush is usually sent before Release, but the FUSE protocol does not
+	// guarantee it. Route every Release through doFlush so a dirty handle
+	// (e.g. a deferred create with no intervening Flush) is not dropped.
+	// doFlush itself inspects dirtyMetadata / asyncFlushPending and fast-paths
+	// the clean case, so the duplicate call after a normal Flush is cheap.
+	if fh := wfs.GetHandle(FileHandleId(in.Fh)); fh != nil {
+		allowAsync := in.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK == 0
+		// Release is the last chance to persist the handle, so it must finish
+		// even if the triggering syscall was interrupted: non-cancellable context.
+		if status := wfs.doFlush(context.Background(), fh, in.Uid, in.Gid, allowAsync); status != fuse.OK {
+			glog.Warningf("release fh %d inode %d: fallback flush failed: %v", in.Fh, in.NodeId, status)
+		}
+	}
+	if in.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK != 0 {
+		wfs.releaseFlockOwner(in.NodeId, in.LockOwner)
+	}
 	wfs.ReleaseHandle(FileHandleId(in.Fh))
 }

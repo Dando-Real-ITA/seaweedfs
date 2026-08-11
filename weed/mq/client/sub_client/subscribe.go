@@ -1,11 +1,13 @@
 package sub_client
 
 import (
+	"sync"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
-	"sync"
-	"time"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type ProcessorState struct {
@@ -20,6 +22,7 @@ func (sub *TopicSubscriber) Subscribe() error {
 	go sub.startProcessors()
 
 	// loop forever
+	// TODO shutdown the subscriber when not needed anymore
 	sub.doKeepConnectedToSubCoordinator()
 
 	return nil
@@ -66,7 +69,21 @@ func (sub *TopicSubscriber) startProcessors() {
 						},
 					},
 				}
-				err := sub.onEachPartition(assigned, stopChan)
+
+				executors := util.NewLimitedConcurrentExecutor(int(sub.SubscriberConfig.SlidingWindowSize))
+				onDataMessageFn := func(m *mq_pb.SubscribeMessageResponse_Data) {
+					executors.Execute(func() {
+						if sub.OnDataMessageFunc != nil {
+							sub.OnDataMessageFunc(m)
+						}
+						sub.PartitionOffsetChan <- KeyedTimestamp{
+							Key:  m.Data.Key,
+							TsNs: m.Data.TsNs,
+						}
+					})
+				}
+
+				err := sub.onEachPartition(assigned, stopChan, onDataMessageFn)
 				if err != nil {
 					glog.V(0).Infof("subscriber %s/%s partition %+v at %v: %v", sub.ContentConfig.Topic, sub.SubscriberConfig.ConsumerGroup, assigned.Partition, assigned.LeaderBroker, err)
 				} else {

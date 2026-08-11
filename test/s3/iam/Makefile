@@ -1,0 +1,311 @@
+# SeaweedFS S3 IAM Integration Tests Makefile
+
+.PHONY: all test clean setup start-services stop-services wait-for-services help
+
+# Default target
+all: test
+
+# Test configuration
+WEED_BINARY ?= $(shell go env GOPATH)/bin/weed
+LOG_LEVEL ?= 2
+S3_PORT ?= 8333
+FILER_PORT ?= 8888
+MASTER_PORT ?= 9333
+VOLUME_PORT ?= 8081
+TEST_TIMEOUT ?= 30m
+
+# Service PIDs
+MASTER_PID_FILE = /tmp/weed-master.pid
+VOLUME_PID_FILE = /tmp/weed-volume.pid  
+FILER_PID_FILE = /tmp/weed-filer.pid
+S3_PID_FILE = /tmp/weed-s3.pid
+MINI_PID_FILE = /tmp/weed-mini.pid
+
+help: ## Show this help message
+	@echo "SeaweedFS S3 IAM Integration Tests"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make [target]"
+	@echo ""
+	@echo "Standard Targets:"
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-25s %s\n", $$1, $$2}' $(MAKEFILE_LIST) | head -20
+	@echo ""
+	@echo "New Test Targets (Previously Skipped):"
+	@echo "  test-distributed         Run distributed IAM tests"
+	@echo "  test-performance         Run performance tests"
+	@echo "  test-stress              Run stress tests"
+	@echo "  test-versioning-stress   Run S3 versioning stress tests"
+	@echo "  test-keycloak-full       Run complete Keycloak integration tests"
+	@echo "  test-all-previously-skipped  Run all previously skipped tests"
+	@echo "  setup-all-tests          Setup environment for all tests"
+	@echo ""
+	@echo "Docker Compose Targets:"
+	@echo "  docker-test              Run tests with Docker Compose including Keycloak"
+	@echo "  docker-up                Start all services with Docker Compose"
+	@echo "  docker-down              Stop all Docker Compose services"
+	@echo "  docker-logs              Show logs from all services"
+
+test: clean setup start-services run-tests stop-services ## Run complete IAM integration test suite
+
+test-quick: run-tests ## Run tests assuming services are already running
+
+run-tests: ## Execute the Go tests
+	@echo "Running S3 IAM Integration Tests..."
+	go test -v -timeout $(TEST_TIMEOUT) ./...
+
+setup: ## Setup test environment
+	@echo "Setting up test environment..."
+	@mkdir -p test-volume-data/filerldb2
+	@mkdir -p test-volume-data/m9333
+	@if [ ! -f iam_config.json ]; then \
+		echo "Creating iam_config.json from iam_config.local.json..."; \
+		cp iam_config.local.json iam_config.json; \
+	fi
+
+start-services: ## Start SeaweedFS services for testing
+	@echo "Starting SeaweedFS services using weed mini..."
+	@mkdir -p test-volume-data
+	@$(WEED_BINARY) mini \
+		-dir=test-volume-data \
+		-s3.port=$(S3_PORT) \
+		-s3.config=test_config.json \
+		-s3.iam.config=$(CURDIR)/iam_config.json \
+		-s3.iam.readOnly=false \
+		> weed-mini.log 2>&1 & \
+		echo $$! > $(MINI_PID_FILE)
+	
+	@echo "Waiting for services to be ready..."
+	@$(MAKE) wait-for-services
+	@echo "OK All services started and ready"
+
+wait-for-services: ## Wait for all services to be ready
+	@echo "Waiting for services to be ready..."
+	@echo "Checking S3 API server..."
+	@for i in $$(seq 1 30); do \
+		if curl -s http://localhost:$(S3_PORT) > /dev/null 2>&1; then \
+			echo "OK S3 API server is ready"; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+		echo "ERROR S3 API failed to start"; \
+	exit 1
+	
+	@echo "Pre-allocating volumes for concurrent operations..."
+	@curl -s "http://localhost:$(MASTER_PORT)/vol/grow?collection=default&count=10&replication=000" > /dev/null || echo "WARNING Volume pre-allocation failed, but continuing..."
+	@sleep 3
+	@echo "OK All services are ready"
+
+stop-services: ## Stop all SeaweedFS services
+	@echo "Stopping SeaweedFS services..."
+	@if [ -f $(MINI_PID_FILE) ]; then \
+		echo "Stopping weed mini..."; \
+		kill $$(cat $(MINI_PID_FILE)) 2>/dev/null || true; \
+		rm -f $(MINI_PID_FILE); \
+	fi
+	@if [ -f $(S3_PID_FILE) ]; then \
+		echo "Stopping S3 API server..."; \
+		kill $$(cat $(S3_PID_FILE)) 2>/dev/null || true; \
+		rm -f $(S3_PID_FILE); \
+	fi
+	@if [ -f $(FILER_PID_FILE) ]; then \
+		echo "Stopping filer server..."; \
+		kill $$(cat $(FILER_PID_FILE)) 2>/dev/null || true; \
+		rm -f $(FILER_PID_FILE); \
+	fi
+	@if [ -f $(VOLUME_PID_FILE) ]; then \
+		echo "Stopping volume server..."; \
+		kill $$(cat $(VOLUME_PID_FILE)) 2>/dev/null || true; \
+		rm -f $(VOLUME_PID_FILE); \
+	fi
+	@if [ -f $(MASTER_PID_FILE) ]; then \
+		echo "Stopping master server..."; \
+		kill $$(cat $(MASTER_PID_FILE)) 2>/dev/null || true; \
+		rm -f $(MASTER_PID_FILE); \
+	fi
+	@echo "OK All services stopped"
+
+clean: stop-services ## Clean up test environment
+	@echo "Cleaning up test environment..."
+	@rm -rf test-volume-data
+	@rm -f weed-*.log
+	@rm -f *.test
+	@rm -f iam_config.json
+	@rm -f .test_env
+	@docker rm -f keycloak-iam-test >/dev/null 2>&1 || true
+	@docker rm -f openldap-iam-test >/dev/null 2>&1 || true
+	@echo "Cleanup complete"
+
+logs: ## Show service logs
+	@echo "Service Logs:"
+	@echo "=== Master Log ==="
+	@tail -20 weed-master.log 2>/dev/null || echo "No master log"
+	@echo ""
+	@echo "=== Volume Log ==="
+	@tail -20 weed-volume.log 2>/dev/null || echo "No volume log"
+	@echo ""
+	@echo "=== Filer Log ==="
+	@tail -20 weed-filer.log 2>/dev/null || echo "No filer log"
+	@echo ""
+	@echo "=== S3 API Log ==="
+	@tail -20 weed-s3.log 2>/dev/null || echo "No S3 log"
+
+status: ## Check service status
+	@echo "Service Status:"
+	@echo -n "Master: "; curl -s http://localhost:$(MASTER_PORT)/cluster/status > /dev/null 2>&1 && echo "✅ Running" || echo "❌ Not running"
+	@echo -n "Filer: "; curl -s http://localhost:$(FILER_PORT)/status > /dev/null 2>&1 && echo "✅ Running" || echo "❌ Not running"
+	@echo -n "S3 API: "; curl -s http://localhost:$(S3_PORT) > /dev/null 2>&1 && echo "✅ Running" || echo "❌ Not running"
+
+debug: start-services wait-for-services ## Start services and keep them running for debugging
+	@echo "🐛 Services started in debug mode. Press Ctrl+C to stop..."
+	@trap 'make stop-services' INT; \
+	while true; do \
+		sleep 1; \
+	done
+
+# Test specific scenarios
+test-auth: ## Test only authentication scenarios
+	go test -v -run TestS3IAMAuthentication ./...
+
+test-policy: ## Test only policy enforcement
+	go test -v -run TestS3IAMPolicyEnforcement ./...
+
+test-expiration: ## Test only session expiration
+	go test -v -run TestS3IAMSessionExpiration ./...
+
+test-multipart: ## Test only multipart upload IAM integration
+	go test -v -run TestS3IAMMultipartUploadPolicyEnforcement ./...
+
+test-bucket-policy: ## Test only bucket policy integration
+	go test -v -run TestS3IAMBucketPolicyIntegration ./...
+
+test-context: ## Test only contextual policy enforcement  
+	go test -v -run TestS3IAMContextualPolicyEnforcement ./...
+
+test-presigned: ## Test only presigned URL integration
+	go test -v -run TestS3IAMPresignedURLIntegration ./...
+
+test-group: ## Run IAM group management tests
+	go test -v -run "TestIAMGroup" ./...
+
+test-sts: ## Run all STS tests
+	go test -v -run "TestSTS" ./...
+
+test-sts-assume-role: ## Run AssumeRole STS tests
+	go test -v -run "TestSTSAssumeRole" ./...
+
+test-sts-ldap: ## Run LDAP STS tests
+	go test -v -run "TestSTSLDAP" ./...
+
+test-sts-suite: start-services ## Run all STS tests with full environment setup/teardown
+	@echo "Running STS test suite..."
+	-go test -v -run "TestSTS" ./...
+	@$(MAKE) stop-services
+
+# Performance testing
+benchmark: setup start-services wait-for-services ## Run performance benchmarks
+	@echo "🏁 Running IAM performance benchmarks..."
+	go test -bench=. -benchmem -timeout $(TEST_TIMEOUT) ./...
+	@make stop-services
+
+# Continuous integration
+ci: ## Run tests suitable for CI environment
+	@echo "🔄 Running CI tests..."
+	@export CGO_ENABLED=0; make test
+
+# Development helpers
+watch: ## Watch for file changes and re-run tests
+	@echo "👀 Watching for changes..."
+	@command -v entr >/dev/null 2>&1 || (echo "entr is required for watch mode. Install with: brew install entr" && exit 1)
+	@find . -name "*.go" | entr -r make test-quick
+
+install-deps: ## Install test dependencies
+	@echo "📦 Installing test dependencies..."
+	go mod tidy
+	go get -u github.com/stretchr/testify
+	go get -u github.com/aws/aws-sdk-go
+	go get -u github.com/golang-jwt/jwt/v5
+
+# Docker support
+docker-test-legacy: ## Run tests in Docker container (legacy)
+	@echo "🐳 Running tests in Docker..."
+	docker build -f Dockerfile.test -t seaweedfs-s3-iam-test .
+	docker run --rm -v $(PWD)/../../../:/app seaweedfs-s3-iam-test
+
+# Docker Compose support with Keycloak
+docker-up: ## Start all services with Docker Compose (including Keycloak)
+	@echo "🐳 Starting services with Docker Compose including Keycloak..."
+	@docker compose up -d
+	@echo "⏳ Waiting for services to be healthy..."
+	@timeout 120 bash -c 'until curl -s http://localhost:8080/health/ready > /dev/null 2>&1; do sleep 2; done' || (echo "❌ Keycloak failed to become ready" && exit 1)
+	@timeout 60 bash -c 'until curl -s http://localhost:8333 > /dev/null 2>&1; do sleep 2; done' || (echo "❌ S3 API failed to become ready" && exit 1)
+	@timeout 60 bash -c 'until curl -s http://localhost:8888 > /dev/null 2>&1; do sleep 2; done' || (echo "❌ Filer failed to become ready" && exit 1)
+	@timeout 60 bash -c 'until curl -s http://localhost:9333 > /dev/null 2>&1; do sleep 2; done' || (echo "❌ Master failed to become ready" && exit 1)
+	@echo "✅ All services are healthy and ready"
+
+docker-down: ## Stop all Docker Compose services
+	@echo "🐳 Stopping Docker Compose services..."
+	@docker compose down -v
+	@echo "✅ All services stopped"
+
+docker-logs: ## Show logs from all services
+	@docker compose logs -f
+
+docker-test: docker-up ## Run tests with Docker Compose including Keycloak
+	@echo "🧪 Running Keycloak integration tests..."
+	@export KEYCLOAK_URL="http://localhost:8080" && \
+	 export S3_ENDPOINT="http://localhost:8333" && \
+	 go test -v -timeout $(TEST_TIMEOUT) -run "TestKeycloak" ./...
+	@echo "🐳 Stopping services after tests..."
+	@make docker-down
+
+docker-build: ## Build custom SeaweedFS image for Docker tests
+	@echo "🏗️ Building custom SeaweedFS image..."
+	@docker build -f Dockerfile.s3 -t seaweedfs-iam:latest ../../..
+	@echo "✅ Image built successfully"
+
+# All PHONY targets
+.PHONY: test test-quick run-tests setup start-services stop-services wait-for-services clean logs status debug
+.PHONY: test-auth test-policy test-expiration test-multipart test-bucket-policy test-context test-presigned test-group test-sts test-sts-assume-role test-sts-ldap  
+.PHONY: benchmark ci watch install-deps docker-test docker-up docker-down docker-logs docker-build
+.PHONY: test-distributed test-performance test-stress test-versioning-stress test-keycloak-full test-all-previously-skipped setup-all-tests help-advanced
+
+
+
+# New test targets for previously skipped tests
+
+test-distributed: ## Run distributed IAM tests
+	@echo "🌐 Running distributed IAM tests..."
+	@export ENABLE_DISTRIBUTED_TESTS=true && go test -v -timeout $(TEST_TIMEOUT) -run "TestS3IAMDistributedTests" ./...
+
+test-performance: ## Run performance tests
+	@echo "🏁 Running performance tests..."
+	@export ENABLE_PERFORMANCE_TESTS=true && go test -v -timeout $(TEST_TIMEOUT) -run "TestS3IAMPerformanceTests" ./...
+
+test-stress: ## Run stress tests
+	@echo "💪 Running stress tests..."
+	@export ENABLE_STRESS_TESTS=true && ./run_stress_tests.sh
+
+test-versioning-stress: ## Run S3 versioning stress tests
+	@echo "📚 Running versioning stress tests..."
+	@cd ../versioning && ./enable_stress_tests.sh
+
+test-keycloak-full: docker-up ## Run complete Keycloak integration tests
+	@echo "🔐 Running complete Keycloak integration tests..."
+	@export KEYCLOAK_URL="http://localhost:8080" && \
+	 export S3_ENDPOINT="http://localhost:8333" && \
+	 go test -v -timeout $(TEST_TIMEOUT) -run "TestKeycloak" ./...
+	@make docker-down
+
+test-all-previously-skipped: ## Run all previously skipped tests
+	@echo "🎯 Running all previously skipped tests..."
+	@./run_all_tests.sh
+
+.PHONY: cleanup
+cleanup: clean
+
+setup-all-tests: ## Setup environment for all tests (including Keycloak)
+	@echo "🚀 Setting up complete test environment..."
+	@./setup_all_tests.sh
+
+

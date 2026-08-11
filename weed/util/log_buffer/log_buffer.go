@@ -2,51 +2,103 @@ package log_buffer
 
 import (
 	"bytes"
-	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
+	"encoding/binary"
+	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 )
 
-const BufferSize = 4 * 1024 * 1024
-const PreviousBufferCount = 3
+const BufferSize = 8 * 1024 * 1024
+const PreviousBufferCount = 4
+
+// flushQueueDepth bounds queued flush copies (BufferSize each); a full queue
+// blocks producers, so a stalled flush backpressures writers instead of
+// pinning hundreds of buffer copies.
+const flushQueueDepth = 16
+
+// Errors that can be returned by log buffer operations
+var (
+	// ErrBufferCorrupted indicates the log buffer contains corrupted data
+	ErrBufferCorrupted = fmt.Errorf("log buffer is corrupted")
+)
 
 type dataToFlush struct {
 	startTime time.Time
 	stopTime  time.Time
-	data      *bytes.Buffer
+	data      []byte // slab from mem.Allocate; returned via mem.Free after flush
+	minOffset int64
+	maxOffset int64
+	done      chan struct{} // Signal when flush completes
 }
 
 type EachLogEntryFuncType func(logEntry *filer_pb.LogEntry) (isDone bool, err error)
-type LogFlushFuncType func(logBuffer *LogBuffer, startTime, stopTime time.Time, buf []byte)
+type EachLogEntryWithOffsetFuncType func(logEntry *filer_pb.LogEntry, offset int64) (isDone bool, err error)
+type LogFlushFuncType func(logBuffer *LogBuffer, startTime, stopTime time.Time, buf []byte, minOffset, maxOffset int64)
 type LogReadFromDiskFuncType func(startPosition MessagePosition, stopTsNs int64, eachLogEntryFn EachLogEntryFuncType) (lastReadPosition MessagePosition, isDone bool, err error)
 
+// DiskChunkCache caches chunks of historical data read from disk
+type DiskChunkCache struct {
+	mu        sync.RWMutex
+	chunks    map[int64]*CachedDiskChunk // Key: chunk start offset (aligned to chunkSize)
+	maxChunks int                        // Maximum number of chunks to cache
+}
+
+// CachedDiskChunk represents a cached chunk of disk data
+type CachedDiskChunk struct {
+	startOffset int64
+	endOffset   int64
+	messages    []*filer_pb.LogEntry
+	lastAccess  time.Time
+}
+
 type LogBuffer struct {
-	LastFlushTsNs     int64
-	name              string
-	prevBuffers       *SealedBuffers
-	buf               []byte
-	batchIndex        int64
-	idx               []int
-	pos               int
+	// 8-byte aligned fields
+	LastTsNs          atomic.Int64
+	lastFlushTsNs     atomic.Int64
+	lastFlushedOffset atomic.Int64 // Highest offset that has been flushed to disk (-1 = nothing flushed yet)
+	offset            int64
+	bufferStartOffset int64
+	minOffset         int64
+	maxOffset         int64
+	flushInterval     time.Duration
 	startTime         time.Time
 	stopTime          time.Time
-	lastFlushDataTime time.Time
-	sizeBuf           []byte
-	flushInterval     time.Duration
-	flushFn           LogFlushFuncType
-	ReadFromDiskFn    LogReadFromDiskFuncType
-	notifyFn          func()
-	isStopping        *atomic.Bool
-	isAllFlushed      bool
-	flushChan         chan *dataToFlush
-	LastTsNs          int64
+
+	// Other fields
+	name           string
+	prevBuffers    *SealedBuffers
+	buf            []byte
+	idx            []int
+	pos            int
+	sizeBuf        []byte
+	flushFn        LogFlushFuncType
+	ReadFromDiskFn LogReadFromDiskFuncType
+	notifyFn       func()
+	// Per-subscriber notification channels for instant wake-up
+	subscribersMu sync.RWMutex
+	subscribers   map[string]chan struct{} // subscriberID -> notification channel
+	isStopping    *atomic.Bool
+	shutdownCh    chan struct{} // closed by ShutdownLogBuffer to wake blocked subscribers
+	isAllFlushed  bool
+	flushChan     chan *dataToFlush
+	// Offset range tracking for Kafka integration
+	hasOffsets bool
+	// Disk chunk cache for historical data reads
+	diskChunkCache *DiskChunkCache
+	// curSnap is a GC-owned copy of the current window's append-only prefix
+	// buf[:len(curSnap)], shared by all readers so each byte is copied once per
+	// window instead of once per reader. Extended lazily under curSnapMu; reset
+	// at seal. Existing holders keep their prefix slices, which never mutate.
+	curSnapMu sync.Mutex
+	curSnap   []byte
 	sync.RWMutex
 }
 
@@ -61,33 +113,259 @@ func NewLogBuffer(name string, flushInterval time.Duration, flushFn LogFlushFunc
 		flushFn:        flushFn,
 		ReadFromDiskFn: readFromDiskFn,
 		notifyFn:       notifyFn,
-		flushChan:      make(chan *dataToFlush, 256),
+		subscribers:    make(map[string]chan struct{}),
+		flushChan:      make(chan *dataToFlush, flushQueueDepth),
 		isStopping:     new(atomic.Bool),
+		shutdownCh:     make(chan struct{}),
+		offset:         0, // Will be initialized from existing data if available
+		diskChunkCache: &DiskChunkCache{
+			chunks:    make(map[int64]*CachedDiskChunk),
+			maxChunks: 16, // Cache up to 16 chunks (configurable)
+		},
 	}
+	lb.lastFlushedOffset.Store(-1) // Nothing flushed to disk yet
 	go lb.loopFlush()
 	go lb.loopInterval()
 	return lb
 }
 
-func (logBuffer *LogBuffer) AddToBuffer(message *mq_pb.DataMessage) {
-	logBuffer.AddDataToBuffer(message.Key, message.Value, message.TsNs)
+// RegisterSubscriber registers a subscriber for instant notifications when data is written
+// Returns a channel that will receive notifications (<1ms latency)
+func (logBuffer *LogBuffer) RegisterSubscriber(subscriberID string) chan struct{} {
+	logBuffer.subscribersMu.Lock()
+	defer logBuffer.subscribersMu.Unlock()
+
+	// Check if already registered
+	if existingChan, exists := logBuffer.subscribers[subscriberID]; exists {
+		return existingChan
+	}
+
+	// Create buffered channel (size 1) so notifications never block
+	notifyChan := make(chan struct{}, 1)
+	logBuffer.subscribers[subscriberID] = notifyChan
+	return notifyChan
 }
 
-func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processingTsNs int64) {
+// UnregisterSubscriber removes a subscriber and closes its notification channel
+func (logBuffer *LogBuffer) UnregisterSubscriber(subscriberID string) {
+	logBuffer.subscribersMu.Lock()
+	defer logBuffer.subscribersMu.Unlock()
 
+	if ch, exists := logBuffer.subscribers[subscriberID]; exists {
+		close(ch)
+		delete(logBuffer.subscribers, subscriberID)
+	}
+}
+
+// IsOffsetInMemory checks if the given offset is available in the in-memory buffer
+// Returns true if:
+// 1. Offset is newer than what's been flushed to disk (must be in memory)
+// 2. Offset is in current buffer or previous buffers (may be flushed but still in memory)
+// Returns false if offset is older than memory buffers (only on disk)
+func (logBuffer *LogBuffer) IsOffsetInMemory(offset int64) bool {
+	logBuffer.RLock()
+	defer logBuffer.RUnlock()
+
+	// Check if we're tracking offsets at all
+	if !logBuffer.hasOffsets {
+		return false // No offsets tracked yet
+	}
+
+	// OPTIMIZATION: If offset is newer than what's been flushed to disk,
+	// it MUST be in memory (not written to disk yet)
+	lastFlushed := logBuffer.lastFlushedOffset.Load()
+	if lastFlushed >= 0 && offset > lastFlushed {
+		return true
+	}
+
+	// Check if offset is in current buffer range AND buffer has data
+	// (data can be both on disk AND in memory during flush window)
+	if offset >= logBuffer.bufferStartOffset && offset <= logBuffer.offset {
+		// CRITICAL: Check if buffer actually has data (pos > 0)
+		// After flush, pos=0 but range is still valid - data is on disk, not in memory
+		if logBuffer.pos > 0 {
+			return true
+		}
+		// Buffer is empty (just flushed) - data is on disk
+		return false
+	}
+
+	// Check if offset is in previous buffers AND they have data
+	for _, buf := range logBuffer.prevBuffers.buffers {
+		if offset >= buf.startOffset && offset <= buf.offset {
+			// Check if prevBuffer actually has data
+			if buf.size > 0 {
+				return true
+			}
+			// Buffer is empty (flushed) - data is on disk
+			return false
+		}
+	}
+
+	// Offset is older than memory buffers - only available on disk
+	return false
+}
+
+// notifySubscribers sends notifications to all registered subscribers
+// Non-blocking: uses select with default to avoid blocking on full channels
+func (logBuffer *LogBuffer) notifySubscribers() {
+	logBuffer.subscribersMu.RLock()
+	defer logBuffer.subscribersMu.RUnlock()
+
+	if len(logBuffer.subscribers) == 0 {
+		return // No subscribers, skip notification
+	}
+
+	for _, notifyChan := range logBuffer.subscribers {
+		select {
+		case notifyChan <- struct{}{}:
+			// Notification sent successfully
+		default:
+			// Channel full - subscriber hasn't consumed previous notification yet
+			// This is OK because one notification is sufficient to wake the subscriber
+		}
+	}
+}
+
+// InitializeOffsetFromExistingData initializes the offset counter from existing data on disk
+// This should be called after LogBuffer creation to ensure offset continuity on restart
+func (logBuffer *LogBuffer) InitializeOffsetFromExistingData(getHighestOffsetFn func() (int64, error)) error {
+	if getHighestOffsetFn == nil {
+		return nil // No initialization function provided
+	}
+
+	highestOffset, err := getHighestOffsetFn()
+	if err != nil {
+		return nil // Continue with offset 0 if we can't read existing data
+	}
+
+	if highestOffset >= 0 {
+		// Set the next offset to be one after the highest existing offset
+		nextOffset := highestOffset + 1
+		logBuffer.offset = nextOffset
+		// bufferStartOffset should match offset after initialization
+		// This ensures that reads for old offsets (0...highestOffset) will trigger disk reads
+		// New data written after this will start at nextOffset
+		logBuffer.bufferStartOffset = nextOffset
+		// CRITICAL: Track that data [0...highestOffset] is on disk
+		logBuffer.lastFlushedOffset.Store(highestOffset)
+		// Set lastFlushTsNs to current time (we know data up to highestOffset is on disk)
+		logBuffer.lastFlushTsNs.Store(time.Now().UnixNano())
+	} else {
+		logBuffer.bufferStartOffset = 0 // Start from offset 0
+		// No data on disk yet
+	}
+
+	return nil
+}
+
+func (logBuffer *LogBuffer) AddToBuffer(message *mq_pb.DataMessage) error {
+	return logBuffer.AddDataToBuffer(message.Key, message.Value, message.TsNs)
+}
+
+// AddLogEntryToBuffer directly adds a LogEntry to the buffer, preserving offset information
+func (logBuffer *LogBuffer) AddLogEntryToBuffer(logEntry *filer_pb.LogEntry) error {
 	var toFlush *dataToFlush
+	var marshalErr error
 	logBuffer.Lock()
 	defer func() {
 		logBuffer.Unlock()
 		if toFlush != nil {
-			logBuffer.flushChan <- toFlush
+			select {
+			case logBuffer.flushChan <- toFlush:
+			case <-logBuffer.shutdownCh:
+				// shutting down; loopFlush may be gone, do not park forever
+			}
 		}
-		if logBuffer.notifyFn != nil {
-			logBuffer.notifyFn()
+		// Only notify if there was no error
+		if marshalErr == nil {
+			if logBuffer.notifyFn != nil {
+				logBuffer.notifyFn()
+			}
+			// Notify all registered subscribers instantly (<1ms latency)
+			logBuffer.notifySubscribers()
 		}
 	}()
 
-	// need to put the timestamp inside the lock
+	processingTsNs := logEntry.TsNs
+	ts := time.Unix(0, processingTsNs)
+
+	// Handle timestamp collision inside lock (rare case)
+	if logBuffer.LastTsNs.Load() >= processingTsNs {
+		processingTsNs = logBuffer.LastTsNs.Add(1)
+		ts = time.Unix(0, processingTsNs)
+		// Re-marshal with corrected timestamp
+		logEntry.TsNs = processingTsNs
+	} else {
+		logBuffer.LastTsNs.Store(processingTsNs)
+	}
+
+	// Size is computed without allocating; the entry is marshaled straight into
+	// the buffer below via MarshalToSizedBufferVT.
+	size := logEntry.SizeVT()
+
+	if logBuffer.pos == 0 {
+		logBuffer.startTime = ts
+		// Reset offset tracking for new buffer
+		logBuffer.hasOffsets = false
+	}
+
+	// Track offset ranges for Kafka integration
+	// Use >= 0 to include offset 0 (first message in a topic)
+	if logEntry.Offset >= 0 {
+		if !logBuffer.hasOffsets {
+			logBuffer.minOffset = logEntry.Offset
+			logBuffer.maxOffset = logEntry.Offset
+			logBuffer.hasOffsets = true
+		} else {
+			if logEntry.Offset < logBuffer.minOffset {
+				logBuffer.minOffset = logEntry.Offset
+			}
+			if logEntry.Offset > logBuffer.maxOffset {
+				logBuffer.maxOffset = logEntry.Offset
+			}
+		}
+	}
+
+	if logBuffer.startTime.Add(logBuffer.flushInterval).Before(ts) || len(logBuffer.buf)-logBuffer.pos < size+4 {
+		toFlush = logBuffer.copyToFlush()
+		logBuffer.startTime = ts
+		if len(logBuffer.buf) < size+4 {
+			// Validate size to prevent integer overflow in computation BEFORE allocation
+			const maxBufferSize = 1 << 30 // 1 GiB practical limit
+			// Ensure 2*size + 4 won't overflow int and stays within practical bounds
+			if size < 0 || size > (math.MaxInt-4)/2 || size > (maxBufferSize-4)/2 {
+				marshalErr = fmt.Errorf("message size %d exceeds maximum allowed size", size)
+				glog.Errorf("%v", marshalErr)
+				return marshalErr
+			}
+			// Safe to compute now that we've validated size is in valid range
+			newSize := 2*size + 4
+			logBuffer.buf = make([]byte, newSize)
+		}
+	}
+	logBuffer.stopTime = ts
+
+	// Marshal directly into the buffer, avoiding an intermediate slice and copy.
+	// On the (practically impossible) error the entry is dropped before idx/pos
+	// are advanced, leaving the buffer consistent.
+	if _, err := logEntry.MarshalToSizedBufferVT(logBuffer.buf[logBuffer.pos+4 : logBuffer.pos+4+size]); err != nil {
+		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
+		glog.Errorf("%v", marshalErr)
+		return marshalErr
+	}
+	logBuffer.idx = append(logBuffer.idx, logBuffer.pos)
+	util.Uint32toBytes(logBuffer.sizeBuf, uint32(size))
+	copy(logBuffer.buf[logBuffer.pos:logBuffer.pos+4], logBuffer.sizeBuf)
+	logBuffer.pos += size + 4
+
+	logBuffer.offset++
+	return nil
+}
+
+func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processingTsNs int64) error {
+
+	// PERFORMANCE OPTIMIZATION: Pre-process expensive operations OUTSIDE the lock
 	var ts time.Time
 	if processingTsNs == 0 {
 		ts = time.Now()
@@ -95,49 +373,143 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	} else {
 		ts = time.Unix(0, processingTsNs)
 	}
-	if logBuffer.LastTsNs >= processingTsNs {
-		// this is unlikely to happen, but just in case
-		processingTsNs = logBuffer.LastTsNs + 1
-		ts = time.Unix(0, processingTsNs)
-	}
-	logBuffer.LastTsNs = processingTsNs
+
 	logEntry := &filer_pb.LogEntry{
-		TsNs:             processingTsNs,
+		TsNs:             processingTsNs, // Will be updated if needed
 		PartitionKeyHash: util.HashToInt32(partitionKey),
 		Data:             data,
 		Key:              partitionKey,
 	}
 
-	logEntryData, _ := proto.Marshal(logEntry)
+	var toFlush *dataToFlush
+	var marshalErr error
+	logBuffer.Lock()
+	defer func() {
+		logBuffer.Unlock()
+		if toFlush != nil {
+			select {
+			case logBuffer.flushChan <- toFlush:
+			case <-logBuffer.shutdownCh:
+				// shutting down; loopFlush may be gone, do not park forever
+			}
+		}
+		// Only notify if there was no error
+		if marshalErr == nil {
+			if logBuffer.notifyFn != nil {
+				logBuffer.notifyFn()
+			}
+			// Notify all registered subscribers instantly (<1ms latency)
+			logBuffer.notifySubscribers()
+		}
+	}()
 
-	size := len(logEntryData)
+	// Handle timestamp collision inside lock (rare case)
+	if logBuffer.LastTsNs.Load() >= processingTsNs {
+		processingTsNs = logBuffer.LastTsNs.Add(1)
+		ts = time.Unix(0, processingTsNs)
+		logEntry.TsNs = processingTsNs
+	} else {
+		logBuffer.LastTsNs.Store(processingTsNs)
+	}
+
+	// Set the offset in the LogEntry before marshaling
+	// This ensures the flushed data contains the correct offset information
+	// Note: This also enables AddToBuffer to work correctly with Kafka-style offset-based reads
+	logEntry.Offset = logBuffer.offset
+
+	// Size is computed without allocating; the entry is marshaled straight into
+	// the buffer below via MarshalToSizedBufferVT.
+	size := logEntry.SizeVT()
 
 	if logBuffer.pos == 0 {
 		logBuffer.startTime = ts
+		// Reset offset tracking for new buffer
+		logBuffer.hasOffsets = false
+	}
+
+	// Track offset ranges for Kafka integration
+	// Track the current offset being written
+	if !logBuffer.hasOffsets {
+		logBuffer.minOffset = logBuffer.offset
+		logBuffer.maxOffset = logBuffer.offset
+		logBuffer.hasOffsets = true
+	} else {
+		if logBuffer.offset < logBuffer.minOffset {
+			logBuffer.minOffset = logBuffer.offset
+		}
+		if logBuffer.offset > logBuffer.maxOffset {
+			logBuffer.maxOffset = logBuffer.offset
+		}
 	}
 
 	if logBuffer.startTime.Add(logBuffer.flushInterval).Before(ts) || len(logBuffer.buf)-logBuffer.pos < size+4 {
-		// glog.V(0).Infof("%s copyToFlush1 batch:%d count:%d start time %v, ts %v, remaining %d bytes", logBuffer.name, logBuffer.batchIndex, len(logBuffer.idx), logBuffer.startTime, ts, len(logBuffer.buf)-logBuffer.pos)
 		toFlush = logBuffer.copyToFlush()
 		logBuffer.startTime = ts
 		if len(logBuffer.buf) < size+4 {
-			logBuffer.buf = make([]byte, 2*size+4)
+			// Validate size to prevent integer overflow in computation BEFORE allocation
+			const maxBufferSize = 1 << 30 // 1 GiB practical limit
+			// Ensure 2*size + 4 won't overflow int and stays within practical bounds
+			if size < 0 || size > (math.MaxInt-4)/2 || size > (maxBufferSize-4)/2 {
+				marshalErr = fmt.Errorf("message size %d exceeds maximum allowed size", size)
+				glog.Errorf("%v", marshalErr)
+				return marshalErr
+			}
+			// Safe to compute now that we've validated size is in valid range
+			newSize := 2*size + 4
+			logBuffer.buf = make([]byte, newSize)
 		}
 	}
 	logBuffer.stopTime = ts
 
+	// Marshal directly into the buffer, avoiding an intermediate slice and copy.
+	// On the (practically impossible) error the entry is dropped before idx/pos
+	// are advanced, leaving the buffer consistent.
+	if _, err := logEntry.MarshalToSizedBufferVT(logBuffer.buf[logBuffer.pos+4 : logBuffer.pos+4+size]); err != nil {
+		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
+		glog.Errorf("%v", marshalErr)
+		return marshalErr
+	}
 	logBuffer.idx = append(logBuffer.idx, logBuffer.pos)
 	util.Uint32toBytes(logBuffer.sizeBuf, uint32(size))
 	copy(logBuffer.buf[logBuffer.pos:logBuffer.pos+4], logBuffer.sizeBuf)
-	copy(logBuffer.buf[logBuffer.pos+4:logBuffer.pos+4+size], logEntryData)
 	logBuffer.pos += size + 4
 
-	// fmt.Printf("partitionKey %v entry size %d total %d count %d\n", string(partitionKey), size, m.pos, len(m.idx))
-
+	logBuffer.offset++
+	return nil
 }
 
 func (logBuffer *LogBuffer) IsStopping() bool {
 	return logBuffer.isStopping.Load()
+}
+
+// ForceFlush immediately flushes the current buffer content and WAITS for completion
+// This is useful for critical topics that need immediate persistence
+// CRITICAL: This function is now SYNCHRONOUS - it blocks until the flush completes
+func (logBuffer *LogBuffer) ForceFlush() {
+	if logBuffer.isStopping.Load() {
+		return // Don't flush if we're shutting down
+	}
+
+	logBuffer.Lock()
+	toFlush := logBuffer.copyToFlushWithCallback()
+	logBuffer.Unlock()
+
+	if toFlush != nil {
+		// The live buffer was already sealed and reset by copyToFlushWithCallback,
+		// so dropping toFlush on a timeout would lose it. Block until queued,
+		// bailing out only on shutdown.
+		select {
+		case logBuffer.flushChan <- toFlush:
+		case <-logBuffer.shutdownCh:
+			return
+		}
+		select {
+		case <-toFlush.done:
+			// Flush completed
+		case <-time.After(5 * time.Second):
+			// Queued but not yet flushed; loopFlush will still persist it
+		}
+	}
 }
 
 // ShutdownLogBuffer flushes the buffer and stops the log buffer
@@ -146,9 +518,20 @@ func (logBuffer *LogBuffer) ShutdownLogBuffer() {
 	if isAlreadyStopped {
 		return
 	}
+	// Wake any subscribers blocked in awaitNotificationOrTimeout so they can
+	// notice IsStopping() and exit promptly, even on an idle buffer where no
+	// flush notification would otherwise fire.
+	close(logBuffer.shutdownCh)
+	logBuffer.Lock()
 	toFlush := logBuffer.copyToFlush()
-	logBuffer.flushChan <- toFlush
-	close(logBuffer.flushChan)
+	logBuffer.Unlock()
+	if toFlush != nil {
+		logBuffer.flushChan <- toFlush
+	}
+	// nil is the shutdown sentinel: loopFlush drains everything queued before
+	// it and exits. The channel is never closed, so a sender racing shutdown
+	// can never panic on a closed channel.
+	logBuffer.flushChan <- nil
 }
 
 // IsAllFlushed returns true if all data in the buffer has been flushed, after calling ShutdownLogBuffer().
@@ -158,12 +541,28 @@ func (logBuffer *LogBuffer) IsAllFlushed() bool {
 
 func (logBuffer *LogBuffer) loopFlush() {
 	for d := range logBuffer.flushChan {
-		if d != nil {
-			// glog.V(4).Infof("%s flush [%v, %v] size %d", m.name, d.startTime, d.stopTime, len(d.data.Bytes()))
-			logBuffer.flushFn(logBuffer, d.startTime, d.stopTime, d.data.Bytes())
-			d.releaseMemory()
-			// local logbuffer is different from aggregate logbuffer here
-			logBuffer.lastFlushDataTime = d.stopTime
+		if d == nil {
+			break // shutdown sentinel
+		}
+		logBuffer.flushFn(logBuffer, d.startTime, d.stopTime, d.data, d.minOffset, d.maxOffset)
+		d.releaseMemory()
+		// local logbuffer is different from aggregate logbuffer here
+		if d.maxOffset >= 0 {
+			logBuffer.lastFlushedOffset.Store(d.maxOffset)
+		}
+		if !d.stopTime.IsZero() {
+			logBuffer.lastFlushTsNs.Store(d.stopTime.UnixNano())
+		}
+
+		// Wake readers that may be waiting to retry disk reads after the flush lands.
+		if logBuffer.notifyFn != nil {
+			logBuffer.notifyFn()
+		}
+		logBuffer.notifySubscribers()
+
+		// Signal completion if there's a callback channel
+		if d.done != nil {
+			close(d.done)
 		}
 	}
 	logBuffer.isAllFlushed = true
@@ -175,64 +574,231 @@ func (logBuffer *LogBuffer) loopInterval() {
 		if logBuffer.IsStopping() {
 			return
 		}
+
 		logBuffer.Lock()
 		toFlush := logBuffer.copyToFlush()
 		logBuffer.Unlock()
 		if toFlush != nil {
-			glog.V(4).Infof("%s flush [%v, %v] size %d", logBuffer.name, toFlush.startTime, toFlush.stopTime, len(toFlush.data.Bytes()))
-			logBuffer.flushChan <- toFlush
-		} else {
-			// glog.V(0).Infof("%s no flush", m.name)
+			select {
+			case logBuffer.flushChan <- toFlush:
+			case <-logBuffer.shutdownCh:
+				// shutting down; loopFlush may be gone, do not park forever
+			}
 		}
 	}
 }
 
 func (logBuffer *LogBuffer) copyToFlush() *dataToFlush {
+	return logBuffer.copyToFlushInternal(false)
+}
+
+func (logBuffer *LogBuffer) copyToFlushWithCallback() *dataToFlush {
+	return logBuffer.copyToFlushInternal(true)
+}
+
+func (logBuffer *LogBuffer) copyToFlushInternal(withCallback bool) *dataToFlush {
 
 	if logBuffer.pos > 0 {
-		// fmt.Printf("flush buffer %d pos %d empty space %d\n", len(m.buf), m.pos, len(m.buf)-m.pos)
 		var d *dataToFlush
 		if logBuffer.flushFn != nil {
 			d = &dataToFlush{
 				startTime: logBuffer.startTime,
 				stopTime:  logBuffer.stopTime,
 				data:      copiedBytes(logBuffer.buf[:logBuffer.pos]),
+				minOffset: logBuffer.minOffset,
+				maxOffset: logBuffer.maxOffset,
 			}
-			// glog.V(4).Infof("%s flushing [0,%d) with %d entries [%v, %v]", m.name, m.pos, len(m.idx), m.startTime, m.stopTime)
-		} else {
-			// glog.V(4).Infof("%s removed from memory [0,%d) with %d entries [%v, %v]", m.name, m.pos, len(m.idx), m.startTime, m.stopTime)
-			logBuffer.lastFlushDataTime = logBuffer.stopTime
+			// Add callback channel for synchronous ForceFlush
+			if withCallback {
+				d.done = make(chan struct{})
+			}
 		}
-		logBuffer.buf = logBuffer.prevBuffers.SealBuffer(logBuffer.startTime, logBuffer.stopTime, logBuffer.buf, logBuffer.pos, logBuffer.batchIndex)
-		logBuffer.startTime = time.Unix(0, 0)
-		logBuffer.stopTime = time.Unix(0, 0)
+		// CRITICAL: logBuffer.offset is the "next offset to assign", so last offset in buffer is offset-1
+		lastOffsetInBuffer := logBuffer.offset - 1
+		logBuffer.buf = logBuffer.prevBuffers.SealBuffer(logBuffer.startTime, logBuffer.stopTime, logBuffer.buf, logBuffer.pos, logBuffer.bufferStartOffset, lastOffsetInBuffer)
+		// Hand a fully extended prefix snapshot to the sealed slot so sealed
+		// readers reuse it instead of re-copying the window; reset for the next
+		// window either way (holders keep their immutable prefix slices).
+		if len(logBuffer.curSnap) == logBuffer.pos {
+			logBuffer.prevBuffers.buffers[len(logBuffer.prevBuffers.buffers)-1].snapshot = logBuffer.curSnap[:logBuffer.pos:logBuffer.pos]
+		}
+		logBuffer.curSnap = nil
+		// Use zero time (time.Time{}) not epoch time (time.Unix(0,0))
+		// Epoch time (1970) breaks time-based reads after flush
+		logBuffer.startTime = time.Time{}
+		logBuffer.stopTime = time.Time{}
 		logBuffer.pos = 0
 		logBuffer.idx = logBuffer.idx[:0]
-		logBuffer.batchIndex++
+		// DON'T increment offset - it's already pointing to the next offset!
+		// logBuffer.offset++ // REMOVED - this was causing offset gaps!
+		logBuffer.bufferStartOffset = logBuffer.offset // Next buffer starts at current offset (which is already the next one)
+		// Reset offset tracking
+		logBuffer.hasOffsets = false
+		logBuffer.minOffset = 0
+		logBuffer.maxOffset = 0
+
+		// Invalidate disk cache chunks after flush
+		// The cache may contain stale data from before this flush
+		// Invalidating ensures consumers will re-read fresh data from disk after flush
+		logBuffer.invalidateAllDiskCacheChunks()
+
 		return d
 	}
 	return nil
 }
 
-func (logBuffer *LogBuffer) GetEarliestTime() time.Time {
-	return logBuffer.startTime
-}
-func (logBuffer *LogBuffer) GetEarliestPosition() MessagePosition {
-	return MessagePosition{
-		Time:       logBuffer.startTime,
-		BatchIndex: logBuffer.batchIndex,
+// invalidateAllDiskCacheChunks clears all cached disk chunks
+// This should be called after a buffer flush to ensure consumers read fresh data from disk
+func (logBuffer *LogBuffer) invalidateAllDiskCacheChunks() {
+	logBuffer.diskChunkCache.mu.Lock()
+	defer logBuffer.diskChunkCache.mu.Unlock()
+
+	if len(logBuffer.diskChunkCache.chunks) > 0 {
+		logBuffer.diskChunkCache.chunks = make(map[int64]*CachedDiskChunk)
 	}
 }
 
-func (d *dataToFlush) releaseMemory() {
-	d.data.Reset()
-	bufferPool.Put(d.data)
-}
-
-func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bufferCopy *bytes.Buffer, batchIndex int64, err error) {
+// GetEarliestTime returns the oldest timestamp still resident in the buffer.
+// It must consider the sealed prev buffers in addition to the active buffer,
+// because ReadFromBuffer's tsMemory (and therefore ResumeFromDiskError) is
+// computed from the min across both.  Returning only the active startTime
+// would cause gap-detection callers to skip past data still living in prev
+// buffers, and can also silently equal the consumer's lastReadTime and
+// stall on listenersCond.Wait().
+func (logBuffer *LogBuffer) GetEarliestTime() time.Time {
 	logBuffer.RLock()
 	defer logBuffer.RUnlock()
 
+	earliest := logBuffer.startTime
+	for _, prevBuf := range logBuffer.prevBuffers.buffers {
+		if prevBuf.startTime.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || prevBuf.startTime.Before(earliest) {
+			earliest = prevBuf.startTime
+		}
+	}
+	return earliest
+}
+
+func (logBuffer *LogBuffer) HasData() bool {
+	logBuffer.RLock()
+	defer logBuffer.RUnlock()
+
+	if logBuffer.pos > 0 {
+		return true
+	}
+	for _, buf := range logBuffer.prevBuffers.buffers {
+		if buf.size > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (logBuffer *LogBuffer) GetEarliestPosition() MessagePosition {
+	return MessagePosition{
+		Time:   logBuffer.startTime,
+		Offset: logBuffer.offset,
+	}
+}
+
+// GetLastFlushTsNs returns the latest flushed timestamp in Unix nanoseconds.
+// Returns 0 if nothing has been flushed yet.
+func (logBuffer *LogBuffer) GetLastFlushTsNs() int64 {
+	return logBuffer.lastFlushTsNs.Load()
+}
+
+func (logBuffer *LogBuffer) SetLastFlushTsNs(ts int64) {
+	logBuffer.lastFlushTsNs.Store(ts)
+}
+
+func (d *dataToFlush) releaseMemory() {
+	// Guard nil: mem.Free(nil) would put a zero-cap slice into the smallest slot
+	// pool, so a later Allocate could hand back nil and panic. Also makes a double
+	// release harmless.
+	if d.data != nil {
+		mem.Free(d.data)
+		d.data = nil
+	}
+}
+
+// ReadFromBuffer returns the in-memory log data at lastReadPosition. isPooled
+// reports whether the returned buffer is a private pooled copy the caller must
+// return via ReleaseMemory; when false the buffer wraps a snapshot shared with
+// other readers and must not be released (or written to).
+func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bufferCopy *bytes.Buffer, batchIndex int64, isPooled bool, err error) {
+	logBuffer.RLock()
+	defer logBuffer.RUnlock()
+
+	isOffsetBased := lastReadPosition.IsOffsetBased
+
+	// For offset-based subscriptions, use offset comparisons, not time comparisons!
+	if isOffsetBased {
+		requestedOffset := lastReadPosition.Offset
+
+		// Check if the requested offset is in the current buffer range
+		if requestedOffset >= logBuffer.bufferStartOffset && requestedOffset <= logBuffer.offset {
+			// If current buffer is empty (pos=0), check if data is on disk or not yet written
+			if logBuffer.pos == 0 {
+				// If buffer is empty but offset range covers the request,
+				// it means data was in memory and has been flushed/moved out.
+				// The bufferStartOffset advancing to cover this offset proves data existed.
+				//
+				// Three cases:
+				// 1. requestedOffset < logBuffer.offset: Data was here, now flushed
+				// 2. requestedOffset == logBuffer.offset && bufferStartOffset > 0: Buffer advanced, data flushed
+				// 3. requestedOffset == logBuffer.offset && bufferStartOffset == 0: Initial state - try disk first!
+				//
+				// Cases 1 & 2: try disk read
+				// Case 3: try disk read (historical data might exist)
+				if requestedOffset < logBuffer.offset {
+					// Data was in the buffer range but buffer is now empty = flushed to disk
+					return nil, -2, false, ResumeFromDiskError
+				}
+				// requestedOffset == logBuffer.offset: Current position
+				// CRITICAL: For subscribers starting from offset 0, try disk read first
+				// (historical data might exist from previous runs)
+				if requestedOffset == 0 && logBuffer.bufferStartOffset == 0 && logBuffer.offset == 0 {
+					// Initial state: try disk read before waiting for new data
+					return nil, -2, false, ResumeFromDiskError
+				}
+				// Otherwise, wait for new data to arrive
+				return nil, logBuffer.offset, false, nil
+			}
+			return logBuffer.currentSnapshotView(0, logBuffer.pos), logBuffer.offset, false, nil
+		}
+
+		// Check previous buffers for the requested offset
+		for _, buf := range logBuffer.prevBuffers.buffers {
+			if requestedOffset >= buf.startOffset && requestedOffset <= buf.offset {
+				// If prevBuffer is empty, it means the data was flushed to disk
+				// (prevBuffers are created when buffer is flushed)
+				if buf.size == 0 {
+					// Empty prevBuffer covering this offset means data was flushed
+					return nil, -2, false, ResumeFromDiskError
+				}
+				return sharedBufferView(buf, 0), buf.offset, false, nil
+			}
+		}
+
+		// Offset not found in any buffer
+		if requestedOffset < logBuffer.bufferStartOffset {
+			// Data not in current buffers - must be on disk (flushed or never existed)
+			// Return ResumeFromDiskError to trigger disk read
+			return nil, -2, false, ResumeFromDiskError
+		}
+
+		if requestedOffset > logBuffer.offset {
+			// Future data, not available yet
+			return nil, logBuffer.offset, false, nil
+		}
+
+		// Offset not found - return nil
+		return nil, logBuffer.offset, false, nil
+	}
+
+	// TIMESTAMP-BASED READ (original logic)
 	// Read from disk and memory
 	//	1. read from disk, last time is = td
 	//	2. in memory, the earliest time = tm
@@ -243,55 +809,88 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 	//	if td < tm, case 2.3
 	//		read from disk again
 	var tsMemory time.Time
-	var tsBatchIndex int64
 	if !logBuffer.startTime.IsZero() {
 		tsMemory = logBuffer.startTime
-		tsBatchIndex = logBuffer.batchIndex
 	}
 	for _, prevBuf := range logBuffer.prevBuffers.buffers {
-		if !prevBuf.startTime.IsZero() && prevBuf.startTime.Before(tsMemory) {
-			tsMemory = prevBuf.startTime
-			tsBatchIndex = prevBuf.batchIndex
+		if !prevBuf.startTime.IsZero() {
+			// If tsMemory is zero, assign directly; otherwise compare
+			if tsMemory.IsZero() || prevBuf.startTime.Before(tsMemory) {
+				tsMemory = prevBuf.startTime
+			}
 		}
 	}
 	if tsMemory.IsZero() { // case 2.2
-		// println("2.2 no data")
-		return nil, -2, nil
-	} else if lastReadPosition.Before(tsMemory) && lastReadPosition.BatchIndex+1 < tsBatchIndex { // case 2.3
-		if !logBuffer.lastFlushDataTime.IsZero() {
-			glog.V(0).Infof("resume with last flush time: %v", logBuffer.lastFlushDataTime)
-			return nil, -2, ResumeFromDiskError
+		// Buffer is empty - return ResumeFromDiskError so caller can read from disk
+		// This fixes issue #4977 where SubscribeMetadata stalls because
+		// MetaAggregator.MetaLogBuffer is empty in single-filer setups
+		return nil, -2, false, ResumeFromDiskError
+	} else if lastReadPosition.Time.Before(tsMemory) { // case 2.3
+		// For time-based reads, only check timestamp for disk reads
+		// Don't use offset comparisons as they're not meaningful for time-based subscriptions
+
+		// Special case: If requested time is zero (Unix epoch), treat as "start from beginning"
+		// This handles queries that want to read all data without knowing the exact start time
+		if lastReadPosition.Time.IsZero() || lastReadPosition.Time.Unix() == 0 {
+			// Start from the beginning of memory
+			// Fall through to case 2.1 to read from earliest buffer
+		} else if lastReadPosition.Offset <= 0 && lastReadPosition.Time.Before(tsMemory) {
+			// Treat first read with sentinel/zero offset as inclusive of earliest in-memory data
+		} else {
+			// Data not in memory buffers - read from disk
+			return nil, -2, false, ResumeFromDiskError
 		}
 	}
 
 	// the following is case 2.1
 
-	if lastReadPosition.Equal(logBuffer.stopTime) {
-		return nil, logBuffer.batchIndex, nil
+	if lastReadPosition.Time.Equal(logBuffer.stopTime) && !logBuffer.stopTime.IsZero() {
+		// For first-read sentinel/zero offset, allow inclusive read at the boundary
+		if lastReadPosition.Offset > 0 {
+			return nil, logBuffer.offset, false, nil
+		}
 	}
-	if lastReadPosition.After(logBuffer.stopTime) {
-		// glog.Fatalf("unexpected last read time %v, older than latest %v", lastReadPosition, m.stopTime)
-		return nil, logBuffer.batchIndex, nil
+	if lastReadPosition.Time.After(logBuffer.stopTime) && !logBuffer.stopTime.IsZero() {
+		return nil, logBuffer.offset, false, nil
 	}
-	if lastReadPosition.Before(logBuffer.startTime) {
-		// println("checking ", lastReadPosition.UnixNano())
+	// Also check prevBuffers when current buffer is empty (startTime is zero)
+	if lastReadPosition.Time.Before(logBuffer.startTime) || logBuffer.startTime.IsZero() {
 		for _, buf := range logBuffer.prevBuffers.buffers {
 			if buf.startTime.After(lastReadPosition.Time) {
-				// glog.V(4).Infof("%s return the %d sealed buffer %v", m.name, i, buf.startTime)
-				// println("return the", i, "th in memory", buf.startTime.UnixNano())
-				return copiedBytes(buf.buf[:buf.size]), buf.batchIndex, nil
+				return sharedBufferView(buf, 0), buf.offset, false, nil
 			}
 			if !buf.startTime.After(lastReadPosition.Time) && buf.stopTime.After(lastReadPosition.Time) {
-				pos := buf.locateByTs(lastReadPosition.Time)
-				// fmt.Printf("locate buffer[%d] pos %d\n", i, pos)
-				return copiedBytes(buf.buf[pos:buf.size]), buf.batchIndex, nil
+				searchTime := lastReadPosition.Time
+				if lastReadPosition.Offset <= 0 {
+					searchTime = searchTime.Add(-time.Nanosecond)
+				}
+				pos, err := buf.locateByTs(searchTime)
+				if err != nil {
+					// Buffer corruption detected - return error wrapped with ErrBufferCorrupted
+					glog.Errorf("ReadFromBuffer: buffer corruption in prevBuffer: %v", err)
+					return nil, -1, false, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
+				}
+				if pos < buf.size {
+					return sharedBufferView(buf, pos), buf.offset, false, nil
+				}
 			}
 		}
-		// glog.V(4).Infof("%s return the current buf %v", m.name, lastReadPosition)
-		return copiedBytes(logBuffer.buf[:logBuffer.pos]), logBuffer.batchIndex, nil
+		// If current buffer is not empty, return it
+		if logBuffer.pos > 0 {
+			return logBuffer.currentSnapshotView(0, logBuffer.pos), logBuffer.offset, false, nil
+		}
+		// Buffer is empty and no data in prevBuffers - wait for new data
+		return nil, logBuffer.offset, false, nil
 	}
 
-	lastTs := lastReadPosition.UnixNano()
+	lastTs := lastReadPosition.Time.UnixNano()
+	// Inclusive boundary for first-read sentinel/zero offset
+	searchTs := lastTs
+	if lastReadPosition.Offset <= 0 {
+		if searchTs > math.MinInt64+1 { // prevent underflow
+			searchTs = searchTs - 1
+		}
+	}
 	l, h := 0, len(logBuffer.idx)-1
 
 	/*
@@ -303,38 +902,62 @@ func (logBuffer *LogBuffer) ReadFromBuffer(lastReadPosition MessagePosition) (bu
 			if entry == nil {
 				entry = event.EventNotification.NewEntry
 			}
-			fmt.Printf("entry %d ts: %v offset:%d dir:%s name:%s\n", i, time.Unix(0, ts), pos, event.Directory, entry.Name)
 		}
-		fmt.Printf("l=%d, h=%d\n", l, h)
 	*/
 
 	for l <= h {
 		mid := (l + h) / 2
 		pos := logBuffer.idx[mid]
-		_, t := readTs(logBuffer.buf, pos)
-		if t <= lastTs {
+		_, t, err := readTs(logBuffer.buf, pos)
+		if err != nil {
+			// Buffer corruption detected in binary search
+			glog.Errorf("ReadFromBuffer: buffer corruption at idx[%d] pos %d: %v", mid, pos, err)
+			return nil, -1, false, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
+		}
+		if t <= searchTs {
 			l = mid + 1
-		} else if lastTs < t {
+		} else if searchTs < t {
 			var prevT int64
 			if mid > 0 {
-				_, prevT = readTs(logBuffer.buf, logBuffer.idx[mid-1])
+				_, prevT, err = readTs(logBuffer.buf, logBuffer.idx[mid-1])
+				if err != nil {
+					// Buffer corruption detected in binary search (previous entry)
+					glog.Errorf("ReadFromBuffer: buffer corruption at idx[%d] pos %d: %v", mid-1, logBuffer.idx[mid-1], err)
+					return nil, -1, false, fmt.Errorf("%w: %v", ErrBufferCorrupted, err)
+				}
 			}
-			if prevT <= lastTs {
-				// fmt.Printf("found l=%d, m-1=%d(ts=%d), m=%d(ts=%d), h=%d [%d, %d) \n", l, mid-1, prevT, mid, t, h, pos, m.pos)
-				return copiedBytes(logBuffer.buf[pos:logBuffer.pos]), logBuffer.batchIndex, nil
+			if prevT <= searchTs {
+				return logBuffer.currentSnapshotView(pos, logBuffer.pos), logBuffer.offset, false, nil
 			}
 			h = mid
 		}
-		// fmt.Printf("l=%d, h=%d\n", l, h)
 	}
 
-	// FIXME: this could be that the buffer has been flushed already
-	println("Not sure why no data", lastReadPosition.BatchIndex, tsBatchIndex)
-	return nil, -2, nil
+	// Binary search didn't find the timestamp - data may have been flushed to disk already
+	// Returning -2 signals to caller that data is not available in memory
+	return nil, -2, false, nil
 
 }
+
+// ReleaseMemory returns a pooled buffer for reuse. Only call it for buffers
+// ReadFromBuffer reported as pooled: recycling a shared sealed-window view
+// would let the next copiedBytes overwrite bytes other readers still hold.
 func (logBuffer *LogBuffer) ReleaseMemory(b *bytes.Buffer) {
 	bufferPool.Put(b)
+}
+
+// GetName returns the log buffer name for metadata tracking
+func (logBuffer *LogBuffer) GetName() string {
+	logBuffer.RLock()
+	defer logBuffer.RUnlock()
+	return logBuffer.name
+}
+
+// GetOffset returns the current offset for metadata tracking
+func (logBuffer *LogBuffer) GetOffset() int64 {
+	logBuffer.RLock()
+	defer logBuffer.RUnlock()
+	return logBuffer.offset
 }
 
 var bufferPool = sync.Pool{
@@ -343,23 +966,185 @@ var bufferPool = sync.Pool{
 	},
 }
 
-func copiedBytes(buf []byte) (copied *bytes.Buffer) {
-	copied = bufferPool.Get().(*bytes.Buffer)
-	copied.Reset()
-	copied.Write(buf)
-	return
+// copiedBytes returns a private copy of buf backed by the shared, size-classed
+// slab pool. The caller owns it until mem.Free (see dataToFlush.releaseMemory),
+// so the live buffer never outlives the flush. Routing through mem reuses slabs
+// across the process instead of reallocating a window-sized array per flush.
+func copiedBytes(buf []byte) []byte {
+	copied := mem.Allocate(len(buf))
+	copy(copied, buf)
+	return copied
 }
 
-func readTs(buf []byte, pos int) (size int, ts int64) {
+// sharedBufferView wraps the sealed window's shared snapshot from pos onward.
+// The returned buffer aliases memory shared with other readers: it must be
+// treated as read-only and never passed to ReleaseMemory (the full-slice cap
+// makes an accidental append reallocate instead of scribbling on the snapshot).
+func sharedBufferView(mb *MemBuffer, pos int) *bytes.Buffer {
+	snap := mb.sharedSnapshot()
+	return bytes.NewBuffer(snap[pos:len(snap):len(snap)])
+}
+
+// currentSnapshotView returns buf[from:to] of the current window as a view of
+// the shared prefix snapshot, extending the snapshot to cover [0:to) first.
+// buf[:pos] is append-only until the window seals, so extension only ever
+// appends stable bytes; earlier holders' slices are unaffected. Callers must
+// hold the read lock (keeps buf and pos stable during extension).
+func (logBuffer *LogBuffer) currentSnapshotView(from, to int) *bytes.Buffer {
+	logBuffer.curSnapMu.Lock()
+	if cap(logBuffer.curSnap) < to {
+		// First use in this window (or the rare window whose array outgrew the
+		// previous one): size to the window array so extensions never reallocate.
+		grown := make([]byte, len(logBuffer.curSnap), len(logBuffer.buf))
+		copy(grown, logBuffer.curSnap)
+		logBuffer.curSnap = grown
+	}
+	if len(logBuffer.curSnap) < to {
+		logBuffer.curSnap = append(logBuffer.curSnap, logBuffer.buf[len(logBuffer.curSnap):to]...)
+	}
+	snap := logBuffer.curSnap[:to]
+	logBuffer.curSnapMu.Unlock()
+	return bytes.NewBuffer(snap[from:to:to])
+}
+
+func readTs(buf []byte, pos int) (size int, ts int64, err error) {
+	// Bounds check for size field (overflow-safe)
+	if pos < 0 || pos > len(buf)-4 {
+		return 0, 0, fmt.Errorf("corrupted log buffer: cannot read size at pos %d, buffer length %d", pos, len(buf))
+	}
 
 	size = int(util.BytesToUint32(buf[pos : pos+4]))
-	entryData := buf[pos+4 : pos+4+size]
-	logEntry := &filer_pb.LogEntry{}
 
-	err := proto.Unmarshal(entryData, logEntry)
-	if err != nil {
-		glog.Fatalf("unexpected unmarshal filer_pb.LogEntry: %v", err)
+	// Bounds check for entry data (overflow-safe, protects against negative size)
+	if size < 0 || size > len(buf)-pos-4 {
+		return 0, 0, fmt.Errorf("corrupted log buffer: entry size %d at pos %d exceeds buffer length %d", size, pos, len(buf))
 	}
-	return size, logEntry.TsNs
 
+	entryData := buf[pos+4 : pos+4+size]
+
+	// Read only LogEntry.ts_ns rather than unmarshaling the whole entry. This
+	// runs on every binary-search probe in ReadFromBuffer; a full proto.Unmarshal
+	// there allocates fresh slices for the data/key byte fields on each call, which
+	// dominated allocation churn under metadata-subscription fan-out.
+	ts, err = readTsNs(entryData)
+	if err != nil {
+		return 0, 0, fmt.Errorf("corrupted log buffer at pos %d, size %d: %w", pos, size, err)
+	}
+
+	return size, ts, nil
+}
+
+// readTsNs scans a marshaled LogEntry and returns its ts_ns (field 1, varint)
+// without decoding the data/key byte fields. Fields serialize in number order,
+// so ts_ns is normally the first tag and this returns after one varint; the full
+// scan keeps it correct for any field order. A missing field 1 means the proto3
+// default, ts_ns == 0.
+func readTsNs(entryData []byte) (tsNs int64, err error) {
+	for i := 0; i < len(entryData); {
+		tag, n := binary.Uvarint(entryData[i:])
+		if n <= 0 {
+			return 0, fmt.Errorf("bad field tag at %d", i)
+		}
+		i += n
+		fieldNum := tag >> 3
+		switch tag & 0x7 { // wire type
+		case 0: // varint
+			v, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return 0, fmt.Errorf("bad varint for field %d", fieldNum)
+			}
+			i += m
+			if fieldNum == 1 { // ts_ns
+				return int64(v), nil
+			}
+		case 1: // 64-bit
+			i += 8
+		case 2: // length-delimited: read length, skip payload without copying
+			l, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return 0, fmt.Errorf("bad length for field %d", fieldNum)
+			}
+			i += m
+			if l > uint64(len(entryData)-i) {
+				return 0, fmt.Errorf("field %d length %d overruns buffer", fieldNum, l)
+			}
+			i += int(l)
+		case 5: // 32-bit
+			i += 4
+		default:
+			return 0, fmt.Errorf("unknown wire type for field %d", fieldNum)
+		}
+		if i > len(entryData) {
+			return 0, fmt.Errorf("field %d overruns buffer", fieldNum)
+		}
+	}
+	return 0, nil
+}
+
+// unmarshalLogEntryAliased decodes a marshaled LogEntry into out, pointing the
+// data and key fields at sub-slices of entryData instead of copying them. A full
+// proto.Unmarshal allocates fresh slices for those byte fields on every entry
+// (protobuf consumeBytesNoZero), which dominated allocation churn when many
+// metadata subscribers each re-read the in-memory log window.
+//
+// The aliased data/key are only valid while entryData is, i.e. for the duration
+// of the eachLogEntryFn callback. Callers must copy anything they retain past the
+// callback; all current subscribers do (they re-decode data into their own event
+// or hand it to a synchronous grpc Send).
+func unmarshalLogEntryAliased(entryData []byte, out *filer_pb.LogEntry) error {
+	out.TsNs = 0
+	out.PartitionKeyHash = 0
+	out.Data = nil
+	out.Key = nil
+	out.Offset = 0
+	for i := 0; i < len(entryData); {
+		tag, n := binary.Uvarint(entryData[i:])
+		if n <= 0 {
+			return fmt.Errorf("bad field tag at %d", i)
+		}
+		i += n
+		fieldNum := tag >> 3
+		switch tag & 0x7 { // wire type
+		case 0: // varint: ts_ns / partition_key_hash / offset
+			v, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return fmt.Errorf("bad varint for field %d", fieldNum)
+			}
+			i += m
+			switch fieldNum {
+			case 1:
+				out.TsNs = int64(v)
+			case 2:
+				out.PartitionKeyHash = int32(v)
+			case 5:
+				out.Offset = int64(v)
+			}
+		case 2: // length-delimited: data / key, aliased not copied
+			l, m := binary.Uvarint(entryData[i:])
+			if m <= 0 {
+				return fmt.Errorf("bad length for field %d", fieldNum)
+			}
+			i += m
+			if l > uint64(len(entryData)-i) {
+				return fmt.Errorf("field %d length %d overruns buffer", fieldNum, l)
+			}
+			switch fieldNum {
+			case 3:
+				out.Data = entryData[i : i+int(l)]
+			case 4:
+				out.Key = entryData[i : i+int(l)]
+			}
+			i += int(l)
+		case 1: // 64-bit
+			i += 8
+		case 5: // 32-bit
+			i += 4
+		default:
+			return fmt.Errorf("unknown wire type for field %d", fieldNum)
+		}
+		if i > len(entryData) {
+			return fmt.Errorf("field %d overruns buffer", fieldNum)
+		}
+	}
+	return nil
 }

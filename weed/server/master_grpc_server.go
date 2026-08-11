@@ -4,19 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"net"
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster/maintenance"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/raft"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -89,7 +93,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			glog.V(0).Infof("unregister disconnected volume server %s:%d", dn.Ip, dn.Port)
 			ms.UnRegisterUuids(dn.Ip, dn.Port)
 
-			if len(message.DeletedVids) > 0 || len(message.DeletedEcVids) > 0 {
+			if ms.Topo.IsLeader() && (len(message.DeletedVids) > 0 || len(message.DeletedEcVids) > 0) {
 				ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: message})
 			}
 		}
@@ -98,9 +102,16 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 	for {
 		heartbeat, err := stream.Recv()
 		if err != nil {
-			if dn != nil {
+			// Graceful shutdown on either side cancels the stream; don't warn.
+			canceled := errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
+			switch {
+			case canceled && dn != nil:
+				glog.V(1).Infof("SendHeartbeat.Recv server %s:%d canceled: %v", dn.Ip, dn.Port, err)
+			case canceled:
+				glog.V(1).Infof("SendHeartbeat.Recv canceled: %v", err)
+			case dn != nil:
 				glog.Warningf("SendHeartbeat.Recv server %s:%d : %v", dn.Ip, dn.Port, err)
-			} else {
+			default:
 				glog.Warningf("SendHeartbeat.Recv: %v", err)
 			}
 			stats.MasterReceivedHeartbeatCounter.WithLabelValues("error").Inc()
@@ -112,7 +123,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			newLeader, err := ms.Topo.Leader()
 			if err != nil {
 				glog.Warningf("SendHeartbeat find leader: %v", err)
-				return err
+				return raft.NotLeaderError
 			}
 			if err := stream.Send(&master_pb.HeartbeatResponse{
 				Leader: string(newLeader),
@@ -136,8 +147,8 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			dcName, rackName := ms.Topo.Configuration.Locate(heartbeat.Ip, heartbeat.DataCenter, heartbeat.Rack)
 			dc := ms.Topo.GetOrCreateDataCenter(dcName)
 			rack := dc.GetOrCreateRack(rackName)
-			dn = rack.GetOrCreateDataNode(heartbeat.Ip, int(heartbeat.Port), int(heartbeat.GrpcPort), heartbeat.PublicUrl, heartbeat.MaxVolumeCounts)
-			glog.V(0).Infof("added volume server %d: %v:%d %v", dn.Counter, heartbeat.GetIp(), heartbeat.GetPort(), heartbeat.LocationUuids)
+			dn = rack.GetOrCreateDataNode(heartbeat.Ip, int(heartbeat.Port), int(heartbeat.GrpcPort), heartbeat.PublicUrl, heartbeat.Id, heartbeat.MaxVolumeCounts)
+			glog.V(0).Infof("added volume server %d: %v (id=%s, ip=%v:%d) %v", dn.Counter, dn.Id(), heartbeat.Id, heartbeat.GetIp(), heartbeat.GetPort(), heartbeat.LocationUuids)
 			uuidlist, err := ms.RegisterUuids(heartbeat)
 			if err != nil {
 				if stream_err := stream.Send(&master_pb.HeartbeatResponse{
@@ -151,6 +162,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 
 			if err := stream.Send(&master_pb.HeartbeatResponse{
 				VolumeSizeLimit: uint64(ms.option.VolumeSizeLimitMB) * 1024 * 1024,
+				Preallocate:     ms.preallocateSize > 0,
 			}); err != nil {
 				glog.Warningf("SendHeartbeat.Send volume size to %s:%d %v", dn.Ip, dn.Port, err)
 				return err
@@ -160,9 +172,27 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 		}
 
 		dn.AdjustMaxVolumeCounts(heartbeat.MaxVolumeCounts)
+		dn.AdjustDiskUsageBytes(heartbeat.DiskTotalBytes, heartbeat.DiskFreeBytes)
+		dn.UpdateDiskTags(heartbeat.DiskTags)
 
 		glog.V(4).Infof("master received heartbeat %s", heartbeat.String())
 		stats.MasterReceivedHeartbeatCounter.WithLabelValues("total").Inc()
+
+		if heartbeat.State != nil {
+			stats.MasterReceivedHeartbeatCounter.WithLabelValues("stateUpdates").Inc()
+
+			updated := false
+			dn.Lock()
+			if dn.MaintenanceMode != heartbeat.State.GetMaintenance() {
+				updated = true
+				dn.MaintenanceMode = heartbeat.State.GetMaintenance()
+			}
+			dn.Unlock()
+
+			if updated {
+				glog.V(1).Infof("master sees state update from %s: %v", dn.Url(), heartbeat.State)
+			}
+		}
 
 		message := &master_pb.VolumeLocation{
 			Url:        dn.Url(),
@@ -199,11 +229,11 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			newVolumes, deletedVolumes := ms.Topo.SyncDataNodeRegistration(heartbeat.Volumes, dn)
 
 			for _, v := range newVolumes {
-				glog.V(0).Infof("master see new volume %d from %s", uint32(v.Id), dn.Url())
+				glog.V(1).Infof("master see new volume %d from %s", uint32(v.Id), dn.Url())
 				message.NewVids = append(message.NewVids, uint32(v.Id))
 			}
 			for _, v := range deletedVolumes {
-				glog.V(0).Infof("master see deleted volume %d from %s", uint32(v.Id), dn.Url())
+				glog.V(1).Infof("master see deleted volume %d from %s", uint32(v.Id), dn.Url())
 				message.DeletedVids = append(message.DeletedVids, uint32(v.Id))
 			}
 		}
@@ -273,22 +303,50 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 
 	clientName, messageChan := ms.addClient(req.FilerGroup, req.ClientType, peerAddress)
 	for _, update := range ms.Cluster.AddClusterNode(req.FilerGroup, req.ClientType, cluster.DataCenter(req.DataCenter), cluster.Rack(req.Rack), peerAddress, req.Version) {
+		glog.V(1).Infof("Cluster: %s node %s added to group '%s'", req.ClientType, peerAddress, req.FilerGroup)
 		ms.broadcastToClients(update)
+	}
+	if req.ClientType == cluster.FilerType {
+		ms.LockRingManager.AddServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
 	}
 
 	defer func() {
 		for _, update := range ms.Cluster.RemoveClusterNode(req.FilerGroup, req.ClientType, peerAddress) {
 			ms.broadcastToClients(update)
 		}
+		if req.ClientType == cluster.FilerType {
+			ms.LockRingManager.RemoveServer(cluster.FilerGroupName(req.FilerGroup), peerAddress)
+		}
 		ms.deleteClient(clientName)
 	}()
-	for i, message := range ms.Topo.ToVolumeLocations() {
-		if i == 0 {
-			if leader, err := ms.Topo.Leader(); err == nil {
-				message.Leader = string(leader)
+
+	// Send volume locations to the client
+	volumeLocations := ms.Topo.ToVolumeLocations()
+	if len(volumeLocations) == 0 {
+		// Always send at least one message with leader info so the client can unblock
+		leader, _ := ms.Topo.Leader()
+		if sendErr := stream.Send(&master_pb.KeepConnectedResponse{
+			VolumeLocation: &master_pb.VolumeLocation{
+				Leader: string(leader),
+			},
+		}); sendErr != nil {
+			return sendErr
+		}
+	} else {
+		for i, message := range volumeLocations {
+			if i == 0 {
+				if leader, err := ms.Topo.Leader(); err == nil {
+					message.Leader = string(leader)
+				}
+			}
+			if sendErr := stream.Send(&master_pb.KeepConnectedResponse{VolumeLocation: message}); sendErr != nil {
+				return sendErr
 			}
 		}
-		if sendErr := stream.Send(&master_pb.KeepConnectedResponse{VolumeLocation: message}); sendErr != nil {
+	}
+
+	if initialLockRingUpdate := ms.initialLockRingUpdate(req.ClientType, req.FilerGroup); initialLockRingUpdate != nil {
+		if sendErr := stream.Send(initialLockRingUpdate); sendErr != nil {
 			return sendErr
 		}
 	}
@@ -335,12 +393,46 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 
 }
 
+func (ms *MasterServer) initialLockRingUpdate(clientType string, filerGroup string) *master_pb.KeepConnectedResponse {
+	if ms.LockRingManager == nil {
+		return nil
+	}
+	// Filers are ring members; S3 gateways are lock clients that need the same
+	// view to dial a key's primary directly. Both get the initial snapshot;
+	// later membership changes already broadcast to every connected client.
+	if clientType != cluster.FilerType && clientType != cluster.S3Type {
+		return nil
+	}
+
+	update := ms.LockRingManager.GetLastUpdate(cluster.FilerGroupName(filerGroup))
+	if update == nil {
+		return nil
+	}
+
+	return &master_pb.KeepConnectedResponse{
+		LockRingUpdate: update,
+	}
+}
+
 func (ms *MasterServer) broadcastToClients(message *master_pb.KeepConnectedResponse) {
 	ms.clientChansLock.RLock()
-	for _, ch := range ms.clientChans {
-		ch <- message
+	for client, ch := range ms.clientChans {
+		select {
+		case ch <- message:
+			glog.V(4).Infof("send message to %s", client)
+		default:
+			stats.MasterBroadcastToFullErrorCounter.Inc()
+			glog.Errorf("broadcastToClients %s message full", client)
+		}
 	}
 	ms.clientChansLock.RUnlock()
+}
+
+// broadcastVolumeLocationsToClients notifies connected clients about newly created volume locations.
+func (ms *MasterServer) broadcastVolumeLocationsToClients(locations []*master_pb.VolumeLocation) {
+	for _, location := range locations {
+		ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: location})
+	}
 }
 
 func (ms *MasterServer) informNewLeader(stream master_pb.Seaweed_KeepConnectedServer) error {
@@ -413,14 +505,24 @@ func (ms *MasterServer) GetMasterConfiguration(ctx context.Context, req *master_
 	// tell the volume servers about the leader
 	leader, _ := ms.Topo.Leader()
 
+	// MIGRATION: expose maintenance scripts for admin server seeding. Remove after March 2027.
+	v := util.GetViper()
+	maintenanceScripts := v.GetString("master.maintenance.scripts")
+	maintenanceSleepMinutes := v.GetInt("master.maintenance.sleep_minutes")
+	if maintenanceSleepMinutes <= 0 {
+		maintenanceSleepMinutes = maintenance.DefaultMaintenanceSleepMinutes
+	}
+
 	resp := &master_pb.GetMasterConfigurationResponse{
-		MetricsAddress:         ms.option.MetricsAddress,
-		MetricsIntervalSeconds: uint32(ms.option.MetricsIntervalSec),
-		StorageBackends:        backend.ToPbStorageBackends(),
-		DefaultReplication:     ms.option.DefaultReplicaPlacement,
-		VolumeSizeLimitMB:      uint32(ms.option.VolumeSizeLimitMB),
-		VolumePreallocate:      ms.option.VolumePreallocate,
-		Leader:                 string(leader),
+		MetricsAddress:          ms.option.MetricsAddress,
+		MetricsIntervalSeconds:  uint32(ms.option.MetricsIntervalSec),
+		StorageBackends:         backend.ToPbStorageBackends(),
+		DefaultReplication:      ms.option.DefaultReplicaPlacement,
+		VolumeSizeLimitMB:       uint32(ms.option.VolumeSizeLimitMB),
+		VolumePreallocate:       ms.option.VolumePreallocate,
+		Leader:                  string(leader),
+		MaintenanceScripts:      maintenanceScripts,
+		MaintenanceSleepMinutes: uint32(maintenanceSleepMinutes),
 	}
 
 	return resp, nil

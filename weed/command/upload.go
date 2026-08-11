@@ -97,7 +97,14 @@ func runUpload(cmd *Command, args []string) bool {
 					if e != nil {
 						return e
 					}
-					results, e := operation.SubmitFiles(func(_ context.Context) pb.ServerAddress { return pb.ServerAddress(*upload.master) }, grpcDialOption, parts, *upload.replication, *upload.collection, *upload.dataCenter, *upload.ttl, *upload.diskType, *upload.maxMB, *upload.usePublicUrl)
+					results, e := operation.SubmitFiles(func(_ context.Context) pb.ServerAddress { return pb.ServerAddress(*upload.master) }, grpcDialOption, parts, operation.StoragePreference{
+						Replication: *upload.replication,
+						Collection:  *upload.collection,
+						DataCenter:  *upload.dataCenter,
+						Ttl:         *upload.ttl,
+						DiskType:    *upload.diskType,
+						MaxMB:       *upload.maxMB,
+					}, *upload.usePublicUrl)
 					bytes, _ := json.Marshal(results)
 					fmt.Println(string(bytes))
 					if e != nil {
@@ -119,7 +126,14 @@ func runUpload(cmd *Command, args []string) bool {
 			fmt.Println(e.Error())
 			return false
 		}
-		results, err := operation.SubmitFiles(func(_ context.Context) pb.ServerAddress { return pb.ServerAddress(*upload.master) }, grpcDialOption, parts, *upload.replication, *upload.collection, *upload.dataCenter, *upload.ttl, *upload.diskType, *upload.maxMB, *upload.usePublicUrl)
+		results, err := operation.SubmitFiles(func(_ context.Context) pb.ServerAddress { return pb.ServerAddress(*upload.master) }, grpcDialOption, parts, operation.StoragePreference{
+			Replication: *upload.replication,
+			Collection:  *upload.collection,
+			DataCenter:  *upload.dataCenter,
+			Ttl:         *upload.ttl,
+			DiskType:    *upload.diskType,
+			MaxMB:       *upload.maxMB,
+		}, *upload.usePublicUrl)
 		if err != nil {
 			fmt.Println(err.Error())
 			return false
@@ -131,7 +145,7 @@ func runUpload(cmd *Command, args []string) bool {
 }
 
 func readMasterConfiguration(grpcDialOption grpc.DialOption, masterAddress pb.ServerAddress) (replication string, err error) {
-	err = pb.WithMasterClient(false, masterAddress, grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+	err = pb.WithMasterClient(context.Background(), false, masterAddress, grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 		resp, err := client.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
 		if err != nil {
 			return fmt.Errorf("get master %s configuration: %v", masterAddress, err)

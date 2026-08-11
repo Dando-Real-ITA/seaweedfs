@@ -3,10 +3,11 @@ package erasure_coding
 import (
 	"bytes"
 	"fmt"
-	"github.com/stretchr/testify/assert"
 	"math/rand"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/klauspost/reedsolomon"
 
@@ -23,7 +24,10 @@ func TestEncodingDecoding(t *testing.T) {
 	bufferSize := 50
 	baseFileName := "1"
 
-	err := generateEcFiles(baseFileName, bufferSize, largeBlockSize, smallBlockSize)
+	// Create default EC context for testing
+	ctx := NewDefaultECContext("", 0)
+
+	_, err := generateEcFiles(baseFileName, bufferSize, largeBlockSize, smallBlockSize, ctx)
 	if err != nil {
 		t.Logf("generateEcFiles: %v", err)
 	}
@@ -33,16 +37,16 @@ func TestEncodingDecoding(t *testing.T) {
 		t.Logf("WriteSortedFileFromIdx: %v", err)
 	}
 
-	err = validateFiles(baseFileName)
+	err = validateFiles(baseFileName, ctx)
 	if err != nil {
 		t.Logf("WriteSortedFileFromIdx: %v", err)
 	}
 
-	removeGeneratedFiles(baseFileName)
+	removeGeneratedFiles(baseFileName, ctx)
 
 }
 
-func validateFiles(baseFileName string) error {
+func validateFiles(baseFileName string, ctx *ECContext) error {
 	nm, err := readNeedleMap(baseFileName)
 	if err != nil {
 		return fmt.Errorf("readNeedleMap: %v", err)
@@ -60,7 +64,7 @@ func validateFiles(baseFileName string) error {
 		return fmt.Errorf("failed to stat dat file: %v", err)
 	}
 
-	ecFiles, err := openEcFiles(baseFileName, true)
+	ecFiles, err := openEcFiles(baseFileName, true, ctx)
 	if err != nil {
 		return fmt.Errorf("error opening ec files: %w", err)
 	}
@@ -184,12 +188,13 @@ func readFromFile(file *os.File, data []byte, ecFileOffset int64) (err error) {
 	return
 }
 
-func removeGeneratedFiles(baseFileName string) {
-	for i := 0; i < DataShardsCount+ParityShardsCount; i++ {
-		fname := fmt.Sprintf("%s.ec%02d", baseFileName, i)
+func removeGeneratedFiles(baseFileName string, ctx *ECContext) {
+	for i := 0; i < ctx.Total(); i++ {
+		fname := baseFileName + ctx.ToExt(i)
 		os.Remove(fname)
 	}
 	os.Remove(baseFileName + ".ecx")
+	RemoveBitrotSidecars(baseFileName)
 }
 
 func TestLocateData(t *testing.T) {
@@ -213,7 +218,9 @@ func (this Interval) sameAs(that Interval) bool {
 }
 
 func TestLocateData2(t *testing.T) {
-	intervals := LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, 3221225472, 21479557912, 4194339)
+	// Use ecdFileSize-1 to simulate the fallback path in LocateEcShardNeedleInterval
+	// when datFileSize is not available (old EC volumes without .vif datFileSize).
+	intervals := LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, 3221225472-1, 21479557912, 4194339)
 	assert.Equal(t, intervals, []Interval{
 		{BlockIndex: 4, InnerBlockOffset: 527128, Size: 521448, IsLargeBlock: false, LargeBlockRowsCount: 2},
 		{BlockIndex: 5, InnerBlockOffset: 0, Size: 1048576, IsLargeBlock: false, LargeBlockRowsCount: 2},
@@ -224,11 +231,45 @@ func TestLocateData2(t *testing.T) {
 }
 
 func TestLocateData3(t *testing.T) {
-	intervals := LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, 3221225472, 30782909808, 112568)
+	// Use ecdFileSize-1 to simulate the fallback path in LocateEcShardNeedleInterval
+	intervals := LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, 3221225472-1, 30782909808, 112568)
 	for _, interval := range intervals {
 		fmt.Printf("%+v\n", interval)
 	}
 	assert.Equal(t, intervals, []Interval{
 		{BlockIndex: 8876, InnerBlockOffset: 912752, Size: 112568, IsLargeBlock: false, LargeBlockRowsCount: 2},
 	})
+}
+
+func TestLocateData_ExactMultiple_Issue8947(t *testing.T) {
+	// When datFileSize is available, shardDatSize = datFileSize / DataShards.
+	// For a 30GB volume with 10 data shards, shardDatSize = 3GB = 3 * ErasureCodingLargeBlockSize.
+	// The encoder produces 3 large block rows, 0 small block rows.
+	// nLargeBlockRows must be 3, not 2.
+	shardDatSize := int64(3) * ErasureCodingLargeBlockSize // 3GB per shard from datFileSize/DataShards
+
+	// Reading from the 3rd large block row (offsets 20GB-30GB) should work
+	offset := int64(2) * ErasureCodingLargeBlockSize * DataShardsCount // 20GB
+	intervals := LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, shardDatSize, offset, 1024)
+	assert.Equal(t, 1, len(intervals))
+	assert.True(t, intervals[0].IsLargeBlock, "data in 3rd large row should be in large blocks")
+	assert.Equal(t, 3, intervals[0].LargeBlockRowsCount)
+	assert.Equal(t, 20, intervals[0].BlockIndex) // block 20 = shard 0 of 3rd row
+}
+
+func TestLocateData_Issue8179(t *testing.T) {
+	large := int64(10000)
+	small := int64(100)
+	shardSize := int64(259092) // Resulting in nLargeBlockRows = 25 as seen in panic log
+
+	// Testing range through the large-to-small transition boundary
+	nLargeBlockRows := shardSize / large
+	largeAreaSize := nLargeBlockRows * int64(DataShardsCount) * large
+
+	for offset := largeAreaSize - 500; offset < largeAreaSize+500; offset++ {
+		intervals := LocateData(large, small, shardSize, offset, 200)
+		for _, interval := range intervals {
+			assert.True(t, interval.Size > 0, "Interval size must be positive at offset %d, got %+v", offset, interval)
+		}
+	}
 }

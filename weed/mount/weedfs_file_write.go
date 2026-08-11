@@ -1,11 +1,13 @@
 package mount
 
 import (
-	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	"net/http"
 	"syscall"
 	"time"
+
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 /**
@@ -36,7 +38,8 @@ import (
  */
 func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (written uint32, code fuse.Status) {
 
-	if wfs.IsOverQuota {
+	// Check quota including uncommitted writes for real-time enforcement
+	if wfs.IsOverQuotaWithUncommitted() {
 		return 0, fuse.Status(syscall.ENOSPC)
 	}
 
@@ -59,10 +62,31 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 
 	entry.Content = nil
 	offset := int64(in.Offset)
-	entry.Attributes.FileSize = uint64(max(offset+int64(len(data)), int64(entry.Attributes.FileSize)))
+	oldFileSize := int64(entry.Attributes.FileSize)
+	newFileSize := max(offset+int64(len(data)), oldFileSize)
+	entry.Attributes.FileSize = uint64(newFileSize)
+
+	// POSIX: writes update mtime and ctime. Stamp the entry now so the
+	// flush path persists the write time rather than overwriting any
+	// user-set mtime (e.g., utimes/touch -m -d) at flush time.
+	writeNow := time.Unix(0, tsNs)
+	entry.Attributes.Mtime = writeNow.Unix()
+	entry.Attributes.MtimeNs = int32(writeNow.Nanosecond())
+	entry.Attributes.Ctime = writeNow.Unix()
+	entry.Attributes.CtimeNs = int32(writeNow.Nanosecond())
+
+	// Track uncommitted bytes for real-time quota enforcement.
+	// Only count the new bytes being added beyond the current file size.
+	if newFileSize > oldFileSize {
+		wfs.AddUncommittedBytes(newFileSize - oldFileSize)
+	}
+
 	// glog.V(4).Infof("%v write [%d,%d) %d", fh.f.fullpath(), req.Offset, req.Offset+int64(len(req.Data)), len(req.Data))
 
-	fh.dirtyPages.AddPage(offset, data, fh.dirtyPages.writerPattern.IsSequentialMode(), tsNs)
+	if err := fh.dirtyPages.AddPage(offset, data, fh.dirtyPages.writerPattern.IsSequentialMode(), tsNs); err != nil {
+		glog.Errorf("AddPage error: %v", err)
+		return 0, writeErrorToFuseStatus(err)
+	}
 
 	written = uint32(len(data))
 
@@ -72,6 +96,14 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 	}
 
 	fh.dirtyMetadata = true
+
+	// Invalidate the mtime cache so the next Open will not set FOPEN_KEEP_CACHE.
+	wfs.invalidateOpenMtimeCache(in.NodeId)
+
+	// POSIX: clear SUID/SGID bits on write by non-root users.
+	if in.Uid != 0 {
+		entry.Attributes.FileMode &^= 0o6000
+	}
 
 	if IsDebugFileReadWrite {
 		// print("+")

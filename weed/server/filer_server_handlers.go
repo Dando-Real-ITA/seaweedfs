@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -13,13 +14,17 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
-	"github.com/seaweedfs/seaweedfs/weed/util"
-
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	inFlightGauge := stats.FilerInFlightRequestsGauge.WithLabelValues(r.Method)
+	inFlightGauge.Inc()
+	defer inFlightGauge.Dec()
+
 	statusRecorder := stats.NewStatusResponseWriter(w)
 	w = statusRecorder
 	origin := r.Header.Get("Origin")
@@ -53,8 +58,8 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 
 	// proxy to volume servers
 	var fileId string
-	if strings.HasPrefix(r.RequestURI, "/?proxyChunkId=") {
-		fileId = r.RequestURI[len("/?proxyChunkId="):]
+	if r.URL.Path == "/" {
+		fileId = r.URL.Query().Get("proxyChunkId")
 	}
 	if fileId != "" {
 		fs.proxyToVolumeServer(w, r, fileId)
@@ -74,7 +79,7 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Server", "SeaweedFS "+util.Version())
+	w.Header().Set("Server", "SeaweedFS "+version.VERSION)
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
@@ -90,15 +95,35 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		contentLength := getContentLength(r)
 		fs.inFlightDataLimitCond.L.Lock()
 		inFlightDataSize := atomic.LoadInt64(&fs.inFlightDataSize)
-		for fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit {
-			glog.V(4).Infof("wait because inflight data %d > %d", inFlightDataSize, fs.option.ConcurrentUploadLimit)
+		inFlightUploads := atomic.LoadInt64(&fs.inFlightUploads)
+
+		// Wait if either data size limit or file count limit is exceeded
+		for (fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit) || (fs.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= fs.option.ConcurrentFileUploadLimit) {
+			if fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit {
+				glog.V(4).Infof("wait because inflight data %d > %d", inFlightDataSize, fs.option.ConcurrentUploadLimit)
+			}
+			if fs.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= fs.option.ConcurrentFileUploadLimit {
+				glog.V(4).Infof("wait because inflight uploads %d >= %d", inFlightUploads, fs.option.ConcurrentFileUploadLimit)
+			}
 			fs.inFlightDataLimitCond.Wait()
 			inFlightDataSize = atomic.LoadInt64(&fs.inFlightDataSize)
+			inFlightUploads = atomic.LoadInt64(&fs.inFlightUploads)
 		}
 		fs.inFlightDataLimitCond.L.Unlock()
-		atomic.AddInt64(&fs.inFlightDataSize, contentLength)
+
+		// Increment counters
+		newUploads := atomic.AddInt64(&fs.inFlightUploads, 1)
+		newSize := atomic.AddInt64(&fs.inFlightDataSize, contentLength)
+		// Update metrics
+		stats.FilerInFlightUploadCountGauge.Set(float64(newUploads))
+		stats.FilerInFlightUploadBytesGauge.Set(float64(newSize))
 		defer func() {
-			atomic.AddInt64(&fs.inFlightDataSize, -contentLength)
+			// Decrement counters
+			newUploads := atomic.AddInt64(&fs.inFlightUploads, -1)
+			newSize := atomic.AddInt64(&fs.inFlightDataSize, -contentLength)
+			// Update metrics
+			stats.FilerInFlightUploadCountGauge.Set(float64(newUploads))
+			stats.FilerInFlightUploadBytesGauge.Set(float64(newSize))
 			fs.inFlightDataLimitCond.Signal()
 		}()
 
@@ -123,7 +148,7 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 	statusRecorder := stats.NewStatusResponseWriter(w)
 	w = statusRecorder
 
-	glog.V(1).Infof("Request: " + r.Method + " " + r.URL.String() + "\n")
+	glog.V(4).Infof("Request: %s %s", r.Method, r.URL.Path)
 
 	origin := r.Header.Get("Origin")
 	if origin != "" {
@@ -162,7 +187,7 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	w.Header().Set("Server", "SeaweedFS "+util.Version())
+	w.Header().Set("Server", "SeaweedFS "+version.VERSION)
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
@@ -188,43 +213,153 @@ func OptionsHandler(w http.ResponseWriter, r *http.Request, isReadOnly bool) {
 // maybeCheckJwtAuthorization returns true if access should be granted, false if it should be denied
 func (fs *FilerServer) maybeCheckJwtAuthorization(r *http.Request, isWrite bool) bool {
 
-	var signingKey security.SigningKey
+	if !isWrite && r.URL.Path == "/" {
+		return true
+	}
 
+	return fs.checkJwtAuthorization(r, isWrite, jwtScopedRequestPaths(r))
+}
+
+// checkJwtAuthorization verifies the request carries a valid filer JWT for the
+// requested access level and, for prefix-restricted tokens, that every path in
+// scopedPaths falls within AllowedPrefixes.
+func (fs *FilerServer) checkJwtAuthorization(r *http.Request, isWrite bool, scopedPaths []string) bool {
+	claims, ok := fs.authenticateFilerJwt(r, isWrite)
+	if !ok {
+		return false
+	}
+	return authorizeFilerJwtPaths(r, claims, scopedPaths)
+}
+
+// authenticateFilerJwt verifies the JWT signature and method claims. A nil claims
+// with ok true means authentication is disabled for this access level. Splitting
+// authentication from path authorization lets a handler load an indirect resource
+// (the TUS session target) only after the caller's credential is verified.
+func (fs *FilerServer) authenticateFilerJwt(r *http.Request, isWrite bool) (*security.SeaweedFilerClaims, bool) {
+
+	var signingKey security.SigningKey
 	if isWrite {
-		if len(fs.filerGuard.SigningKey) == 0 {
-			return true
-		} else {
-			signingKey = fs.filerGuard.SigningKey
-		}
+		signingKey = fs.filerGuard.SigningKey()
 	} else {
-		if len(fs.filerGuard.ReadSigningKey) == 0 {
-			return true
-		} else {
-			signingKey = fs.filerGuard.ReadSigningKey
-		}
+		signingKey = fs.filerGuard.ReadSigningKey()
+	}
+	if len(signingKey) == 0 {
+		return nil, true
 	}
 
 	tokenStr := security.GetJwt(r)
 	if tokenStr == "" {
 		glog.V(1).Infof("missing jwt from %s", r.RemoteAddr)
-		return false
+		return nil, false
 	}
 
 	token, err := security.DecodeJwt(signingKey, tokenStr, &security.SeaweedFilerClaims{})
 	if err != nil {
 		glog.V(1).Infof("jwt verification error from %s: %v", r.RemoteAddr, err)
-		return false
+		return nil, false
 	}
 	if !token.Valid {
 		glog.V(1).Infof("jwt invalid from %s: %v", r.RemoteAddr, tokenStr)
-		return false
-	} else {
+		return nil, false
+	}
+
+	claims, ok := token.Claims.(*security.SeaweedFilerClaims)
+	if !ok {
+		glog.V(1).Infof("jwt claims not of type *SeaweedFilerClaims from %s", r.RemoteAddr)
+		return nil, false
+	}
+
+	if len(claims.AllowedMethods) > 0 {
+		hasMethod := false
+		for _, method := range claims.AllowedMethods {
+			if method == r.Method {
+				hasMethod = true
+				break
+			}
+		}
+		if !hasMethod {
+			glog.V(1).Infof("jwt method not allowed from %s: %v", r.RemoteAddr, r.Method)
+			return nil, false
+		}
+	}
+
+	return claims, true
+}
+
+// authorizeFilerJwtPaths checks the resource scope after authentication. A
+// prefix-restricted token must name at least one resource path; an empty list
+// fails closed, so a caller that cannot resolve its target never falls open.
+func authorizeFilerJwtPaths(r *http.Request, claims *security.SeaweedFilerClaims, scopedPaths []string) bool {
+	if claims == nil || len(claims.AllowedPrefixes) == 0 {
 		return true
 	}
+	if len(scopedPaths) == 0 {
+		glog.V(1).Infof("jwt resource path missing from %s", r.RemoteAddr)
+		return false
+	}
+	for _, p := range scopedPaths {
+		if !anyComponentPrefixMatches(claims.AllowedPrefixes, p) {
+			glog.V(1).Infof("jwt path not allowed from %s: %v", r.RemoteAddr, p)
+			return false
+		}
+	}
+	return true
+}
+
+// jwtScopedRequestPaths returns every filer path a request touches that must be
+// covered by the JWT AllowedPrefixes: the write target (r.URL.Path) plus any
+// copy/move source named by the cp.from / mv.from query parameters.
+func jwtScopedRequestPaths(r *http.Request) []string {
+	paths := []string{r.URL.Path}
+	if query := r.URL.Query(); query.Has("cp.from") || query.Has("mv.from") {
+		if from := query.Get("cp.from"); from != "" {
+			paths = append(paths, from)
+		}
+		if from := query.Get("mv.from"); from != "" {
+			paths = append(paths, from)
+		}
+	}
+	return paths
+}
+
+// anyComponentPrefixMatches reports whether p is within any of the prefixes.
+func anyComponentPrefixMatches(prefixes []string, p string) bool {
+	for _, prefix := range prefixes {
+		if pathHasComponentPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathHasComponentPrefix reports whether reqPath is contained within the
+// directory subtree denoted by prefix, treating both as "/"-separated
+// path components. Both inputs are normalised with path.Clean to neutralise
+// "." and ".." segments and collapse duplicate slashes. A prefix of "/"
+// matches any path.
+func pathHasComponentPrefix(reqPath, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	cleanedPath := path.Clean(reqPath)
+	if cleanedPath == "." {
+		cleanedPath = "/"
+	}
+	cleanedPrefix := path.Clean(prefix)
+	if cleanedPrefix == "." {
+		cleanedPrefix = "/"
+	}
+	if cleanedPrefix == "/" {
+		return true
+	}
+	if cleanedPath == cleanedPrefix {
+		return true
+	}
+	return strings.HasPrefix(cleanedPath, cleanedPrefix+"/")
 }
 
 func (fs *FilerServer) filerHealthzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS "+util.Version())
+	w.Header().Set("Server", "SeaweedFS "+version.VERSION)
 	if _, err := fs.filer.Store.FindEntry(context.Background(), filer.TopicsDir); err != nil && err != filer_pb.ErrNotFound {
 		glog.Warningf("filerHealthzHandler FindEntry: %+v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)

@@ -1,8 +1,13 @@
 package s3api
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"sync"
+	"sync/atomic"
+
 	"github.com/gorilla/mux"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -11,9 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
-	"net/http"
-	"sync"
-	"sync/atomic"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
 type CircuitBreaker struct {
@@ -21,6 +24,15 @@ type CircuitBreaker struct {
 	Enabled     bool
 	counters    map[string]*int64
 	limitations map[string]int64
+	s3a         *S3ApiServer
+
+	// Interceptor, if set, wraps the per-route handler ahead of ALL
+	// circuit-breaker logic (upload limiting and the breaker checks) and runs
+	// even when the breaker is disabled. It is a general per-request
+	// interceptor seam: an implementation may reject the request (write its own
+	// response and not call next) or wrap next to observe/shape it. Nil by
+	// default, so it is a no-op unless explicitly set.
+	Interceptor func(next http.HandlerFunc, action string) http.HandlerFunc
 }
 
 func NewCircuitBreaker(option *S3ApiServerOption) *CircuitBreaker {
@@ -29,20 +41,20 @@ func NewCircuitBreaker(option *S3ApiServerOption) *CircuitBreaker {
 		limitations: make(map[string]int64),
 	}
 
-	err := pb.WithFilerClient(false, 0, option.Filer, option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		content, err := filer.ReadInsideFiler(client, s3_constants.CircuitBreakerConfigDir, s3_constants.CircuitBreakerConfigFile)
+	// Use WithOneOfGrpcFilerClients to support multiple filers with failover
+	err := pb.WithOneOfGrpcFilerClients(false, option.Filers, option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		content, err := filer.ReadInsideFiler(context.Background(), client, s3_constants.CircuitBreakerConfigDir, s3_constants.CircuitBreakerConfigFile)
 		if errors.Is(err, filer_pb.ErrNotFound) {
-			glog.Infof("s3 circuit breaker not configured")
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("read S3 circuit breaker config: %v", err)
+			return fmt.Errorf("read S3 circuit breaker config: %w", err)
 		}
 		return cb.LoadS3ApiConfigurationFromBytes(content)
 	})
 
 	if err != nil {
-		glog.Infof("s3 circuit breaker not configured correctly: %v", err)
+		glog.Warningf("S3 circuit breaker disabled; failed to load config from any filer: %v", err)
 	}
 
 	return cb
@@ -52,7 +64,7 @@ func (cb *CircuitBreaker) LoadS3ApiConfigurationFromBytes(content []byte) error 
 	cbCfg := &s3_pb.S3CircuitBreakerConfig{}
 	if err := filer.ParseS3ConfigurationFromBytes(content, cbCfg); err != nil {
 		glog.Warningf("unmarshal error: %v", err)
-		return fmt.Errorf("unmarshal error: %v", err)
+		return fmt.Errorf("unmarshal error: %w", err)
 	}
 	if err := cb.loadCircuitBreakerConfig(cbCfg); err != nil {
 		return err
@@ -88,7 +100,55 @@ func (cb *CircuitBreaker) loadCircuitBreakerConfig(cfg *s3_pb.S3CircuitBreakerCo
 }
 
 func (cb *CircuitBreaker) Limit(f func(w http.ResponseWriter, r *http.Request), action string) (http.HandlerFunc, Action) {
-	return func(w http.ResponseWriter, r *http.Request) {
+	inner := func(w http.ResponseWriter, r *http.Request) {
+		// Apply upload limiting for write actions if configured
+		if cb.s3a != nil && (action == s3_constants.ACTION_WRITE) &&
+			(cb.s3a.option.ConcurrentUploadLimit != 0 || cb.s3a.option.ConcurrentFileUploadLimit != 0) {
+
+			// Get content length, default to 0 if not provided
+			contentLength := r.ContentLength
+			if contentLength < 0 {
+				contentLength = 0
+			}
+
+			// Wait until in flight data is less than the limit
+			cb.s3a.inFlightDataLimitCond.L.Lock()
+			inFlightDataSize := atomic.LoadInt64(&cb.s3a.inFlightDataSize)
+			inFlightUploads := atomic.LoadInt64(&cb.s3a.inFlightUploads)
+
+			// Wait if either data size limit or file count limit is exceeded
+			for (cb.s3a.option.ConcurrentUploadLimit != 0 && inFlightDataSize > cb.s3a.option.ConcurrentUploadLimit) ||
+				(cb.s3a.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= cb.s3a.option.ConcurrentFileUploadLimit) {
+				if cb.s3a.option.ConcurrentUploadLimit != 0 && inFlightDataSize > cb.s3a.option.ConcurrentUploadLimit {
+					glog.V(4).Infof("wait because inflight data %d > %d", inFlightDataSize, cb.s3a.option.ConcurrentUploadLimit)
+				}
+				if cb.s3a.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= cb.s3a.option.ConcurrentFileUploadLimit {
+					glog.V(4).Infof("wait because inflight uploads %d >= %d", inFlightUploads, cb.s3a.option.ConcurrentFileUploadLimit)
+				}
+				cb.s3a.inFlightDataLimitCond.Wait()
+				inFlightDataSize = atomic.LoadInt64(&cb.s3a.inFlightDataSize)
+				inFlightUploads = atomic.LoadInt64(&cb.s3a.inFlightUploads)
+			}
+			cb.s3a.inFlightDataLimitCond.L.Unlock()
+
+			// Increment counters
+			newUploads := atomic.AddInt64(&cb.s3a.inFlightUploads, 1)
+			newSize := atomic.AddInt64(&cb.s3a.inFlightDataSize, contentLength)
+			// Update metrics
+			stats.S3InFlightUploadCountGauge.Set(float64(newUploads))
+			stats.S3InFlightUploadBytesGauge.Set(float64(newSize))
+			defer func() {
+				// Decrement counters
+				newUploads := atomic.AddInt64(&cb.s3a.inFlightUploads, -1)
+				newSize := atomic.AddInt64(&cb.s3a.inFlightDataSize, -contentLength)
+				// Update metrics
+				stats.S3InFlightUploadCountGauge.Set(float64(newUploads))
+				stats.S3InFlightUploadBytesGauge.Set(float64(newSize))
+				cb.s3a.inFlightDataLimitCond.Signal()
+			}()
+		}
+
+		// Apply circuit breaker logic
 		if !cb.Enabled {
 			f(w, r)
 			return
@@ -109,6 +169,20 @@ func (cb *CircuitBreaker) Limit(f func(w http.ResponseWriter, r *http.Request), 
 			return
 		}
 		s3err.WriteErrorResponse(w, r, errCode)
+	}
+
+	// The interceptor is consulted per request rather than captured here, so it
+	// can be installed after the routes are registered (e.g. once the server and
+	// its dependencies are constructed) and so a nil CircuitBreaker is never
+	// dereferenced at registration time. When unset this is just a nil check.
+	// It runs outermost: before upload limiting and the breaker checks, and
+	// regardless of cb.Enabled.
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cb.Interceptor != nil {
+			cb.Interceptor(inner, action)(w, r)
+			return
+		}
+		inner(w, r)
 	}, Action(action)
 }
 

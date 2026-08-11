@@ -4,11 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"io"
 )
 
 func init() {
@@ -28,6 +29,10 @@ func (c *commandGrow) Help() string {
 	volume.grow [-collection=<collection name>] [-dataCenter=<data center name>]
 
 `
+}
+
+func (c *commandGrow) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandGrow) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {

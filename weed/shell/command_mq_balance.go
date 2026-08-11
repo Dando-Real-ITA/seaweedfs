@@ -3,9 +3,10 @@ package shell
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
-	"io"
 )
 
 func init() {
@@ -23,6 +24,10 @@ func (c *commandMqBalanceTopics) Help() string {
 	return `balance topic partitions
 
 `
+}
+
+func (c *commandMqBalanceTopics) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandMqBalanceTopics) Do(args []string, commandEnv *CommandEnv, writer io.Writer) error {

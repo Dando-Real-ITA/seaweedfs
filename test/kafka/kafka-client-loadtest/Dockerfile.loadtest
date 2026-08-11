@@ -1,0 +1,51 @@
+# Kafka Client Load Test Runner Dockerfile
+# Multi-stage build for cross-platform support
+
+# Stage 1: Builder
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+# Copy go module files
+COPY test/kafka/kafka-client-loadtest/go.mod test/kafka/kafka-client-loadtest/go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY test/kafka/kafka-client-loadtest/ ./
+
+# Build the loadtest binary
+RUN CGO_ENABLED=0 GOOS=linux go build -o /kafka-loadtest ./cmd/loadtest
+
+# Stage 2: Runtime
+# Use alpine so we don't depend on Ubuntu apt mirrors, which intermittently
+# refuse connections from GitHub Actions runners and fail the CI build.
+# All runtime dependencies we need (ca-certificates, curl, jq, bash, nc)
+# are in the Alpine main repo.
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    jq \
+    bash \
+    netcat-openbsd
+
+# Copy built binary from builder stage
+COPY --from=builder /kafka-loadtest /usr/local/bin/kafka-loadtest
+RUN chmod +x /usr/local/bin/kafka-loadtest
+
+# Copy scripts and configuration
+COPY test/kafka/kafka-client-loadtest/scripts/ /scripts/
+COPY test/kafka/kafka-client-loadtest/config/ /config/
+
+# Create results directory
+RUN mkdir -p /test-results
+
+# Make scripts executable
+RUN chmod +x /scripts/*.sh
+
+WORKDIR /app
+
+# Default command runs the comprehensive load test
+CMD ["/usr/local/bin/kafka-loadtest", "-config", "/config/loadtest.yaml"]
+

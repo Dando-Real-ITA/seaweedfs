@@ -3,15 +3,17 @@ package topology
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"math/rand/v2"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
@@ -65,10 +67,27 @@ type VolumeGrowOption struct {
 	Rack               string                        `json:"rack,omitempty"`
 	DataNode           string                        `json:"dataNode,omitempty"`
 	MemoryMapMaxSizeMb uint32                        `json:"memoryMapMaxSizeMb,omitempty"`
+	Version            uint32                        `json:"version,omitempty"`
 }
 
 type VolumeGrowth struct {
 	accessLock sync.Mutex
+}
+
+// VolumeGrowReservation tracks capacity reservations for a volume creation operation
+type VolumeGrowReservation struct {
+	servers        []*DataNode
+	reservationIds []string
+	diskType       types.DiskType
+}
+
+// releaseAllReservations releases all reservations in this volume grow operation
+func (vgr *VolumeGrowReservation) releaseAllReservations() {
+	for i, server := range vgr.servers {
+		if i < len(vgr.reservationIds) && vgr.reservationIds[i] != "" {
+			server.ReleaseReservedCapacity(vgr.reservationIds[i])
+		}
+	}
 }
 
 func (o *VolumeGrowOption) String() string {
@@ -80,20 +99,25 @@ func NewDefaultVolumeGrowth() *VolumeGrowth {
 	return &VolumeGrowth{}
 }
 
+// VolumeGrowthCountForCopies returns the configured number of logical volumes
+// to create at once for a given replica copy count (master.volume_growth.copy_N).
+func VolumeGrowthCountForCopies(copyCount int) uint32 {
+	switch copyCount {
+	case 1:
+		return VolumeGrowStrategy.Copy1Count
+	case 2:
+		return VolumeGrowStrategy.Copy2Count
+	case 3:
+		return VolumeGrowStrategy.Copy3Count
+	default:
+		return VolumeGrowStrategy.CopyOtherCount
+	}
+}
+
 // one replication type may need rp.GetCopyCount() actual volumes
 // given copyCount, how many logical volumes to create
 func (vg *VolumeGrowth) findVolumeCount(copyCount int) (count uint32) {
-	switch copyCount {
-	case 1:
-		count = VolumeGrowStrategy.Copy1Count
-	case 2:
-		count = VolumeGrowStrategy.Copy2Count
-	case 3:
-		count = VolumeGrowStrategy.Copy3Count
-	default:
-		count = VolumeGrowStrategy.CopyOtherCount
-	}
-	return
+	return VolumeGrowthCountForCopies(copyCount)
 }
 
 func (vg *VolumeGrowth) AutomaticGrowByType(option *VolumeGrowOption, grpcDialOption grpc.DialOption, topo *Topology, targetCount uint32) (result []*master_pb.VolumeLocation, err error) {
@@ -113,8 +137,10 @@ func (vg *VolumeGrowth) GrowByCountAndType(grpcDialOption grpc.DialOption, targe
 	for i := uint32(0); i < targetCount; i++ {
 		if res, e := vg.findAndGrow(grpcDialOption, topo, option); e == nil {
 			result = append(result, res...)
+			stats.MasterVolumeCreationCounter.WithLabelValues("success").Inc()
 		} else {
 			glog.V(0).Infof("create %d volume, created %d: %v", targetCount, len(result), e)
+			stats.MasterVolumeCreationCounter.WithLabelValues("failure").Inc()
 			return result, e
 		}
 	}
@@ -122,15 +148,28 @@ func (vg *VolumeGrowth) GrowByCountAndType(grpcDialOption grpc.DialOption, targe
 }
 
 func (vg *VolumeGrowth) findAndGrow(grpcDialOption grpc.DialOption, topo *Topology, option *VolumeGrowOption) (result []*master_pb.VolumeLocation, err error) {
-	servers, e := vg.findEmptySlotsForOneVolume(topo, option)
+	// Wait for warmup to complete before searching for slots so the
+	// topology has all volume servers registered.
+	for topo.IsWarmingUp() {
+		glog.V(0).Infof("wait for volume servers to join back")
+		time.Sleep(topo.WarmupDuration() / WarmupPulseMultiplier / 2)
+	}
+
+	servers, reservation, e := vg.findEmptySlotsForOneVolume(topo, option, true) // use reservations
 	if e != nil {
 		return nil, e
 	}
+	// Ensure reservations are released if anything goes wrong
+	defer func() {
+		if err != nil && reservation != nil {
+			reservation.releaseAllReservations()
+		}
+	}()
 	vid, raftErr := topo.NextVolumeId()
 	if raftErr != nil {
 		return nil, raftErr
 	}
-	if err = vg.grow(grpcDialOption, topo, vid, option, servers...); err == nil {
+	if err = vg.grow(grpcDialOption, topo, vid, option, reservation, servers...); err == nil {
 		for _, server := range servers {
 			result = append(result, &master_pb.VolumeLocation{
 				Url:        server.Url(),
@@ -149,9 +188,48 @@ func (vg *VolumeGrowth) findAndGrow(grpcDialOption grpc.DialOption, topo *Topolo
 // 2.2 collect all racks that have rp.SameRackCount+1
 // 2.2 collect all data centers that have DiffRackCount+rp.SameRackCount+1
 // 2. find rest data nodes
-func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *VolumeGrowOption) (servers []*DataNode, err error) {
+// If useReservations is true, reserves capacity on each server and returns reservation info
+func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *VolumeGrowOption, useReservations bool) (servers []*DataNode, reservation *VolumeGrowReservation, err error) {
 	//find main datacenter and other data centers
 	rp := option.ReplicaPlacement
+
+	// Track tentative reservations to make the process atomic
+	var tentativeReservation *VolumeGrowReservation
+
+	// Select appropriate functions based on useReservations flag
+	var availableSpaceFunc func(Node, *VolumeGrowOption) int64
+	var reserveOneVolumeFunc func(Node, int64, *VolumeGrowOption) (*DataNode, error)
+
+	if useReservations {
+		// Initialize tentative reservation tracking
+		tentativeReservation = &VolumeGrowReservation{
+			servers:        make([]*DataNode, 0),
+			reservationIds: make([]string, 0),
+			diskType:       option.DiskType,
+		}
+
+		// For reservations, we make actual reservations during node selection
+		availableSpaceFunc = func(node Node, option *VolumeGrowOption) int64 {
+			return node.AvailableSpaceForReservation(option)
+		}
+		reserveOneVolumeFunc = func(node Node, r int64, option *VolumeGrowOption) (*DataNode, error) {
+			return node.ReserveOneVolumeForReservation(r, option)
+		}
+	} else {
+		availableSpaceFunc = func(node Node, option *VolumeGrowOption) int64 {
+			return node.AvailableSpaceFor(option)
+		}
+		reserveOneVolumeFunc = func(node Node, r int64, option *VolumeGrowOption) (*DataNode, error) {
+			return node.ReserveOneVolume(r, option)
+		}
+	}
+
+	// Ensure cleanup of partial reservations on error
+	defer func() {
+		if err != nil && tentativeReservation != nil {
+			tentativeReservation.releaseAllReservations()
+		}
+	}()
 	mainDataCenter, otherDataCenters, dc_err := topo.PickNodesByWeight(rp.DiffDataCenterCount+1, option, func(node Node) error {
 		if option.DataCenter != "" && node.IsDataCenter() && node.Id() != NodeId(option.DataCenter) {
 			return fmt.Errorf("Not matching preferred data center:%s", option.DataCenter)
@@ -159,14 +237,14 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		if len(node.Children()) < rp.DiffRackCount+1 {
 			return fmt.Errorf("Only has %d racks, not enough for %d.", len(node.Children()), rp.DiffRackCount+1)
 		}
-		if node.AvailableSpaceFor(option) < int64(rp.DiffRackCount+rp.SameRackCount+1) {
-			return fmt.Errorf("Free:%d < Expected:%d", node.AvailableSpaceFor(option), rp.DiffRackCount+rp.SameRackCount+1)
+		if availableSpaceFunc(node, option) < int64(rp.DiffRackCount+rp.SameRackCount+1) {
+			return fmt.Errorf("Free:%d < Expected:%d", availableSpaceFunc(node, option), rp.DiffRackCount+rp.SameRackCount+1)
 		}
 		possibleRacksCount := 0
 		for _, rack := range node.Children() {
 			possibleDataNodesCount := 0
 			for _, n := range rack.Children() {
-				if n.AvailableSpaceFor(option) >= 1 {
+				if availableSpaceFunc(n, option) >= 1 {
 					possibleDataNodesCount++
 				}
 			}
@@ -180,7 +258,7 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		return nil
 	})
 	if dc_err != nil {
-		return nil, dc_err
+		return nil, nil, dc_err
 	}
 
 	//find main rack and other racks
@@ -188,8 +266,8 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		if option.Rack != "" && node.IsRack() && node.Id() != NodeId(option.Rack) {
 			return fmt.Errorf("Not matching preferred rack:%s", option.Rack)
 		}
-		if node.AvailableSpaceFor(option) < int64(rp.SameRackCount+1) {
-			return fmt.Errorf("Free:%d < Expected:%d", node.AvailableSpaceFor(option), rp.SameRackCount+1)
+		if availableSpaceFunc(node, option) < int64(rp.SameRackCount+1) {
+			return fmt.Errorf("Free:%d < Expected:%d", availableSpaceFunc(node, option), rp.SameRackCount+1)
 		}
 		if len(node.Children()) < rp.SameRackCount+1 {
 			// a bit faster way to test free racks
@@ -197,7 +275,7 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		}
 		possibleDataNodesCount := 0
 		for _, n := range node.Children() {
-			if n.AvailableSpaceFor(option) >= 1 {
+			if availableSpaceFunc(n, option) >= 1 {
 				possibleDataNodesCount++
 			}
 		}
@@ -207,7 +285,7 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		return nil
 	})
 	if rackErr != nil {
-		return nil, rackErr
+		return nil, nil, rackErr
 	}
 
 	//find main server and other servers
@@ -215,13 +293,27 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		if option.DataNode != "" && node.IsDataNode() && node.Id() != NodeId(option.DataNode) {
 			return fmt.Errorf("Not matching preferred data node:%s", option.DataNode)
 		}
-		if node.AvailableSpaceFor(option) < 1 {
-			return fmt.Errorf("Free:%d < Expected:%d", node.AvailableSpaceFor(option), 1)
+
+		if useReservations {
+			// For reservations, atomically check and reserve capacity
+			if node.IsDataNode() {
+				reservationId, success := node.TryReserveCapacity(option.DiskType, 1)
+				if !success {
+					return fmt.Errorf("Cannot reserve capacity on node %s", node.Id())
+				}
+				// Track the reservation for later cleanup if needed
+				tentativeReservation.servers = append(tentativeReservation.servers, node.(*DataNode))
+				tentativeReservation.reservationIds = append(tentativeReservation.reservationIds, reservationId)
+			} else if availableSpaceFunc(node, option) < 1 {
+				return fmt.Errorf("Free:%d < Expected:%d", availableSpaceFunc(node, option), 1)
+			}
+		} else if availableSpaceFunc(node, option) < 1 {
+			return fmt.Errorf("Free:%d < Expected:%d", availableSpaceFunc(node, option), 1)
 		}
 		return nil
 	})
 	if serverErr != nil {
-		return nil, serverErr
+		return nil, nil, serverErr
 	}
 
 	servers = append(servers, mainServer.(*DataNode))
@@ -229,25 +321,53 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		servers = append(servers, server.(*DataNode))
 	}
 	for _, rack := range otherRacks {
-		r := rand.Int64N(rack.AvailableSpaceFor(option))
-		if server, e := rack.ReserveOneVolume(r, option); e == nil {
+		r := rand.Int64N(availableSpaceFunc(rack, option))
+		if server, e := reserveOneVolumeFunc(rack, r, option); e == nil {
 			servers = append(servers, server)
+
+			// If using reservations, also make a reservation on the selected server
+			if useReservations {
+				reservationId, success := server.TryReserveCapacity(option.DiskType, 1)
+				if !success {
+					return servers, nil, fmt.Errorf("failed to reserve capacity on server %s from other rack", server.Id())
+				}
+				tentativeReservation.servers = append(tentativeReservation.servers, server)
+				tentativeReservation.reservationIds = append(tentativeReservation.reservationIds, reservationId)
+			}
 		} else {
-			return servers, e
+			return servers, nil, e
 		}
 	}
 	for _, datacenter := range otherDataCenters {
-		r := rand.Int64N(datacenter.AvailableSpaceFor(option))
-		if server, e := datacenter.ReserveOneVolume(r, option); e == nil {
+		r := rand.Int64N(availableSpaceFunc(datacenter, option))
+		if server, e := reserveOneVolumeFunc(datacenter, r, option); e == nil {
 			servers = append(servers, server)
+
+			// If using reservations, also make a reservation on the selected server
+			if useReservations {
+				reservationId, success := server.TryReserveCapacity(option.DiskType, 1)
+				if !success {
+					return servers, nil, fmt.Errorf("failed to reserve capacity on server %s from other datacenter", server.Id())
+				}
+				tentativeReservation.servers = append(tentativeReservation.servers, server)
+				tentativeReservation.reservationIds = append(tentativeReservation.reservationIds, reservationId)
+			}
 		} else {
-			return servers, e
+			return servers, nil, e
 		}
 	}
-	return
+
+	// If reservations were made, return the tentative reservation
+	if useReservations && tentativeReservation != nil {
+		reservation = tentativeReservation
+		glog.V(1).Infof("Successfully reserved capacity on %d servers for volume creation", len(servers))
+	}
+
+	return servers, reservation, nil
 }
 
-func (vg *VolumeGrowth) grow(grpcDialOption grpc.DialOption, topo *Topology, vid needle.VolumeId, option *VolumeGrowOption, servers ...*DataNode) (growErr error) {
+// grow creates volumes on the provided servers, optionally managing capacity reservations
+func (vg *VolumeGrowth) grow(grpcDialOption grpc.DialOption, topo *Topology, vid needle.VolumeId, option *VolumeGrowOption, reservation *VolumeGrowReservation, servers ...*DataNode) (growErr error) {
 	var createdVolumes []storage.VolumeInfo
 	for _, server := range servers {
 		if err := AllocateVolume(server, grpcDialOption, vid, option); err == nil {
@@ -257,7 +377,7 @@ func (vg *VolumeGrowth) grow(grpcDialOption grpc.DialOption, topo *Topology, vid
 				Collection:       option.Collection,
 				ReplicaPlacement: option.ReplicaPlacement,
 				Ttl:              option.Ttl,
-				Version:          needle.CurrentVersion,
+				Version:          needle.Version(option.Version),
 				DiskType:         option.DiskType.String(),
 				ModifiedAtSecond: time.Now().Unix(),
 			})
@@ -276,6 +396,10 @@ func (vg *VolumeGrowth) grow(grpcDialOption grpc.DialOption, topo *Topology, vid
 			topo.RegisterVolumeLayout(vi, server)
 			glog.V(0).Infof("Registered Volume %d on %s", vid, server.NodeImpl.String())
 		}
+		// Release reservations on success since volumes are now registered
+		if reservation != nil {
+			reservation.releaseAllReservations()
+		}
 	} else {
 		// cleaning up created volume replicas
 		for i, vi := range createdVolumes {
@@ -284,6 +408,7 @@ func (vg *VolumeGrowth) grow(grpcDialOption grpc.DialOption, topo *Topology, vid
 				glog.Warningf("Failed to clean up volume %d on %s", vid, server.NodeImpl.String())
 			}
 		}
+		// Reservations will be released by the caller in case of failure
 	}
 
 	return growErr

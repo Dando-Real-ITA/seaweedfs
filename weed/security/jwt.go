@@ -13,6 +13,11 @@ import (
 type EncodedJwt string
 type SigningKey []byte
 
+// BearerPrefix is the RFC 6750 Authorization header scheme prefix for bearer
+// tokens. Used when constructing "Authorization: Bearer <token>" headers; the
+// scheme name itself is matched case-insensitively when parsing (see GetJwt).
+const BearerPrefix = "Bearer "
+
 // SeaweedFileIdClaims is created by Master server(s) and consumed by Volume server(s),
 // restricting the access this JWT allows to only a single file.
 type SeaweedFileIdClaims struct {
@@ -24,7 +29,44 @@ type SeaweedFileIdClaims struct {
 // Right now, it only contains the standard claims; but this might be extended later
 // for more fine-grained permissions.
 type SeaweedFilerClaims struct {
+	AllowedPrefixes []string `json:"allowed_prefixes,omitempty"`
+	AllowedMethods  []string `json:"allowed_methods,omitempty"`
 	jwt.RegisteredClaims
+}
+
+// SeaweedFilerAdminClaims is presented by callers of the filer's IAM gRPC
+// service to prove they are authorised to administer users, access keys, and
+// policies. The token is signed with the filer write-signing key
+// (jwt.filer_signing.key in security.toml).
+//
+// Validation is delegated to DecodeJwt below: it enforces HS256 via the
+// SigningMethodHMAC type check, and jwt/v5 validates exp/nbf on the embedded
+// RegisteredClaims. Extra JSON fields in the payload are silently ignored by
+// encoding/json, which is the desired behaviour here (forward-compat).
+type SeaweedFilerAdminClaims struct {
+	jwt.RegisteredClaims
+}
+
+// GenJwtForFilerAdmin mints a Bearer token for the filer IAM gRPC service.
+// Returns an empty string if the signing key is not configured.
+func GenJwtForFilerAdmin(signingKey SigningKey, expiresAfterSec int) EncodedJwt {
+	if len(signingKey) == 0 {
+		return ""
+	}
+
+	claims := SeaweedFilerAdminClaims{
+		RegisteredClaims: jwt.RegisteredClaims{},
+	}
+	if expiresAfterSec > 0 {
+		claims.ExpiresAt = jwt.NewNumericDate(time.Now().Add(time.Second * time.Duration(expiresAfterSec)))
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	encoded, e := t.SignedString([]byte(signingKey))
+	if e != nil {
+		glog.V(0).Infof("Failed to sign claims %+v: %v", t.Claims, e)
+		return ""
+	}
+	return EncodedJwt(encoded)
 }
 
 func GenJwtForVolumeServer(signingKey SigningKey, expiresAfterSec int, fileId string) EncodedJwt {
@@ -56,7 +98,7 @@ func GenJwtForFilerServer(signingKey SigningKey, expiresAfterSec int) EncodedJwt
 	}
 
 	claims := SeaweedFilerClaims{
-		jwt.RegisteredClaims{},
+		RegisteredClaims: jwt.RegisteredClaims{},
 	}
 	if expiresAfterSec > 0 {
 		claims.ExpiresAt = jwt.NewNumericDate(time.Now().Add(time.Second * time.Duration(expiresAfterSec)))

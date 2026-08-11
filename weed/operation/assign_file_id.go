@@ -3,13 +3,17 @@ package operation
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
-	"sync"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type VolumeAssignRequest struct {
@@ -22,6 +26,7 @@ type VolumeAssignRequest struct {
 	Rack                string
 	DataNode            string
 	WritableVolumeCount uint32
+	ExpectedDataSize    uint64
 }
 
 type AssignResult struct {
@@ -35,111 +40,7 @@ type AssignResult struct {
 	Replicas  []Location          `json:"replicas,omitempty"`
 }
 
-// This is a proxy to the master server, only for assigning volume ids.
-// It runs via grpc to the master server in streaming mode.
-// The connection to the master would only be re-established when the last connection has error.
-type AssignProxy struct {
-	grpcConnection *grpc.ClientConn
-	pool           chan *singleThreadAssignProxy
-}
-
-func NewAssignProxy(masterFn GetMasterFn, grpcDialOption grpc.DialOption, concurrency int) (ap *AssignProxy, err error) {
-	ap = &AssignProxy{
-		pool: make(chan *singleThreadAssignProxy, concurrency),
-	}
-	ap.grpcConnection, err = pb.GrpcDial(context.Background(), masterFn(context.Background()).ToGrpcAddress(), true, grpcDialOption)
-	if err != nil {
-		return nil, fmt.Errorf("fail to dial %s: %v", masterFn(context.Background()).ToGrpcAddress(), err)
-	}
-	for i := 0; i < concurrency; i++ {
-		ap.pool <- &singleThreadAssignProxy{}
-	}
-	return ap, nil
-}
-
-func (ap *AssignProxy) Assign(primaryRequest *VolumeAssignRequest, alternativeRequests ...*VolumeAssignRequest) (ret *AssignResult, err error) {
-	p := <-ap.pool
-	defer func() {
-		ap.pool <- p
-	}()
-
-	return p.doAssign(ap.grpcConnection, primaryRequest, alternativeRequests...)
-}
-
-type singleThreadAssignProxy struct {
-	assignClient master_pb.Seaweed_StreamAssignClient
-	sync.Mutex
-}
-
-func (ap *singleThreadAssignProxy) doAssign(grpcConnection *grpc.ClientConn, primaryRequest *VolumeAssignRequest, alternativeRequests ...*VolumeAssignRequest) (ret *AssignResult, err error) {
-	ap.Lock()
-	defer ap.Unlock()
-
-	if ap.assignClient == nil {
-		client := master_pb.NewSeaweedClient(grpcConnection)
-		ap.assignClient, err = client.StreamAssign(context.Background())
-		if err != nil {
-			ap.assignClient = nil
-			return nil, fmt.Errorf("fail to create stream assign client: %v", err)
-		}
-	}
-
-	var requests []*VolumeAssignRequest
-	requests = append(requests, primaryRequest)
-	requests = append(requests, alternativeRequests...)
-	ret = &AssignResult{}
-
-	for _, request := range requests {
-		if request == nil {
-			continue
-		}
-		req := &master_pb.AssignRequest{
-			Count:               request.Count,
-			Replication:         request.Replication,
-			Collection:          request.Collection,
-			Ttl:                 request.Ttl,
-			DiskType:            request.DiskType,
-			DataCenter:          request.DataCenter,
-			Rack:                request.Rack,
-			DataNode:            request.DataNode,
-			WritableVolumeCount: request.WritableVolumeCount,
-		}
-		if err = ap.assignClient.Send(req); err != nil {
-			return nil, fmt.Errorf("StreamAssignSend: %v", err)
-		}
-		resp, grpcErr := ap.assignClient.Recv()
-		if grpcErr != nil {
-			return nil, grpcErr
-		}
-		if resp.Error != "" {
-			return nil, fmt.Errorf("StreamAssignRecv: %v", resp.Error)
-		}
-
-		ret.Count = resp.Count
-		ret.Fid = resp.Fid
-		ret.Url = resp.Location.Url
-		ret.PublicUrl = resp.Location.PublicUrl
-		ret.GrpcPort = int(resp.Location.GrpcPort)
-		ret.Error = resp.Error
-		ret.Auth = security.EncodedJwt(resp.Auth)
-		for _, r := range resp.Replicas {
-			ret.Replicas = append(ret.Replicas, Location{
-				Url:        r.Url,
-				PublicUrl:  r.PublicUrl,
-				DataCenter: r.DataCenter,
-			})
-		}
-
-		if ret.Count <= 0 {
-			continue
-		}
-		break
-	}
-
-	return
-}
-
-func Assign(masterFn GetMasterFn, grpcDialOption grpc.DialOption, primaryRequest *VolumeAssignRequest, alternativeRequests ...*VolumeAssignRequest) (*AssignResult, error) {
+func Assign(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialOption, primaryRequest *VolumeAssignRequest, alternativeRequests ...*VolumeAssignRequest) (*AssignResult, error) {
 
 	var requests []*VolumeAssignRequest
 	requests = append(requests, primaryRequest)
@@ -148,50 +49,94 @@ func Assign(masterFn GetMasterFn, grpcDialOption grpc.DialOption, primaryRequest
 	var lastError error
 	ret := &AssignResult{}
 
+	// Compute a single deadline so all request entries (primary + fallback)
+	// share one 30s retry budget instead of each getting its own.
+	// Use a deadline-aware context so both RetryWithBackoff and per-attempt
+	// timeouts are bounded by the shared budget.
+	deadline := time.Now().Add(30 * time.Second)
+	deadlineCtx, deadlineCancel := context.WithDeadline(ctx, deadline)
+	defer deadlineCancel()
+
 	for i, request := range requests {
 		if request == nil {
 			continue
 		}
 
-		lastError = WithMasterServerClient(false, masterFn(context.Background()), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
-			req := &master_pb.AssignRequest{
-				Count:               request.Count,
-				Replication:         request.Replication,
-				Collection:          request.Collection,
-				Ttl:                 request.Ttl,
-				DiskType:            request.DiskType,
-				DataCenter:          request.DataCenter,
-				Rack:                request.Rack,
-				DataNode:            request.DataNode,
-				WritableVolumeCount: request.WritableVolumeCount,
-			}
-			resp, grpcErr := masterClient.Assign(context.Background(), req)
-			if grpcErr != nil {
-				return grpcErr
-			}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
 
-			if resp.Error != "" {
-				return fmt.Errorf("assignRequest: %v", resp.Error)
-			}
+		lastError = util.RetryWithBackoff(deadlineCtx, "assign", remaining,
+			func(err error) bool {
+				st, ok := status.FromError(err)
+				if !ok {
+					return false
+				}
+				switch st.Code() {
+				case codes.Unavailable, codes.ResourceExhausted:
+					// ResourceExhausted: the master is shedding because volume growth
+					// is in flight; retry so we pick up the new volume once it lands.
+					return true
+				case codes.Canceled, codes.DeadlineExceeded:
+					// A stale cached gRPC channel (e.g., master restart behind
+					// a k8s Service VIP) can return Canceled/DeadlineExceeded
+					// immediately even though the caller's context is still
+					// live. The first failure invalidates the cached ClientConn
+					// via shouldInvalidateConnection; retry so the next attempt
+					// dials a fresh channel.
+					return deadlineCtx.Err() == nil
+				}
+				return false
+			},
+			func() error {
+				// Per-attempt timeout to prevent a single slow RPC from consuming the entire retry budget
+				attemptCtx, attemptCancel := context.WithTimeout(deadlineCtx, 10*time.Second)
+				defer attemptCancel()
+				// Pass attemptCtx so its expiry is not mistaken for a dead shared
+				// connection: invalidating it would cancel every other in-flight
+				// assign with "the client connection is closing".
+				return WithMasterServerClient(attemptCtx, false, masterFn(attemptCtx), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+					req := &master_pb.AssignRequest{
+						Count:               request.Count,
+						Replication:         request.Replication,
+						Collection:          request.Collection,
+						Ttl:                 request.Ttl,
+						DiskType:            request.DiskType,
+						DataCenter:          request.DataCenter,
+						Rack:                request.Rack,
+						DataNode:            request.DataNode,
+						WritableVolumeCount: request.WritableVolumeCount,
+						ExpectedDataSize:    request.ExpectedDataSize,
+					}
+					resp, grpcErr := masterClient.Assign(attemptCtx, req)
+					if grpcErr != nil {
+						return grpcErr
+					}
 
-			ret.Count = resp.Count
-			ret.Fid = resp.Fid
-			ret.Url = resp.Location.Url
-			ret.PublicUrl = resp.Location.PublicUrl
-			ret.GrpcPort = int(resp.Location.GrpcPort)
-			ret.Error = resp.Error
-			ret.Auth = security.EncodedJwt(resp.Auth)
-			for _, r := range resp.Replicas {
-				ret.Replicas = append(ret.Replicas, Location{
-					Url:        r.Url,
-					PublicUrl:  r.PublicUrl,
-					DataCenter: r.DataCenter,
+					if resp.Error != "" {
+						return fmt.Errorf("assignRequest: %v", resp.Error)
+					}
+
+					ret.Count = resp.Count
+					ret.Fid = resp.Fid
+					ret.Url = resp.Location.Url
+					ret.PublicUrl = resp.Location.PublicUrl
+					ret.GrpcPort = int(resp.Location.GrpcPort)
+					ret.Error = resp.Error
+					ret.Auth = security.EncodedJwt(resp.Auth)
+					ret.Replicas = nil
+					for _, r := range resp.Replicas {
+						ret.Replicas = append(ret.Replicas, Location{
+							Url:        r.Url,
+							PublicUrl:  r.PublicUrl,
+							DataCenter: r.DataCenter,
+						})
+					}
+
+					return nil
 				})
-			}
-
-			return nil
-
-		})
+			})
 
 		if lastError != nil {
 			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorChunkAssign).Inc()
@@ -211,7 +156,7 @@ func Assign(masterFn GetMasterFn, grpcDialOption grpc.DialOption, primaryRequest
 
 func LookupJwt(master pb.ServerAddress, grpcDialOption grpc.DialOption, fileId string) (token security.EncodedJwt) {
 
-	WithMasterServerClient(false, master, grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+	WithMasterServerClient(context.Background(), false, master, grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 
 		resp, grpcErr := masterClient.LookupVolume(context.Background(), &master_pb.LookupVolumeRequest{
 			VolumeOrFileIds: []string{fileId},

@@ -2,11 +2,12 @@ package chunk_cache
 
 import (
 	"fmt"
+	"path"
+	"slices"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"golang.org/x/exp/slices"
-	"path"
 )
 
 type OnDiskCacheLayer struct {
@@ -59,50 +60,6 @@ func (c *OnDiskCacheLayer) setChunk(needleId types.NeedleId, data []byte) {
 	if err := c.diskCaches[0].WriteNeedle(needleId, data); err != nil {
 		glog.V(0).Infof("cache write %v size %d: %v", needleId, len(data), err)
 	}
-
-}
-
-func (c *OnDiskCacheLayer) getChunk(needleId types.NeedleId) (data []byte) {
-
-	var err error
-
-	for _, diskCache := range c.diskCaches {
-		data, err = diskCache.GetNeedle(needleId)
-		if err == storage.ErrorNotFound {
-			continue
-		}
-		if err != nil {
-			glog.Errorf("failed to read cache file %s id %d", diskCache.fileName, needleId)
-			continue
-		}
-		if len(data) != 0 {
-			return
-		}
-	}
-
-	return nil
-
-}
-
-func (c *OnDiskCacheLayer) getChunkSlice(needleId types.NeedleId, offset, length uint64) (data []byte) {
-
-	var err error
-
-	for _, diskCache := range c.diskCaches {
-		data, err = diskCache.getNeedleSlice(needleId, offset, length)
-		if err == storage.ErrorNotFound {
-			continue
-		}
-		if err != nil {
-			glog.Warningf("failed to read cache file %s id %d: %v", diskCache.fileName, needleId, err)
-			continue
-		}
-		if len(data) != 0 {
-			return
-		}
-	}
-
-	return nil
 
 }
 

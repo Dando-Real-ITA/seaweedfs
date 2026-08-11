@@ -2,6 +2,7 @@ package broker
 
 import (
 	"fmt"
+
 	"github.com/seaweedfs/seaweedfs/weed/mq/pub_balancer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
 	"google.golang.org/grpc/codes"
@@ -15,7 +16,7 @@ func (b *MessageQueueBroker) PublisherToPubBalancer(stream mq_pb.SeaweedMessagin
 	}
 	req, err := stream.Recv()
 	if err != nil {
-		return fmt.Errorf("receive init message: %v", err)
+		return fmt.Errorf("receive init message: %w", err)
 	}
 
 	// process init message
@@ -44,6 +45,4 @@ func (b *MessageQueueBroker) PublisherToPubBalancer(stream mq_pb.SeaweedMessagin
 			// glog.V(4).Infof("received from %v: %+v", initMessage.Broker, receivedStats)
 		}
 	}
-
-	return nil
 }

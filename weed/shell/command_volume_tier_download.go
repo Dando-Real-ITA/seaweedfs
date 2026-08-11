@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 
@@ -33,12 +34,21 @@ func (c *commandVolumeTierDownload) Help() string {
 	volume.tier.download [-collection=""]
 	volume.tier.download [-collection=""] -volumeId=<volume_id>
 
+	The -collection parameter supports regular expressions for pattern matching:
+	  - Use exact match: volume.tier.download -collection="^mybucket$"
+	  - Match multiple buckets: volume.tier.download -collection="bucket.*"
+	  - Match all collections: volume.tier.download -collection=".*"
+
 	e.g.:
 	volume.tier.download -volumeId=7
 
 	This command will download the dat file of a volume from a remote tier to a volume server in local cluster.
 
 `
+}
+
+func (c *commandVolumeTierDownload) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandVolumeTierDownload) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -69,7 +79,7 @@ func (c *commandVolumeTierDownload) Do(args []string, commandEnv *CommandEnv, wr
 
 	// apply to all volumes in the collection
 	// reusing collectVolumeIdsForEcEncode for now
-	volumeIds := collectRemoteVolumes(topologyInfo, *collection)
+	volumeIds, err := collectRemoteVolumes(topologyInfo, *collection)
 	if err != nil {
 		return err
 	}
@@ -83,13 +93,18 @@ func (c *commandVolumeTierDownload) Do(args []string, commandEnv *CommandEnv, wr
 	return nil
 }
 
-func collectRemoteVolumes(topoInfo *master_pb.TopologyInfo, selectedCollection string) (vids []needle.VolumeId) {
+func collectRemoteVolumes(topoInfo *master_pb.TopologyInfo, collectionPattern string) (vids []needle.VolumeId, err error) {
+	// compile regex pattern for collection matching
+	collectionRegex, err := compileCollectionPattern(collectionPattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid collection pattern '%s': %v", collectionPattern, err)
+	}
 
 	vidMap := make(map[uint32]bool)
-	eachDataNode(topoInfo, func(dc string, rack RackId, dn *master_pb.DataNodeInfo) {
+	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		for _, diskInfo := range dn.DiskInfos {
 			for _, v := range diskInfo.VolumeInfos {
-				if v.Collection == selectedCollection && v.RemoteStorageKey != "" && v.RemoteStorageName != "" {
+				if collectionRegex.MatchString(v.Collection) && v.RemoteStorageKey != "" && v.RemoteStorageName != "" {
 					vidMap[v.Id] = true
 				}
 			}
@@ -110,11 +125,20 @@ func doVolumeTierDownload(commandEnv *CommandEnv, writer io.Writer, collection s
 		return fmt.Errorf("volume %d not found", vid)
 	}
 
+	// All replicas point at the same remote object; only the final download may delete
+	// it. Every earlier replica keeps it so the survivors are not left dangling.
 	// TODO parallelize this
-	for _, loc := range locations {
+	for i, loc := range locations {
+		keepRemote := i < len(locations)-1
 		// copy the .dat file from remote tier to local
-		err = downloadDatFromRemoteTier(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(vid), collection, loc.ServerAddress())
+		err = downloadDatFromRemoteTier(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(vid), collection, loc.ServerAddress(), keepRemote)
 		if err != nil {
+			// A replica already made local by a prior interrupted run is not a
+			// failure; skip it so the remaining remote replicas still download.
+			if strings.Contains(err.Error(), "already on local disk") {
+				fmt.Fprintf(writer, "volume %d on %s is already on local disk, skipping\n", vid, loc.Url)
+				continue
+			}
 			return fmt.Errorf("download dat file for volume %d to %s: %v", vid, loc.Url, err)
 		}
 	}
@@ -122,12 +146,13 @@ func doVolumeTierDownload(commandEnv *CommandEnv, writer io.Writer, collection s
 	return nil
 }
 
-func downloadDatFromRemoteTier(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, collection string, targetVolumeServer pb.ServerAddress) error {
+func downloadDatFromRemoteTier(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, collection string, targetVolumeServer pb.ServerAddress, keepRemote bool) error {
 
 	err := operation.WithVolumeServerClient(true, targetVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 		stream, downloadErr := volumeServerClient.VolumeTierMoveDatFromRemote(context.Background(), &volume_server_pb.VolumeTierMoveDatFromRemoteRequest{
-			VolumeId:   uint32(volumeId),
-			Collection: collection,
+			VolumeId:          uint32(volumeId),
+			Collection:        collection,
+			KeepRemoteDatFile: keepRemote,
 		})
 
 		var lastProcessed int64

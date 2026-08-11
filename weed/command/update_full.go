@@ -1,5 +1,4 @@
-//go:build elastic && ydb && gocdk && tikv
-// +build elastic,ydb,gocdk,tikv
+//go:build elastic && gocdk && rclone && sqlite && tarantool && tikv && ydb
 
 package command
 

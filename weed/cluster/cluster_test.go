@@ -1,10 +1,11 @@
 package cluster
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"strconv"
 	"sync"
 	"testing"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 )
 
 func TestConcurrentAddRemoveNodes(t *testing.T) {
@@ -37,4 +38,29 @@ func TestConcurrentAddRemoveNodes(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestIsKnownNode(t *testing.T) {
+	c := NewCluster()
+	filer := pb.ServerAddress("10.0.0.20:8888")
+	c.AddClusterNode("", FilerType, "dc1", "rack1", filer, "test")
+
+	if !c.IsKnownNode(FilerType, filer) {
+		t.Fatalf("registered filer %s should be known", filer)
+	}
+	if c.IsKnownNode(VolumeServerType, filer) {
+		t.Fatalf("filer address must not be accepted as a volume server target")
+	}
+	if c.IsKnownNode(FilerType, pb.ServerAddress("127.0.0.1:1")) {
+		t.Fatalf("unregistered low-port target must be rejected")
+	}
+	if c.IsKnownNode(FilerType, pb.ServerAddress("127.0.0.1:65000")) {
+		t.Fatalf("unregistered high-port target must be rejected")
+	}
+	if c.IsKnownNode(FilerType, pb.ServerAddress("example.com:443")) {
+		t.Fatalf("unrelated host must be rejected")
+	}
+	if c.IsKnownNode("garbage", filer) {
+		t.Fatalf("unknown node type must be rejected")
+	}
 }

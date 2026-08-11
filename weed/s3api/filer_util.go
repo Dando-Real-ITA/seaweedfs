@@ -2,28 +2,34 @@ package s3api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"strings"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (s3a *S3ApiServer) mkdir(parentDirectoryPath string, dirName string, fn func(entry *filer_pb.Entry)) error {
 
-	return filer_pb.Mkdir(s3a, parentDirectoryPath, dirName, fn)
+	return filer_pb.Mkdir(context.Background(), s3a, parentDirectoryPath, dirName, fn)
 
 }
 
 func (s3a *S3ApiServer) mkFile(parentDirectoryPath string, fileName string, chunks []*filer_pb.FileChunk, fn func(entry *filer_pb.Entry)) error {
 
-	return filer_pb.MkFile(s3a, parentDirectoryPath, fileName, chunks, fn)
+	return filer_pb.MkFile(context.Background(), s3a, parentDirectoryPath, fileName, chunks, fn)
 
 }
 
 func (s3a *S3ApiServer) list(parentDirectoryPath, prefix, startFrom string, inclusive bool, limit uint32) (entries []*filer_pb.Entry, isLast bool, err error) {
 
-	err = filer_pb.List(s3a, parentDirectoryPath, prefix, func(entry *filer_pb.Entry, isLastEntry bool) error {
+	err = filer_pb.List(context.Background(), s3a, parentDirectoryPath, prefix, func(entry *filer_pb.Entry, isLastEntry bool) error {
 		entries = append(entries, entry)
 		if isLastEntry {
 			isLast = true
@@ -43,14 +49,30 @@ func (s3a *S3ApiServer) rm(parentDirectoryPath, entryName string, isDeleteData, 
 
 	return s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
-		err := doDeleteEntry(client, parentDirectoryPath, entryName, isDeleteData, isRecursive)
-		if err != nil {
-			return err
-		}
-
-		return nil
+		return doDeleteEntry(client, parentDirectoryPath, entryName, isDeleteData, isRecursive)
 	})
 
+}
+
+func (s3a *S3ApiServer) rmObject(parentDirectoryPath, entryName string, isDeleteData, isRecursive bool) error {
+
+	return s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+
+		return deleteObjectEntry(client, parentDirectoryPath, entryName, isDeleteData, isRecursive)
+	})
+
+}
+
+func deleteObjectEntry(client filer_pb.SeaweedFilerClient, parentDirectoryPath, entryName string, isDeleteData, isRecursive bool) error {
+	err := doDeleteEntry(client, parentDirectoryPath, entryName, isDeleteData, isRecursive)
+	if err == nil {
+		return nil
+	}
+	if !strings.Contains(err.Error(), filer.MsgFailDelNonEmptyFolder) {
+		return err
+	}
+
+	return demoteDirectoryMarkerToImplicitDirectory(client, parentDirectoryPath, entryName)
 }
 
 func doDeleteEntry(client filer_pb.SeaweedFilerClient, parentDirectoryPath string, entryName string, isDeleteData bool, isRecursive bool) error {
@@ -64,7 +86,7 @@ func doDeleteEntry(client filer_pb.SeaweedFilerClient, parentDirectoryPath strin
 
 	glog.V(1).Infof("delete entry %v/%v: %v", parentDirectoryPath, entryName, request)
 	if resp, err := client.DeleteEntry(context.Background(), request); err != nil {
-		glog.V(0).Infof("delete entry %v: %v", request, err)
+		glog.V(1).Infof("delete entry %v: %v", request, err)
 		return fmt.Errorf("delete entry %s/%s: %v", parentDirectoryPath, entryName, err)
 	} else {
 		if resp.Error != "" {
@@ -74,21 +96,80 @@ func doDeleteEntry(client filer_pb.SeaweedFilerClient, parentDirectoryPath strin
 	return nil
 }
 
-func (s3a *S3ApiServer) exists(parentDirectoryPath string, entryName string, isDirectory bool) (exists bool, err error) {
+func demoteDirectoryMarkerToImplicitDirectory(client filer_pb.SeaweedFilerClient, parentDirectoryPath, entryName string) error {
+	resp, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
+		Directory: parentDirectoryPath,
+		Name:      entryName,
+	})
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("lookup entry %s/%s: %w", parentDirectoryPath, entryName, err)
+	}
+	if resp.Entry == nil || !resp.Entry.IsDirectory {
+		return nil
+	}
+	if !resp.Entry.IsDirectoryKeyObject() {
+		return nil
+	}
 
-	return filer_pb.Exists(s3a, parentDirectoryPath, entryName, isDirectory)
+	clearDirectoryMarkerMetadata(resp.Entry)
 
+	if err := filer_pb.UpdateEntry(context.Background(), client, &filer_pb.UpdateEntryRequest{
+		Directory: parentDirectoryPath,
+		Entry:     resp.Entry,
+	}); err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) || status.Code(err) == codes.NotFound {
+			return nil
+		}
+		return fmt.Errorf("update entry %s/%s: %w", parentDirectoryPath, entryName, err)
+	}
+	return nil
 }
 
-func (s3a *S3ApiServer) touch(parentDirectoryPath string, entryName string, entry *filer_pb.Entry) (err error) {
+func clearDirectoryMarkerMetadata(entry *filer_pb.Entry) {
+	if entry == nil {
+		return
+	}
+	if entry.Attributes == nil {
+		entry.Attributes = &filer_pb.FuseAttributes{}
+	}
 
-	return filer_pb.Touch(s3a, parentDirectoryPath, entryName, entry)
+	entry.Attributes.Mime = ""
+	entry.Attributes.Md5 = nil
+	entry.Attributes.FileSize = 0
+	entry.Content = nil
+	entry.Chunks = nil
+
+	if len(entry.Extended) == 0 {
+		return
+	}
+
+	filtered := make(map[string][]byte)
+	for k, v := range entry.Extended {
+		lowerKey := strings.ToLower(k)
+		if strings.HasPrefix(lowerKey, "xattr-") || strings.HasPrefix(lowerKey, s3_constants.SeaweedFSInternalPrefix) {
+			filtered[k] = v
+		}
+	}
+
+	if len(filtered) == 0 {
+		entry.Extended = nil
+		return
+	}
+	entry.Extended = filtered
+}
+
+func (s3a *S3ApiServer) exists(parentDirectoryPath string, entryName string, isDirectory bool) (exists bool, err error) {
+
+	return filer_pb.Exists(context.Background(), s3a, parentDirectoryPath, entryName, isDirectory)
 
 }
 
 func (s3a *S3ApiServer) getEntry(parentDirectoryPath, entryName string) (entry *filer_pb.Entry, err error) {
 	fullPath := util.NewFullPath(parentDirectoryPath, entryName)
-	return filer_pb.GetEntry(s3a, fullPath)
+	return filer_pb.GetEntry(context.Background(), s3a, fullPath)
 }
 
 func (s3a *S3ApiServer) updateEntry(parentDirectoryPath string, newEntry *filer_pb.Entry) error {
@@ -98,7 +179,7 @@ func (s3a *S3ApiServer) updateEntry(parentDirectoryPath string, newEntry *filer_
 	}
 
 	err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		err := filer_pb.UpdateEntry(client, updateEntryRequest)
+		err := filer_pb.UpdateEntry(context.Background(), client, updateEntryRequest)
 		if err != nil {
 			return err
 		}

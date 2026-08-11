@@ -3,7 +3,6 @@ package source
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -16,11 +15,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
 )
-
-type ReplicationSource interface {
-	ReadPart(part string) io.ReadCloser
-}
 
 type FilerSource struct {
 	grpcAddress    string
@@ -30,6 +26,7 @@ type FilerSource struct {
 	proxyByFiler   bool
 	dataCenter     string
 	signature      int32
+	httpClient     *util_http_client.HTTPClient
 }
 
 func (fs *FilerSource) Initialize(configuration util.Configuration, prefix string) error {
@@ -55,7 +52,15 @@ func (fs *FilerSource) DoInitialize(address, grpcAddress string, dir string, rea
 	return nil
 }
 
-func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) {
+func (fs *FilerSource) SetGrpcDialOption(option grpc.DialOption) {
+	fs.grpcDialOption = option
+}
+
+func (fs *FilerSource) SetHttpClient(client *util_http_client.HTTPClient) {
+	fs.httpClient = client
+}
+
+func (fs *FilerSource) LookupFileId(ctx context.Context, part string) (fileUrls []string, err error) {
 
 	vid2Locations := make(map[string]*filer_pb.Locations)
 
@@ -63,7 +68,7 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 
 	err = fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
-		resp, err := client.LookupVolume(context.Background(), &filer_pb.LookupVolumeRequest{
+		resp, err := client.LookupVolume(ctx, &filer_pb.LookupVolumeRequest{
 			VolumeIds: []string{vid},
 		})
 		if err != nil {
@@ -76,14 +81,14 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 	})
 
 	if err != nil {
-		glog.V(1).Infof("LookupFileId volume id %s: %v", vid, err)
+		glog.V(1).InfofCtx(ctx, "LookupFileId volume id %s: %v", vid, err)
 		return nil, fmt.Errorf("LookupFileId volume id %s: %v", vid, err)
 	}
 
 	locations := vid2Locations[vid]
 
 	if locations == nil || len(locations.Locations) == 0 {
-		glog.V(1).Infof("LookupFileId locate volume id %s: %v", vid, err)
+		glog.V(1).InfofCtx(ctx, "LookupFileId locate volume id %s: %v", vid, err)
 		return nil, fmt.Errorf("LookupFileId locate volume id %s: %v", vid, err)
 	}
 
@@ -104,22 +109,35 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 	return
 }
 
-func (fs *FilerSource) ReadPart(fileId string) (filename string, header http.Header, resp *http.Response, err error) {
-
-	if fs.proxyByFiler {
-		return util_http.DownloadFile("http://"+fs.address+"/?proxyChunkId="+fileId, "")
+func (fs *FilerSource) ReadPart(fileId string, offset int64) (filename string, header http.Header, resp *http.Response, err error) {
+	downloadFn := util_http.DownloadFile
+	if fs.httpClient != nil {
+		downloadFn = func(fileUrl string, jwt string, offset ...int64) (string, http.Header, *http.Response, error) {
+			return util_http.DownloadFileWithClient(fs.httpClient, fileUrl, jwt, offset...)
+		}
 	}
 
-	fileUrls, err := fs.LookupFileId(fileId)
+	if fs.proxyByFiler {
+		filename, header, resp, err = downloadFn("http://"+fs.address+"/?proxyChunkId="+fileId, "", offset)
+		if err != nil {
+			glog.V(0).Infof("read part %s via filer proxy %s offset %d: %v", fileId, fs.address, offset, err)
+		} else {
+			glog.V(4).Infof("read part %s via filer proxy %s offset %d content-length:%s", fileId, fs.address, offset, header.Get("Content-Length"))
+		}
+		return
+	}
+
+	fileUrls, err := fs.LookupFileId(context.Background(), fileId)
 	if err != nil {
 		return "", nil, nil, err
 	}
 
 	for _, fileUrl := range fileUrls {
-		filename, header, resp, err = util_http.DownloadFile(fileUrl, "")
+		filename, header, resp, err = downloadFn(fileUrl, "", offset)
 		if err != nil {
-			glog.V(1).Infof("fail to read from %s: %v", fileUrl, err)
+			glog.V(0).Infof("fail to read part %s from %s offset %d: %v", fileId, fileUrl, offset, err)
 		} else {
+			glog.V(4).Infof("read part %s from %s offset %d content-length:%s", fileId, fileUrl, offset, header.Get("Content-Length"))
 			break
 		}
 	}
@@ -131,7 +149,7 @@ var _ = filer_pb.FilerClient(&FilerSource{})
 
 func (fs *FilerSource) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithGrpcClient(streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
+	return pb.WithGrpcClient(context.Background(), streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, fs.grpcAddress, false, fs.grpcDialOption)

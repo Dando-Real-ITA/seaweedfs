@@ -1,0 +1,1194 @@
+package oidc
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/iam/providers"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+)
+
+// OIDCProvider implements OpenID Connect authentication
+type OIDCProvider struct {
+	name        string
+	config      *OIDCConfig
+	initialized bool
+	httpClient  *http.Client
+	jwksTTL     time.Duration
+
+	// mu guards the lazily-mutated cache fields below: jwksCache, jwksFetchedAt,
+	// resolvedJWKSUri, and discoveryFailed are all populated on the first
+	// validate-token call and refreshed when the cache expires. Multiple S3
+	// requests can land here in parallel, so they need synchronization.
+	mu              sync.RWMutex
+	jwksCache       *JWKS
+	jwksFetchedAt   time.Time
+	resolvedJWKSUri string
+	discoveryFailed bool
+}
+
+// OIDCConfig holds OIDC provider configuration
+type OIDCConfig struct {
+	// Issuer is the OIDC issuer URL
+	Issuer string `json:"issuer"`
+
+	// ClientID is the OAuth2 client ID. Either ClientID or ClientIDs is
+	// required; when both are present, ClientID is appended to the audience
+	// allowlist.
+	ClientID string `json:"clientId,omitempty"`
+
+	// ClientIDs is the AWS-compatible audience allowlist. Tokens are accepted
+	// when any of `aud` or `azp` matches any entry. Mutually compatible with
+	// ClientID for backward compatibility.
+	ClientIDs []string `json:"clientIds,omitempty"`
+
+	// ClientSecret is the OAuth2 client secret (optional for public clients)
+	ClientSecret string `json:"clientSecret,omitempty"`
+
+	// JWKSUri is the JSON Web Key Set URI
+	JWKSUri string `json:"jwksUri,omitempty"`
+
+	// UserInfoUri is the UserInfo endpoint URI
+	UserInfoUri string `json:"userInfoUri,omitempty"`
+
+	// Scopes are the OAuth2 scopes to request
+	Scopes []string `json:"scopes,omitempty"`
+
+	// RoleMapping defines how to map OIDC claims to roles
+	RoleMapping *providers.RoleMapping `json:"roleMapping,omitempty"`
+
+	// ClaimsMapping defines how to map OIDC claims to identity attributes
+	ClaimsMapping map[string]string `json:"claimsMapping,omitempty"`
+
+	// JWKSCacheTTLSeconds sets how long to cache JWKS before refresh (default 3600 seconds)
+	JWKSCacheTTLSeconds int `json:"jwksCacheTTLSeconds,omitempty"`
+
+	// Thumbprints, when non-empty, pins the issuer's TLS certificate against
+	// this allowlist of SHA-1 hex digests. Matches the AWS IAM
+	// CreateOpenIDConnectProvider semantics. Empty means "trust the system
+	// root store" (or whatever TLSCACert configures).
+	Thumbprints []string `json:"thumbprints,omitempty"`
+
+	// AllowedPrincipalTagKeys filters the keys read from the AWS principal
+	// session tags claim. Empty means "no tags surfaced". Provide an explicit
+	// allowlist (e.g. ["team", "env"]) to opt specific keys in.
+	AllowedPrincipalTagKeys []string `json:"allowedPrincipalTagKeys,omitempty"`
+
+	// PolicyClaim names a JWT claim whose value carries the effective policy
+	// list for the session. When non-empty and the assume request opts into
+	// claim-based policy mode via the ClaimBasedPolicyRoleArn sentinel, the
+	// policies are pulled from this claim rather than from a server-side
+	// role mapping. Accepted shapes: string (single policy), comma-separated
+	// string, or string array.
+	PolicyClaim string `json:"policyClaim,omitempty"`
+
+	// TLSCACert is the path to the CA certificate file for custom/self-signed certificates
+	TLSCACert string `json:"tlsCaCert,omitempty"`
+
+	// TLSInsecureSkipVerify controls whether to skip TLS verification.
+	// WARNING: Should only be used in development/testing environments. Never use in production.
+	TLSInsecureSkipVerify bool `json:"tlsInsecureSkipVerify,omitempty"`
+}
+
+// PrincipalTagsClaim is the AWS-defined namespace claim that carries
+// principal session tags. Tokens that include this claim must encode it as
+// an object whose top-level keys are tag names. AWS uses the same string;
+// see https://docs.aws.amazon.com/IAM/latest/UserGuide/id_session-tags.html.
+const PrincipalTagsClaim = "https://aws.amazon.com/tags/principal_tags"
+
+// extractClaimPolicies reads policy names from the configured JWT claim.
+// Accepts three shapes: a single string ("readonly"), a comma-separated
+// string ("readonly,billing"), or a string array. Returns nil when the
+// provider isn't in claim-based mode or the claim is absent/empty.
+func extractClaimPolicies(claims map[string]interface{}, claimName string) []string {
+	if claimName == "" {
+		return nil
+	}
+	raw, ok := claims[claimName]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case string:
+		return splitPolicyClaimString(v)
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				continue
+			}
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			out = append(out, s)
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	return nil
+}
+
+func splitPolicyClaimString(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// filterPrincipalTags drops keys that are not on `allowed`. An empty
+// allowlist means "deny all" — security-conservative default that forces
+// operators to explicitly opt tags in. Returns nil when the result is empty.
+//
+// Comparison is case-insensitive on the key, matching AWS IAM's session-tag
+// rules (the AWS docs explicitly state tag keys are case-insensitive even
+// though the original casing is preserved on the value side). Without this
+// an IDP whose claim casing drifts from the operator's allowlist string
+// would fail in surprising ways.
+func filterPrincipalTags(tags map[string]string, allowed []string) map[string]string {
+	if len(tags) == 0 {
+		return nil
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	allowSet := make(map[string]struct{}, len(allowed))
+	for _, k := range allowed {
+		allowSet[strings.ToLower(k)] = struct{}{}
+	}
+	out := make(map[string]string, len(tags))
+	for k, v := range tags {
+		if _, ok := allowSet[strings.ToLower(k)]; ok {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// extractPrincipalTags pulls the principal-tags namespace claim out of the
+// JWT claim map. Only string values survive — everything else is dropped to
+// avoid surfacing structured data into a flat policy condition key. Returns
+// nil when the claim is absent or empty.
+func extractPrincipalTags(claims map[string]interface{}) map[string]string {
+	raw, ok := claims[PrincipalTagsClaim]
+	if !ok {
+		return nil
+	}
+	obj, ok := raw.(map[string]interface{})
+	if !ok || len(obj) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(obj))
+	for k, v := range obj {
+		switch s := v.(type) {
+		case string:
+			out[k] = s
+		case []interface{}:
+			// Multi-value tag: AWS condition keys carry only a single value, so
+			// take the first stringy element. Multi-value matching can land
+			// later if a real customer needs it.
+			for _, e := range s {
+				if str, ok := e.(string); ok {
+					out[k] = str
+					break
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeThumbprints lowercases and de-duplicates the configured allowlist.
+// Returns a set keyed by lowercase hex for O(1) lookup during TLS verification.
+func normalizeThumbprints(in []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(in))
+	for _, t := range in {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" {
+			continue
+		}
+		out[t] = struct{}{}
+	}
+	return out
+}
+
+// verifyThumbprintMatch checks that some certificate in the negotiated chain
+// hashes to a thumbprint in `expected`. AWS pins the certificate immediately
+// below the root in the chain; we accept any chain certificate to also cover
+// self-signed deployments and skip-verify test setups. When the chain has not
+// been built (InsecureSkipVerify), we fall back to PeerCertificates.
+func verifyThumbprintMatch(cs tls.ConnectionState, expected map[string]struct{}) error {
+	candidates := collectThumbprintCandidates(cs)
+	for _, c := range candidates {
+		sum := sha1.Sum(c.Raw)
+		hexSum := hex.EncodeToString(sum[:])
+		if _, ok := expected[hexSum]; ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("OIDC TLS thumbprint did not match any configured allowlist entry")
+}
+
+// collectThumbprintCandidates flattens the verified chains and peer cert list
+// into a single slice of unique certificates worth checking.
+func collectThumbprintCandidates(cs tls.ConnectionState) []*x509.Certificate {
+	var out []*x509.Certificate
+	seen := map[string]struct{}{}
+	add := func(c *x509.Certificate) {
+		if c == nil {
+			return
+		}
+		k := string(c.Raw)
+		if _, ok := seen[k]; ok {
+			return
+		}
+		seen[k] = struct{}{}
+		out = append(out, c)
+	}
+	for _, chain := range cs.VerifiedChains {
+		for _, c := range chain {
+			add(c)
+		}
+	}
+	for _, c := range cs.PeerCertificates {
+		add(c)
+	}
+	return out
+}
+
+// JWKS represents JSON Web Key Set
+type JWKS struct {
+	Keys []JWK `json:"keys"`
+}
+
+// JWK represents a JSON Web Key
+type JWK struct {
+	Kty string `json:"kty"` // Key Type (RSA, EC, etc.)
+	Kid string `json:"kid"` // Key ID
+	Use string `json:"use"` // Usage (sig for signature)
+	Alg string `json:"alg"` // Algorithm (RS256, etc.)
+	N   string `json:"n"`   // RSA public key modulus
+	E   string `json:"e"`   // RSA public key exponent
+	X   string `json:"x"`   // EC public key x coordinate
+	Y   string `json:"y"`   // EC public key y coordinate
+	Crv string `json:"crv"` // EC curve
+}
+
+// NewOIDCProvider creates a new OIDC provider
+func NewOIDCProvider(name string) *OIDCProvider {
+	return &OIDCProvider{
+		name:       name,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// Name returns the provider name
+func (p *OIDCProvider) Name() string {
+	return p.name
+}
+
+// GetIssuer returns the configured issuer URL for efficient provider lookup
+func (p *OIDCProvider) GetIssuer() string {
+	if p.config == nil {
+		return ""
+	}
+	return p.config.Issuer
+}
+
+// Initialize initializes the OIDC provider with configuration
+func (p *OIDCProvider) Initialize(config interface{}) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	oidcConfig, ok := config.(*OIDCConfig)
+	if !ok {
+		return fmt.Errorf("invalid config type for OIDC provider")
+	}
+
+	if err := p.validateConfig(oidcConfig); err != nil {
+		return fmt.Errorf("invalid OIDC configuration: %w", err)
+	}
+
+	p.config = oidcConfig
+	p.initialized = true
+
+	// Configure JWKS cache TTL
+	if oidcConfig.JWKSCacheTTLSeconds > 0 {
+		p.jwksTTL = time.Duration(oidcConfig.JWKSCacheTTLSeconds) * time.Second
+	} else {
+		p.jwksTTL = time.Hour
+	}
+
+	// Configure HTTP client with TLS settings
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: oidcConfig.TLSInsecureSkipVerify,
+		MinVersion:         tls.VersionTLS12, // Prevent TLS downgrade attacks
+	}
+
+	if oidcConfig.TLSInsecureSkipVerify {
+		glog.Warningf("OIDC provider %q is configured to skip TLS verification. This is insecure and should not be used in production.", p.name)
+	}
+
+	// Thumbprint pinning: when configured, every TLS handshake to the IDP must
+	// present a chain whose terminal certificate (the cert just below the root,
+	// matching AWS IAM semantics) hashes to one of the listed SHA-1 digests.
+	// VerifyConnection runs after the chain build, so cs.VerifiedChains is
+	// populated when InsecureSkipVerify is false; we additionally pin against
+	// PeerCertificates so self-signed test setups work too.
+	if len(oidcConfig.Thumbprints) > 0 {
+		expected := normalizeThumbprints(oidcConfig.Thumbprints)
+		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+			return verifyThumbprintMatch(cs, expected)
+		}
+		glog.V(2).Infof("OIDC provider %q: TLS thumbprint pinning enabled (%d allowed)", p.name, len(expected))
+	}
+
+	if oidcConfig.TLSCACert != "" {
+		// Validate that the CA cert path is absolute to prevent reading unintended files
+		if !filepath.IsAbs(oidcConfig.TLSCACert) {
+			return fmt.Errorf("TLSCACert must be an absolute path, got: %s", oidcConfig.TLSCACert)
+		}
+
+		caCert, err := os.ReadFile(oidcConfig.TLSCACert)
+		if err != nil {
+			return fmt.Errorf("failed to read CA cert file: %w", err)
+		}
+		// Start with the system cert pool to trust public CAs, then add the custom one.
+		rootCAs, _ := x509.SystemCertPool()
+		if rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		if !rootCAs.AppendCertsFromPEM(caCert) {
+			return fmt.Errorf("failed to append CA cert from file: %s", oidcConfig.TLSCACert)
+		}
+		tlsConfig.RootCAs = rootCAs
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+	p.httpClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+
+	// For testing, we'll skip the actual OIDC client initialization
+	return nil
+}
+
+// validateConfig validates the OIDC configuration
+func (p *OIDCProvider) validateConfig(config *OIDCConfig) error {
+	if config.Issuer == "" {
+		return fmt.Errorf("issuer is required")
+	}
+
+	if config.ClientID == "" && len(config.ClientIDs) == 0 {
+		return fmt.Errorf("client ID is required")
+	}
+
+	// Basic URL validation for issuer
+	if config.Issuer != "" && config.Issuer != "https://accounts.google.com" && config.Issuer[0:4] != "http" {
+		return fmt.Errorf("invalid issuer URL format")
+	}
+
+	return nil
+}
+
+// allowedAudiences returns the merged list of acceptable audiences for this
+// provider. Both the singular ClientID and the plural ClientIDs are honoured;
+// duplicates collapse silently.
+func (p *OIDCProvider) allowedAudiences() []string {
+	if p.config == nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	add(p.config.ClientID)
+	for _, c := range p.config.ClientIDs {
+		add(c)
+	}
+	return out
+}
+
+// Authenticate authenticates a user with an OIDC token
+func (p *OIDCProvider) Authenticate(ctx context.Context, token string) (*providers.ExternalIdentity, error) {
+	if !p.initialized {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if token == "" {
+		return nil, fmt.Errorf("token cannot be empty")
+	}
+
+	// Validate token and get claims
+	claims, err := p.ValidateToken(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+
+	// Map claims to external identity
+	email, _ := claims.GetClaimString("email")
+	displayName, _ := claims.GetClaimString("name")
+	groups, _ := claims.GetClaimStringSlice("groups")
+	// The raw `roles` claim (e.g. from a Keycloak realm-role mapper). Surfaced into
+	// the STS request context below (see ExternalIdentity.Roles) so resource policies
+	// can gate on jwt:roles. Distinct from the provider-configured role mapping below.
+	rawRoles, _ := claims.GetClaimStringSlice("roles")
+
+	// Debug: Log available claims
+	glog.V(3).Infof("Available claims: %+v", claims.Claims)
+	if rolesFromClaims, exists := claims.GetClaimStringSlice("roles"); exists {
+		glog.V(3).Infof("Roles claim found as string slice: %v", rolesFromClaims)
+	} else if roleFromClaims, exists := claims.GetClaimString("roles"); exists {
+		glog.V(3).Infof("Roles claim found as string: %s", roleFromClaims)
+	} else {
+		glog.V(3).Infof("No roles claim found in token")
+	}
+
+	// Map claims to roles using configured role mapping
+	roles := p.mapClaimsToRolesWithConfig(claims)
+
+	// Create attributes map and add roles
+	attributes := make(map[string]string)
+	if len(roles) > 0 {
+		// Store roles as a comma-separated string in attributes
+		attributes["roles"] = strings.Join(roles, ",")
+	}
+
+	// Store all additional claims as attributes
+	processedClaims := map[string]struct{}{
+		// user / business claims already handled elsewhere
+		"sub":    {},
+		"email":  {},
+		"name":   {},
+		"groups": {},
+		"roles":  {},
+		// standard structural OIDC/JWT claims that should not be exposed as attributes
+		"iss": {},
+		"aud": {},
+		"exp": {},
+		"iat": {},
+		"nbf": {},
+		"jti": {},
+	}
+	for key, value := range claims.Claims {
+		if _, isProcessed := processedClaims[key]; !isProcessed {
+			if strValue, ok := value.(string); ok {
+				attributes[key] = strValue
+			} else if jsonValue, err := json.Marshal(value); err == nil {
+				attributes[key] = string(jsonValue)
+			} else {
+				glog.Warningf("failed to marshal claim %q to JSON for OIDC attributes: %v", key, err)
+			}
+		}
+	}
+
+	identity := &providers.ExternalIdentity{
+		UserID:        claims.Subject,
+		Email:         email,
+		DisplayName:   displayName,
+		Groups:        groups,
+		Roles:         rawRoles,
+		Attributes:    attributes,
+		Provider:      p.name,
+		Issuer:        claims.Issuer,
+		PrincipalTags: filterPrincipalTags(extractPrincipalTags(claims.Claims), p.config.AllowedPrincipalTagKeys),
+		ClaimPolicies: extractClaimPolicies(claims.Claims, p.config.PolicyClaim),
+	}
+
+	// Pass the token expiration to limit session duration
+	// This ensures the STS session doesn't exceed the source token's validity
+	if !claims.ExpiresAt.IsZero() {
+		identity.TokenExpiration = &claims.ExpiresAt
+	}
+
+	return identity, nil
+}
+
+// GetUserInfo retrieves user information from the UserInfo endpoint
+func (p *OIDCProvider) GetUserInfo(ctx context.Context, userID string) (*providers.ExternalIdentity, error) {
+	if !p.initialized {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if userID == "" {
+		return nil, fmt.Errorf("user ID cannot be empty")
+	}
+
+	// For now, we'll use a token-based approach since OIDC UserInfo typically requires a token
+	// In a real implementation, this would need an access token from the authentication flow
+	return p.getUserInfoWithToken(ctx, userID, "")
+}
+
+// GetUserInfoWithToken retrieves user information using an access token
+func (p *OIDCProvider) GetUserInfoWithToken(ctx context.Context, accessToken string) (*providers.ExternalIdentity, error) {
+	if !p.initialized {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if accessToken == "" {
+		return nil, fmt.Errorf("access token cannot be empty")
+	}
+
+	return p.getUserInfoWithToken(ctx, "", accessToken)
+}
+
+// getUserInfoWithToken is the internal implementation for UserInfo endpoint calls
+func (p *OIDCProvider) getUserInfoWithToken(ctx context.Context, userID, accessToken string) (*providers.ExternalIdentity, error) {
+	// Determine UserInfo endpoint URL
+	userInfoUri := p.config.UserInfoUri
+	if userInfoUri == "" {
+		// Use standard OIDC discovery endpoint convention
+		userInfoUri = strings.TrimSuffix(p.config.Issuer, "/") + "/userinfo"
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "GET", userInfoUri, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create UserInfo request: %v", err)
+	}
+
+	// Set authorization header if access token is provided
+	if accessToken != "" {
+		req.Header.Set("Authorization", security.BearerPrefix+accessToken)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	// Make HTTP request
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call UserInfo endpoint: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("UserInfo endpoint returned status %d", resp.StatusCode)
+	}
+
+	// Parse JSON response
+	var userInfo map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return nil, fmt.Errorf("failed to decode UserInfo response: %v", err)
+	}
+
+	glog.V(4).Infof("Received UserInfo response: %+v", userInfo)
+
+	// Map UserInfo claims to ExternalIdentity
+	identity := p.mapUserInfoToIdentity(userInfo)
+
+	// If userID was provided but not found in claims, use it
+	if userID != "" && identity.UserID == "" {
+		identity.UserID = userID
+	}
+
+	glog.V(3).Infof("Retrieved user info from OIDC provider: %s", identity.UserID)
+	return identity, nil
+}
+
+// ValidateToken validates an OIDC JWT token
+func (p *OIDCProvider) ValidateToken(ctx context.Context, token string) (*providers.TokenClaims, error) {
+	if !p.initialized {
+		return nil, fmt.Errorf("provider not initialized")
+	}
+
+	if token == "" {
+		return nil, fmt.Errorf("token cannot be empty")
+	}
+
+	// Parse token without verification first to get header info
+	parsedToken, _, err := new(jwt.Parser).ParseUnverified(token, jwt.MapClaims{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JWT token: %v", err)
+	}
+
+	// Get key ID from header
+	kid, ok := parsedToken.Header["kid"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing key ID in JWT header")
+	}
+
+	// Get signing key from JWKS
+	publicKey, err := p.getPublicKey(ctx, kid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public key: %v", err)
+	}
+
+	// Parse and validate token with proper signature verification
+	claims := jwt.MapClaims{}
+	validatedToken, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+		// Verify signing method
+		switch token.Method.(type) {
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodECDSA:
+			return publicKey, nil
+		default:
+			return nil, fmt.Errorf("unsupported signing method: %v", token.Header["alg"])
+		}
+	})
+
+	if err != nil {
+		// Use JWT library's typed errors for robust error checking
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, fmt.Errorf("%w: %v", providers.ErrProviderTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", providers.ErrProviderInvalidToken, err)
+	}
+
+	if !validatedToken.Valid {
+		return nil, fmt.Errorf("%w: token validation failed", providers.ErrProviderInvalidToken)
+	}
+
+	// Validate required claims
+	issuer, ok := claims["iss"].(string)
+	if !ok || issuer != p.config.Issuer {
+		return nil, fmt.Errorf("%w: expected %s, got %s", providers.ErrProviderInvalidIssuer, p.config.Issuer, issuer)
+	}
+
+	// Check audience claim (aud) or authorized party (azp) — Keycloak uses azp.
+	// Per RFC 7519, aud can be either a string or an array of strings.
+	// Multiple client IDs are supported per AWS IAM CreateOpenIDConnectProvider
+	// semantics: any one match in the allowlist accepts the token.
+	allowed := p.allowedAudiences()
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, a := range allowed {
+		allowedSet[a] = struct{}{}
+	}
+
+	var audienceMatched bool
+	if audClaim, ok := claims["aud"]; ok {
+		switch aud := audClaim.(type) {
+		case string:
+			if _, ok := allowedSet[aud]; ok {
+				audienceMatched = true
+			}
+		case []interface{}:
+			for _, a := range aud {
+				if str, ok := a.(string); ok {
+					if _, ok := allowedSet[str]; ok {
+						audienceMatched = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if !audienceMatched {
+		if azp, ok := claims["azp"].(string); ok {
+			if _, ok := allowedSet[azp]; ok {
+				audienceMatched = true
+			}
+		}
+	}
+
+	if !audienceMatched {
+		return nil, fmt.Errorf("%w: token audience matches none of the configured client IDs", providers.ErrProviderInvalidAudience)
+	}
+
+	subject, ok := claims["sub"].(string)
+	if !ok {
+		return nil, fmt.Errorf("%w: missing subject claim", providers.ErrProviderMissingClaims)
+	}
+
+	// Convert to our TokenClaims structure
+	tokenClaims := &providers.TokenClaims{
+		Subject: subject,
+		Issuer:  issuer,
+		Claims:  make(map[string]interface{}),
+	}
+
+	// Extract time-based claims (exp, iat, nbf)
+	for key, target := range map[string]*time.Time{
+		"exp": &tokenClaims.ExpiresAt,
+		"iat": &tokenClaims.IssuedAt,
+		"nbf": &tokenClaims.NotBefore,
+	} {
+		if val, ok := claims[key]; ok {
+			switch v := val.(type) {
+			case float64:
+				*target = time.Unix(int64(v), 0)
+			case json.Number:
+				if intVal, err := v.Int64(); err == nil {
+					*target = time.Unix(intVal, 0)
+				}
+			}
+		}
+	}
+
+	// Copy all claims
+	for key, value := range claims {
+		tokenClaims.Claims[key] = value
+	}
+
+	return tokenClaims, nil
+}
+
+// mapClaimsToRoles maps token claims to SeaweedFS roles (legacy method)
+func (p *OIDCProvider) mapClaimsToRoles(claims *providers.TokenClaims) []string {
+	roles := []string{}
+
+	// Get groups from claims
+	groups, _ := claims.GetClaimStringSlice("groups")
+
+	// Basic role mapping based on groups
+	for _, group := range groups {
+		switch group {
+		case "admins":
+			roles = append(roles, "admin")
+		case "developers":
+			roles = append(roles, "readwrite")
+		case "users":
+			roles = append(roles, "readonly")
+		}
+	}
+
+	if len(roles) == 0 {
+		roles = []string{"readonly"} // Default role
+	}
+
+	return roles
+}
+
+// mapClaimsToRolesWithConfig maps token claims to roles using configured role mapping
+func (p *OIDCProvider) mapClaimsToRolesWithConfig(claims *providers.TokenClaims) []string {
+	glog.V(3).Infof("mapClaimsToRolesWithConfig: RoleMapping is nil? %t", p.config.RoleMapping == nil)
+
+	if p.config.RoleMapping == nil {
+		glog.V(2).Infof("No role mapping configured for provider %s, using legacy mapping", p.name)
+		// Fallback to legacy mapping if no role mapping configured
+		return p.mapClaimsToRoles(claims)
+	}
+
+	glog.V(3).Infof("Applying %d role mapping rules", len(p.config.RoleMapping.Rules))
+	roles := []string{}
+
+	// Apply role mapping rules
+	for i, rule := range p.config.RoleMapping.Rules {
+		glog.V(3).Infof("Rule %d: claim=%s, value=%s, role=%s", i, rule.Claim, rule.Value, rule.Role)
+
+		if rule.Matches(claims) {
+			glog.V(2).Infof("Rule %d matched! Adding role: %s", i, rule.Role)
+			roles = append(roles, rule.Role)
+		} else {
+			glog.V(3).Infof("Rule %d did not match", i)
+		}
+	}
+
+	// Use default role if no rules matched
+	if len(roles) == 0 && p.config.RoleMapping.DefaultRole != "" {
+		glog.V(2).Infof("No rules matched, using default role: %s", p.config.RoleMapping.DefaultRole)
+		roles = []string{p.config.RoleMapping.DefaultRole}
+	}
+
+	glog.V(2).Infof("Role mapping result: %v", roles)
+	return roles
+}
+
+// getPublicKey retrieves the public key for the given key ID from JWKS.
+// Cache hits use the read lock so concurrent token validations don't
+// serialize on JWKS lookup. Misses and expirations promote to the write
+// lock so the JWKS fetch + cache write happens once per refresh cycle.
+func (p *OIDCProvider) getPublicKey(ctx context.Context, kid string) (interface{}, error) {
+	// Fast path: read lock and look in cache.
+	p.mu.RLock()
+	if p.jwksCache != nil && (p.jwksFetchedAt.IsZero() || time.Since(p.jwksFetchedAt) <= p.jwksTTL) {
+		for _, key := range p.jwksCache.Keys {
+			if key.Kid == kid {
+				k := key
+				p.mu.RUnlock()
+				return p.parseJWK(&k)
+			}
+		}
+	}
+	p.mu.RUnlock()
+
+	// Slow path: take the write lock for the (re)fetch + retry. Re-check the
+	// cache under the write lock in case another goroutine already refreshed.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	cacheValid := p.jwksCache != nil && (p.jwksFetchedAt.IsZero() || time.Since(p.jwksFetchedAt) <= p.jwksTTL)
+	if !cacheValid {
+		if err := p.fetchJWKSLocked(ctx); err != nil {
+			return nil, fmt.Errorf("failed to fetch JWKS: %v", err)
+		}
+	}
+	for _, key := range p.jwksCache.Keys {
+		if key.Kid == kid {
+			k := key
+			return p.parseJWK(&k)
+		}
+	}
+
+	// Key not found in cache. Refresh JWKS once to handle key rotation.
+	if err := p.fetchJWKSLocked(ctx); err != nil {
+		return nil, fmt.Errorf("failed to refresh JWKS after key miss: %v", err)
+	}
+	for _, key := range p.jwksCache.Keys {
+		if key.Kid == kid {
+			k := key
+			return p.parseJWK(&k)
+		}
+	}
+	return nil, fmt.Errorf("key with ID %s not found in JWKS after refresh", kid)
+}
+
+// discoveryDocument is the subset of the OpenID Provider Configuration we need.
+// See https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata.
+type discoveryDocument struct {
+	Issuer  string `json:"issuer"`
+	JWKSUri string `json:"jwks_uri"`
+}
+
+// resolveJWKSUriLocked determines the JWKS URI for the provider. The caller
+// must hold p.mu (write lock); the function reads/writes p.resolvedJWKSUri
+// and p.discoveryFailed without taking the lock itself.
+//
+// Order of resolution:
+//  1. explicit config.JWKSUri (operator override; never overridden by discovery).
+//  2. cached resolvedJWKSUri from a prior discovery (refreshed when JWKS cache expires).
+//  3. .well-known/openid-configuration discovery (per OIDC Discovery 1.0).
+//  4. fallback to {issuer}/.well-known/jwks.json (compat path for IDPs that
+//     don't publish discovery).
+func (p *OIDCProvider) resolveJWKSUriLocked(ctx context.Context) (string, error) {
+	if p.config.JWKSUri != "" {
+		return p.config.JWKSUri, nil
+	}
+	if p.resolvedJWKSUri != "" {
+		return p.resolvedJWKSUri, nil
+	}
+
+	issuer := strings.TrimSuffix(p.config.Issuer, "/")
+
+	if !p.discoveryFailed {
+		discoveryURL := issuer + "/.well-known/openid-configuration"
+		uri, err := p.fetchDiscoveryJWKSUri(ctx, discoveryURL)
+		switch {
+		case err == nil:
+			p.resolvedJWKSUri = uri
+			return uri, nil
+		default:
+			// Cache the failure so we don't pay the discovery RTT on every refresh.
+			// Operators with non-discovery IDPs see one failed lookup at startup.
+			glog.V(3).Infof("OIDC discovery at %s failed (%v); falling back to /.well-known/jwks.json", discoveryURL, err)
+			p.discoveryFailed = true
+		}
+	}
+
+	return issuer + "/.well-known/jwks.json", nil
+}
+
+// fetchDiscoveryJWKSUri retrieves the OIDC discovery document and returns
+// the jwks_uri field. The issuer claim in the document must match config.Issuer
+// to defend against issuer-substitution attacks during discovery.
+func (p *OIDCProvider) fetchDiscoveryJWKSUri(ctx context.Context, discoveryURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", discoveryURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create discovery request: %v", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch discovery document: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("discovery endpoint returned status %d", resp.StatusCode)
+	}
+
+	var doc discoveryDocument
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return "", fmt.Errorf("decode discovery document: %v", err)
+	}
+
+	if doc.JWKSUri == "" {
+		return "", fmt.Errorf("discovery document missing jwks_uri")
+	}
+
+	// Issuer must be present and match: a discovery doc that points to a
+	// different issuer is either a misconfiguration or an attack against
+	// issuer-confusion, and a doc that omits the issuer field entirely
+	// would have bypassed the previous check (doc.Issuer != "" guard) and
+	// silently accepted whatever JWKS URI the document supplied. OIDC
+	// Discovery 1.0 §3 mandates the issuer field, so treat missing as a
+	// hard failure. Compare after trimming a single trailing slash on each
+	// side because real IdPs disagree on whether the configured issuer
+	// has one.
+	if strings.TrimSuffix(doc.Issuer, "/") != strings.TrimSuffix(p.config.Issuer, "/") {
+		return "", fmt.Errorf("discovery issuer %q does not match configured issuer %q", doc.Issuer, p.config.Issuer)
+	}
+
+	return doc.JWKSUri, nil
+}
+
+// fetchJWKS is a thin wrapper around fetchJWKSLocked that acquires the
+// write lock. Used by tests; production callers in getPublicKey already
+// hold the lock and call fetchJWKSLocked directly.
+func (p *OIDCProvider) fetchJWKS(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fetchJWKSLocked(ctx)
+}
+
+// fetchJWKSLocked fetches the JWKS from the provider. The caller must hold
+// p.mu (write lock); the function writes p.jwksCache and p.jwksFetchedAt
+// without taking the lock itself.
+//
+// Each fetch reattempts discovery if the previous attempt failed: a
+// transient 5xx that flipped discoveryFailed at startup shouldn't lock the
+// provider into the fallback path forever. The retry rate is bounded by
+// the JWKS TTL (typically 1h), so the discovery RTT cost is amortized.
+func (p *OIDCProvider) fetchJWKSLocked(ctx context.Context) error {
+	if p.config.JWKSUri == "" && p.resolvedJWKSUri == "" {
+		p.discoveryFailed = false
+	}
+	jwksURL, err := p.resolveJWKSUriLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve JWKS URI: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", jwksURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create JWKS request: %v", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch JWKS: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("JWKS endpoint returned status: %d", resp.StatusCode)
+	}
+
+	var jwks JWKS
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		return fmt.Errorf("failed to decode JWKS response: %v", err)
+	}
+
+	p.jwksCache = &jwks
+	p.jwksFetchedAt = time.Now()
+	glog.V(3).Infof("Fetched JWKS with %d keys from %s", len(jwks.Keys), jwksURL)
+	return nil
+}
+
+// parseJWK converts a JWK to a public key
+func (p *OIDCProvider) parseJWK(key *JWK) (interface{}, error) {
+	switch key.Kty {
+	case "RSA":
+		return p.parseRSAKey(key)
+	case "EC":
+		return p.parseECKey(key)
+	default:
+		return nil, fmt.Errorf("unsupported key type: %s", key.Kty)
+	}
+}
+
+// parseRSAKey parses an RSA key from JWK
+func (p *OIDCProvider) parseRSAKey(key *JWK) (*rsa.PublicKey, error) {
+	// Decode the modulus (n)
+	nBytes, err := base64.RawURLEncoding.DecodeString(key.N)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode RSA modulus: %v", err)
+	}
+
+	// Decode the exponent (e)
+	eBytes, err := base64.RawURLEncoding.DecodeString(key.E)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode RSA exponent: %v", err)
+	}
+
+	// Convert exponent bytes to int
+	var exponent int
+	for _, b := range eBytes {
+		exponent = exponent*256 + int(b)
+	}
+
+	// Create RSA public key
+	pubKey := &rsa.PublicKey{
+		E: exponent,
+	}
+	pubKey.N = new(big.Int).SetBytes(nBytes)
+
+	return pubKey, nil
+}
+
+// parseECKey parses an Elliptic Curve key from JWK
+func (p *OIDCProvider) parseECKey(key *JWK) (*ecdsa.PublicKey, error) {
+	// Validate required fields
+	if key.X == "" || key.Y == "" || key.Crv == "" {
+		return nil, fmt.Errorf("incomplete EC key: missing x, y, or crv parameter")
+	}
+
+	// Get the curve
+	var curve elliptic.Curve
+	switch key.Crv {
+	case "P-256":
+		curve = elliptic.P256()
+	case "P-384":
+		curve = elliptic.P384()
+	case "P-521":
+		curve = elliptic.P521()
+	default:
+		return nil, fmt.Errorf("unsupported EC curve: %s", key.Crv)
+	}
+
+	// Decode x coordinate
+	xBytes, err := base64.RawURLEncoding.DecodeString(key.X)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode EC x coordinate: %v", err)
+	}
+
+	// Decode y coordinate
+	yBytes, err := base64.RawURLEncoding.DecodeString(key.Y)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode EC y coordinate: %v", err)
+	}
+
+	// Create EC public key
+	pubKey := &ecdsa.PublicKey{
+		Curve: curve,
+		X:     new(big.Int).SetBytes(xBytes),
+		Y:     new(big.Int).SetBytes(yBytes),
+	}
+
+	// Validate that the point is on the curve
+	if !curve.IsOnCurve(pubKey.X, pubKey.Y) {
+		return nil, fmt.Errorf("EC key coordinates are not on the specified curve")
+	}
+
+	return pubKey, nil
+}
+
+// mapUserInfoToIdentity maps UserInfo response to ExternalIdentity
+func (p *OIDCProvider) mapUserInfoToIdentity(userInfo map[string]interface{}) *providers.ExternalIdentity {
+	identity := &providers.ExternalIdentity{
+		Provider:   p.name,
+		Attributes: make(map[string]string),
+	}
+
+	// Map standard OIDC claims
+	if sub, ok := userInfo["sub"].(string); ok {
+		identity.UserID = sub
+	}
+
+	if email, ok := userInfo["email"].(string); ok {
+		identity.Email = email
+	}
+
+	if name, ok := userInfo["name"].(string); ok {
+		identity.DisplayName = name
+	}
+
+	// Handle groups claim (can be array of strings or single string)
+	if groupsData, exists := userInfo["groups"]; exists {
+		switch groups := groupsData.(type) {
+		case []interface{}:
+			// Array of groups
+			for _, group := range groups {
+				if groupStr, ok := group.(string); ok {
+					identity.Groups = append(identity.Groups, groupStr)
+				}
+			}
+		case []string:
+			// Direct string array
+			identity.Groups = groups
+		case string:
+			// Single group as string
+			identity.Groups = []string{groups}
+		}
+	}
+
+	// Map configured custom claims
+	if p.config.ClaimsMapping != nil {
+		for identityField, oidcClaim := range p.config.ClaimsMapping {
+			if value, exists := userInfo[oidcClaim]; exists {
+				if strValue, ok := value.(string); ok {
+					switch identityField {
+					case "email":
+						if identity.Email == "" {
+							identity.Email = strValue
+						}
+					case "displayName":
+						if identity.DisplayName == "" {
+							identity.DisplayName = strValue
+						}
+					case "userID":
+						if identity.UserID == "" {
+							identity.UserID = strValue
+						}
+					default:
+						identity.Attributes[identityField] = strValue
+					}
+				}
+			}
+		}
+	}
+
+	// Store all additional claims as attributes
+	for key, value := range userInfo {
+		if key != "sub" && key != "email" && key != "name" && key != "groups" {
+			if strValue, ok := value.(string); ok {
+				identity.Attributes[key] = strValue
+			} else if jsonValue, err := json.Marshal(value); err == nil {
+				identity.Attributes[key] = string(jsonValue)
+			}
+		}
+	}
+
+	return identity
+}

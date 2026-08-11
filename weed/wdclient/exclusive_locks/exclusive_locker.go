@@ -2,6 +2,7 @@ package exclusive_locks
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,15 +15,24 @@ const (
 	RenewInterval     = 4 * time.Second
 	SafeRenewInterval = 3 * time.Second
 	InitLockInterval  = 1 * time.Second
+	// bounds each lease and renew RPC attempt so an unresponsive master
+	// cannot hold l.mu (and block ReleaseLock) indefinitely
+	rpcTimeout = 3 * time.Second
 )
 
 type ExclusiveLocker struct {
 	token        int64
 	lockTsNs     int64
-	isLocked     bool
+	isLocked     atomic.Bool
 	masterClient *wdclient.MasterClient
 	lockName     string
 	message      string
+	clientName   string
+	// serializes renew and release RPCs: a renewal in flight during a release
+	// would re-create the lock on the master and leave it held until expiry
+	mu sync.Mutex
+	// Each lock has and only has one goroutine
+	renewGoroutineRunning atomic.Bool
 }
 
 func NewExclusiveLocker(masterClient *wdclient.MasterClient, lockName string) *ExclusiveLocker {
@@ -33,7 +43,7 @@ func NewExclusiveLocker(masterClient *wdclient.MasterClient, lockName string) *E
 }
 
 func (l *ExclusiveLocker) IsLocked() bool {
-	return l.isLocked
+	return l.isLocked.Load()
 }
 
 func (l *ExclusiveLocker) GetToken() (token int64, lockTsNs int64) {
@@ -45,17 +55,16 @@ func (l *ExclusiveLocker) GetToken() (token int64, lockTsNs int64) {
 }
 
 func (l *ExclusiveLocker) RequestLock(clientName string) {
-	if l.isLocked {
+	if l.isLocked.Load() {
 		return
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// retry to get the lease
 	for {
 		if err := l.masterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-			resp, err := client.LeaseAdminToken(ctx, &master_pb.LeaseAdminTokenRequest{
+			attemptCtx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+			defer cancel()
+			resp, err := client.LeaseAdminToken(attemptCtx, &master_pb.LeaseAdminTokenRequest{
 				PreviousToken:    atomic.LoadInt64(&l.token),
 				PreviousLockTime: atomic.LoadInt64(&l.lockTsNs),
 				LockName:         l.lockName,
@@ -67,64 +76,92 @@ func (l *ExclusiveLocker) RequestLock(clientName string) {
 			}
 			return err
 		}); err != nil {
-			println("lock:", err.Error())
+			glog.V(2).Infof("Failed to acquire lock %s: %v", l.lockName, err)
 			time.Sleep(InitLockInterval)
 		} else {
 			break
 		}
 	}
 
-	l.isLocked = true
+	l.mu.Lock()
+	l.clientName = clientName
+	l.isLocked.Store(true)
+	l.mu.Unlock()
+	glog.V(1).Infof("Acquired lock %s", l.lockName)
 
-	// start a goroutine to renew the lease
-	go func() {
-		ctx2, cancel2 := context.WithCancel(context.Background())
-		defer cancel2()
+	// Each lock has and only has one goroutine
+	if l.renewGoroutineRunning.CompareAndSwap(false, true) {
+		// start a goroutine to renew the lease
+		go func() {
+			defer l.renewGoroutineRunning.Store(false)
+			ctx2, cancel2 := context.WithCancel(context.Background())
+			defer cancel2()
 
-		for l.isLocked {
-			if err := l.masterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-				resp, err := client.LeaseAdminToken(ctx2, &master_pb.LeaseAdminTokenRequest{
-					PreviousToken:    atomic.LoadInt64(&l.token),
-					PreviousLockTime: atomic.LoadInt64(&l.lockTsNs),
-					LockName:         l.lockName,
-					ClientName:       clientName,
-					Message:          l.message,
-				})
-				if err == nil {
-					atomic.StoreInt64(&l.token, resp.Token)
-					atomic.StoreInt64(&l.lockTsNs, resp.LockTsNs)
-					// println("ts", l.lockTsNs, "token", l.token)
+			for {
+				if err := l.renewLease(ctx2); err != nil {
+					glog.Warningf("Failed to renew lock %s: %v", l.lockName, err)
+					l.isLocked.Store(false)
+					return
 				}
-				return err
-			}); err != nil {
-				glog.Errorf("failed to renew lock: %v", err)
-				l.isLocked = false
-				return
-			} else {
 				time.Sleep(RenewInterval)
 			}
-
-		}
-	}()
+		}()
+	}
 
 }
 
+func (l *ExclusiveLocker) renewLease(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.isLocked.Load() {
+		return nil
+	}
+	return l.masterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
+		attemptCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+		defer cancel()
+		resp, err := client.LeaseAdminToken(attemptCtx, &master_pb.LeaseAdminTokenRequest{
+			PreviousToken:    atomic.LoadInt64(&l.token),
+			PreviousLockTime: atomic.LoadInt64(&l.lockTsNs),
+			LockName:         l.lockName,
+			ClientName:       l.clientName,
+			Message:          l.message,
+		})
+		if err == nil {
+			atomic.StoreInt64(&l.token, resp.Token)
+			atomic.StoreInt64(&l.lockTsNs, resp.LockTsNs)
+			glog.V(2).Infof("Renewed lock %s: ts %d token %d", l.lockName, l.lockTsNs, l.token)
+		}
+		return err
+	})
+}
+
 func (l *ExclusiveLocker) ReleaseLock() {
-	l.isLocked = false
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.isLocked.Store(false)
+	l.clientName = ""
+
+	prevToken := atomic.LoadInt64(&l.token)
+	prevLockTsNs := atomic.LoadInt64(&l.lockTsNs)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// single unbounded attempt: a release cut short by a deadline leaves the
+	// lock held until it expires, turning a slow unlock into a ghost lock
 	l.masterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
 		client.ReleaseAdminToken(ctx, &master_pb.ReleaseAdminTokenRequest{
-			PreviousToken:    atomic.LoadInt64(&l.token),
-			PreviousLockTime: atomic.LoadInt64(&l.lockTsNs),
+			PreviousToken:    prevToken,
+			PreviousLockTime: prevLockTsNs,
 			LockName:         l.lockName,
 		})
 		return nil
 	})
-	atomic.StoreInt64(&l.token, 0)
-	atomic.StoreInt64(&l.lockTsNs, 0)
+	// compare on clear: a RequestLock racing a slow release must not have its
+	// fresh token zeroed
+	atomic.CompareAndSwapInt64(&l.token, prevToken, 0)
+	atomic.CompareAndSwapInt64(&l.lockTsNs, prevLockTsNs, 0)
 }
 
 func (l *ExclusiveLocker) SetMessage(message string) {

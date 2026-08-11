@@ -1,9 +1,10 @@
 package s3api
 
 import (
+	"net/http"
+
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
-	"net/http"
 )
 
 func getAccountId(r *http.Request) string {
@@ -20,8 +21,12 @@ func (s3a *S3ApiServer) checkAccessByOwnership(r *http.Request, bucket string) s
 	if errCode != s3err.ErrNone {
 		return errCode
 	}
+	// Admin by capability, not account id: account-less identities share the "admin" id.
+	if s3a.isUserAdmin(r) {
+		return s3err.ErrNone
+	}
 	accountId := getAccountId(r)
-	if accountId == AccountAdmin.Id || accountId == *metadata.Owner.ID {
+	if metadata.Owner != nil && metadata.Owner.ID != nil && accountId == *metadata.Owner.ID {
 		return s3err.ErrNone
 	}
 	return s3err.ErrAccessDenied

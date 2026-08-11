@@ -2,6 +2,7 @@ package s3
 
 import (
 	"fmt"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
@@ -42,7 +43,7 @@ func (s WasabiRemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_stora
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return nil, fmt.Errorf("create wasabi session: %v", err)
+		return nil, fmt.Errorf("create wasabi session: %w", err)
 	}
 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
 	client.conn = s3.New(sess)

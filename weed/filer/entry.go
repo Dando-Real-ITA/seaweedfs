@@ -5,12 +5,15 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type Attr struct {
 	Mtime         time.Time   // time of last modification
 	Crtime        time.Time   // time of creation (OS X only)
+	Ctime         time.Time   // time of last inode change
+	Atime         time.Time   // time of last access
 	Mode          os.FileMode // file mode
 	Uid           uint32      // owner uid
 	Gid           uint32      // group gid
@@ -38,11 +41,12 @@ type Entry struct {
 	// the following is for files
 	Chunks []*filer_pb.FileChunk `json:"chunks,omitempty"`
 
-	HardLinkId      HardLinkId
-	HardLinkCounter int32
-	Content         []byte
-	Remote          *filer_pb.RemoteEntry
-	Quota           int64
+	HardLinkId         HardLinkId
+	HardLinkCounter    int32
+	Content            []byte
+	Remote             *filer_pb.RemoteEntry
+	Quota              int64
+	WORMEnforcedAtTsNs int64
 }
 
 func (entry *Entry) Size() uint64 {
@@ -90,7 +94,12 @@ func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
 		return
 	}
 	message.IsDirectory = entry.IsDirectory()
-	message.Attributes = EntryAttributeToPb(entry)
+	// Reuse pre-allocated attributes if available, otherwise allocate
+	if message.Attributes != nil {
+		EntryAttributeToExistingPb(entry, message.Attributes)
+	} else {
+		message.Attributes = EntryAttributeToPb(entry)
+	}
 	message.Chunks = entry.GetChunks()
 	message.Extended = entry.Extended
 	message.HardLinkId = entry.HardLinkId
@@ -98,6 +107,7 @@ func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
 	message.Content = entry.Content
 	message.RemoteEntry = entry.Remote
 	message.Quota = entry.Quota
+	message.WormEnforcedAtTsNs = entry.WORMEnforcedAtTsNs
 }
 
 func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
@@ -110,6 +120,7 @@ func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
 	fsEntry.Remote = message.RemoteEntry
 	fsEntry.Quota = message.Quota
 	fsEntry.FileSize = FileSize(message)
+	fsEntry.WORMEnforcedAtTsNs = message.WormEnforcedAtTsNs
 }
 
 func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {
@@ -139,4 +150,27 @@ func maxUint64(x, y uint64) uint64 {
 		return x
 	}
 	return y
+}
+
+func (entry *Entry) IsExpireS3Enabled() (exist bool) {
+	if entry.Extended != nil {
+		_, exist = entry.Extended[s3_constants.SeaweedFSExpiresS3]
+	}
+	return exist
+}
+
+func (entry *Entry) IsS3Versioning() (exist bool) {
+	if entry.Extended != nil {
+		_, exist = entry.Extended[s3_constants.ExtVersionIdKey]
+	}
+	return exist
+}
+
+func (entry *Entry) GetS3ExpireTime() (expireTime time.Time) {
+	if entry.Mtime.IsZero() {
+		expireTime = entry.Crtime
+	} else {
+		expireTime = entry.Mtime
+	}
+	return expireTime.Add(time.Duration(entry.TtlSec) * time.Second)
 }

@@ -3,13 +3,15 @@ package shell
 import (
 	"context"
 	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
-	"io"
-	"net/url"
-	"strconv"
-	"strings"
 
 	"google.golang.org/grpc"
 
@@ -29,6 +31,7 @@ type ShellOptions struct {
 	FilerGroup   *string
 	FilerAddress pb.ServerAddress
 	Directory    string
+	Debug        bool
 }
 
 type CommandEnv struct {
@@ -36,25 +39,19 @@ type CommandEnv struct {
 	MasterClient *wdclient.MasterClient
 	option       *ShellOptions
 	locker       *exclusive_locks.ExclusiveLocker
+	noLock       bool
+	forceNoLock  bool
+	verbose      bool
 }
-
-type command interface {
-	Name() string
-	Help() string
-	Do([]string, *CommandEnv, io.Writer) error
-}
-
-var (
-	Commands = []command{}
-)
 
 func NewCommandEnv(options *ShellOptions) *CommandEnv {
 	ce := &CommandEnv{
 		env:          make(map[string]string),
 		MasterClient: wdclient.NewMasterClient(options.GrpcDialOption, *options.FilerGroup, pb.AdminShellClient, "", "", "", *pb.ServerAddresses(*options.Masters).ToServiceDiscovery()),
 		option:       options,
+		noLock:       false,
 	}
-	ce.locker = exclusive_locks.NewExclusiveLocker(ce.MasterClient, "shell")
+	ce.locker = exclusive_locks.NewExclusiveLocker(ce.MasterClient, cluster.AdminShellLockName)
 	return ce
 }
 
@@ -77,6 +74,9 @@ func (ce *CommandEnv) isDirectory(path string) bool {
 
 func (ce *CommandEnv) confirmIsLocked(args []string) error {
 
+	if ce.noLock || ce.forceNoLock {
+		return nil
+	}
 	if ce.locker.IsLocked() {
 		return nil
 	}
@@ -86,18 +86,53 @@ func (ce *CommandEnv) confirmIsLocked(args []string) error {
 
 }
 
+func (ce *CommandEnv) SetNoLock(noLock bool) {
+	if ce == nil {
+		return
+	}
+	ce.noLock = noLock
+}
+
+func (ce *CommandEnv) ForceNoLock() {
+	if ce == nil {
+		return
+	}
+	ce.forceNoLock = true
+}
+
 func (ce *CommandEnv) isLocked() bool {
 	if ce == nil {
 		return true
 	}
+	if ce.noLock || ce.forceNoLock {
+		return true
+	}
 	return ce.locker.IsLocked()
+}
+
+// shellLockHolder asks the master who currently holds the cluster-wide shell
+// lock. Best effort: masters without GetAdminLockStatus report no holder, and
+// each attempt is bounded so an unresponsive master cannot hang the shell.
+func (ce *CommandEnv) shellLockHolder() (clientName string, message string, held bool) {
+	ce.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
+		attemptCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		resp, err := client.GetAdminLockStatus(attemptCtx, &master_pb.GetAdminLockStatusRequest{
+			LockName: cluster.AdminShellLockName,
+		})
+		if err == nil && resp.IsLocked {
+			clientName, message, held = resp.ClientName, resp.Message, true
+		}
+		return err
+	})
+	return
 }
 
 func (ce *CommandEnv) checkDirectory(path string) error {
 
 	dir, name := util.FullPath(path).DirAndName()
 
-	exists, err := filer_pb.Exists(ce, dir, name, true)
+	exists, err := filer_pb.Exists(context.Background(), ce, dir, name, true)
 
 	if !exists {
 		return fmt.Errorf("%s is not a directory", path)
@@ -120,26 +155,7 @@ func (ce *CommandEnv) AdjustedUrl(location *filer_pb.Location) string {
 }
 
 func (ce *CommandEnv) GetDataCenter() string {
-	return ce.MasterClient.DataCenter
-}
-
-func parseFilerUrl(entryPath string) (filerServer string, filerPort int64, path string, err error) {
-	if strings.HasPrefix(entryPath, "http") {
-		var u *url.URL
-		u, err = url.Parse(entryPath)
-		if err != nil {
-			return
-		}
-		filerServer = u.Hostname()
-		portString := u.Port()
-		if portString != "" {
-			filerPort, err = strconv.ParseInt(portString, 10, 32)
-		}
-		path = u.Path
-	} else {
-		err = fmt.Errorf("path should have full url /path/to/dirOrFile : %s", entryPath)
-	}
-	return
+	return ce.MasterClient.GetDataCenter()
 }
 
 func findInputDirectory(args []string) (input string) {
@@ -153,21 +169,35 @@ func findInputDirectory(args []string) (input string) {
 	return input
 }
 
-func readNeedleMeta(grpcDialOption grpc.DialOption, volumeServer pb.ServerAddress, volumeId uint32, needleValue needle_map.NeedleValue) (resp *volume_server_pb.ReadNeedleMetaResponse, err error) {
-	err = operation.WithVolumeServerClient(false, volumeServer, grpcDialOption,
-		func(client volume_server_pb.VolumeServerClient) error {
-			if resp, err = client.ReadNeedleMeta(context.Background(), &volume_server_pb.ReadNeedleMetaRequest{
-				VolumeId: volumeId,
-				NeedleId: uint64(needleValue.Key),
-				Offset:   needleValue.Offset.ToActualOffset(),
-				Size:     int32(needleValue.Size),
-			}); err != nil {
-				return err
+// isHelpRequest checks if the args contain a help flag (-h, --help, or -help)
+// It also handles combined short flags like -lh or -hl
+func isHelpRequest(args []string) bool {
+	for _, arg := range args {
+		// Check for exact matches
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			return true
+		}
+		// Check for combined short flags (e.g., -lh, -hl, -rfh)
+		// Limit to reasonable length (2-4 chars total) to avoid matching long options like -verbose
+		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") && len(arg) > 1 && len(arg) <= 4 {
+			for _, char := range arg[1:] {
+				if char == 'h' {
+					return true
+				}
 			}
-			return nil
-		},
-	)
-	return
+		}
+	}
+	return false
+}
+
+// handleHelpRequest checks for help flags and prints the help message if requested.
+// It returns true if the help message was printed, indicating the command should exit.
+func handleHelpRequest(c command, args []string, writer io.Writer) bool {
+	if isHelpRequest(args) {
+		fmt.Fprintln(writer, c.Help())
+		return true
+	}
+	return false
 }
 
 func readNeedleStatus(grpcDialOption grpc.DialOption, sourceVolumeServer pb.ServerAddress, volumeId uint32, needleValue needle_map.NeedleValue) (resp *volume_server_pb.VolumeNeedleStatusResponse, err error) {

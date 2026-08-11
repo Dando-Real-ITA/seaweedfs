@@ -3,14 +3,15 @@ package command
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os"
+	"strings"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"google.golang.org/grpc"
-	"net/url"
-	"os"
-	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -28,9 +29,9 @@ type FilerCatOptions struct {
 }
 
 func (fco *FilerCatOptions) GetLookupFileIdFunction() wdclient.LookupFileIdFunctionType {
-	return func(fileId string) (targetUrls []string, err error) {
+	return func(ctx context.Context, fileId string) (targetUrls []string, err error) {
 		vid := filer.VolumeId(fileId)
-		resp, err := fco.filerClient.LookupVolume(context.Background(), &filer_pb.LookupVolumeRequest{
+		resp, err := fco.filerClient.LookupVolume(ctx, &filer_pb.LookupVolumeRequest{
 			VolumeIds: []string{vid},
 		})
 		if err != nil {
@@ -59,6 +60,7 @@ var cmdFilerCat = &Command{
 
 func runFilerCat(cmd *Command, args []string) bool {
 
+	*filerCat.output = util.ResolvePath(*filerCat.output)
 	util.LoadSecurityConfiguration()
 
 	if len(args) == 0 {
@@ -102,7 +104,7 @@ func runFilerCat(cmd *Command, args []string) bool {
 			Name:      name,
 			Directory: dir,
 		}
-		respLookupEntry, err := filer_pb.LookupEntry(client, request)
+		respLookupEntry, err := filer_pb.LookupEntry(context.Background(), client, request)
 		if err != nil {
 			return err
 		}

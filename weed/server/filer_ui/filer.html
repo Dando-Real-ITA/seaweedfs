@@ -170,7 +170,7 @@
 
     {{ if .ShouldDisplayLoadMore }}
     <div class="row">
-        <a href={{ print .Path "?limit=" .Limit "&lastFileName=" .LastFileName }} >
+        <a href="{{ printpath .Path }}?limit={{ .Limit }}&lastFileName={{ queryEscape .LastFileName }}" >
         Load more
         </a>
     </div>
@@ -315,7 +315,7 @@
         if (dirName == null || dirName == '') {
             return;
         }
-        var baseUrl = window.location.href;
+        var baseUrl = window.location.origin + window.location.pathname;
         if (!baseUrl.endsWith('/')) {
             baseUrl += '/';
         }
@@ -323,6 +323,7 @@
         if (!url.endsWith('/')) {
             url += '/';
         }
+        url += window.location.search;
         var xhr = new XMLHttpRequest();
         xhr.open('POST', url, false);
         xhr.setRequestHeader('Content-Type', '');

@@ -26,8 +26,16 @@ func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, g
 	go func(garbageThreshold float64) {
 		for {
 			if t.IsLeader() {
-				if !t.isDisableVacuum {
-					t.Vacuum(grpcDialOption, garbageThreshold, concurrentVacuumLimitPerVolumeServer, 0, "", preallocate)
+				// Safety net: if vacuum was disabled by the plugin monitor but the
+				// admin server is no longer connected, automatically re-enable.
+				// This handles the case where the admin server crashes without
+				// cleanup. Does NOT override an operator's intentional disable.
+				if t.IsVacuumDisabledByPlugin() && t.adminServerConnectedFunc != nil && !t.adminServerConnectedFunc() {
+					glog.V(0).Infof("Admin server disconnected while vacuum was disabled by plugin, clearing plugin disable")
+					t.EnableVacuumByPlugin()
+				}
+				if !t.IsVacuumDisabled() {
+					t.Vacuum(grpcDialOption, garbageThreshold, concurrentVacuumLimitPerVolumeServer, 0, "", preallocate, true)
 				}
 			} else {
 				stats.MasterReplicaPlacementMismatch.Reset()
@@ -65,10 +73,9 @@ func (t *Topology) SetVolumeCapacityFull(volumeInfo storage.VolumeInfo) bool {
 		if !volumeInfo.ReadOnly {
 
 			disk := dn.getOrCreateDisk(volumeInfo.DiskType)
-			deltaDiskUsages := newDiskUsages()
-			deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(volumeInfo.DiskType))
-			deltaDiskUsage.activeVolumeCount = -1
-			disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			disk.UpAdjustDiskUsageDelta(types.ToDiskType(volumeInfo.DiskType), &DiskUsageCounts{
+				activeVolumeCount: -1,
+			})
 
 		}
 	}
@@ -96,9 +103,12 @@ func (t *Topology) UnRegisterDataNode(dn *DataNode) {
 	}
 
 	negativeUsages := dn.GetDiskUsages().negative()
-	dn.UpAdjustDiskUsageDelta(negativeUsages)
+	for dt, du := range negativeUsages.usages {
+		dn.UpAdjustDiskUsageDelta(dt, du)
+	}
 	dn.DeltaUpdateVolumes([]storage.VolumeInfo{}, dn.GetVolumes())
 	dn.DeltaUpdateEcShards([]*erasure_coding.EcVolumeInfo{}, dn.GetEcShards())
+	t.unregisterDataNodeAddress(dn.ServerAddress(), dn)
 	if dn.Parent() != nil {
 		dn.Parent().UnlinkChildNode(dn.Id())
 	}

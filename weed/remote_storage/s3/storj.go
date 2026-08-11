@@ -2,6 +2,8 @@ package s3
 
 import (
 	"fmt"
+	"os"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -9,7 +11,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"os"
 )
 
 func init() {
@@ -42,7 +43,7 @@ func (s StorjRemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storag
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return nil, fmt.Errorf("create storj session: %v", err)
+		return nil, fmt.Errorf("create storj session: %w", err)
 	}
 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
 	client.conn = s3.New(sess)

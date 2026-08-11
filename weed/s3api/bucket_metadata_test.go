@@ -3,15 +3,16 @@ package s3api
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
-	"reflect"
-	"sync"
-	"testing"
-	"time"
 )
 
 type BucketMetadataTestCase struct {
@@ -78,7 +79,8 @@ var (
 	}
 
 	//load filer is
-	loadFilerBucket = make(map[string]int, 1)
+	loadFilerBucket     = make(map[string]int, 1)
+	loadFilerBucketLock sync.Mutex
 	//override `loadBucketMetadataFromFiler` to avoid really load from filer
 )
 
@@ -176,17 +178,15 @@ func TestBuildBucketMetadata(t *testing.T) {
 func TestGetBucketMetadata(t *testing.T) {
 	loadBucketMetadataFromFiler = func(r *BucketRegistry, bucketName string) (*BucketMetaData, error) {
 		time.Sleep(time.Second)
+		loadFilerBucketLock.Lock()
 		loadFilerBucket[bucketName] = loadFilerBucket[bucketName] + 1
+		loadFilerBucketLock.Unlock()
 		return &BucketMetaData{
 			Name: bucketName,
 		}, nil
 	}
 
-	br := &BucketRegistry{
-		metadataCache: make(map[string]*BucketMetaData),
-		notFound:      make(map[string]struct{}),
-		s3a:           nil,
-	}
+	br := NewBucketRegistry(nil)
 
 	//start 40 goroutine for
 	var wg sync.WaitGroup

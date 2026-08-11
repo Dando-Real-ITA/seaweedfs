@@ -11,13 +11,13 @@ services:
     ports:
       - 9333:9333
       - 19333:19333
-    command: "master -ip=master -volumeSizeLimitMB=1024"
+    command: "master -ip=master -volumeSizeLimitMB=100"
   volume:
     image: chrislusf/seaweedfs:local
     ports:
       - 8080:8080
       - 18080:18080
-    command: "volume -mserver=master:9333 -port=8080 -ip=volume -max=0 -preStopSeconds=1"
+    command: "volume -master=master:9333 -port=8080 -ip=volume -max=0 -preStopSeconds=1"
     depends_on:
       - master
   s3:

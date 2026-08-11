@@ -10,20 +10,28 @@ import (
 
 type EcShardLocations struct {
 	Collection string
-	Locations  [erasure_coding.TotalShardsCount][]*DataNode
+	// Use MaxShardCount (32) to support custom EC ratios
+	Locations [erasure_coding.MaxShardCount][]*DataNode
 }
 
 func (t *Topology) SyncDataNodeEcShards(shardInfos []*master_pb.VolumeEcShardInformationMessage, dn *DataNode) (newShards, deletedShards []*erasure_coding.EcVolumeInfo) {
 	// convert into in memory struct storage.VolumeInfo
 	var shards []*erasure_coding.EcVolumeInfo
 	for _, shardInfo := range shardInfos {
-		shards = append(shards,
-			erasure_coding.NewEcVolumeInfo(
-				shardInfo.DiskType,
-				shardInfo.Collection,
-				needle.VolumeId(shardInfo.Id),
-				erasure_coding.ShardBits(shardInfo.EcIndexBits),
-				shardInfo.DestroyTime))
+		// Create EcVolumeInfo directly with optimized format
+		ecVolumeInfo := &erasure_coding.EcVolumeInfo{
+			VolumeId:    needle.VolumeId(shardInfo.Id),
+			Collection:  shardInfo.Collection,
+			ShardsInfo:  erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
+			DiskType:    shardInfo.DiskType,
+			DiskId:      shardInfo.DiskId,
+			ExpireAtSec: shardInfo.ExpireAtSec,
+			FileCount:   shardInfo.FileCount,
+			DeleteCount: shardInfo.DeleteCount,
+			EncodeTsNs:  shardInfo.EncodeTsNs,
+		}
+
+		shards = append(shards, ecVolumeInfo)
 	}
 	// find out the delta volumes
 	newShards, deletedShards = dn.UpdateEcShards(shards)
@@ -40,20 +48,36 @@ func (t *Topology) IncrementalSyncDataNodeEcShards(newEcShards, deletedEcShards 
 	// convert into in memory struct storage.VolumeInfo
 	var newShards, deletedShards []*erasure_coding.EcVolumeInfo
 	for _, shardInfo := range newEcShards {
-		newShards = append(newShards,
-			erasure_coding.NewEcVolumeInfo(
-				shardInfo.DiskType,
-				shardInfo.Collection,
-				needle.VolumeId(shardInfo.Id),
-				erasure_coding.ShardBits(shardInfo.EcIndexBits), shardInfo.DestroyTime))
+		// Create EcVolumeInfo directly with optimized format
+		ecVolumeInfo := &erasure_coding.EcVolumeInfo{
+			VolumeId:    needle.VolumeId(shardInfo.Id),
+			Collection:  shardInfo.Collection,
+			ShardsInfo:  erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
+			DiskType:    shardInfo.DiskType,
+			DiskId:      shardInfo.DiskId,
+			ExpireAtSec: shardInfo.ExpireAtSec,
+			FileCount:   shardInfo.FileCount,
+			DeleteCount: shardInfo.DeleteCount,
+			EncodeTsNs:  shardInfo.EncodeTsNs,
+		}
+
+		newShards = append(newShards, ecVolumeInfo)
 	}
 	for _, shardInfo := range deletedEcShards {
-		deletedShards = append(deletedShards,
-			erasure_coding.NewEcVolumeInfo(
-				shardInfo.DiskType,
-				shardInfo.Collection,
-				needle.VolumeId(shardInfo.Id),
-				erasure_coding.ShardBits(shardInfo.EcIndexBits), shardInfo.DestroyTime))
+		// Create EcVolumeInfo directly with optimized format
+		ecVolumeInfo := &erasure_coding.EcVolumeInfo{
+			VolumeId:    needle.VolumeId(shardInfo.Id),
+			Collection:  shardInfo.Collection,
+			ShardsInfo:  erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
+			DiskType:    shardInfo.DiskType,
+			DiskId:      shardInfo.DiskId,
+			ExpireAtSec: shardInfo.ExpireAtSec,
+			FileCount:   shardInfo.FileCount,
+			DeleteCount: shardInfo.DeleteCount,
+			EncodeTsNs:  shardInfo.EncodeTsNs,
+		}
+
+		deletedShards = append(deletedShards, ecVolumeInfo)
 	}
 
 	dn.DeltaUpdateEcShards(newShards, deletedShards)
@@ -64,7 +88,6 @@ func (t *Topology) IncrementalSyncDataNodeEcShards(newEcShards, deletedEcShards 
 	for _, v := range deletedShards {
 		t.UnRegisterEcShards(v, dn)
 	}
-	return
 }
 
 func NewEcShardLocations(collection string) *EcShardLocations {
@@ -74,6 +97,10 @@ func NewEcShardLocations(collection string) *EcShardLocations {
 }
 
 func (loc *EcShardLocations) AddShard(shardId erasure_coding.ShardId, dn *DataNode) (added bool) {
+	// Defensive bounds check to prevent panic with out-of-range shard IDs
+	if int(shardId) >= erasure_coding.MaxShardCount {
+		return false
+	}
 	dataNodes := loc.Locations[shardId]
 	for _, n := range dataNodes {
 		if n.Id() == dn.Id() {
@@ -85,6 +112,10 @@ func (loc *EcShardLocations) AddShard(shardId erasure_coding.ShardId, dn *DataNo
 }
 
 func (loc *EcShardLocations) DeleteShard(shardId erasure_coding.ShardId, dn *DataNode) (deleted bool) {
+	// Defensive bounds check to prevent panic with out-of-range shard IDs
+	if int(shardId) >= erasure_coding.MaxShardCount {
+		return false
+	}
 	dataNodes := loc.Locations[shardId]
 	foundIndex := -1
 	for index, n := range dataNodes {
@@ -99,31 +130,35 @@ func (loc *EcShardLocations) DeleteShard(shardId erasure_coding.ShardId, dn *Dat
 	return true
 }
 
-func (t *Topology) RegisterEcShards(ecShardInfos *erasure_coding.EcVolumeInfo, dn *DataNode) {
+func (t *Topology) RegisterEcShards(ecvi *erasure_coding.EcVolumeInfo, dn *DataNode) {
+
+	// EC-only volumes (source volume deleted after encoding) must bump
+	// maxVolumeId too, or a heartbeat-rebuilt master could re-issue their id.
+	t.UpAdjustMaxVolumeId(ecvi.VolumeId)
 
 	t.ecShardMapLock.Lock()
 	defer t.ecShardMapLock.Unlock()
 
-	locations, found := t.ecShardMap[ecShardInfos.VolumeId]
+	locations, found := t.ecShardMap[ecvi.VolumeId]
 	if !found {
-		locations = NewEcShardLocations(ecShardInfos.Collection)
-		t.ecShardMap[ecShardInfos.VolumeId] = locations
+		locations = NewEcShardLocations(ecvi.Collection)
+		t.ecShardMap[ecvi.VolumeId] = locations
 	}
-	for _, shardId := range ecShardInfos.ShardIds() {
+	for _, shardId := range ecvi.ShardsInfo.Ids() {
 		locations.AddShard(shardId, dn)
 	}
 }
 
-func (t *Topology) UnRegisterEcShards(ecShardInfos *erasure_coding.EcVolumeInfo, dn *DataNode) {
-	glog.Infof("removing ec shard info:%+v", ecShardInfos)
+func (t *Topology) UnRegisterEcShards(ecvi *erasure_coding.EcVolumeInfo, dn *DataNode) {
+	glog.Infof("removing ec shard info:%+v", ecvi)
 	t.ecShardMapLock.Lock()
 	defer t.ecShardMapLock.Unlock()
 
-	locations, found := t.ecShardMap[ecShardInfos.VolumeId]
+	locations, found := t.ecShardMap[ecvi.VolumeId]
 	if !found {
 		return
 	}
-	for _, shardId := range ecShardInfos.ShardIds() {
+	for _, shardId := range ecvi.ShardsInfo.Ids() {
 		locations.DeleteShard(shardId, dn)
 	}
 }
@@ -173,6 +208,4 @@ func (t *Topology) DeleteEcCollection(collection string) {
 	for _, vid := range vids {
 		delete(t.ecShardMap, vid)
 	}
-
-	return
 }

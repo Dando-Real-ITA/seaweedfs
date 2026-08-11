@@ -2,6 +2,7 @@ package topology
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -17,9 +18,20 @@ import (
 
 type Disk struct {
 	NodeImpl
-	volumes      map[needle.VolumeId]storage.VolumeInfo
-	ecShards     map[needle.VolumeId]*erasure_coding.EcVolumeInfo
+	volumes map[needle.VolumeId]storage.VolumeInfo
+	// ecShards is nested so the same volume can retain separate entries per
+	// physical disk id. A single topology Disk represents one DiskType on a
+	// DataNode and may front multiple physical disks of that type, so EC
+	// shards of one volume can legitimately live on several of them. The
+	// outer key is the volume id; the inner key is the physical disk id.
+	ecShards     map[needle.VolumeId]map[types.DiskId]*erasure_coding.EcVolumeInfo
 	ecShardsLock sync.RWMutex
+}
+
+// ecShardSlots returns the number of volume slots consumed by the given
+// number of EC shards, rounded up to whole-volume equivalents.
+func ecShardSlots(ecShardCount int64) int64 {
+	return (ecShardCount + erasure_coding.DataShardsCount - 1) / erasure_coding.DataShardsCount
 }
 
 func NewDisk(diskType string) *Disk {
@@ -28,7 +40,7 @@ func NewDisk(diskType string) *Disk {
 	s.nodeType = "Disk"
 	s.diskUsages = newDiskUsages()
 	s.volumes = make(map[needle.VolumeId]storage.VolumeInfo, 2)
-	s.ecShards = make(map[needle.VolumeId]*erasure_coding.EcVolumeInfo, 2)
+	s.ecShards = make(map[needle.VolumeId]map[types.DiskId]*erasure_coding.EcVolumeInfo, 2)
 	s.NodeImpl.value = s
 	return s
 }
@@ -55,6 +67,8 @@ func (d *DiskUsages) negative() *DiskUsages {
 		a.activeVolumeCount = -b.activeVolumeCount
 		a.ecShardCount = -b.ecShardCount
 		a.maxVolumeCount = -b.maxVolumeCount
+		a.diskTotalBytes = -b.diskTotalBytes
+		a.diskFreeBytes = -b.diskFreeBytes
 
 	}
 	return t
@@ -66,9 +80,11 @@ func (d *DiskUsages) ToDiskInfo() map[string]*master_pb.DiskInfo {
 		m := &master_pb.DiskInfo{
 			VolumeCount:       diskUsageCounts.volumeCount,
 			MaxVolumeCount:    diskUsageCounts.maxVolumeCount,
-			FreeVolumeCount:   diskUsageCounts.maxVolumeCount - diskUsageCounts.volumeCount,
+			FreeVolumeCount:   diskUsageCounts.maxVolumeCount - (diskUsageCounts.volumeCount - diskUsageCounts.remoteVolumeCount) - ecShardSlots(diskUsageCounts.ecShardCount),
 			ActiveVolumeCount: diskUsageCounts.activeVolumeCount,
 			RemoteVolumeCount: diskUsageCounts.remoteVolumeCount,
+			DiskTotalBytes:    uint64(max(0, diskUsageCounts.diskTotalBytes)),
+			DiskFreeBytes:     uint64(max(0, diskUsageCounts.diskFreeBytes)),
 		}
 		ret[string(diskType)] = m
 	}
@@ -99,6 +115,10 @@ type DiskUsageCounts struct {
 	activeVolumeCount int64
 	ecShardCount      int64
 	maxVolumeCount    int64
+	// Physical filesystem capacity reported by the volume server, in bytes.
+	// 0 means the volume server did not report it (e.g. an older build).
+	diskTotalBytes int64
+	diskFreeBytes  int64
 }
 
 func (a *DiskUsageCounts) addDiskUsageCounts(b *DiskUsageCounts) {
@@ -107,24 +127,12 @@ func (a *DiskUsageCounts) addDiskUsageCounts(b *DiskUsageCounts) {
 	atomic.AddInt64(&a.activeVolumeCount, b.activeVolumeCount)
 	atomic.AddInt64(&a.ecShardCount, b.ecShardCount)
 	atomic.AddInt64(&a.maxVolumeCount, b.maxVolumeCount)
+	atomic.AddInt64(&a.diskTotalBytes, b.diskTotalBytes)
+	atomic.AddInt64(&a.diskFreeBytes, b.diskFreeBytes)
 }
 
 func (a *DiskUsageCounts) FreeSpace() int64 {
-	freeVolumeSlotCount := a.maxVolumeCount + a.remoteVolumeCount - a.volumeCount
-	if a.ecShardCount > 0 {
-		freeVolumeSlotCount = freeVolumeSlotCount - a.ecShardCount/erasure_coding.DataShardsCount - 1
-	}
-	return freeVolumeSlotCount
-}
-
-func (a *DiskUsageCounts) minus(b *DiskUsageCounts) *DiskUsageCounts {
-	return &DiskUsageCounts{
-		volumeCount:       a.volumeCount - b.volumeCount,
-		remoteVolumeCount: a.remoteVolumeCount - b.remoteVolumeCount,
-		activeVolumeCount: a.activeVolumeCount - b.activeVolumeCount,
-		ecShardCount:      a.ecShardCount - b.ecShardCount,
-		maxVolumeCount:    a.maxVolumeCount - b.maxVolumeCount,
-	}
+	return a.maxVolumeCount + a.remoteVolumeCount - a.volumeCount - ecShardSlots(a.ecShardCount)
 }
 
 func (du *DiskUsages) getOrCreateDisk(diskType types.DiskType) *DiskUsageCounts {
@@ -152,8 +160,7 @@ func (d *Disk) AddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
 }
 
 func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
-	deltaDiskUsages := newDiskUsages()
-	deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+	deltaDiskUsage := &DiskUsageCounts{}
 	if oldV, ok := d.volumes[v.Id]; !ok {
 		d.volumes[v.Id] = v
 		deltaDiskUsage.volumeCount = 1
@@ -164,7 +171,7 @@ func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool)
 			deltaDiskUsage.activeVolumeCount = 1
 		}
 		d.UpAdjustMaxVolumeId(v.Id)
-		d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		isNew = true
 	} else {
 		if oldV.IsRemote() != v.IsRemote() {
@@ -174,9 +181,22 @@ func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool)
 			if oldV.IsRemote() {
 				deltaDiskUsage.remoteVolumeCount = -1
 			}
-			d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
 		isChanged = d.volumes[v.Id].ReadOnly != v.ReadOnly
+		if isChanged {
+			// Adjust active volume count when ReadOnly status changes
+			// Use a separate delta object to avoid affecting other metric adjustments
+			readOnlyDelta := &DiskUsageCounts{}
+			if v.ReadOnly {
+				// Changed from writable to read-only
+				readOnlyDelta.activeVolumeCount = -1
+			} else {
+				// Changed from read-only to writable
+				readOnlyDelta.activeVolumeCount = 1
+			}
+			d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), readOnlyDelta)
+		}
 		d.volumes[v.Id] = v
 	}
 	return
@@ -247,18 +267,32 @@ func (d *Disk) FreeSpace() int64 {
 
 func (d *Disk) ToDiskInfo() *master_pb.DiskInfo {
 	diskUsage := d.diskUsages.getOrCreateDisk(types.ToDiskType(string(d.Id())))
+
+	// Get disk ID from first volume or EC shard
+	var diskId uint32
+	volumes := d.GetVolumes()
+	ecShards := d.GetEcShards()
+	if len(volumes) > 0 {
+		diskId = volumes[0].DiskId
+	} else if len(ecShards) > 0 {
+		diskId = ecShards[0].DiskId
+	}
+
 	m := &master_pb.DiskInfo{
 		Type:              string(d.Id()),
 		VolumeCount:       diskUsage.volumeCount,
 		MaxVolumeCount:    diskUsage.maxVolumeCount,
-		FreeVolumeCount:   diskUsage.maxVolumeCount - diskUsage.volumeCount,
+		FreeVolumeCount:   diskUsage.maxVolumeCount - (diskUsage.volumeCount - diskUsage.remoteVolumeCount) - ecShardSlots(diskUsage.ecShardCount),
 		ActiveVolumeCount: diskUsage.activeVolumeCount,
 		RemoteVolumeCount: diskUsage.remoteVolumeCount,
+		DiskId:            diskId,
+		DiskTotalBytes:    uint64(max(0, diskUsage.diskTotalBytes)),
+		DiskFreeBytes:     uint64(max(0, diskUsage.diskFreeBytes)),
 	}
-	for _, v := range d.GetVolumes() {
+	for _, v := range volumes {
 		m.VolumeInfos = append(m.VolumeInfos, v.ToVolumeInformationMessage())
 	}
-	for _, ecv := range d.GetEcShards() {
+	for _, ecv := range ecShards {
 		m.EcShardInfos = append(m.EcShardInfos, ecv.ToVolumeEcShardInformationMessage())
 	}
 	return m
@@ -273,6 +307,8 @@ func (d *Disk) GetVolumeIds() string {
 	for k := range d.volumes {
 		ids = append(ids, int(k))
 	}
+
+	slices.Sort(ids)
 
 	return util.HumanReadableIntsMax(100, ids...)
 }

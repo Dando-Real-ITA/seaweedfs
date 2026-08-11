@@ -5,7 +5,7 @@ RUN mkdir -p /go/src/github.com/seaweedfs/
 ADD . /go/src/github.com/seaweedfs/seaweedfs
 RUN ls -al /go/src/github.com/seaweedfs/ && \
   cd /go/src/github.com/seaweedfs/seaweedfs/weed \
-  && export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=$(git rev-parse --short HEAD)" \
+  && export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$(git rev-parse --short HEAD)" \
   && go install -tags "5BytesOffset rocksdb" -ldflags "-extldflags -static ${LDFLAGS}"
 
 
@@ -15,7 +15,12 @@ COPY --from=builder /go/bin/weed /usr/bin/
 RUN mkdir -p /etc/seaweedfs
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer_rocksdb.toml /etc/seaweedfs/filer.toml
 COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
-RUN apk add fuse snappy gflags tmux
+
+# Install dependencies and create non-root user
+RUN apk upgrade --no-cache && \
+    apk add --no-cache fuse snappy gflags curl tmux su-exec && \
+    addgroup -g 1000 seaweed && \
+    adduser -D -u 1000 -G seaweed seaweed
 
 # volume server gprc port
 EXPOSE 18080
@@ -34,12 +39,15 @@ EXPOSE 8333
 # webdav server http port
 EXPOSE 7333
 
-RUN mkdir -p /data/filer_rocksdb
+# Create data directory and set proper ownership for seaweed user
+RUN mkdir -p /data/filer_rocksdb && \
+    chown -R seaweed:seaweed /data && \
+    chown -R seaweed:seaweed /etc/seaweedfs && \
+    chmod 755 /entrypoint.sh
 
 VOLUME /data
 
 WORKDIR /data
 
-RUN chmod +x /entrypoint.sh
-
+# Entrypoint will handle permission fixes and user switching
 ENTRYPOINT ["/entrypoint.sh"]

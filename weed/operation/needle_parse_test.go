@@ -2,6 +2,7 @@ package operation
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,7 +45,7 @@ func TestCreateNeedleFromRequest(t *testing.T) {
 	{
 		mockClient.needleHandling = func(n *needle.Needle, originalSize int, err error) {
 			assert.Equal(t, nil, err, "upload: %v", err)
-			assert.Equal(t, "", string(n.Mime), "mime detection failed: %v", string(n.Mime))
+			assert.Equal(t, "text/plain; charset=utf-8", string(n.Mime), "mime detection failed: %v", string(n.Mime))
 			assert.Equal(t, true, n.IsCompressed(), "this should be compressed")
 			assert.Equal(t, true, util.IsGzippedContent(n.Data), "this should be gzip")
 			fmt.Printf("needle: %v, originalSize: %d\n", n, originalSize)
@@ -58,7 +59,7 @@ func TestCreateNeedleFromRequest(t *testing.T) {
 			PairMap:           nil,
 			Jwt:               "",
 		}
-		uploadResult, err, data := uploader.Upload(bytes.NewReader([]byte(textContent)), uploadOption)
+		uploadResult, err, data := uploader.Upload(context.Background(), bytes.NewReader([]byte(textContent)), uploadOption)
 		if len(data) != len(textContent) {
 			t.Errorf("data actual %d expected %d", len(data), len(textContent))
 		}
@@ -86,7 +87,7 @@ func TestCreateNeedleFromRequest(t *testing.T) {
 			PairMap:           nil,
 			Jwt:               "",
 		}
-		uploader.Upload(bytes.NewReader(gzippedData), uploadOption)
+		uploader.Upload(context.Background(), bytes.NewReader(gzippedData), uploadOption)
 	}
 
 	/*

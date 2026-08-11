@@ -1,12 +1,13 @@
 package weed_server
 
 import (
+	"net/http"
+	"time"
+
 	"github.com/cenkalti/backoff/v4"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
-	"net/http"
-	"time"
 )
 
 type ClusterStatusResult struct {
@@ -35,7 +36,7 @@ func (s *RaftServer) HealthzHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if s.serverAddr == leader {
+	if s.serverAddr.Equals(leader) {
 		expBackoff := backoff.NewExponentialBackOff()
 		expBackoff.InitialInterval = 20 * time.Millisecond
 		expBackoff.MaxInterval = 1 * time.Second

@@ -2,14 +2,16 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
-	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
@@ -49,6 +51,10 @@ func (c *commandS3CircuitBreaker) Help() string {
 	# clear all circuit breaker config
 	s3.circuitBreaker -delete -apply
 	`
+}
+
+func (c *commandS3CircuitBreaker) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3CircuitBreaker) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -176,12 +182,12 @@ func (c *commandS3CircuitBreaker) Do(args []string, commandEnv *CommandEnv, writ
 		return err
 	}
 
-	_, _ = fmt.Fprintf(writer, string(buf.Bytes()))
-	_, _ = fmt.Fprintln(writer)
+	fmt.Fprint(writer, buf.String())
+	fmt.Fprintln(writer)
 
 	if *apply {
 		if err := commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(client, dir, file, buf.Bytes())
+			return filer.SaveInsideFiler(context.Background(), client, dir, file, buf.Bytes())
 		}); err != nil {
 			return err
 		}

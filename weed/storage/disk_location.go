@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,8 +17,15 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/storage/volume_info"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+)
+
+const (
+	UUIDFileName = "vol_dir.uuid"
+	UUIDFileMod  = 0644
 )
 
 type DiskLocation struct {
@@ -24,42 +33,58 @@ type DiskLocation struct {
 	DirectoryUuid          string
 	IdxDirectory           string
 	DiskType               types.DiskType
+	Tags                   []string
 	MaxVolumeCount         int32
 	OriginalMaxVolumeCount int32
 	MinFreeSpace           util.MinFreeSpace
-	volumes                map[needle.VolumeId]*Volume
-	volumesLock            sync.RWMutex
+	AvailableSpace         atomic.Uint64
+	// Physical filesystem capacity from the latest CheckDiskSpace probe, reported
+	// to the master so balancing can see real disk fullness, not just slot counts.
+	diskTotalBytes atomic.Uint64
+	diskFreeBytes  atomic.Uint64
+	volumes        map[needle.VolumeId]*Volume
+	volumesLock    sync.RWMutex
 
 	// erasure coding
 	ecVolumes     map[needle.VolumeId]*erasure_coding.EcVolume
 	ecVolumesLock sync.RWMutex
 
-	isDiskSpaceLow bool
-	closeCh        chan struct{}
+	ecShardNotifyHandler func(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, ecVolume *erasure_coding.EcVolume)
+
+	isDiskSpaceLow    atomic.Bool
+	isDiskUnavailable atomic.Bool
+	closeCh           chan struct{}
 }
 
 func GenerateDirUuid(dir string) (dirUuidString string, err error) {
 	glog.V(1).Infof("Getting uuid of volume directory:%s", dir)
-	dirUuidString = ""
-	fileName := dir + "/vol_dir.uuid"
+	fileName := filepath.Join(dir, UUIDFileName)
 	if !util.FileExists(fileName) {
-		dirUuid, _ := uuid.NewRandom()
-		dirUuidString = dirUuid.String()
-		writeErr := util.WriteFile(fileName, []byte(dirUuidString), 0644)
-		if writeErr != nil {
-			return "", fmt.Errorf("failed to write uuid to %s : %v", fileName, writeErr)
-		}
+		dirUuidString, err = writeNewUuid(fileName)
 	} else {
 		uuidData, readErr := os.ReadFile(fileName)
 		if readErr != nil {
 			return "", fmt.Errorf("failed to read uuid from %s : %v", fileName, readErr)
 		}
-		dirUuidString = string(uuidData)
+		if len(uuidData) > 0 {
+			dirUuidString = string(uuidData)
+		} else {
+			dirUuidString, err = writeNewUuid(fileName)
+		}
+	}
+	return dirUuidString, err
+}
+
+func writeNewUuid(fileName string) (string, error) {
+	dirUuid, _ := uuid.NewRandom()
+	dirUuidString := dirUuid.String()
+	if err := util.WriteFile(fileName, []byte(dirUuidString), UUIDFileMod); err != nil {
+		return "", fmt.Errorf("failed to write uuid to %s : %v", fileName, err)
 	}
 	return dirUuidString, nil
 }
 
-func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFreeSpace, idxDir string, diskType types.DiskType) *DiskLocation {
+func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFreeSpace, idxDir string, diskType types.DiskType, tags []string, config stats.DiskIOProbeConfig) *DiskLocation {
 	glog.V(4).Infof("Added new Disk %s: maxVolumes=%d", dir, maxVolumeCount)
 	dir = util.ResolvePath(dir)
 	if idxDir == "" {
@@ -71,11 +96,18 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 	if err != nil {
 		glog.Fatalf("cannot generate uuid of dir %s: %v", dir, err)
 	}
+	// Defensive copy of tags to prevent external mutation
+	var copiedTags []string
+	if len(tags) > 0 {
+		copiedTags = make([]string, len(tags))
+		copy(copiedTags, tags)
+	}
 	location := &DiskLocation{
 		Directory:              dir,
 		DirectoryUuid:          dirUuid,
 		IdxDirectory:           idxDir,
 		DiskType:               diskType,
+		Tags:                   copiedTags,
 		MaxVolumeCount:         maxVolumeCount,
 		OriginalMaxVolumeCount: maxVolumeCount,
 		MinFreeSpace:           minFreeSpace,
@@ -84,13 +116,13 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 	location.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
 	location.closeCh = make(chan struct{})
 	go func() {
-		location.CheckDiskSpace()
+		location.CheckDiskSpace(config)
 		for {
 			select {
 			case <-location.closeCh:
 				return
 			case <-time.After(time.Minute):
-				location.CheckDiskSpace()
+				location.CheckDiskSpace(config)
 			}
 		}
 	}()
@@ -127,7 +159,50 @@ func getValidVolumeName(basename string) string {
 	return ""
 }
 
-func (l *DiskLocation) loadExistingVolume(dirEntry os.DirEntry, needleMapKind NeedleMapKind, skipIfEcVolumesExists bool, ldbTimeout int64) bool {
+// hasEcxFile reports whether an .ecx for volumeName exists on this disk.
+// Checks IdxDirectory first, then falls back to Directory (the .ecx may
+// have been created before -dir.idx was configured).
+func (l *DiskLocation) hasEcxFile(volumeName string) bool {
+	if util.FileExists(filepath.Join(l.IdxDirectory, volumeName+".ecx")) {
+		return true
+	}
+	if l.IdxDirectory != l.Directory {
+		return util.FileExists(filepath.Join(l.Directory, volumeName+".ecx"))
+	}
+	return false
+}
+
+// removeEmptyEcDatStub removes a leftover empty EC .dat stub and returns
+// whether one was swept. A stub is an empty .dat (<= a superblock, i.e. zero
+// needles) whose .vif records an EC shard config. An EC volume keeps no local
+// .dat, so the stub holds no data -- its shards live on other servers. Such
+// stubs (phantoms from the pre-fix loader) otherwise load as phantom empty
+// volumes, and a same-vid stub on two disks can shadow a real replica. The
+// .dat and its empty .idx are removed; non-EC empty .dat files are left alone.
+// The .vif is looked up in both the data and idx directories (which differ
+// only when -dir.idx is configured).
+func (l *DiskLocation) removeEmptyEcDatStub(volumeName string, vid needle.VolumeId, collection string) bool {
+	datPath := l.Directory + "/" + volumeName + ".dat"
+	if fi, err := os.Stat(datPath); err != nil || fi.Size() > int64(super_block.SuperBlockSize) {
+		return false
+	}
+	if !vifIsEcVolume(l.Directory+"/"+volumeName+".vif") &&
+		!(l.IdxDirectory != l.Directory && vifIsEcVolume(l.IdxDirectory+"/"+volumeName+".vif")) {
+		return false
+	}
+	glog.Warningf("removing leftover empty .dat stub for EC volume %d (collection=%q)", vid, collection)
+	os.Remove(datPath)
+	os.Remove(l.IdxDirectory + "/" + volumeName + ".idx")
+	return true
+}
+
+// vifIsEcVolume reports whether the .vif at vifPath records an EC shard config.
+func vifIsEcVolume(vifPath string) bool {
+	vi, _, _, err := volume_info.MaybeLoadVolumeInfo(vifPath)
+	return err == nil && vi.GetEcShardConfig() != nil
+}
+
+func (l *DiskLocation) loadExistingVolume(dirEntry os.DirEntry, needleMapKind NeedleMapKind, skipIfEcVolumesExists bool, ldbTimeout int64, diskId uint32) bool {
 	basename := dirEntry.Name()
 	if dirEntry.IsDir() {
 		return false
@@ -137,10 +212,40 @@ func (l *DiskLocation) loadExistingVolume(dirEntry os.DirEntry, needleMapKind Ne
 		return false
 	}
 
-	// skip if ec volumes exists
+	// parse out collection, volume id (moved up to use in EC validation)
+	vid, collection, err := volumeIdFromFileName(basename)
+	if err != nil {
+		glog.Warningf("get volume id failed, %s, err : %s", volumeName, err)
+		return false
+	}
+
+	// Sweep a leftover empty .dat stub before any EC presence checks below.
+	// It must go first: next to an .ecx it would otherwise make
+	// validateEcVolume mistake a healthy distributed EC volume for an
+	// interrupted local encode and delete its shards.
+	if l.removeEmptyEcDatStub(volumeName, vid, collection) {
+		return false
+	}
+
+	// .vif next to .ecx is EC shard metadata, not a regular volume.
+	// Without this guard NewVolume below would create a phantom empty .dat.
+	if strings.HasSuffix(basename, ".vif") && l.hasEcxFile(volumeName) {
+		glog.V(1).Infof("loadExistingVolume: skipping .vif-only entry for volume %d (collection=%q); .ecx present", vid, collection)
+		return false
+	}
+
+	// skip if ec volumes exists, but validate EC files first
 	if skipIfEcVolumesExists {
-		if util.FileExists(l.IdxDirectory + "/" + volumeName + ".ecx") {
-			return false
+		if l.hasEcxFile(volumeName) {
+			// Validate EC volume: shard count, size consistency, and expected size vs .dat file
+			if !l.validateEcVolume(collection, vid) {
+				glog.Warningf("EC volume %d validation failed, removing incomplete EC files to allow .dat file loading", vid)
+				l.removeEcVolumeFiles(collection, vid)
+				// Continue to load .dat file
+			} else {
+				// Valid EC volume exists, skip .dat file
+				return false
+			}
 		}
 	}
 
@@ -149,15 +254,12 @@ func (l *DiskLocation) loadExistingVolume(dirEntry os.DirEntry, needleMapKind Ne
 	if util.FileExists(noteFile) {
 		note, _ := os.ReadFile(noteFile)
 		glog.Warningf("volume %s was not completed: %s", volumeName, string(note))
-		removeVolumeFiles(l.Directory + "/" + volumeName)
-		removeVolumeFiles(l.IdxDirectory + "/" + volumeName)
-		return false
-	}
-
-	// parse out collection, volume id
-	vid, collection, err := volumeIdFromFileName(basename)
-	if err != nil {
-		glog.Warningf("get volume id failed, %s, err : %s", volumeName, err)
+		// Keep the .vif when an .ecx for this vid coexists on the disk: the
+		// regular and EC volumes share <base>.vif, so removing the incomplete
+		// regular copy must not strip the EC volume's info file.
+		keepVif := l.hasEcxFile(volumeName)
+		removeVolumeFiles(l.Directory+"/"+volumeName, keepVif)
+		removeVolumeFiles(l.IdxDirectory+"/"+volumeName, keepVif)
 		return false
 	}
 
@@ -170,22 +272,40 @@ func (l *DiskLocation) loadExistingVolume(dirEntry os.DirEntry, needleMapKind Ne
 		return true
 	}
 
+	// Load existing data only; never let NewVolume create a phantom .dat. A
+	// lone .vif/.idx (e.g. an EC sidecar whose .ecx is on a sibling disk,
+	// which the same-disk hasEcxFile() guard misses) would otherwise get an
+	// 8-byte stub that the sibling-.dat prune deletes real shards against.
+	// Remote-tiered volumes also have no local .dat, but their .vif points at
+	// remote files and must still load via the remote path.
+	if !util.FileExists(l.Directory + "/" + volumeName + ".dat") {
+		_, hasRemote, _, _ := volume_info.MaybeLoadVolumeInfo(l.Directory + "/" + volumeName + ".vif")
+		if !hasRemote && l.IdxDirectory != l.Directory {
+			_, hasRemote, _, _ = volume_info.MaybeLoadVolumeInfo(l.IdxDirectory + "/" + volumeName + ".vif")
+		}
+		if !hasRemote {
+			glog.V(1).Infof("loadExistingVolume: skipping volume %d (collection=%q); no .dat and no remote file", vid, collection)
+			return false
+		}
+	}
+
 	// load the volume
-	v, e := NewVolume(l.Directory, l.IdxDirectory, collection, vid, needleMapKind, nil, nil, 0, 0, ldbTimeout)
+	v, e := NewVolume(l.Directory, l.IdxDirectory, collection, vid, needleMapKind, nil, nil, 0, needle.GetCurrentVersion(), 0, ldbTimeout)
 	if e != nil {
 		glog.V(0).Infof("new volume %s error %s", volumeName, e)
 		return false
 	}
 
+	v.diskId = diskId // Set the disk ID for existing volumes
 	l.SetVolume(vid, v)
 
 	size, _, _ := v.FileStat()
-	glog.V(0).Infof("data file %s, replication=%s v=%d size=%d ttl=%s",
-		l.Directory+"/"+volumeName+".dat", v.ReplicaPlacement, v.Version(), size, v.Ttl.String())
+	glog.V(2).Infof("data file %s, replication=%s v=%d size=%d ttl=%s disk_id=%d",
+		l.Directory+"/"+volumeName+".dat", v.ReplicaPlacement, v.Version(), size, v.Ttl.String(), diskId)
 	return true
 }
 
-func (l *DiskLocation) concurrentLoadingVolumes(needleMapKind NeedleMapKind, concurrency int, ldbTimeout int64) {
+func (l *DiskLocation) concurrentLoadingVolumes(needleMapKind NeedleMapKind, concurrency int, ldbTimeout int64, diskId uint32) {
 
 	task_queue := make(chan os.DirEntry, 10*concurrency)
 	go func() {
@@ -211,7 +331,7 @@ func (l *DiskLocation) concurrentLoadingVolumes(needleMapKind NeedleMapKind, con
 		go func() {
 			defer wg.Done()
 			for fi := range task_queue {
-				_ = l.loadExistingVolume(fi, needleMapKind, true, ldbTimeout)
+				_ = l.loadExistingVolume(fi, needleMapKind, true, ldbTimeout, diskId)
 			}
 		}()
 	}
@@ -220,6 +340,10 @@ func (l *DiskLocation) concurrentLoadingVolumes(needleMapKind NeedleMapKind, con
 }
 
 func (l *DiskLocation) loadExistingVolumes(needleMapKind NeedleMapKind, ldbTimeout int64) {
+	l.loadExistingVolumesWithId(needleMapKind, ldbTimeout, 0) // Default disk ID for backward compatibility
+}
+
+func (l *DiskLocation) loadExistingVolumesWithId(needleMapKind NeedleMapKind, ldbTimeout int64, diskId uint32) {
 
 	workerNum := runtime.NumCPU()
 	val, ok := os.LookupEnv("GOMAXPROCS")
@@ -235,12 +359,74 @@ func (l *DiskLocation) loadExistingVolumes(needleMapKind NeedleMapKind, ldbTimeo
 			workerNum = 10
 		}
 	}
-	l.concurrentLoadingVolumes(needleMapKind, workerNum, ldbTimeout)
-	glog.V(0).Infof("Store started on dir: %s with %d volumes max %d", l.Directory, len(l.volumes), l.MaxVolumeCount)
+	// Recover any interrupted compaction commit before the volume scan. This
+	// must run here, not inside loadExistingVolume: that loop is keyed on
+	// .idx/.vif entries and would miss the marker-only or already-renamed-.idx
+	// states a mid-commit crash can leave behind.
+	l.reconcileCompactStates()
 
-	l.loadAllEcShards()
-	glog.V(0).Infof("Store started on dir: %s with %d ec shards", l.Directory, len(l.ecVolumes))
+	l.concurrentLoadingVolumes(needleMapKind, workerNum, ldbTimeout, diskId)
+	glog.V(2).Infof("Store started on dir: %s with %d volumes max %d (disk ID: %d)", l.Directory, len(l.volumes), l.MaxVolumeCount, diskId)
 
+	l.loadAllEcShards(l.ecShardNotifyHandler)
+	glog.V(2).Infof("Store started on dir: %s with %d ec shards (disk ID: %d)", l.Directory, len(l.ecVolumes), diskId)
+
+}
+
+// reconcileCompactStates is the directory pre-pass that recovers interrupted
+// compaction commits. It collects every volume id that still has a .cpc commit
+// marker or a leftover .cpd/.cpx temp file across the data and idx directories,
+// then runs reconcileCompactState per volume to roll the swap forward (marker
+// present) or back (marker absent).
+func (l *DiskLocation) reconcileCompactStates() {
+	type volKey struct {
+		collection string
+		vid        needle.VolumeId
+	}
+	pending := make(map[volKey]bool)
+	collect := func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".cpc") && !strings.HasSuffix(name, ".cpd") && !strings.HasSuffix(name, ".cpx") {
+				continue
+			}
+			collection, vid, err := parseCollectionVolumeId(name[:len(name)-4])
+			if err != nil {
+				continue
+			}
+			pending[volKey{collection, vid}] = true
+		}
+	}
+	collect(l.Directory)
+	if l.IdxDirectory != l.Directory {
+		collect(l.IdxDirectory)
+	}
+
+	for k := range pending {
+		// On a runtime reload (SIGHUP -> LoadNewVolumes), an already-loaded
+		// volume may be mid-vacuum: its .cpd/.cpx are live, not crash
+		// leftovers, and rolling them back would clobber the in-flight
+		// compaction (and remove a live .ldb). Only reconcile vids that are
+		// not currently loaded; genuine startup recovery runs before any
+		// volume is loaded, so the map is empty then.
+		l.volumesLock.RLock()
+		_, loaded := l.volumes[k.vid]
+		l.volumesLock.RUnlock()
+		if loaded {
+			continue
+		}
+		v := &Volume{dir: l.Directory, dirIdx: l.IdxDirectory, Collection: k.collection, Id: k.vid}
+		if err := v.reconcileCompactState(); err != nil {
+			glog.Errorf("volume %d: reconcile interrupted compaction failed: %v", k.vid, err)
+		}
+	}
 }
 
 func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (e error) {
@@ -257,9 +443,13 @@ func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (e er
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		for _, v := range delVolsMap {
-			if err := v.Destroy(false); err != nil {
+		for k, v := range delVolsMap {
+			if err := v.Destroy(false, false); err != nil {
 				errChain <- err
+			} else {
+				l.volumesLock.Lock()
+				delete(l.volumes, k)
+				l.volumesLock.Unlock()
 			}
 		}
 		wg.Done()
@@ -283,18 +473,18 @@ func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (e er
 		errBuilder.WriteString("; ")
 	}
 	if errBuilder.Len() > 0 {
-		e = fmt.Errorf(errBuilder.String())
+		e = fmt.Errorf("%s", errBuilder.String())
 	}
 
 	return
 }
 
-func (l *DiskLocation) deleteVolumeById(vid needle.VolumeId, onlyEmpty bool) (found bool, e error) {
+func (l *DiskLocation) deleteVolumeById(vid needle.VolumeId, onlyEmpty bool, keepRemoteData bool) (found bool, e error) {
 	v, ok := l.volumes[vid]
 	if !ok {
 		return
 	}
-	e = v.Destroy(onlyEmpty)
+	e = v.Destroy(onlyEmpty, keepRemoteData)
 	if e != nil {
 		return
 	}
@@ -303,16 +493,16 @@ func (l *DiskLocation) deleteVolumeById(vid needle.VolumeId, onlyEmpty bool) (fo
 	return
 }
 
-func (l *DiskLocation) LoadVolume(vid needle.VolumeId, needleMapKind NeedleMapKind) bool {
+func (l *DiskLocation) LoadVolume(diskId uint32, vid needle.VolumeId, needleMapKind NeedleMapKind) bool {
 	if fileInfo, found := l.LocateVolume(vid); found {
-		return l.loadExistingVolume(fileInfo, needleMapKind, false, 0)
+		return l.loadExistingVolume(fileInfo, needleMapKind, false, 0, diskId)
 	}
 	return false
 }
 
 var ErrVolumeNotFound = fmt.Errorf("volume not found")
 
-func (l *DiskLocation) DeleteVolume(vid needle.VolumeId, onlyEmpty bool) error {
+func (l *DiskLocation) DeleteVolume(vid needle.VolumeId, onlyEmpty bool, keepRemoteData bool) error {
 	l.volumesLock.Lock()
 	defer l.volumesLock.Unlock()
 
@@ -320,7 +510,7 @@ func (l *DiskLocation) DeleteVolume(vid needle.VolumeId, onlyEmpty bool) error {
 	if !ok {
 		return ErrVolumeNotFound
 	}
-	_, err := l.deleteVolumeById(vid, onlyEmpty)
+	_, err := l.deleteVolumeById(vid, onlyEmpty, keepRemoteData)
 	return err
 }
 
@@ -340,13 +530,9 @@ func (l *DiskLocation) UnloadVolume(vid needle.VolumeId) error {
 func (l *DiskLocation) unmountVolumeByCollection(collectionName string) map[needle.VolumeId]*Volume {
 	deltaVols := make(map[needle.VolumeId]*Volume, 0)
 	for k, v := range l.volumes {
-		if v.Collection == collectionName && !v.isCompacting && !v.isCommitCompacting {
+		if v.Collection == collectionName && !v.isCompactionInProgress.Load() {
 			deltaVols[k] = v
 		}
-	}
-
-	for k := range deltaVols {
-		delete(l.volumes, k)
 	}
 	return deltaVols
 }
@@ -367,11 +553,56 @@ func (l *DiskLocation) FindVolume(vid needle.VolumeId) (*Volume, bool) {
 	return v, ok
 }
 
+// Returns all regular volume IDs stored at this location.
+func (l *DiskLocation) VolumeIds() []needle.VolumeId {
+	l.volumesLock.RLock()
+	defer l.volumesLock.RUnlock()
+
+	vids := make([]needle.VolumeId, len(l.volumes))
+	i := 0
+	for vid := range l.volumes {
+		vids[i] = vid
+		i++
+	}
+
+	slices.Sort(vids)
+	return vids
+}
+
+// Returns all EC volume IDs stored at this location.
+func (l *DiskLocation) EcVolumeIds() []needle.VolumeId {
+	l.ecVolumesLock.RLock()
+	defer l.ecVolumesLock.RUnlock()
+
+	vids := make([]needle.VolumeId, len(l.ecVolumes))
+	i := 0
+	for vid := range l.ecVolumes {
+		vids[i] = vid
+		i++
+	}
+
+	slices.Sort(vids)
+	return vids
+}
+
 func (l *DiskLocation) VolumesLen() int {
 	l.volumesLock.RLock()
 	defer l.volumesLock.RUnlock()
 
 	return len(l.volumes)
+}
+
+func (l *DiskLocation) LocalVolumesLen() int {
+	l.volumesLock.RLock()
+	defer l.volumesLock.RUnlock()
+
+	count := 0
+	for _, v := range l.volumes {
+		if !v.HasRemoteFile() {
+			count++
+		}
+	}
+	return count
 }
 
 func (l *DiskLocation) SetStopping() {
@@ -436,20 +667,32 @@ func (l *DiskLocation) UnUsedSpace(volumeSizeLimit uint64) (unUsedSpace uint64) 
 	return
 }
 
-func (l *DiskLocation) CheckDiskSpace() {
+func (l *DiskLocation) CheckDiskSpace(config stats.DiskIOProbeConfig) {
 	if dir, e := filepath.Abs(l.Directory); e == nil {
-		s := stats.NewDiskStatus(dir)
+		s := stats.NewDiskStatusOnStart(dir, config)
+		if len(s.Error) != 0 {
+			l.isDiskUnavailable.Store(true)
+			stats.VolumeServerDiskErrorGauge.WithLabelValues(l.Directory, "error").Set(1)
+			glog.V(1).Infof("disk %s is not healthy: %s", dir, s.Error)
+		} else {
+			l.isDiskUnavailable.Store(false)
+			stats.VolumeServerDiskErrorGauge.WithLabelValues(l.Directory, "error").Set(0)
+		}
+		available := l.MinFreeSpace.AvailableSpace(s.Free, s.All)
 		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "all").Set(float64(s.All))
 		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "used").Set(float64(s.Used))
 		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "free").Set(float64(s.Free))
-
+		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "avail").Set(float64(available))
+		l.AvailableSpace.Store(available)
+		l.diskTotalBytes.Store(s.All)
+		l.diskFreeBytes.Store(s.Free)
 		isLow, desc := l.MinFreeSpace.IsLow(s.Free, s.PercentFree)
-		if isLow != l.isDiskSpaceLow {
-			l.isDiskSpaceLow = !l.isDiskSpaceLow
+		if isLow != l.isDiskSpaceLow.Load() {
+			l.isDiskSpaceLow.Store(isLow)
 		}
 
 		logLevel := glog.Level(4)
-		if l.isDiskSpaceLow {
+		if l.isDiskSpaceLow.Load() {
 			logLevel = glog.Level(0)
 		}
 

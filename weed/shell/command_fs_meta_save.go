@@ -1,9 +1,11 @@
 package shell
 
 import (
+	"compress/gzip"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 
 	"google.golang.org/protobuf/proto"
 
@@ -38,17 +42,21 @@ func (c *commandFsMetaSave) Help() string {
 	fs.meta.save .               # save from current directory
 	fs.meta.save                 # save from current directory
 
-	The meta data will be saved into a local <filer_host>-<port>-<time>.meta file.
+	The meta data will be saved into a local <filer_host>-<port>-<time>.meta.gz file.
 	These meta data can be later loaded by fs.meta.load command
 
 `
+}
+
+func (c *commandFsMetaSave) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	fsMetaSaveCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	verbose := fsMetaSaveCommand.Bool("v", false, "print out each processed files")
-	outputFileName := fsMetaSaveCommand.String("o", "", "output the meta data to this file")
+	outputFileName := fsMetaSaveCommand.String("o", "", "output the meta data to this file. If file name ends with .gz or .gzip, it will be gzip compressed")
 	isObfuscate := fsMetaSaveCommand.Bool("obfuscate", false, "obfuscate the file names")
 	// chunksFileName := fsMetaSaveCommand.String("chunks", "", "output all the chunks to this file")
 	if err = fsMetaSaveCommand.Parse(args); err != nil {
@@ -60,25 +68,41 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 		return parseErr
 	}
 
-	fileName := *outputFileName
+	fileName := util.ResolvePath(*outputFileName)
 	if fileName == "" {
 		t := time.Now()
-		fileName = fmt.Sprintf("%s-%4d%02d%02d-%02d%02d%02d.meta",
+		fileName = fmt.Sprintf("%s-%4d%02d%02d-%02d%02d%02d.meta.gz",
 			commandEnv.option.FilerAddress.ToHttpAddress(), t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second())
 	}
 
-	dst, openErr := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	var dst io.Writer
+
+	f, openErr := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if openErr != nil {
 		return fmt.Errorf("failed to create file %s: %v", fileName, openErr)
 	}
-	defer dst.Close()
+	defer f.Close()
+
+	dst = f
+
+	if strings.HasSuffix(fileName, ".gz") || strings.HasSuffix(fileName, ".gzip") {
+		gw := gzip.NewWriter(dst)
+		defer func() {
+			err1 := gw.Close()
+			if err == nil {
+				err = err1
+			}
+		}()
+
+		dst = gw
+	}
 
 	var cipherKey util.CipherKey
 	if *isObfuscate {
 		cipherKey = util.GenCipherKey()
 	}
 
-	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, func(entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
+	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, true, func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
 		if !entry.Entry.IsDirectory {
 			ext := filepath.Ext(entry.Entry.Name)
 			if encrypted, encErr := util.Encrypt([]byte(entry.Entry.Name), cipherKey); encErr == nil {
@@ -92,16 +116,27 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 			return
 		}
 
-		outputChan <- bytes
+		select {
+		case outputChan <- bytes:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		return nil
-	}, func(outputChan chan interface{}) {
+	}, func(outputChan chan interface{}) error {
 		sizeBuf := make([]byte, 4)
 		for item := range outputChan {
 			b := item.([]byte)
 			util.Uint32toBytes(sizeBuf, uint32(len(b)))
-			dst.Write(sizeBuf)
-			dst.Write(b)
+			_, err := dst.Write(sizeBuf)
+			if err != nil {
+				return err
+			}
+			_, err = dst.Write(b)
+			if err != nil {
+				return err
+			}
 		}
+		return nil
 	})
 
 	if err == nil {
@@ -112,22 +147,71 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 
 }
 
-func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, path string, verbose bool, genFn func(entry *filer_pb.FullEntry, outputChan chan interface{}) error, saveFn func(outputChan chan interface{})) error {
+// skipSystemLog excludes the metadata-log subtree (SystemLogDir) from the
+// traversal. fs.meta.save sets it so the export doesn't carry the whole change
+// log; volume.fsck and fs.verify must leave it false so the live log-file
+// chunks are accounted for — otherwise fsck reports them as orphans and could
+// delete referenced needles.
+func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, path string, verbose bool, skipSystemLog bool, genFn func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) error, saveFn func(outputChan chan interface{}) error) error {
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	outputChan := make(chan interface{}, 1024)
+	saveErrChan := make(chan error, 1)
 	go func() {
-		saveFn(outputChan)
+		saveErr := saveFn(outputChan)
+		saveErrChan <- saveErr
+		if saveErr != nil {
+			cancel()
+		}
 		wg.Done()
 	}()
 
 	var dirCount, fileCount uint64
+	var once sync.Once
+	var firstErr error
+	var hasErr atomic.Bool
 
-	err := filer_pb.TraverseBfs(filerClient, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) {
+	// also save the directory itself (path) if it exists in the filer
+	if e, getErr := filer_pb.GetEntry(ctx, filerClient, util.FullPath(path)); getErr != nil {
+		// Entry not found is expected and can be ignored; log other errors.
+		if !errors.Is(getErr, filer_pb.ErrNotFound) {
+			fmt.Fprintf(writer, "failed to get entry %s: %v\n", path, getErr)
+		}
+	} else if e != nil {
+		parentDir, _ := util.FullPath(path).DirAndName()
+		protoMessage := &filer_pb.FullEntry{
+			Dir:   parentDir,
+			Entry: e,
+		}
 
-		if strings.HasPrefix(string(parentPath), filer.SystemLogDir) {
-			return
+		if genErr := genFn(ctx, protoMessage, outputChan); genErr != nil {
+			once.Do(func() {
+				firstErr = genErr
+				hasErr.Store(true)
+			})
+			return genErr
+		} else {
+			if e.IsDirectory {
+				atomic.AddUint64(&dirCount, 1)
+			} else {
+				atomic.AddUint64(&fileCount, 1)
+			}
+		}
+	}
+
+	defer cancel()
+	systemLogChildPrefix := filer.SystemLogDir + "/"
+	err := filer_pb.TraverseBfs(ctx, filerClient, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
+
+		if skipSystemLog {
+			parent := string(parentPath)
+			if parent == filer.SystemLogDir || strings.HasPrefix(parent, systemLogChildPrefix) {
+				return nil
+			}
 		}
 
 		protoMessage := &filer_pb.FullEntry{
@@ -135,9 +219,17 @@ func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, 
 			Entry: entry,
 		}
 
-		if err := genFn(protoMessage, outputChan); err != nil {
-			fmt.Fprintf(writer, "marshall error: %v\n", err)
-			return
+		if hasErr.Load() {
+			// fail-fast: stop traversal once an error is observed.
+			return firstErr
+		}
+		if genErr := genFn(ctx, protoMessage, outputChan); genErr != nil {
+			once.Do(func() {
+				firstErr = genErr
+				hasErr.Store(true)
+				cancel()
+			})
+			return genErr
 		}
 
 		if entry.IsDirectory {
@@ -150,14 +242,23 @@ func doTraverseBfsAndSaving(filerClient filer_pb.FilerClient, writer io.Writer, 
 			println(parentPath.Child(entry.Name))
 		}
 
+		return nil
 	})
 
 	close(outputChan)
 
 	wg.Wait()
+	saveErr := <-saveErrChan
 
-	if err == nil && writer != nil {
+	if err != nil {
+		return err
+	}
+	if saveErr != nil {
+		return saveErr
+	}
+
+	if writer != nil {
 		fmt.Fprintf(writer, "total %d directories, %d files\n", dirCount, fileCount)
 	}
-	return err
+	return nil
 }

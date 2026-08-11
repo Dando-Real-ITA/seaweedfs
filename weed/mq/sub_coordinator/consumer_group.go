@@ -2,12 +2,14 @@ package sub_coordinator
 
 import (
 	"fmt"
+	"time"
+
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/seaweedfs/seaweedfs/weed/filer_client"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
-	"time"
+	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 )
 
 type ConsumerGroup struct {
@@ -20,7 +22,7 @@ type ConsumerGroup struct {
 	stopCh                 chan struct{}
 }
 
-func NewConsumerGroup(t *mq_pb.Topic, reblanceSeconds int32, filerClientAccessor *filer_client.FilerClientAccessor) *ConsumerGroup {
+func NewConsumerGroup(t *schema_pb.Topic, reblanceSeconds int32, filerClientAccessor *filer_client.FilerClientAccessor) *ConsumerGroup {
 	cg := &ConsumerGroup{
 		topic:                  topic.FromPbTopic(t),
 		ConsumerGroupInstances: cmap.New[*ConsumerGroupInstance](),

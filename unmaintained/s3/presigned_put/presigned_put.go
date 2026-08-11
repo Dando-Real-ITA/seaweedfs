@@ -4,12 +4,13 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
@@ -17,12 +18,15 @@ import (
 // or AWS_REGION environment variable.
 //
 // Usage:
-//     go run presigned_put.go
+//
+//	go run presigned_put.go
+//
 // For this exampl to work, the domainName is needd
-//     weed s3 -domainName=localhost
+//
+//	weed s3 -domainName=localhost
 func main() {
 	util_http.InitGlobalHttpClient()
-	
+
 	h := md5.New()
 	content := strings.NewReader(stringContent)
 	content.WriteTo(h)

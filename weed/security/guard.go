@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
@@ -39,30 +41,50 @@ Generating JWT:
 Referenced:
 https://github.com/pkieltyka/jwtauth/blob/master/jwtauth.go
 */
-type Guard struct {
-	whiteList           []string
-	SigningKey          SigningKey
-	ExpiresAfterSec     int
-	ReadSigningKey      SigningKey
-	ReadExpiresAfterSec int
+// guardState is the immutable snapshot of all hot-reloadable Guard state. The
+// Update* methods build a new snapshot from the current one and swap it in
+// atomically, so request-path readers (WhiteList, IsWhiteListed, the SigningKey
+// accessors) always observe a consistent set of keys and whitelist — never a
+// torn slice header or a mix of old and new state across a SIGHUP.
+type guardState struct {
+	signingKey          SigningKey
+	expiresAfterSec     int
+	readSigningKey      SigningKey
+	readExpiresAfterSec int
 
-	isWriteActive bool
+	whiteListIp      map[string]struct{}
+	whiteListCIDR    map[string]*net.IPNet
+	isWriteActive    bool
+	isEmptyWhiteList bool
+}
+
+type Guard struct {
+	// state is swapped atomically by the Update* methods. Read it via Load.
+	state atomic.Pointer[guardState]
+	// updateMu serializes the read-modify-write inside the Update* methods so
+	// concurrent reloads don't clobber each other; readers stay lock-free.
+	updateMu sync.Mutex
 }
 
 func NewGuard(whiteList []string, signingKey string, expiresAfterSec int, readSigningKey string, readExpiresAfterSec int) *Guard {
-	g := &Guard{
-		whiteList:           whiteList,
-		SigningKey:          SigningKey(signingKey),
-		ExpiresAfterSec:     expiresAfterSec,
-		ReadSigningKey:      SigningKey(readSigningKey),
-		ReadExpiresAfterSec: readExpiresAfterSec,
-	}
-	g.isWriteActive = len(g.whiteList) != 0 || len(g.SigningKey) != 0
+	g := &Guard{}
+	g.state.Store(&guardState{
+		signingKey:          SigningKey(signingKey),
+		expiresAfterSec:     expiresAfterSec,
+		readSigningKey:      SigningKey(readSigningKey),
+		readExpiresAfterSec: readExpiresAfterSec,
+	})
+	g.UpdateWhiteList(whiteList)
 	return g
 }
 
+func (g *Guard) SigningKey() SigningKey     { return g.state.Load().signingKey }
+func (g *Guard) ExpiresAfterSec() int       { return g.state.Load().expiresAfterSec }
+func (g *Guard) ReadSigningKey() SigningKey { return g.state.Load().readSigningKey }
+func (g *Guard) ReadExpiresAfterSec() int   { return g.state.Load().readExpiresAfterSec }
+
 func (g *Guard) WhiteList(f http.HandlerFunc) http.HandlerFunc {
-	if !g.isWriteActive {
+	if !g.state.Load().isWriteActive {
 		//if no security needed, just skip all checking
 		return f
 	}
@@ -75,52 +97,97 @@ func (g *Guard) WhiteList(f http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func GetActualRemoteHost(r *http.Request) (host string, err error) {
-	host = r.Header.Get("HTTP_X_FORWARDED_FOR")
-	if host == "" {
-		host = r.Header.Get("X-FORWARDED-FOR")
+func GetActualRemoteHost(r *http.Request) string {
+	// For security reasons, only use RemoteAddr to determine the client's IP address.
+	// Do not trust headers like X-Forwarded-For, as they can be easily spoofed by clients.
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
 	}
-	if strings.Contains(host, ",") {
-		host = host[0:strings.Index(host, ",")]
+
+	// If SplitHostPort fails, it may be because of a missing port.
+	// We try to parse RemoteAddr as a raw host (IP or hostname).
+	host = strings.TrimSpace(r.RemoteAddr)
+	// It might be an IPv6 address without a port, but with brackets.
+	// e.g. "[::1]"
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
 	}
-	if host == "" {
-		host, _, err = net.SplitHostPort(r.RemoteAddr)
-	}
-	return
+
+	// Return the host (can be IP or hostname, just like headers)
+	return host
 }
 
 func (g *Guard) checkWhiteList(w http.ResponseWriter, r *http.Request) error {
-	if len(g.whiteList) == 0 {
+	host := GetActualRemoteHost(r)
+	if g.IsWhiteListed(host) {
 		return nil
 	}
+	glog.V(0).Infof("Not in whitelist: %s (original RemoteAddr: %s)", host, r.RemoteAddr)
+	return fmt.Errorf("Not in whitelist: %s", host)
+}
 
-	host, err := GetActualRemoteHost(r)
-	if err == nil {
-		for _, ip := range g.whiteList {
-
-			// If the whitelist entry contains a "/" it
-			// is a CIDR range, and we should check the
-			// remote host is within it
-			if strings.Contains(ip, "/") {
-				_, cidrnet, err := net.ParseCIDR(ip)
-				if err != nil {
-					panic(err)
-				}
-				remote := net.ParseIP(host)
-				if cidrnet.Contains(remote) {
-					return nil
-				}
-			}
-
-			//
-			// Otherwise we're looking for a literal match.
-			//
-			if ip == host {
-				return nil
+// IsWhiteListed returns true if the given host IP is allowed by the guard.
+// When no whitelist is configured (security inactive), all hosts are allowed.
+func (g *Guard) IsWhiteListed(host string) bool {
+	st := g.state.Load()
+	if !st.isWriteActive {
+		return true
+	}
+	if st.isEmptyWhiteList {
+		return true
+	}
+	if _, ok := st.whiteListIp[host]; ok {
+		return true
+	}
+	remote := net.ParseIP(host)
+	if remote != nil {
+		for _, cidrnet := range st.whiteListCIDR {
+			if cidrnet.Contains(remote) {
+				return true
 			}
 		}
 	}
+	return false
+}
 
-	glog.V(0).Infof("Not in whitelist: %s", r.RemoteAddr)
-	return fmt.Errorf("Not in whitelist: %s", r.RemoteAddr)
+// UpdateSigningKeys refreshes the JWT signing keys and their expirations so
+// operators can rotate keys (e.g. via SIGHUP) without restarting the process.
+// It swaps in a new snapshot carrying the existing whitelist, so a concurrent
+// reader sees either the old keys or the new ones, never a torn slice header.
+func (g *Guard) UpdateSigningKeys(signingKey string, expiresAfterSec int, readSigningKey string, readExpiresAfterSec int) {
+	g.updateMu.Lock()
+	defer g.updateMu.Unlock()
+	next := *g.state.Load()
+	next.signingKey = SigningKey(signingKey)
+	next.expiresAfterSec = expiresAfterSec
+	next.readSigningKey = SigningKey(readSigningKey)
+	next.readExpiresAfterSec = readExpiresAfterSec
+	next.isWriteActive = !next.isEmptyWhiteList || len(next.signingKey) != 0
+	g.state.Store(&next)
+}
+
+func (g *Guard) UpdateWhiteList(whiteList []string) {
+	whiteListIp := make(map[string]struct{})
+	whiteListCIDR := make(map[string]*net.IPNet)
+	for _, ip := range whiteList {
+		if strings.Contains(ip, "/") {
+			_, cidrnet, err := net.ParseCIDR(ip)
+			if err != nil {
+				glog.Errorf("Parse CIDR %s in whitelist failed: %v", ip, err)
+				continue
+			}
+			whiteListCIDR[ip] = cidrnet
+		} else {
+			whiteListIp[ip] = struct{}{}
+		}
+	}
+	g.updateMu.Lock()
+	defer g.updateMu.Unlock()
+	next := *g.state.Load()
+	next.isEmptyWhiteList = len(whiteListIp) == 0 && len(whiteListCIDR) == 0
+	next.isWriteActive = !next.isEmptyWhiteList || len(next.signingKey) != 0
+	next.whiteListIp = whiteListIp
+	next.whiteListCIDR = whiteListCIDR
+	g.state.Store(&next)
 }

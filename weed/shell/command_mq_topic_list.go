@@ -3,11 +3,12 @@ package shell
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/mq/pub_balancer"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
-	"io"
 )
 
 func init() {
@@ -23,6 +24,10 @@ func (c *commandMqTopicList) Name() string {
 
 func (c *commandMqTopicList) Help() string {
 	return `print out all topics`
+}
+
+func (c *commandMqTopicList) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandMqTopicList) Do(args []string, commandEnv *CommandEnv, writer io.Writer) error {
@@ -55,7 +60,7 @@ func findBrokerBalancer(commandEnv *CommandEnv) (brokerBalancer string, err erro
 			Name: pub_balancer.LockBrokerBalancer,
 		})
 		if err != nil {
-			return fmt.Errorf("FindLockOwner: %v", err)
+			return fmt.Errorf("FindLockOwner: %w", err)
 		}
 		brokerBalancer = resp.Owner
 		return nil

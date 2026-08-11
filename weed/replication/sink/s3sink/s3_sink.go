@@ -3,6 +3,10 @@ package S3Sink
 import (
 	"encoding/base64"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -10,12 +14,11 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
-	"strconv"
-	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
 	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -118,7 +121,7 @@ func (s3sink *S3Sink) initialize(awsAccessKeyId, awsSecretAccessKey string) erro
 
 	sess, err := session.NewSession(config)
 	if err != nil {
-		return fmt.Errorf("create aws session: %v", err)
+		return fmt.Errorf("create aws session: %w", err)
 	}
 	s3sink.conn = s3.New(sess)
 
@@ -159,6 +162,14 @@ func (s3sink *S3Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures 
 
 	reader := filer.NewFileReader(s3sink.filerSource, entry)
 
+	// Decrypt SSE-encrypted objects so the destination receives plaintext
+	decryptedReader, err := repl_util.MaybeDecryptReader(reader, entry)
+	if err != nil {
+		repl_util.CloseReader(reader)
+		return fmt.Errorf("decrypt SSE object: %w", err)
+	}
+	defer repl_util.CloseMaybeDecryptedReader(reader, decryptedReader)
+
 	// Create an uploader with the session and custom options
 	uploader := s3manager.NewUploaderWithClient(s3sink.conn, func(u *s3manager.Uploader) {
 		u.PartSize = int64(s3sink.uploaderPartSizeMb * 1024 * 1024)
@@ -187,20 +198,19 @@ func (s3sink *S3Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures 
 		entry.Extended[s3_constants.AmzUserMetaMtime] = []byte(strconv.FormatInt(entry.Attributes.Mtime, 10))
 	}
 	// process tagging
-	tags := ""
-	for k, v := range entry.Extended {
-		if len(tags) > 0 {
-			tags = tags + "&"
-		}
-		tags = tags + k + "=" + string(v)
-	}
+	tags := buildTaggingString(entry.Extended)
 
 	// Upload the file to S3.
 	uploadInput := s3manager.UploadInput{
-		Bucket:  aws.String(s3sink.bucket),
-		Key:     aws.String(key),
-		Body:    reader,
-		Tagging: aws.String(tags),
+		Bucket: aws.String(s3sink.bucket),
+		Key:    aws.String(key),
+		Body:   decryptedReader,
+	}
+	if tags != "" {
+		uploadInput.Tagging = aws.String(tags)
+	}
+	if entry.Attributes.Mime != "" {
+		uploadInput.ContentType = aws.String(entry.Attributes.Mime)
 	}
 	if len(entry.Attributes.Md5) > 0 {
 		uploadInput.ContentMD5 = aws.String(base64.StdEncoding.EncodeToString([]byte(entry.Attributes.Md5)))
@@ -221,4 +231,19 @@ func cleanKey(key string) string {
 		key = key[1:]
 	}
 	return key
+}
+
+// buildTaggingString builds the S3 Tagging header value from entry extended metadata.
+// Only keys with the AmzObjectTaggingPrefix ("X-Amz-Tagging-") are included as object
+// tags. The prefix is stripped and values are URL-encoded to produce a valid S3 tagging
+// query string.
+func buildTaggingString(extended map[string][]byte) string {
+	tagValues := url.Values{}
+	for k, v := range extended {
+		if strings.HasPrefix(k, s3_constants.AmzObjectTaggingPrefix) {
+			tagKey := k[len(s3_constants.AmzObjectTaggingPrefix):]
+			tagValues.Set(tagKey, string(v))
+		}
+	}
+	return tagValues.Encode()
 }

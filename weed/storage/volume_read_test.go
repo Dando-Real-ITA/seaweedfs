@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -9,13 +10,43 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestReadNeedMetaWithWritesAndUpdates(t *testing.T) {
+func TestReadNeedleNilNeedleMap(t *testing.T) {
 	dir := t.TempDir()
 
-	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, 0, 0)
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
 	if err != nil {
 		t.Fatalf("volume creation: %v", err)
 	}
+	defer v.Close()
+
+	v.dataFileAccessLock.Lock()
+	if v.nm != nil {
+		v.nm.Close()
+		v.nm = nil
+	}
+	v.dataFileAccessLock.Unlock()
+
+	n := new(needle.Needle)
+	n.Id = types.Uint64ToNeedleId(1)
+
+	if _, err := v.readNeedle(n, &ReadOption{}, nil); err != ErrorNotFound {
+		t.Fatalf("readNeedle: want ErrorNotFound, got %v", err)
+	}
+
+	err = v.readNeedleDataInto(n, &ReadOption{ReadBufferSize: 1024}, &bytes.Buffer{}, 0, 0)
+	if err != ErrorNotFound {
+		t.Fatalf("readNeedleDataInto: want ErrorNotFound, got %v", err)
+	}
+}
+
+func TestReadNeedMetaWithWritesAndUpdates(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
 	type WriteInfo struct {
 		offset int64
 		size   int32
@@ -51,10 +82,11 @@ func TestReadNeedMetaWithWritesAndUpdates(t *testing.T) {
 func TestReadNeedMetaWithDeletesThenWrites(t *testing.T) {
 	dir := t.TempDir()
 
-	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, 0, 0)
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
 	if err != nil {
 		t.Fatalf("volume creation: %v", err)
 	}
+	defer v.Close()
 	type WriteInfo struct {
 		offset int64
 		size   int32

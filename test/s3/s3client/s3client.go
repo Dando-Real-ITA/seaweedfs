@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"time"
 )
 
 func main() {
@@ -22,7 +23,7 @@ func main() {
 			Name:       "newbucket",
 			Versioning: false,
 		},
-		MaxBackoffDelay:  aws.Int(int(time.Second * 5)),
+		MaxBackoffDelay:  aws.Int(int((5 * time.Second).Milliseconds())),
 		MaxRetryAttempts: aws.Int(1),
 	}
 
@@ -76,7 +77,7 @@ func MyAwsConfig(cfg MyConfig) (*aws.Config, error) {
 		config.WithEndpointResolverWithOptions(customResolver),
 		config.WithRetryer(func() aws.Retryer {
 			r := retry.AddWithMaxAttempts(retry.NewStandard(), *cfg.MaxRetryAttempts)
-			return retry.AddWithMaxBackoffDelay(r, time.Duration(*cfg.MaxBackoffDelay*1000*1000))
+			return retry.AddWithMaxBackoffDelay(r, time.Duration(*cfg.MaxBackoffDelay)*time.Millisecond)
 		}))
 	return &awsCfg, err
 }

@@ -1,8 +1,10 @@
 package shell
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/util"
+	"fmt"
 	"io"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func init() {
@@ -25,9 +27,32 @@ func (c *commandLock) Help() string {
 `
 }
 
+func (c *commandLock) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandLock) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
+	waited := false
+	if !commandEnv.locker.IsLocked() {
+		if holder, message, held := commandEnv.shellLockHolder(); held {
+			waited = true
+			if holder == "" {
+				holder = "another client"
+			}
+			if message != "" {
+				fmt.Fprintf(writer, "waiting for lock held by %s: %s\n", holder, message)
+			} else {
+				fmt.Fprintf(writer, "waiting for lock held by %s\n", holder)
+			}
+		}
+	}
+
 	commandEnv.locker.RequestLock(util.DetectedHostAddress())
+
+	if waited {
+		fmt.Fprintln(writer, "lock acquired")
+	}
 
 	return nil
 }
@@ -45,6 +70,10 @@ func (c *commandUnlock) Help() string {
 	return `unlock the cluster-wide lock
 
 `
+}
+
+func (c *commandUnlock) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandUnlock) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {

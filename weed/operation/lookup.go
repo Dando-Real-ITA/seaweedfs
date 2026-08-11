@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
-	"google.golang.org/grpc"
 	"math/rand/v2"
 	"strings"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
@@ -29,6 +30,7 @@ type LookupResult struct {
 	Locations      []Location `json:"locations,omitempty"`
 	Jwt            string     `json:"jwt,omitempty"`
 	Error          string     `json:"error,omitempty"`
+	NotFound       bool       `json:"-"`
 }
 
 func (lr *LookupResult) String() string {
@@ -59,6 +61,11 @@ func LookupVolumeId(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid st
 	return results[vid], err
 }
 
+// InvalidateVolumeIdLocationCache drops cached locations for vid so the next lookup re-queries the master.
+func InvalidateVolumeIdLocationCache(vid string) {
+	vc.Delete(vid)
+}
+
 // LookupVolumeIds find volume locations by cache and actual lookup
 func LookupVolumeIds(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids []string) (map[string]*LookupResult, error) {
 	ret := make(map[string]*LookupResult)
@@ -80,7 +87,7 @@ func LookupVolumeIds(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids 
 
 	//only query unknown_vids
 
-	err := WithMasterServerClient(false, masterFn(context.Background()), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+	err := WithMasterServerClient(context.Background(), false, masterFn(context.Background()), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 
 		req := &master_pb.LookupVolumeRequest{
 			VolumeOrFileIds: unknown_vids,
@@ -101,7 +108,7 @@ func LookupVolumeIds(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vids 
 					GrpcPort:   int(loc.GrpcPort),
 				})
 			}
-			if vidLocations.Error != "" {
+			if vidLocations.Error == "" {
 				vc.Set(vidLocations.VolumeOrFileId, locations, 10*time.Minute)
 			}
 			ret[vidLocations.VolumeOrFileId] = &LookupResult{

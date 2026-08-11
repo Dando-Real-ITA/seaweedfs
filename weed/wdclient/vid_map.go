@@ -1,27 +1,25 @@
 package wdclient
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/seaweedfs/seaweedfs/weed/glog"
-)
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 
-const (
-	maxCursorIndex = 4096
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 type HasLookupFileIdFunction interface {
 	GetLookupFileIdFunction() LookupFileIdFunctionType
 }
 
-type LookupFileIdFunctionType func(fileId string) (targetUrls []string, err error)
+type LookupFileIdFunctionType func(ctx context.Context, fileId string) (targetUrls []string, err error)
 
 type Location struct {
 	Url        string `json:"url,omitempty"`
@@ -38,28 +36,30 @@ type vidMap struct {
 	sync.RWMutex
 	vid2Locations   map[uint32][]Location
 	ecVid2Locations map[uint32][]Location
-	DataCenter      string
-	cursor          int32
-	cache           *vidMap
+	// serverRefCount tracks how many vid locations (regular + EC) currently
+	// reference each volume server address. Maintaining it incrementally lets
+	// hasVolumeServer answer in O(1) instead of walking every volume entry.
+	// Keys are the canonical http form of pb.ServerAddress, so callers that
+	// pass either "host:port" or "host:port.grpc" find the same entry.
+	serverRefCount map[string]int
+	DataCenter     string
+	cache          atomic.Pointer[vidMap]
 }
 
 func newVidMap(dataCenter string) *vidMap {
 	return &vidMap{
 		vid2Locations:   make(map[uint32][]Location),
 		ecVid2Locations: make(map[uint32][]Location),
+		serverRefCount:  make(map[string]int),
 		DataCenter:      dataCenter,
-		cursor:          -1,
 	}
 }
 
-func (vc *vidMap) getLocationIndex(length int) (int, error) {
-	if length <= 0 {
-		return 0, fmt.Errorf("invalid length: %d", length)
-	}
-	if atomic.LoadInt32(&vc.cursor) == maxCursorIndex {
-		atomic.CompareAndSwapInt32(&vc.cursor, maxCursorIndex, -1)
-	}
-	return int(atomic.AddInt32(&vc.cursor, 1)) % length, nil
+// locationServerKey returns the index key used by serverRefCount for a
+// Location. The key normalises away the optional grpc-port suffix so the
+// counter stays consistent with hasVolumeServer's lookup.
+func locationServerKey(loc Location) string {
+	return loc.ServerAddress().ToHttpAddress()
 }
 
 func (vc *vidMap) isSameDataCenter(loc *Location) bool {
@@ -99,7 +99,7 @@ func (vc *vidMap) LookupVolumeServerUrl(vid string) (serverUrls []string, err er
 	return
 }
 
-func (vc *vidMap) LookupFileId(fileId string) (fullUrls []string, err error) {
+func (vc *vidMap) LookupFileId(ctx context.Context, fileId string) (fullUrls []string, err error) {
 	parts := strings.Split(fileId, ",")
 	if len(parts) != 2 {
 		return nil, errors.New("Invalid fileId " + fileId)
@@ -130,12 +130,21 @@ func (vc *vidMap) GetVidLocations(vid string) (locations []Location, err error) 
 func (vc *vidMap) GetLocations(vid uint32) (locations []Location, found bool) {
 	// glog.V(4).Infof("~ lookup volume id %d: %+v ec:%+v", vid, vc.vid2Locations, vc.ecVid2Locations)
 	locations, found = vc.getLocations(vid)
-	if found && len(locations) > 0 {
-		return locations, found
+	if found {
+		// If volume is explicitly tracked (found=true), return its locations even if empty.
+		// An empty array means "volume has no locations" (e.g., during pod restart),
+		// which is different from "volume never existed" (found=false).
+		// Don't fall back to stale cache for explicitly empty volumes.
+		if len(locations) > 0 {
+			return locations, found
+		}
+		// Volume exists but has no locations - return empty, don't check cache
+		return nil, false
 	}
 
-	if vc.cache != nil {
-		return vc.cache.GetLocations(vid)
+	// Volume not found in current map - check cache for unknown volumes
+	if cachedMap := vc.cache.Load(); cachedMap != nil {
+		return cachedMap.GetLocations(vid)
 	}
 
 	return nil, false
@@ -166,6 +175,28 @@ func (vc *vidMap) getLocations(vid uint32) (locations []Location, found bool) {
 	return
 }
 
+// hasVolumeServer reports whether any tracked volume (regular or EC) is hosted
+// on addr. It walks the cache chain so recently expired maps are still
+// considered. Used to gate admission of operations targeting a volume server.
+// The lookup is O(1) thanks to serverRefCount; we still consult the cache
+// chain to keep covering volume servers that just rolled out of the live map.
+func (vc *vidMap) hasVolumeServer(addr pb.ServerAddress) bool {
+	key := addr.ToHttpAddress()
+	if key == "" {
+		return false
+	}
+	vc.RLock()
+	count := vc.serverRefCount[key]
+	vc.RUnlock()
+	if count > 0 {
+		return true
+	}
+	if cachedMap := vc.cache.Load(); cachedMap != nil {
+		return cachedMap.hasVolumeServer(addr)
+	}
+	return false
+}
+
 func (vc *vidMap) addLocation(vid uint32, location Location) {
 	vc.Lock()
 	defer vc.Unlock()
@@ -175,6 +206,7 @@ func (vc *vidMap) addLocation(vid uint32, location Location) {
 	locations, found := vc.vid2Locations[vid]
 	if !found {
 		vc.vid2Locations[vid] = []Location{location}
+		vc.incrementServerRef(locationServerKey(location))
 		return
 	}
 
@@ -185,6 +217,7 @@ func (vc *vidMap) addLocation(vid uint32, location Location) {
 	}
 
 	vc.vid2Locations[vid] = append(locations, location)
+	vc.incrementServerRef(locationServerKey(location))
 
 }
 
@@ -197,6 +230,7 @@ func (vc *vidMap) addEcLocation(vid uint32, location Location) {
 	locations, found := vc.ecVid2Locations[vid]
 	if !found {
 		vc.ecVid2Locations[vid] = []Location{location}
+		vc.incrementServerRef(locationServerKey(location))
 		return
 	}
 
@@ -207,12 +241,13 @@ func (vc *vidMap) addEcLocation(vid uint32, location Location) {
 	}
 
 	vc.ecVid2Locations[vid] = append(locations, location)
+	vc.incrementServerRef(locationServerKey(location))
 
 }
 
 func (vc *vidMap) deleteLocation(vid uint32, location Location) {
-	if vc.cache != nil {
-		vc.cache.deleteLocation(vid, location)
+	if cachedMap := vc.cache.Load(); cachedMap != nil {
+		cachedMap.deleteLocation(vid, location)
 	}
 
 	vc.Lock()
@@ -228,14 +263,15 @@ func (vc *vidMap) deleteLocation(vid uint32, location Location) {
 	for i, loc := range locations {
 		if loc.Url == location.Url {
 			vc.vid2Locations[vid] = append(locations[0:i], locations[i+1:]...)
+			vc.decrementServerRef(locationServerKey(loc))
 			break
 		}
 	}
 }
 
 func (vc *vidMap) deleteEcLocation(vid uint32, location Location) {
-	if vc.cache != nil {
-		vc.cache.deleteLocation(vid, location)
+	if cachedMap := vc.cache.Load(); cachedMap != nil {
+		cachedMap.deleteEcLocation(vid, location)
 	}
 
 	vc.Lock()
@@ -251,7 +287,52 @@ func (vc *vidMap) deleteEcLocation(vid uint32, location Location) {
 	for i, loc := range locations {
 		if loc.Url == location.Url {
 			vc.ecVid2Locations[vid] = append(locations[0:i], locations[i+1:]...)
+			vc.decrementServerRef(locationServerKey(loc))
 			break
+		}
+	}
+}
+
+func (vc *vidMap) deleteVid(vid uint32) {
+	if cachedMap := vc.cache.Load(); cachedMap != nil {
+		cachedMap.deleteVid(vid)
+	}
+
+	vc.Lock()
+	defer vc.Unlock()
+
+	for _, loc := range vc.vid2Locations[vid] {
+		vc.decrementServerRef(locationServerKey(loc))
+	}
+	for _, loc := range vc.ecVid2Locations[vid] {
+		vc.decrementServerRef(locationServerKey(loc))
+	}
+	delete(vc.vid2Locations, vid)
+	delete(vc.ecVid2Locations, vid)
+}
+
+// incrementServerRef increases the refcount for key. Empty keys are skipped
+// so a zero-value Location (which serialises to "") does not leak a permanent
+// bucket that hasVolumeServer and decrementServerRef both ignore. Callers
+// must hold vc's write lock.
+func (vc *vidMap) incrementServerRef(key string) {
+	if key == "" {
+		return
+	}
+	vc.serverRefCount[key]++
+}
+
+// decrementServerRef decreases the refcount for key and removes the entry
+// once it falls to zero. Callers must hold vc's write lock.
+func (vc *vidMap) decrementServerRef(key string) {
+	if key == "" {
+		return
+	}
+	if n, ok := vc.serverRefCount[key]; ok {
+		if n <= 1 {
+			delete(vc.serverRefCount, key)
+		} else {
+			vc.serverRefCount[key] = n - 1
 		}
 	}
 }

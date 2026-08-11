@@ -4,8 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"io"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 func init() {
@@ -27,6 +28,10 @@ func (c *commandRaftServerRemove) Help() string {
 `
 }
 
+func (c *commandRaftServerRemove) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandRaftServerRemove) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	raftServerAddCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -45,7 +50,7 @@ func (c *commandRaftServerRemove) Do(args []string, commandEnv *CommandEnv, writ
 			Force: true,
 		})
 		if err != nil {
-			return fmt.Errorf("raft remove server: %v", err)
+			return fmt.Errorf("raft remove server: %w", err)
 		}
 		println("removed server", *serverId)
 		return nil

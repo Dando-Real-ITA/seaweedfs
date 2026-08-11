@@ -1,8 +1,9 @@
 package s3bucket
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func Test_verifyBucketName(t *testing.T) {
@@ -11,10 +12,12 @@ func Test_verifyBucketName(t *testing.T) {
 		"123.12.153.10",
 		"abc214..2",
 		"d",
+		"aa",
 		".ewfs3253543",
 		"grehtrry-",
 		"----------",
 		"x@fdsgr032",
+		"filemeta",
 	}
 	for _, invalidName := range invalidS3BucketNames {
 		err := VerifyS3BucketName(invalidName)

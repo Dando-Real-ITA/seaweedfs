@@ -17,15 +17,28 @@
 package s3_constants
 
 import (
-	"github.com/gorilla/mux"
+	"context"
 	"net/http"
 	"strings"
+	"sync/atomic"
+
+	"github.com/gorilla/mux"
+)
+
+// S3 XML namespace
+const (
+	S3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
+)
+
+// S3 object key limits
+const (
+	MaxS3ObjectKeyLength = 1024
 )
 
 // Standard S3 HTTP request constants
 const (
 	// S3 storage class
-	AmzStorageClass = "x-amz-storage-class"
+	AmzStorageClass = "X-Amz-Storage-Class"
 
 	// S3 user-defined metadata
 	AmzUserMetaPrefix    = "X-Amz-Meta-"
@@ -38,9 +51,17 @@ const (
 	AmzObjectTaggingDirective = "X-Amz-Tagging-Directive"
 	AmzTagCount               = "x-amz-tagging-count"
 
-	SeaweedFSIsDirectoryKey = "X-Seaweedfs-Is-Directory-Key"
-	SeaweedFSPartNumber     = "X-Seaweedfs-Part-Number"
-	SeaweedFSUploadId       = "X-Seaweedfs-Upload-Id"
+	// GetObjectAttributes headers
+	AmzObjectAttributes = "X-Amz-Object-Attributes"
+	AmzMaxParts         = "X-Amz-Max-Parts"
+	AmzPartNumberMarker = "X-Amz-Part-Number-Marker"
+	AmzDeleteMarker     = "X-Amz-Delete-Marker"
+
+	SeaweedFSUploadId                = "X-Seaweedfs-Upload-Id"
+	SeaweedFSMultipartPartsCount     = "X-Seaweedfs-Multipart-Parts-Count"
+	SeaweedFSMultipartPartBoundaries = "X-Seaweedfs-Multipart-Part-Boundaries" // JSON: [{part:1,start:0,end:2,etag:"abc"},{part:2,start:2,end:3,etag:"def"}]
+	SeaweedFSExpiresS3               = "X-Seaweedfs-Expires-S3"
+	AmzMpPartsCount                  = "x-amz-mp-parts-count"
 
 	// S3 ACL headers
 	AmzCannedAcl      = "X-Amz-Acl"
@@ -50,7 +71,103 @@ const (
 	AmzAclReadAcp     = "X-Amz-Grant-Read-Acp"
 	AmzAclWriteAcp    = "X-Amz-Grant-Write-Acp"
 
-	AmzMpPartsCount = "X-Amz-Mp-Parts-Count"
+	// S3 Object Lock headers
+	AmzBucketObjectLockEnabled   = "X-Amz-Bucket-Object-Lock-Enabled"
+	AmzObjectLockMode            = "X-Amz-Object-Lock-Mode"
+	AmzObjectLockRetainUntilDate = "X-Amz-Object-Lock-Retain-Until-Date"
+	AmzObjectLockLegalHold       = "X-Amz-Object-Lock-Legal-Hold"
+
+	// S3 checksum headers
+	AmzChecksumAlgorithm    = "X-Amz-Checksum-Algorithm"
+	AmzChecksumCRC32        = "X-Amz-Checksum-Crc32"
+	AmzChecksumCRC32C       = "X-Amz-Checksum-Crc32c"
+	AmzChecksumCRC64NVME    = "X-Amz-Checksum-Crc64nvme"
+	AmzChecksumSHA1         = "X-Amz-Checksum-Sha1"
+	AmzChecksumSHA256       = "X-Amz-Checksum-Sha256"
+	AmzTrailer              = "X-Amz-Trailer"
+	AmzSdkChecksumAlgorithm = "X-Amz-Sdk-Checksum-Algorithm"
+	AmzChecksumType         = "X-Amz-Checksum-Type"
+
+	// S3 checksum type values (x-amz-checksum-type). A COMPOSITE checksum is a
+	// checksum-of-per-part-checksums ("base64-N"); a FULL_OBJECT checksum is the
+	// checksum of the whole object as if uploaded in a single request ("base64").
+	ChecksumTypeComposite  = "COMPOSITE"
+	ChecksumTypeFullObject = "FULL_OBJECT"
+
+	// S3 conditional headers
+	IfMatch           = "If-Match"
+	IfNoneMatch       = "If-None-Match"
+	IfModifiedSince   = "If-Modified-Since"
+	IfUnmodifiedSince = "If-Unmodified-Since"
+
+	// S3 conditional copy headers
+	AmzCopySourceIfMatch           = "X-Amz-Copy-Source-If-Match"
+	AmzCopySourceIfNoneMatch       = "X-Amz-Copy-Source-If-None-Match"
+	AmzCopySourceIfModifiedSince   = "X-Amz-Copy-Source-If-Modified-Since"
+	AmzCopySourceIfUnmodifiedSince = "X-Amz-Copy-Source-If-Unmodified-Since"
+
+	// S3 Server-Side Encryption with Customer-provided Keys (SSE-C)
+	AmzServerSideEncryptionCustomerAlgorithm = "X-Amz-Server-Side-Encryption-Customer-Algorithm"
+	AmzServerSideEncryptionCustomerKey       = "X-Amz-Server-Side-Encryption-Customer-Key"
+	AmzServerSideEncryptionCustomerKeyMD5    = "X-Amz-Server-Side-Encryption-Customer-Key-MD5"
+	AmzServerSideEncryptionContext           = "X-Amz-Server-Side-Encryption-Context"
+
+	// S3 Server-Side Encryption with KMS (SSE-KMS)
+	AmzServerSideEncryption                 = "X-Amz-Server-Side-Encryption"
+	AmzServerSideEncryptionAwsKmsKeyId      = "X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"
+	AmzServerSideEncryptionBucketKeyEnabled = "X-Amz-Server-Side-Encryption-Bucket-Key-Enabled"
+
+	// S3 SSE-C copy source headers
+	AmzCopySourceServerSideEncryptionCustomerAlgorithm = "X-Amz-Copy-Source-Server-Side-Encryption-Customer-Algorithm"
+	AmzCopySourceServerSideEncryptionCustomerKey       = "X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key"
+	AmzCopySourceServerSideEncryptionCustomerKeyMD5    = "X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key-MD5"
+)
+
+// Metadata keys for internal storage
+const (
+	// SSE-KMS metadata keys
+	AmzEncryptedDataKey      = "x-amz-encrypted-data-key"
+	AmzEncryptionContextMeta = "x-amz-encryption-context"
+
+	// SeaweedFS internal metadata prefix (used to filter internal headers from client responses)
+	SeaweedFSInternalPrefix = "x-seaweedfs-"
+
+	// SeaweedFS internal metadata keys for encryption (prefixed to avoid automatic HTTP header conversion)
+	SeaweedFSSSEKMSKey = "x-seaweedfs-sse-kms-key" // Key for storing serialized SSE-KMS metadata
+	SeaweedFSSSES3Key  = "x-seaweedfs-sse-s3-key"  // Key for storing serialized SSE-S3 metadata
+	SeaweedFSSSEIV     = "x-seaweedfs-sse-c-iv"    // Key for storing SSE-C IV
+
+	// Multipart upload metadata keys for SSE-KMS (consistent with internal metadata key pattern)
+	SeaweedFSSSEKMSKeyID             = "x-seaweedfs-sse-kms-key-id"             // Key ID for multipart upload SSE-KMS inheritance
+	SeaweedFSSSEKMSEncryption        = "x-seaweedfs-sse-kms-encryption"         // Encryption type for multipart upload SSE-KMS inheritance
+	SeaweedFSSSEKMSBucketKeyEnabled  = "x-seaweedfs-sse-kms-bucket-key-enabled" // Bucket key setting for multipart upload SSE-KMS inheritance
+	SeaweedFSSSEKMSEncryptionContext = "x-seaweedfs-sse-kms-encryption-context" // Encryption context for multipart upload SSE-KMS inheritance
+	SeaweedFSSSEKMSBaseIV            = "x-seaweedfs-sse-kms-base-iv"            // Base IV for multipart upload SSE-KMS (for IV offset calculation)
+
+	// Multipart upload metadata keys for SSE-S3
+	SeaweedFSSSES3Encryption = "x-seaweedfs-sse-s3-encryption" // Encryption type for multipart upload SSE-S3 inheritance
+	SeaweedFSSSES3BaseIV     = "x-seaweedfs-sse-s3-base-iv"    // Base IV for multipart upload SSE-S3 (for IV offset calculation)
+	SeaweedFSSSES3KeyData    = "x-seaweedfs-sse-s3-key-data"   // Encrypted key data for multipart upload SSE-S3 inheritance
+)
+
+// SeaweedFS internal headers for filer communication
+const (
+	SeaweedFSSSEKMSKeyHeader    = "X-SeaweedFS-SSE-KMS-Key"     // Header for passing SSE-KMS metadata to filer
+	SeaweedFSSSEIVHeader        = "X-SeaweedFS-SSE-IV"          // Header for passing SSE-C IV to filer (SSE-C only)
+	SeaweedFSSSEKMSBaseIVHeader = "X-SeaweedFS-SSE-KMS-Base-IV" // Header for passing base IV for multipart SSE-KMS
+	SeaweedFSSSES3BaseIVHeader  = "X-SeaweedFS-SSE-S3-Base-IV"  // Header for passing base IV for multipart SSE-S3
+	SeaweedFSSSES3KeyDataHeader = "X-SeaweedFS-SSE-S3-Key-Data" // Header for passing key data for multipart SSE-S3
+
+	// SeaweedFSPrincipalHeader and SeaweedFSSessionTokenHeader carry the
+	// server-derived principal ARN and session token from the auth layer to
+	// downstream authorization (IAM policy evaluation, S3Tables IAM checks).
+	// These headers are trusted: callers of AuthSignatureOnly /
+	// authenticateRequestInternal must scrub any client-supplied values at the
+	// very start of authentication to prevent privilege escalation via header
+	// injection. Prefer these constants over literals so that any future scrub
+	// or consumer cannot drift by typo.
+	SeaweedFSPrincipalHeader    = "X-SeaweedFS-Principal"
+	SeaweedFSSessionTokenHeader = "X-SeaweedFS-Session-Token"
 )
 
 // Non-Standard S3 HTTP request constants
@@ -58,18 +175,108 @@ const (
 	AmzIdentityId = "s3-identity-id"
 	AmzAccountId  = "s3-account-id"
 	AmzAuthType   = "s3-auth-type"
-	AmzIsAdmin    = "s3-is-admin" // only set to http request header as a context
 )
 
 func GetBucketAndObject(r *http.Request) (bucket, object string) {
 	vars := mux.Vars(r)
 	bucket = vars["bucket"]
-	object = vars["object"]
-	if !strings.HasPrefix(object, "/") {
-		object = "/" + object
+	object = NormalizeObjectKey(vars["object"])
+	return
+}
+
+// IsValidObjectKey rejects S3 object keys that — after normalization
+// (backslash→slash, slash collapse) — contain a `.` or `..` path segment, or
+// embed a NUL byte. Such keys are collapsed by filepath.Join inside the filer
+// and would escape the bucket directory, so they must not reach the gRPC layer.
+// Gorilla mux URL-decodes captured vars before this runs, so `%2e%2e` is
+// already `..` here.
+func IsValidObjectKey(object string) bool {
+	if object == "" {
+		return true
+	}
+	if strings.ContainsRune(object, '\x00') {
+		return false
+	}
+	object = strings.ReplaceAll(object, "\\", "/")
+	for _, seg := range strings.Split(object, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidBucketName rejects bucket names captured from the URL path that are
+// unsafe to use in filer path construction (`.`, `..`, contain `/` or `\`, or
+// embed NUL). This is a path-safety check, not a full S3 naming-rule check.
+func IsValidBucketName(bucket string) bool {
+	if bucket == "" {
+		return true
+	}
+	if bucket == "." || bucket == ".." {
+		return false
+	}
+	return !strings.ContainsAny(bucket, "/\\\x00")
+}
+
+// IsValidPathSegment reports whether value is safe to use as one filer path
+// component. It intentionally does not enforce any application-specific
+// format; callers can layer stricter checks on top.
+func IsValidPathSegment(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	return !strings.ContainsAny(value, "/\\\x00")
+}
+
+// NormalizeObjectKey normalizes object keys by removing duplicate slashes and converting backslashes.
+// This normalizes keys from various sources (URL path, form values, etc.) to a consistent format.
+// It also converts Windows-style backslashes to forward slashes for cross-platform compatibility.
+// Returns keys WITHOUT leading slash to match S3 API format (e.g., "foo/bar" not "/foo/bar").
+// Preserves trailing slash if present (e.g., "foo/" stays "foo/").
+func NormalizeObjectKey(object string) string {
+	// Preserve trailing slash if present
+	hasTrailingSlash := strings.HasSuffix(object, "/")
+
+	// Convert Windows-style backslashes to forward slashes
+	object = strings.ReplaceAll(object, "\\", "/")
+	object = removeDuplicateSlashes(object)
+	// Remove leading slash to match S3 API format
+	object = strings.TrimPrefix(object, "/")
+
+	// Restore trailing slash if it was present and result is not empty
+	if hasTrailingSlash && object != "" && !strings.HasSuffix(object, "/") {
+		object = object + "/"
 	}
 
-	return
+	return object
+}
+
+// removeDuplicateSlashes removes consecutive slashes from a path
+func removeDuplicateSlashes(s string) string {
+	var result strings.Builder
+	result.Grow(len(s))
+
+	lastWasSlash := false
+	for _, r := range s {
+		if r == '/' {
+			if !lastWasSlash {
+				result.WriteRune(r)
+			}
+			lastWasSlash = true
+		} else {
+			result.WriteRune(r)
+			lastWasSlash = false
+		}
+	}
+	return result.String()
+}
+
+func GetPrefix(r *http.Request) string {
+	query := r.URL.Query()
+	prefix := query.Get("prefix")
+	prefix = removeDuplicateSlashes(prefix)
+	return prefix
 }
 
 var PassThroughHeaders = map[string]string{
@@ -79,4 +286,94 @@ var PassThroughHeaders = map[string]string{
 	"response-content-language":    "Content-Language",
 	"response-content-type":        "Content-Type",
 	"response-expires":             "Expires",
+}
+
+// IsSeaweedFSInternalHeader checks if a header key is a SeaweedFS internal header
+// that should be filtered from client responses.
+// Header names are case-insensitive in HTTP, so this function normalizes to lowercase.
+func IsSeaweedFSInternalHeader(headerKey string) bool {
+	return strings.HasPrefix(strings.ToLower(headerKey), SeaweedFSInternalPrefix)
+}
+
+// Context keys for storing authenticated identity information
+type contextKey string
+
+const (
+	contextKeyIdentityName   contextKey = "s3-identity-name"
+	contextKeyIdentityObject contextKey = "s3-identity-object"
+	contextKeyIdentityHolder contextKey = "s3-identity-holder"
+)
+
+// identityHolder is a mutable container for the authenticated identity name,
+// stored by pointer in the request context. Authentication runs as an inner
+// handler that records the identity with r.WithContext, which returns a request
+// copy; that copy's new context values are invisible to outer middleware (e.g.
+// the audit logger) holding an earlier copy of the request. A pointer to a
+// holder installed before authentication is shared across all copies, so the
+// name written by the inner handler is readable by the outer middleware.
+type identityHolder struct {
+	name atomic.Pointer[string]
+}
+
+// EnsureIdentityHolder attaches a mutable identity holder to the request context
+// if one is not already present, returning the (possibly new) request. Install
+// it before authentication so the authenticated requester remains recoverable
+// from the original request, e.g. when emitting an audit entry for a handler
+// that does not log the requester itself.
+func EnsureIdentityHolder(r *http.Request) *http.Request {
+	if r == nil {
+		return nil
+	}
+	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), contextKeyIdentityHolder, &identityHolder{}))
+}
+
+// SetIdentityNameInContext stores the authenticated identity name in the request context
+// This is the secure way to propagate identity - headers can be spoofed, context cannot
+func SetIdentityNameInContext(ctx context.Context, identityName string) context.Context {
+	if identityName == "" {
+		return ctx
+	}
+	// Also record into the mutable holder (if installed) so the name survives the
+	// request-context copy and stays visible to outer middleware such as the
+	// audit logger.
+	if h, ok := ctx.Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		h.name.Store(&identityName)
+	}
+	return context.WithValue(ctx, contextKeyIdentityName, identityName)
+}
+
+// GetIdentityNameFromContext retrieves the authenticated identity name from the request context
+// Returns empty string if no identity is set (unauthenticated request)
+// This is the secure way to retrieve identity - never read from headers directly
+func GetIdentityNameFromContext(r *http.Request) string {
+	// Prefer the per-request context value; fall back to the mutable holder for
+	// callers (e.g. the audit middleware) that hold a copy of the request taken
+	// before authentication set the identity.
+	if name, ok := r.Context().Value(contextKeyIdentityName).(string); ok && name != "" {
+		return name
+	}
+	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		if name := h.name.Load(); name != nil {
+			return *name
+		}
+	}
+	return ""
+}
+
+// SetIdentityInContext stores the full authenticated identity object in the request context
+// This is used to pass the full identity (including for JWT users) to handlers
+func SetIdentityInContext(ctx context.Context, identity interface{}) context.Context {
+	if identity != nil {
+		return context.WithValue(ctx, contextKeyIdentityObject, identity)
+	}
+	return ctx
+}
+
+// GetIdentityFromContext retrieves the full identity object from the request context
+// Returns nil if no identity is set (unauthenticated request)
+func GetIdentityFromContext(r *http.Request) interface{} {
+	return r.Context().Value(contextKeyIdentityObject)
 }

@@ -169,7 +169,7 @@ func (store *RocksDBStore) DeleteFolderChildren(ctx context.Context, fullpath we
 
 	iter := store.db.NewIterator(ro)
 	defer iter.Close()
-	err = enumerate(iter, directoryPrefix, nil, false, -1, func(key, value []byte) bool {
+	err = enumerate(iter, directoryPrefix, nil, false, -1, "", func(key, value []byte) bool {
 		batch.Delete(key)
 		return true
 	})
@@ -186,23 +186,16 @@ func (store *RocksDBStore) DeleteFolderChildren(ctx context.Context, fullpath we
 	return nil
 }
 
-func enumerate(iter *gorocksdb.Iterator, prefix, lastKey []byte, includeLastKey bool, limit int64, fn func(key, value []byte) bool) (err error) {
+func enumerate(iter *gorocksdb.Iterator, prefix, lastKey []byte, includeLastKey bool, limit int64, startFileName string, fn func(key, value []byte) bool) (err error) {
 
 	if len(lastKey) == 0 {
 		iter.Seek(prefix)
 	} else {
 		iter.Seek(lastKey)
-		if !includeLastKey {
-			if iter.Valid() {
-				if bytes.Equal(iter.Key().Data(), lastKey) {
-					iter.Next()
-				}
-			}
-		}
 	}
 
 	i := int64(0)
-	for ; iter.Valid(); iter.Next() {
+	for iter.Valid() {
 
 		if limit > 0 {
 			i++
@@ -217,16 +210,27 @@ func enumerate(iter *gorocksdb.Iterator, prefix, lastKey []byte, includeLastKey 
 			break
 		}
 
+		fileName := getNameFromKey(key)
+		if fileName == "" {
+			iter.Next()
+			continue
+		}
+		if fileName == startFileName && !includeLastKey {
+			iter.Next()
+			continue
+		}
+
 		ret := fn(key, iter.Value().Data())
 
 		if !ret {
 			break
 		}
 
+		iter.Next()
 	}
 
 	if err := iter.Err(); err != nil {
-		return fmt.Errorf("prefix scan iterator: %v", err)
+		return fmt.Errorf("prefix scan iterator: %w", err)
 	}
 	return nil
 }
@@ -247,9 +251,10 @@ func (store *RocksDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 	defer ro.Destroy()
 	ro.SetFillCache(false)
 
+	var callbackErr error
 	iter := store.db.NewIterator(ro)
 	defer iter.Close()
-	err = enumerate(iter, directoryPrefix, lastFileStart, includeStartFile, limit, func(key, value []byte) bool {
+	err = enumerate(iter, directoryPrefix, lastFileStart, includeStartFile, limit, startFileName, func(key, value []byte) bool {
 		fileName := getNameFromKey(key)
 		if fileName == "" {
 			return true
@@ -262,14 +267,31 @@ func (store *RocksDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		// println("list", entry.FullPath, "chunks", len(entry.GetChunks()))
 		if decodeErr := entry.DecodeAttributesAndChunks(value); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			return false
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			glog.V(0).InfofCtx(ctx, "failed to process eachEntryFunc for entry %q: %v", fileName, resEachEntryFuncErr)
+			callbackErr = resEachEntryFuncErr
 			return false
 		}
+
+		if !resEachEntryFunc {
+			return false
+		}
+
 		return true
 	})
+
+	if callbackErr != nil {
+		return lastFileName, fmt.Errorf(
+			"failed to process eachEntryFunc for dir %q, entry %q: %w",
+			dirPath, lastFileName, callbackErr,
+		)
+	}
+
 	if err != nil {
 		return lastFileName, fmt.Errorf("prefix list %s : %v", dirPath, err)
 	}

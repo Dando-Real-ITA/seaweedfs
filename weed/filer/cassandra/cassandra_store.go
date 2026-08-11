@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gocql/gocql"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -202,15 +203,26 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 		lastFileName = name
 		if decodeErr := entry.DecodeAttributesAndChunks(util.MaybeDecompressData(data)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc for entry %q: %w", entry.FullPath, resEachEntryFuncErr)
+			glog.V(0).InfofCtx(ctx, "failed to process eachEntryFunc for entry %q: %v", entry.FullPath, resEachEntryFuncErr)
+			break
+		}
+
+		if !resEachEntryFunc {
 			break
 		}
 	}
-	if err := iter.Close(); err != nil {
-		glog.V(0).Infof("list iterator close: %v", err)
+	if errClose := iter.Close(); errClose != nil {
+		glog.V(0).InfofCtx(ctx, "list iterator close: %v", errClose)
+		if err == nil {
+			return lastFileName, errClose
+		}
 	}
 
 	return lastFileName, err

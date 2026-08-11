@@ -118,6 +118,13 @@ func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bo
 		shortPath = weed_util.FullPath(bucketAndObjectKey[t:])
 	}
 
+	// Dot-prefixed entries directly under /buckets (e.g. .system) are internal
+	// folders, not S3 buckets; keep them in the default DB by full path.
+	if strings.HasPrefix(bucket, ".") {
+		store.dbsLock.RUnlock()
+		return defaultDB, DEFAULT, fullpath, nil
+	}
+
 	if db, found := store.dbs[bucket]; found {
 		store.dbsLock.RUnlock()
 		return db, bucket, shortPath, nil
@@ -342,10 +349,17 @@ func (store *LevelDB3Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 		// println("list", entry.FullPath, "chunks", len(entry.GetChunks()))
 		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(iter.Value())); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
+			break
+		}
+
+		if !resEachEntryFunc {
 			break
 		}
 	}

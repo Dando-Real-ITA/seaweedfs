@@ -4,8 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"io"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 func init() {
@@ -25,6 +26,10 @@ func (c *commandRaftServerAdd) Help() string {
 	Example:
 		cluster.raft.add -id <server_name> -address <server_host:port> -voter
 `
+}
+
+func (c *commandRaftServerAdd) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandRaftServerAdd) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -48,7 +53,7 @@ func (c *commandRaftServerAdd) Do(args []string, commandEnv *CommandEnv, writer 
 			Voter:   *serverVoter,
 		})
 		if err != nil {
-			return fmt.Errorf("raft add server: %v", err)
+			return fmt.Errorf("raft add server: %w", err)
 		}
 		println("added server", *serverId)
 		return nil

@@ -2,7 +2,7 @@ package skiplist
 
 import (
 	"bytes"
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 	"testing"
 )
@@ -27,6 +27,49 @@ func TestReverseInsert(t *testing.T) {
 		t.Fail()
 	}
 
+}
+
+// TestDeleteRekeyedNode reproduces the redis3 filer crash: a node re-keyed in
+// place leaves a stale StartLevels key, so deleting it must still clear both
+// ends together rather than leaving EndLevels[0] nil for the next insert.
+func TestDeleteRekeyedNode(t *testing.T) {
+	list := New(memStore)
+
+	list.InsertByKey([]byte("b"), 1, []byte("b"))
+
+	// Drifted start reference: same element id, stale cached key.
+	list.StartLevels[0] = &SkipListElementReference{ElementPointer: 1, Key: []byte("stale")}
+
+	if _, err := list.DeleteByKey([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+
+	if (list.StartLevels[0] == nil) != (list.EndLevels[0] == nil) {
+		t.Fatalf("inconsistent ends after delete: start=%v end=%v", list.StartLevels[0], list.EndLevels[0])
+	}
+
+	if _, err := list.InsertByKey([]byte("c"), 2, []byte("c")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := list.Find([]byte("c")); !ok {
+		t.Fatal("expected to find inserted key")
+	}
+}
+
+// TestInsertByKeyRecoversInconsistentEnds: a persisted skiplist with
+// StartLevels[0] set but EndLevels[0] nil must self-heal, not crash on load.
+func TestInsertByKeyRecoversInconsistentEnds(t *testing.T) {
+	list := New(memStore)
+	list.InsertByKey([]byte("m"), 1, []byte("m"))
+
+	list.EndLevels[0] = nil
+
+	if _, err := list.InsertByKey([]byte("n"), 2, []byte("n")); err != nil {
+		t.Fatal(err)
+	}
+	if list.IsEmpty() {
+		t.Fatal("list should not be empty")
+	}
 }
 
 func TestInsertAndFind(t *testing.T) {
@@ -235,11 +278,11 @@ func TestFindGreaterOrEqual(t *testing.T) {
 	list = New(memStore)
 
 	for i := 0; i < maxN; i++ {
-		list.InsertByKey(Element(rand.Intn(maxNumber)), 0, Element(i))
+		list.InsertByKey(Element(rand.IntN(maxNumber)), 0, Element(i))
 	}
 
 	for i := 0; i < maxN; i++ {
-		key := Element(rand.Intn(maxNumber))
+		key := Element(rand.IntN(maxNumber))
 		if _, v, ok, _ := list.FindGreaterOrEqual(key); ok {
 			// if f is v should be bigger than the element before
 			if v.Prev != nil && bytes.Compare(key, v.Prev.Key) < 0 {

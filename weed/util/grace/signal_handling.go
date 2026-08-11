@@ -1,16 +1,16 @@
 //go:build !plan9
-// +build !plan9
 
 package grace
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"os"
 	"os/signal"
 	"reflect"
 	"runtime"
 	"sync"
 	"syscall"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 var signalChan chan os.Signal
@@ -44,7 +44,10 @@ func init() {
 				reloadHookLock.RUnlock()
 			} else {
 				interruptHookLock.RLock()
-				for _, hook := range interruptHooks {
+				// Execute hooks in reverse registration order (LIFO/defer-style) so
+				// later-started services shut down before the services they depend on.
+				for i := len(interruptHooks) - 1; i >= 0; i-- {
+					hook := interruptHooks[i]
 					glog.V(4).Infof("exec interrupt hook func name:%s", GetFunctionName(hook))
 					hook()
 				}

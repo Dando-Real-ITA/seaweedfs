@@ -4,10 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"io"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"google.golang.org/grpc"
@@ -32,6 +32,10 @@ func (c *commandVolumeUnmount) Help() string {
 	This command unmounts a volume from one volume server.
 
 `
+}
+
+func (c *commandVolumeUnmount) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandVolumeUnmount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {

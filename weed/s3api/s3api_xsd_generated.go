@@ -1074,8 +1074,13 @@ type ListAllMyBucketsResponse struct {
 }
 
 type ListAllMyBucketsResult struct {
+	XMLName xml.Name             `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListAllMyBucketsResult"`
 	Owner   CanonicalUser        `xml:"Owner"`
 	Buckets ListAllMyBucketsList `xml:"Buckets"`
+	// ContinuationToken is set when the listing is truncated; passing it back
+	// via ?continuation-token= resumes the listing after the last bucket returned.
+	ContinuationToken string `xml:"ContinuationToken,omitempty"`
+	Prefix            string `xml:"Prefix,omitempty"`
 }
 
 type ListBucket struct {
@@ -1130,12 +1135,12 @@ type ListBucketResult struct {
 }
 
 type ListEntry struct {
-	Key          string        `xml:"Key"`
-	LastModified time.Time     `xml:"LastModified"`
-	ETag         string        `xml:"ETag"`
-	Size         int64         `xml:"Size"`
-	Owner        CanonicalUser `xml:"Owner,omitempty"`
-	StorageClass StorageClass  `xml:"StorageClass"`
+	Key          string         `xml:"Key"`
+	LastModified time.Time      `xml:"LastModified"`
+	ETag         string         `xml:"ETag"`
+	Size         int64          `xml:"Size"`
+	Owner        *CanonicalUser `xml:"Owner,omitempty"`
+	StorageClass StorageClass   `xml:"StorageClass"`
 }
 
 func (t *ListEntry) MarshalXML(e *xml.Encoder, start xml.StartElement) error {

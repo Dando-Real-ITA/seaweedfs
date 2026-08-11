@@ -1,13 +1,14 @@
 package filer
 
 import (
-	"github.com/stretchr/testify/assert"
-	"golang.org/x/exp/slices"
+	"context"
 	"log"
+	"slices"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestDoMinusChunks(t *testing.T) {
@@ -65,7 +66,7 @@ func TestCompactFileChunksRealCase(t *testing.T) {
 
 	printChunks("before", chunks)
 
-	compacted, garbage := CompactFileChunks(nil, chunks)
+	compacted, garbage := CompactFileChunks(context.Background(), nil, chunks)
 
 	printChunks("compacted", compacted)
 	printChunks("garbage", garbage)

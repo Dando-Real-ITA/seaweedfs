@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime"
 	"net/http"
 	"net/url"
@@ -16,30 +17,126 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/images"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-var fileNameEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+const reqIsProxied = "proxied"
 
 func NotFound(w http.ResponseWriter) {
+	stats.VolumeServerFileReadFailures.Inc()
 	stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorGetNotFound).Inc()
 	w.WriteHeader(http.StatusNotFound)
 }
 
 func InternalError(w http.ResponseWriter) {
+	stats.VolumeServerFileReadFailures.Inc()
 	stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorGetInternal).Inc()
 	w.WriteHeader(http.StatusInternalServerError)
+}
+
+func (vs *VolumeServer) proxyReqToTargetServer(w http.ResponseWriter, r *http.Request) {
+	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
+	volumeId, err := needle.NewVolumeId(vid)
+	if err != nil {
+		glog.V(2).Infof("parsing vid %s: %v", r.URL.Path, err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	lookupResult, err := operation.LookupVolumeId(vs.GetMaster, vs.grpcDialOption, volumeId.String())
+	if err != nil || len(lookupResult.Locations) <= 0 {
+		glog.V(0).Infoln("lookup error:", err, r.URL.Path)
+		stats.VolumeServerFileReadInvalidNeedles.Inc()
+		NotFound(w)
+		return
+	}
+	if len(lookupResult.Locations) >= 2 {
+		rand.Shuffle(len(lookupResult.Locations), func(i, j int) {
+			lookupResult.Locations[i], lookupResult.Locations[j] = lookupResult.Locations[j], lookupResult.Locations[i]
+		})
+	}
+	var targetUrl *url.URL
+	location := fmt.Sprintf("%s:%d", vs.store.Ip, vs.store.Port)
+	for _, loc := range lookupResult.Locations {
+		if !strings.Contains(loc.Url, location) {
+			rawURL, _ := util_http.NormalizeUrl(loc.Url)
+			targetUrl, _ = url.Parse(rawURL)
+			break
+		}
+	}
+	if targetUrl == nil {
+		stats.VolumeServerFileReadInvalidNeedles.Inc()
+		stats.VolumeServerHandlerCounter.WithLabelValues(stats.EmptyReadProxyLoc).Inc()
+		glog.Errorf("failed lookup target host is empty locations: %+v, %s", lookupResult.Locations, location)
+		NotFound(w)
+		return
+	}
+	if vs.ReadMode == "proxy" {
+		stats.VolumeServerHandlerCounter.WithLabelValues(stats.ReadProxyReq).Inc()
+		// proxy client request to target server
+		r.URL.Host = targetUrl.Host
+		r.URL.Scheme = targetUrl.Scheme
+		query := r.URL.Query()
+		query.Set(reqIsProxied, "true")
+		r.URL.RawQuery = query.Encode()
+		request, err := http.NewRequest(http.MethodGet, r.URL.String(), nil)
+		if err != nil {
+			glog.V(0).Infof("failed to instance http request of url %s: %v", r.URL.String(), err)
+			InternalError(w)
+			return
+		}
+		for k, vv := range r.Header {
+			for _, v := range vv {
+				request.Header.Add(k, v)
+			}
+		}
+
+		response, err := util_http.GetGlobalHttpClient().Do(request)
+		if err != nil {
+			stats.VolumeServerHandlerCounter.WithLabelValues(stats.FailedReadProxyReq).Inc()
+			glog.V(0).Infof("request remote url %s: %v", r.URL.String(), err)
+			InternalError(w)
+			return
+		}
+		defer util_http.CloseResponse(response)
+		// proxy target response to client
+		for k, vv := range response.Header {
+			if k == "Server" {
+				continue
+			}
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(response.StatusCode)
+		buf := mem.Allocate(128 * 1024)
+		defer mem.Free(buf)
+		io.CopyBuffer(w, response.Body, buf)
+		return
+	} else {
+		// redirect
+		stats.VolumeServerHandlerCounter.WithLabelValues(stats.ReadRedirectReq).Inc()
+		targetUrl.Path = fmt.Sprintf("%s/%s,%s", targetUrl.Path, vid, fid)
+		arg := url.Values{}
+		if c := r.FormValue("collection"); c != "" {
+			arg.Set("collection", c)
+		}
+		arg.Set(reqIsProxied, "true")
+		targetUrl.RawQuery = arg.Encode()
+		http.Redirect(w, r, targetUrl.String(), http.StatusMovedPermanently)
+		return
+	}
 }
 
 func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) {
@@ -69,66 +166,13 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 	_, hasEcVolume := vs.store.FindEcVolume(volumeId)
 	if !hasVolume && !hasEcVolume {
 		if vs.ReadMode == "local" {
+			stats.VolumeServerFileReadInvalidNeedles.Inc()
 			glog.V(0).Infoln("volume is not local:", err, r.URL.Path)
 			NotFound(w)
 			return
 		}
-		lookupResult, err := operation.LookupVolumeId(vs.GetMaster, vs.grpcDialOption, volumeId.String())
-		glog.V(2).Infoln("volume", volumeId, "found on", lookupResult, "error", err)
-		if err != nil || len(lookupResult.Locations) <= 0 {
-			glog.V(0).Infoln("lookup error:", err, r.URL.Path)
-			NotFound(w)
-			return
-		}
-		if vs.ReadMode == "proxy" {
-			// proxy client request to target server
-			rawURL, _ := util_http.NormalizeUrl(lookupResult.Locations[0].Url)
-			u, _ := url.Parse(rawURL)
-			r.URL.Host = u.Host
-			r.URL.Scheme = u.Scheme
-			request, err := http.NewRequest(http.MethodGet, r.URL.String(), nil)
-			if err != nil {
-				glog.V(0).Infof("failed to instance http request of url %s: %v", r.URL.String(), err)
-				InternalError(w)
-				return
-			}
-			for k, vv := range r.Header {
-				for _, v := range vv {
-					request.Header.Add(k, v)
-				}
-			}
-
-			response, err := util_http.GetGlobalHttpClient().Do(request)
-			if err != nil {
-				glog.V(0).Infof("request remote url %s: %v", r.URL.String(), err)
-				InternalError(w)
-				return
-			}
-			defer util_http.CloseResponse(response)
-			// proxy target response to client
-			for k, vv := range response.Header {
-				for _, v := range vv {
-					w.Header().Add(k, v)
-				}
-			}
-			w.WriteHeader(response.StatusCode)
-			buf := mem.Allocate(128 * 1024)
-			defer mem.Free(buf)
-			io.CopyBuffer(w, response.Body, buf)
-			return
-		} else {
-			// redirect
-			rawURL, _ := util_http.NormalizeUrl(lookupResult.Locations[0].PublicUrl)
-			u, _ := url.Parse(rawURL)
-			u.Path = fmt.Sprintf("%s/%s,%s", u.Path, vid, fid)
-			arg := url.Values{}
-			if c := r.FormValue("collection"); c != "" {
-				arg.Set("collection", c)
-			}
-			u.RawQuery = arg.Encode()
-			http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
-			return
-		}
+		vs.proxyReqToTargetServer(w, r)
+		return
 	}
 	cookie := n.Cookie
 
@@ -145,14 +189,18 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 		memoryCost = size
 		atomic.AddInt64(&vs.inFlightDownloadDataSize, int64(memoryCost))
 	}
+
 	if hasVolume {
 		count, err = vs.store.ReadVolumeNeedle(volumeId, n, readOption, onReadSizeFn)
 	} else if hasEcVolume {
 		count, err = vs.store.ReadEcShardNeedle(volumeId, n, onReadSizeFn)
 	}
+
 	defer func() {
 		atomic.AddInt64(&vs.inFlightDownloadDataSize, -int64(memoryCost))
-		vs.inFlightDownloadDataLimitCond.Signal()
+		if vs.concurrentDownloadLimit != 0 {
+			vs.inFlightDownloadDataLimitCond.Broadcast()
+		}
 	}()
 
 	if err != nil && err != storage.ErrorDeleted && hasVolume {
@@ -162,7 +210,11 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 	// glog.V(4).Infoln("read bytes", count, "error", err)
 	if err != nil || count < 0 {
 		glog.V(3).Infof("read %s isNormalVolume %v error: %v", r.URL.Path, hasVolume, err)
-		if err == storage.ErrorNotFound || err == storage.ErrorDeleted {
+		invalid_needle := err == storage.ErrorNotFound || errors.Is(err, erasure_coding.NotFoundError)
+		if invalid_needle {
+			stats.VolumeServerFileReadInvalidNeedles.Inc()
+		}
+		if invalid_needle || err == storage.ErrorDeleted {
 			NotFound(w)
 		} else {
 			InternalError(w)

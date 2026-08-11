@@ -3,11 +3,14 @@ package weed_server
 import (
 	"context"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -17,7 +20,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
@@ -48,7 +50,8 @@ func (ms *MasterServer) collectionDeleteHandler(w http.ResponseWriter, r *http.R
 
 func (ms *MasterServer) dirStatusHandler(w http.ResponseWriter, r *http.Request) {
 	m := make(map[string]interface{})
-	m["Version"] = util.Version()
+	m["Version"] = version.Version()
+	m["TopologyId"] = ms.Topo.GetTopologyId()
 	m["Topology"] = ms.Topo.ToInfo()
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
@@ -66,7 +69,7 @@ func (ms *MasterServer) volumeVacuumHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	// glog.Infoln("garbageThreshold =", gcThreshold)
-	ms.Topo.Vacuum(ms.grpcDialOption, gcThreshold, ms.option.MaxParallelVacuumPerServer, 0, "", ms.preallocateSize)
+	ms.Topo.Vacuum(ms.grpcDialOption, gcThreshold, ms.option.MaxParallelVacuumPerServer, 0, "", ms.preallocateSize, false)
 	ms.dirStatusHandler(w, r)
 }
 
@@ -88,6 +91,9 @@ func (ms *MasterServer) volumeGrowHandler(w http.ResponseWriter, r *http.Request
 		} else {
 			var newVidLocations []*master_pb.VolumeLocation
 			newVidLocations, err = ms.vg.GrowByCountAndType(ms.grpcDialOption, uint32(count), option, ms.Topo)
+			if len(newVidLocations) > 0 {
+				ms.broadcastVolumeLocationsToClients(newVidLocations)
+			}
 			count = uint64(len(newVidLocations))
 		}
 	} else {
@@ -103,7 +109,7 @@ func (ms *MasterServer) volumeGrowHandler(w http.ResponseWriter, r *http.Request
 
 func (ms *MasterServer) volumeStatusHandler(w http.ResponseWriter, r *http.Request) {
 	m := make(map[string]interface{})
-	m["Version"] = util.Version()
+	m["Version"] = version.Version()
 	m["Volumes"] = ms.Topo.ToVolumeMap()
 	writeJsonQuiet(w, r, http.StatusOK, m)
 }
@@ -165,6 +171,7 @@ func (ms *MasterServer) getVolumeGrowOption(r *http.Request) (*topology.VolumeGr
 			return nil, fmt.Errorf("Failed to parse int64 preallocate = %s: %v", r.FormValue("preallocate"), err)
 		}
 	}
+	ver := needle.GetCurrentVersion()
 	volumeGrowOption := &topology.VolumeGrowOption{
 		Collection:         r.FormValue("collection"),
 		ReplicaPlacement:   replicaPlacement,
@@ -175,6 +182,7 @@ func (ms *MasterServer) getVolumeGrowOption(r *http.Request) (*topology.VolumeGr
 		Rack:               r.FormValue("rack"),
 		DataNode:           r.FormValue("dataNode"),
 		MemoryMapMaxSizeMb: memoryMapMaxSizeMb,
+		Version:            uint32(ver),
 	}
 	return volumeGrowOption, nil
 }
@@ -203,7 +211,7 @@ func (ms *MasterServer) collectionInfoHandler(w http.ResponseWriter, r *http.Req
 		for i, volumeLayout := range volumeLayouts {
 			volumeLayoutStats := volumeLayout.Stats()
 			m := make(map[string]interface{})
-			m["Version"] = util.Version()
+			m["Version"] = version.Version()
 			m["Collection"] = collectionName
 			m["TotalSize"] = volumeLayoutStats.TotalSize
 			m["FileCount"] = volumeLayoutStats.FileCount
@@ -215,7 +223,7 @@ func (ms *MasterServer) collectionInfoHandler(w http.ResponseWriter, r *http.Req
 	} else {
 		//prepare the json response
 		collectionStats := map[string]interface{}{
-			"Version":     util.Version(),
+			"Version":     version.Version(),
 			"Collection":  collectionName,
 			"TotalSize":   uint64(0),
 			"FileCount":   uint64(0),

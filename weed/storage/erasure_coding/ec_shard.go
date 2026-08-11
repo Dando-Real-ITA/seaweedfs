@@ -2,17 +2,63 @@ package erasure_coding
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 type ShardId uint8
+
+// Converts a slice of uint32s to ShardId.
+func Uint32ToShardIds(ids []uint32) []ShardId {
+	res := make([]ShardId, len(ids))
+	for i, id := range ids {
+		res[i] = ShardId(id)
+	}
+	return res
+}
+
+// Converts a slice of ShardIds to uint32
+func ShardIdsToUint32(ids []ShardId) []uint32 {
+	res := make([]uint32, len(ids))
+	for i, id := range ids {
+		res[i] = uint32(id)
+	}
+	return res
+}
+
+// Returns a slice of all possible ShardIds.
+func AllShardIds() []ShardId {
+	res := make([]ShardId, TotalShardsCount)
+	for i := range res {
+		res[i] = ShardId(i)
+	}
+	return res
+}
+
+// Compares a pair of EcShardInfo protos for sorting.
+func CmpEcShardInfo(a, b *volume_server_pb.EcShardInfo) int {
+	if a.VolumeId < b.VolumeId {
+		return -1
+	}
+	if a.VolumeId > b.VolumeId {
+		return 1
+	}
+	if a.ShardId < b.ShardId {
+		return -1
+	}
+	if a.ShardId > b.ShardId {
+		return 1
+	}
+	return 0
+}
 
 type EcVolumeShard struct {
 	VolumeId    needle.VolumeId
@@ -44,9 +90,17 @@ func NewEcVolumeShard(diskType types.DiskType, dirname string, collection string
 	}
 	v.ecdFileSize = ecdFi.Size()
 
-	stats.VolumeServerVolumeGauge.WithLabelValues(v.Collection, "ec_shards").Inc()
+	v.Mount()
 
 	return
+}
+
+func (shard *EcVolumeShard) Mount() {
+	stats.VolumeServerVolumeGauge.WithLabelValues(shard.Collection, "ec_shards").Inc()
+}
+
+func (shard *EcVolumeShard) Unmount() {
+	stats.VolumeServerVolumeGauge.WithLabelValues(shard.Collection, "ec_shards").Dec()
 }
 
 func (shard *EcVolumeShard) Size() int64 {
@@ -80,19 +134,34 @@ func EcShardBaseFileName(collection string, id int) (baseFileName string) {
 }
 
 func (shard *EcVolumeShard) Close() {
+	// Close the fd but do NOT nil it: a reader resolves the shard under the
+	// ecVolumesLock then calls ReadAt after the lock is released, so a
+	// concurrent eviction that nils the field would race that read and panic.
+	// Leaving the field set means ReadAt hits a closed fd and returns a clean
+	// error (the caller recovers from parity) with no data race on the field.
 	if shard.ecdFile != nil {
 		_ = shard.ecdFile.Close()
-		shard.ecdFile = nil
 	}
 }
 
 func (shard *EcVolumeShard) Destroy() {
+	shard.Unmount()
 	os.Remove(shard.FileName() + ToExt(int(shard.ShardId)))
-	stats.VolumeServerVolumeGauge.WithLabelValues(shard.Collection, "ec_shards").Dec()
 }
 
 func (shard *EcVolumeShard) ReadAt(buf []byte, offset int64) (int, error) {
+	n, err := shard.ecdFile.ReadAt(buf, offset)
+	if err == io.EOF && n == len(buf) {
+		err = nil
+	}
+	return n, err
+}
 
-	return shard.ecdFile.ReadAt(buf, offset)
-
+func (shard *EcVolumeShard) ToEcShardInfo() *volume_server_pb.EcShardInfo {
+	return &volume_server_pb.EcShardInfo{
+		ShardId:    uint32(shard.ShardId),
+		Size:       int64(shard.Size()),
+		Collection: shard.Collection,
+		VolumeId:   uint32(shard.VolumeId),
+	}
 }

@@ -38,7 +38,7 @@ func (cm *MemDb) Set(key NeedleId, offset Offset, size Size) error {
 	bytes := ToBytes(key, offset, size)
 
 	if err := cm.db.Put(bytes[0:NeedleIdSize], bytes[NeedleIdSize:NeedleIdSize+OffsetSize+SizeSize], nil); err != nil {
-		return fmt.Errorf("failed to write temp leveldb: %v", err)
+		return fmt.Errorf("failed to write temp leveldb: %w", err)
 	}
 	return nil
 }
@@ -118,8 +118,14 @@ func (cm *MemDb) SaveToIdx(idxName string) (ret error) {
 		return
 	}
 	defer func() {
-		idxFile.Sync()
-		idxFile.Close()
+		// The .cpx generated here is renamed to .idx at commit, so a discarded
+		// fsync or close error could leave a partially-written index after a crash.
+		if syncErr := idxFile.Sync(); syncErr != nil && ret == nil {
+			ret = syncErr
+		}
+		if closeErr := idxFile.Close(); closeErr != nil && ret == nil {
+			ret = closeErr
+		}
 	}()
 
 	return cm.AscendingVisit(func(value NeedleValue) error {

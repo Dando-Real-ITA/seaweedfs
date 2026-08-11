@@ -1,0 +1,755 @@
+package topology
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// Helper function to find a disk by ID for testing - reduces code duplication
+func findDiskByID(disks []*DiskInfo, diskID uint32) *DiskInfo {
+	for _, disk := range disks {
+		if disk.DiskID == diskID {
+			return disk
+		}
+	}
+	return nil
+}
+
+// TestActiveTopologyBasicOperations tests basic topology management
+func TestActiveTopologyBasicOperations(t *testing.T) {
+	topology := NewActiveTopology(10)
+	assert.NotNil(t, topology)
+	assert.Equal(t, 10, topology.recentTaskWindowSeconds)
+
+	// Test empty topology
+	assert.Equal(t, 0, len(topology.nodes))
+	assert.Equal(t, 0, len(topology.disks))
+	assert.Equal(t, 0, len(topology.pendingTasks))
+}
+
+// TestActiveTopologyUpdate tests topology updates from master
+func TestActiveTopologyUpdate(t *testing.T) {
+	topology := NewActiveTopology(10)
+
+	// Create sample topology info
+	topologyInfo := createSampleTopology()
+
+	err := topology.UpdateTopology(topologyInfo)
+	require.NoError(t, err)
+
+	// Verify topology structure
+	assert.Equal(t, 2, len(topology.nodes)) // 2 nodes
+	assert.Equal(t, 4, len(topology.disks)) // 4 disks total (2 per node)
+
+	// Verify node structure
+	node1, exists := topology.nodes["10.0.0.1:8080"]
+	require.True(t, exists)
+	assert.Equal(t, "dc1", node1.dataCenter)
+	assert.Equal(t, "rack1", node1.rack)
+	assert.Equal(t, 2, len(node1.disks))
+
+	// Verify disk structure
+	disk1, exists := topology.disks["10.0.0.1:8080:0"]
+	require.True(t, exists)
+	assert.Equal(t, uint32(0), disk1.DiskID)
+	assert.Equal(t, "hdd", disk1.DiskType)
+	assert.Equal(t, "dc1", disk1.DataCenter)
+}
+
+// TestTaskLifecycle tests the complete task lifecycle
+func TestTaskLifecycle(t *testing.T) {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	taskID := "balance-001"
+
+	// 1. Add pending task
+	err := topology.AddPendingTask(TaskSpec{
+		TaskID:     taskID,
+		TaskType:   TaskTypeBalance,
+		VolumeID:   1001,
+		VolumeSize: 1024 * 1024 * 1024,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "10.0.0.2:8080", DiskID: 1},
+		},
+	})
+	assert.NoError(t, err, "Should add pending task successfully")
+
+	// Verify pending state
+	assert.Equal(t, 1, len(topology.pendingTasks))
+	assert.Equal(t, 0, len(topology.assignedTasks))
+	assert.Equal(t, 0, len(topology.recentTasks))
+
+	task := topology.pendingTasks[taskID]
+	assert.Equal(t, TaskStatusPending, task.Status)
+	assert.Equal(t, uint32(1001), task.VolumeID)
+
+	// Verify task assigned to disks
+	sourceDisk := topology.disks["10.0.0.1:8080:0"]
+	targetDisk := topology.disks["10.0.0.2:8080:1"]
+	assert.Equal(t, 1, len(sourceDisk.pendingTasks))
+	assert.Equal(t, 1, len(targetDisk.pendingTasks))
+
+	// 2. Assign task
+	err = topology.AssignTask(taskID)
+	require.NoError(t, err)
+
+	// Verify assigned state
+	assert.Equal(t, 0, len(topology.pendingTasks))
+	assert.Equal(t, 1, len(topology.assignedTasks))
+	assert.Equal(t, 0, len(topology.recentTasks))
+
+	task = topology.assignedTasks[taskID]
+	assert.Equal(t, TaskStatusInProgress, task.Status)
+
+	// Verify task moved to assigned on disks
+	assert.Equal(t, 0, len(sourceDisk.pendingTasks))
+	assert.Equal(t, 1, len(sourceDisk.assignedTasks))
+	assert.Equal(t, 0, len(targetDisk.pendingTasks))
+	assert.Equal(t, 1, len(targetDisk.assignedTasks))
+
+	// 3. Complete task
+	err = topology.CompleteTask(taskID)
+	require.NoError(t, err)
+
+	// Verify completed state
+	assert.Equal(t, 0, len(topology.pendingTasks))
+	assert.Equal(t, 0, len(topology.assignedTasks))
+	assert.Equal(t, 1, len(topology.recentTasks))
+
+	task = topology.recentTasks[taskID]
+	assert.Equal(t, TaskStatusCompleted, task.Status)
+	assert.False(t, task.CompletedAt.IsZero())
+}
+
+// TestTaskDetectionScenarios tests various task detection scenarios
+func TestTaskDetectionScenarios(t *testing.T) {
+	tests := []struct {
+		name          string
+		scenario      func() *ActiveTopology
+		expectedTasks map[string]bool // taskType -> shouldDetect
+	}{
+		{
+			name: "Empty cluster - no tasks needed",
+			scenario: func() *ActiveTopology {
+				topology := NewActiveTopology(10)
+				topology.UpdateTopology(createEmptyTopology())
+				return topology
+			},
+			expectedTasks: map[string]bool{
+				"balance": false,
+				"vacuum":  false,
+				"ec":      false,
+			},
+		},
+		{
+			name: "Unbalanced cluster - balance task needed",
+			scenario: func() *ActiveTopology {
+				topology := NewActiveTopology(10)
+				topology.UpdateTopology(createUnbalancedTopology())
+				return topology
+			},
+			expectedTasks: map[string]bool{
+				"balance": true,
+				"vacuum":  false,
+				"ec":      false,
+			},
+		},
+		{
+			name: "High garbage ratio - vacuum task needed",
+			scenario: func() *ActiveTopology {
+				topology := NewActiveTopology(10)
+				topology.UpdateTopology(createHighGarbageTopology())
+				return topology
+			},
+			expectedTasks: map[string]bool{
+				"balance": false,
+				"vacuum":  true,
+				"ec":      false,
+			},
+		},
+		{
+			name: "Large volumes - EC task needed",
+			scenario: func() *ActiveTopology {
+				topology := NewActiveTopology(10)
+				topology.UpdateTopology(createLargeVolumeTopology())
+				return topology
+			},
+			expectedTasks: map[string]bool{
+				"balance": false,
+				"vacuum":  false,
+				"ec":      true,
+			},
+		},
+		{
+			name: "Recent tasks - no immediate re-detection",
+			scenario: func() *ActiveTopology {
+				topology := NewActiveTopology(10)
+				topology.UpdateTopology(createUnbalancedTopology())
+				// Add recent balance task
+				topology.recentTasks["recent-balance"] = &taskState{
+					VolumeID:    1001,
+					TaskType:    TaskTypeBalance,
+					Status:      TaskStatusCompleted,
+					CompletedAt: time.Now().Add(-5 * time.Second), // 5 seconds ago
+				}
+				return topology
+			},
+			expectedTasks: map[string]bool{
+				"balance": false, // Should not detect due to recent task
+				"vacuum":  false,
+				"ec":      false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			topology := tt.scenario()
+
+			// Test balance task detection
+			shouldDetectBalance := tt.expectedTasks["balance"]
+			actualDetectBalance := !topology.HasRecentTaskForVolume(1001, TaskTypeBalance)
+			if shouldDetectBalance {
+				assert.True(t, actualDetectBalance, "Should detect balance task")
+			} else {
+				// Note: In real implementation, task detection would be more sophisticated
+				// This is a simplified test of the recent task prevention mechanism
+			}
+
+			// Test that recent tasks prevent re-detection
+			if len(topology.recentTasks) > 0 {
+				for _, task := range topology.recentTasks {
+					hasRecent := topology.HasRecentTaskForVolume(task.VolumeID, task.TaskType)
+					assert.True(t, hasRecent, "Should find recent task for volume %d", task.VolumeID)
+				}
+			}
+		})
+	}
+}
+
+// TestTargetSelectionScenarios tests target selection for different task types
+func TestTargetSelectionScenarios(t *testing.T) {
+	tests := []struct {
+		name               string
+		topology           *ActiveTopology
+		taskType           TaskType
+		excludeNode        string
+		expectedTargets    int
+		expectedBestTarget string
+	}{
+		{
+			name:            "Balance task - find least loaded disk",
+			topology:        createTopologyWithLoad(),
+			taskType:        TaskTypeBalance,
+			excludeNode:     "10.0.0.1:8080", // Exclude source node
+			expectedTargets: 2,               // 2 disks on other node
+		},
+		{
+			name:            "EC task - find multiple available disks",
+			topology:        createTopologyForEC(),
+			taskType:        TaskTypeErasureCoding,
+			excludeNode:     "", // Don't exclude any nodes
+			expectedTargets: 4,  // All 4 disks available
+		},
+		{
+			name:            "Vacuum task - cross-type tasks do not block per disk",
+			topology:        createTopologyWithConflicts(),
+			taskType:        TaskTypeVacuum,
+			excludeNode:     "",
+			expectedTargets: 4, // All 4 disks available; per-volume safety is enforced by HasAnyTask
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			availableDisks := tt.topology.GetAvailableDisks(tt.taskType, tt.excludeNode)
+			assert.Equal(t, tt.expectedTargets, len(availableDisks),
+				"Expected %d available disks, got %d", tt.expectedTargets, len(availableDisks))
+
+			// Verify disks are actually available
+			for _, disk := range availableDisks {
+				assert.NotEqual(t, tt.excludeNode, disk.NodeID,
+					"Available disk should not be on excluded node")
+			}
+		})
+	}
+}
+
+// TestDiskLoadCalculation tests disk load calculation
+func TestDiskLoadCalculation(t *testing.T) {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	// Initially no load
+	disks := topology.GetNodeDisks("10.0.0.1:8080")
+	targetDisk := findDiskByID(disks, 0)
+	require.NotNil(t, targetDisk, "Should find disk with ID 0")
+	assert.Equal(t, 0, targetDisk.LoadCount)
+
+	// Add pending task
+	err := topology.AddPendingTask(TaskSpec{
+		TaskID:     "task1",
+		TaskType:   TaskTypeBalance,
+		VolumeID:   1001,
+		VolumeSize: 1024 * 1024 * 1024,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "10.0.0.2:8080", DiskID: 1},
+		},
+	})
+	assert.NoError(t, err, "Should add pending task successfully")
+
+	// Check load increased
+	disks = topology.GetNodeDisks("10.0.0.1:8080")
+	targetDisk = findDiskByID(disks, 0)
+	assert.Equal(t, 1, targetDisk.LoadCount)
+
+	// Add another task to same disk
+	err = topology.AddPendingTask(TaskSpec{
+		TaskID:     "task2",
+		TaskType:   TaskTypeVacuum,
+		VolumeID:   1002,
+		VolumeSize: 0,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "", DiskID: 0}, // Vacuum doesn't have a destination
+		},
+	})
+	assert.NoError(t, err, "Should add vacuum task successfully")
+
+	disks = topology.GetNodeDisks("10.0.0.1:8080")
+	targetDisk = findDiskByID(disks, 0)
+	assert.Equal(t, 2, targetDisk.LoadCount)
+
+	// Move one task to assigned
+	topology.AssignTask("task1")
+
+	// Load should still be 2 (1 pending + 1 assigned)
+	disks = topology.GetNodeDisks("10.0.0.1:8080")
+	targetDisk = findDiskByID(disks, 0)
+	assert.Equal(t, 2, targetDisk.LoadCount)
+
+	// Complete one task
+	topology.CompleteTask("task1")
+
+	// Load should decrease to 1
+	disks = topology.GetNodeDisks("10.0.0.1:8080")
+	targetDisk = findDiskByID(disks, 0)
+	assert.Equal(t, 1, targetDisk.LoadCount)
+}
+
+func TestCrossTypeTasksDoNotBlockPerDisk(t *testing.T) {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	err := topology.AddPendingTask(TaskSpec{
+		TaskID:     "balance1",
+		TaskType:   TaskTypeBalance,
+		VolumeID:   1001,
+		VolumeSize: 1024 * 1024 * 1024,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "10.0.0.2:8080", DiskID: 1},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, topology.AssignTask("balance1"))
+
+	availableDisks := topology.GetAvailableDisks(TaskTypeVacuum, "")
+	sourceDiskAvailable := false
+	for _, disk := range availableDisks {
+		if disk.NodeID == "10.0.0.1:8080" && disk.DiskID == 0 {
+			sourceDiskAvailable = true
+			break
+		}
+	}
+	assert.True(t, sourceDiskAvailable,
+		"Source disk should remain available for an unrelated task type")
+}
+
+// Regression for #9147: a 4-disk cluster with one in-flight balance task must
+// still expose all 4 disks to EC placement so MinTotalDisks can be satisfied.
+func TestECPlanningNotBlockedByUnrelatedBalance(t *testing.T) {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology()) // 2 nodes x 2 disks
+
+	err := topology.AddPendingTask(TaskSpec{
+		TaskID:     "balance1",
+		TaskType:   TaskTypeBalance,
+		VolumeID:   42,
+		VolumeSize: 1024 * 1024 * 1024,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "10.0.0.2:8080", DiskID: 0},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, topology.AssignTask("balance1"))
+
+	ecCandidates := topology.GetDisksWithEffectiveCapacity(TaskTypeErasureCoding, "", 0)
+	assert.Equal(t, 4, len(ecCandidates),
+		"EC must still see all 4 disks even with an unrelated in-flight balance")
+}
+
+// #9369: same-type physical disks collapse into one DiskInfo at the master;
+// the active topology must still expose one entry per physical disk_id.
+func TestECPlannerSeesEachPhysicalDisk(t *testing.T) {
+	topology := NewActiveTopology(10)
+
+	const numServers = 7
+	const disksPerServer = 2
+	nodes := make([]*master_pb.DataNodeInfo, 0, numServers)
+	for i := 1; i <= numServers; i++ {
+		volumeInfos := make([]*master_pb.VolumeInformationMessage, 0, disksPerServer)
+		for d := uint32(0); d < disksPerServer; d++ {
+			volumeInfos = append(volumeInfos, &master_pb.VolumeInformationMessage{
+				Id:       uint32(i*10 + int(d)),
+				DiskId:   d,
+				DiskType: "hdd",
+			})
+		}
+		nodes = append(nodes, &master_pb.DataNodeInfo{
+			Id: fmt.Sprintf("127.0.0.1:%d", 8080+i),
+			DiskInfos: map[string]*master_pb.DiskInfo{
+				"hdd": {
+					DiskId:         0,
+					VolumeCount:    int64(disksPerServer),
+					MaxVolumeCount: 200,
+					VolumeInfos:    volumeInfos,
+				},
+			},
+		})
+	}
+
+	require.NoError(t, topology.UpdateTopology(&master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{{
+			Id: "dc1",
+			RackInfos: []*master_pb.RackInfo{{
+				Id:            "rack1",
+				DataNodeInfos: nodes,
+			}},
+		}},
+	}))
+
+	candidates := topology.GetDisksWithEffectiveCapacity(TaskTypeErasureCoding, "", 0)
+	assert.Equal(t, numServers*disksPerServer, len(candidates))
+
+	seen := make(map[string]bool, len(candidates))
+	for _, c := range candidates {
+		key := fmt.Sprintf("%s:%d", c.NodeID, c.DiskID)
+		assert.False(t, seen[key], "duplicate placement target %s", key)
+		seen[key] = true
+	}
+}
+
+// TestVolumeIndexResolvesPhysicalDiskZero pins that a volume genuinely on
+// physical disk 0 resolves to its own disk via GetVolumeLocations even when the
+// aggregate DiskInfo.DiskId is seeded from a non-zero sibling (as ToDiskInfo
+// does from volumes[0]). Re-deriving the per-record disk id would fold disk 0
+// onto the sibling, then the lookup would find no matching volume and drop it.
+func TestVolumeIndexResolvesPhysicalDiskZero(t *testing.T) {
+	topology := NewActiveTopology(10)
+
+	require.NoError(t, topology.UpdateTopology(&master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{{
+			Id: "dc1",
+			RackInfos: []*master_pb.RackInfo{{
+				Id: "rack1",
+				DataNodeInfos: []*master_pb.DataNodeInfo{{
+					Id: "127.0.0.1:8080",
+					DiskInfos: map[string]*master_pb.DiskInfo{
+						"hdd": {
+							DiskId:         6, // seeded from volumes[0].DiskId
+							MaxVolumeCount: 200,
+							VolumeInfos: []*master_pb.VolumeInformationMessage{
+								{Id: 11, DiskId: 6, DiskType: "hdd"},
+								{Id: 10, DiskId: 0, DiskType: "hdd"},
+							},
+						},
+					},
+				}},
+			}},
+		}},
+	}))
+
+	loc10 := topology.GetVolumeLocations(10, "")
+	require.Len(t, loc10, 1, "volume on physical disk 0 must resolve to one disk")
+	assert.Equal(t, uint32(0), loc10[0].DiskID, "volume 10 lives on physical disk 0")
+
+	loc11 := topology.GetVolumeLocations(11, "")
+	require.Len(t, loc11, 1)
+	assert.Equal(t, uint32(6), loc11[0].DiskID, "volume 11 lives on physical disk 6")
+}
+
+// TestECShardIndexResolvesPhysicalDiskZero is the EC-shard twin of
+// TestVolumeIndexResolvesPhysicalDiskZero: rebuildIndexes builds ecShardIndex
+// the same way, so an EC shard on physical disk 0 must resolve via
+// GetECShardLocations rather than being folded onto a non-zero sibling.
+func TestECShardIndexResolvesPhysicalDiskZero(t *testing.T) {
+	topology := NewActiveTopology(10)
+
+	require.NoError(t, topology.UpdateTopology(&master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{{
+			Id: "dc1",
+			RackInfos: []*master_pb.RackInfo{{
+				Id: "rack1",
+				DataNodeInfos: []*master_pb.DataNodeInfo{{
+					Id: "127.0.0.1:8080",
+					DiskInfos: map[string]*master_pb.DiskInfo{
+						"hdd": {
+							DiskId:         6, // seeded from a non-zero sibling
+							MaxVolumeCount: 200,
+							EcShardInfos: []*master_pb.VolumeEcShardInformationMessage{
+								{Id: 21, DiskId: 6, Collection: "c1", EcIndexBits: 0b1},
+								{Id: 20, DiskId: 0, Collection: "c1", EcIndexBits: 0b1},
+							},
+						},
+					},
+				}},
+			}},
+		}},
+	}))
+
+	loc20 := topology.GetECShardLocations(20, "c1")
+	require.Len(t, loc20, 1, "EC shard on physical disk 0 must resolve to one disk")
+	assert.Equal(t, uint32(0), loc20[0].DiskID, "shard 20 lives on physical disk 0")
+
+	loc21 := topology.GetECShardLocations(21, "c1")
+	require.Len(t, loc21, 1)
+	assert.Equal(t, uint32(6), loc21[0].DiskID, "shard 21 lives on physical disk 6")
+}
+
+// TestPublicInterfaces tests the public interface methods
+func TestPublicInterfaces(t *testing.T) {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	// Test GetAllNodes
+	nodes := topology.GetAllNodes()
+	assert.Equal(t, 2, len(nodes))
+	assert.Contains(t, nodes, "10.0.0.1:8080")
+	assert.Contains(t, nodes, "10.0.0.2:8080")
+
+	// Test GetNodeDisks
+	disks := topology.GetNodeDisks("10.0.0.1:8080")
+	assert.Equal(t, 2, len(disks))
+
+	// Test with non-existent node
+	disks = topology.GetNodeDisks("non-existent")
+	assert.Nil(t, disks)
+}
+
+// Helper functions to create test topologies
+
+func createSampleTopology() *master_pb.TopologyInfo {
+	return &master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{
+			{
+				Id: "dc1",
+				RackInfos: []*master_pb.RackInfo{
+					{
+						Id: "rack1",
+						DataNodeInfos: []*master_pb.DataNodeInfo{
+							{
+								Id: "10.0.0.1:8080",
+								DiskInfos: map[string]*master_pb.DiskInfo{
+									"hdd": {DiskId: 0, VolumeCount: 10, MaxVolumeCount: 100},
+									"ssd": {DiskId: 1, VolumeCount: 5, MaxVolumeCount: 50},
+								},
+							},
+							{
+								Id: "10.0.0.2:8080",
+								DiskInfos: map[string]*master_pb.DiskInfo{
+									"hdd": {DiskId: 0, VolumeCount: 8, MaxVolumeCount: 100},
+									"ssd": {DiskId: 1, VolumeCount: 3, MaxVolumeCount: 50},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createEmptyTopology() *master_pb.TopologyInfo {
+	return &master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{
+			{
+				Id: "dc1",
+				RackInfos: []*master_pb.RackInfo{
+					{
+						Id: "rack1",
+						DataNodeInfos: []*master_pb.DataNodeInfo{
+							{
+								Id: "10.0.0.1:8080",
+								DiskInfos: map[string]*master_pb.DiskInfo{
+									"hdd": {DiskId: 0, VolumeCount: 0, MaxVolumeCount: 100},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createUnbalancedTopology() *master_pb.TopologyInfo {
+	return &master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{
+			{
+				Id: "dc1",
+				RackInfos: []*master_pb.RackInfo{
+					{
+						Id: "rack1",
+						DataNodeInfos: []*master_pb.DataNodeInfo{
+							{
+								Id: "10.0.0.1:8080",
+								DiskInfos: map[string]*master_pb.DiskInfo{
+									"hdd": {DiskId: 0, VolumeCount: 90, MaxVolumeCount: 100}, // Very loaded
+								},
+							},
+							{
+								Id: "10.0.0.2:8080",
+								DiskInfos: map[string]*master_pb.DiskInfo{
+									"hdd": {DiskId: 0, VolumeCount: 10, MaxVolumeCount: 100}, // Lightly loaded
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createHighGarbageTopology() *master_pb.TopologyInfo {
+	// In a real implementation, this would include volume-level garbage metrics
+	return createSampleTopology()
+}
+
+func createLargeVolumeTopology() *master_pb.TopologyInfo {
+	// In a real implementation, this would include volume-level size metrics
+	return createSampleTopology()
+}
+
+func createTopologyWithLoad() *ActiveTopology {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	// Add some existing tasks to create load
+	err := topology.AddPendingTask(TaskSpec{
+		TaskID:     "existing1",
+		TaskType:   TaskTypeVacuum,
+		VolumeID:   2001,
+		VolumeSize: 0,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "", DiskID: 0}, // Vacuum doesn't have a destination
+		},
+	})
+	if err != nil {
+		// In test helper function, just log error instead of failing
+		fmt.Printf("Warning: Failed to add existing task: %v\n", err)
+	}
+	topology.AssignTask("existing1")
+
+	return topology
+}
+
+func createTopologyForEC() *ActiveTopology {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+	return topology
+}
+
+func createTopologyWithConflicts() *ActiveTopology {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	// Add conflicting tasks
+	err := topology.AddPendingTask(TaskSpec{
+		TaskID:     "balance1",
+		TaskType:   TaskTypeBalance,
+		VolumeID:   3001,
+		VolumeSize: 1024 * 1024 * 1024,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 0},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "10.0.0.2:8080", DiskID: 0},
+		},
+	})
+	if err != nil {
+		fmt.Printf("Warning: Failed to add balance task: %v\n", err)
+	}
+	topology.AssignTask("balance1")
+
+	err = topology.AddPendingTask(TaskSpec{
+		TaskID:     "ec1",
+		TaskType:   TaskTypeErasureCoding,
+		VolumeID:   3002,
+		VolumeSize: 1024 * 1024 * 1024,
+		Sources: []TaskSourceSpec{
+			{ServerID: "10.0.0.1:8080", DiskID: 1},
+		},
+		Destinations: []TaskDestinationSpec{
+			{ServerID: "", DiskID: 0}, // EC doesn't have single destination
+		},
+	})
+	if err != nil {
+		fmt.Printf("Warning: Failed to add EC task: %v\n", err)
+	}
+	topology.AssignTask("ec1")
+
+	return topology
+}
+
+// TestDestinationPlanning tests that the public interface works correctly
+// NOTE: Destination planning is now done in task detection phase, not in ActiveTopology
+func TestDestinationPlanning(t *testing.T) {
+	topology := NewActiveTopology(10)
+	topology.UpdateTopology(createSampleTopology())
+
+	// Test that GetAvailableDisks works for destination planning
+	t.Run("GetAvailableDisks functionality", func(t *testing.T) {
+		availableDisks := topology.GetAvailableDisks(TaskTypeBalance, "10.0.0.1:8080")
+		assert.Greater(t, len(availableDisks), 0)
+
+		// Should exclude the source node
+		for _, disk := range availableDisks {
+			assert.NotEqual(t, "10.0.0.1:8080", disk.NodeID)
+		}
+	})
+
+	// Test that topology state can be used for planning
+	t.Run("Topology provides planning information", func(t *testing.T) {
+		topologyInfo := topology.GetTopologyInfo()
+		assert.NotNil(t, topologyInfo)
+		assert.Greater(t, len(topologyInfo.DataCenterInfos), 0)
+
+		// Test getting node disks
+		disks := topology.GetNodeDisks("10.0.0.1:8080")
+		assert.Greater(t, len(disks), 0)
+	})
+}

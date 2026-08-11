@@ -2,8 +2,9 @@ package filer
 
 import (
 	"container/list"
+	"slices"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"golang.org/x/exp/slices"
 )
 
 func readResolvedChunks(chunks []*filer_pb.FileChunk, startOffset int64, stopOffset int64) (visibles *IntervalList[*VisibleInterval]) {

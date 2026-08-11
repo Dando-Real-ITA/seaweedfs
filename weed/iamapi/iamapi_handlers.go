@@ -1,31 +1,48 @@
 package iamapi
 
 import (
-	"fmt"
+	"net/http"
+
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
-	"net/http"
 )
 
-func writeIamErrorResponse(w http.ResponseWriter, r *http.Request, err error, object string, value string, msg error) {
-	errCode := err.Error()
+func newErrorResponse(errCode string, errMsg string, requestID string) ErrorResponse {
 	errorResp := ErrorResponse{}
 	errorResp.Error.Type = "Sender"
 	errorResp.Error.Code = &errCode
-	if msg != nil {
-		errMsg := msg.Error()
-		errorResp.Error.Message = &errMsg
+	errorResp.Error.Message = &errMsg
+	errorResp.SetRequestId(requestID)
+	return errorResp
+}
+
+func writeIamErrorResponse(w http.ResponseWriter, r *http.Request, reqID string, iamError *IamError) {
+	if iamError == nil {
+		glog.Errorf("writeIamErrorResponse called with nil error")
+		internalResp := newErrorResponse(iam.ErrCodeServiceFailureException, "Internal server error", reqID)
+		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalResp)
+		return
 	}
-	glog.Errorf("Response %+v", err)
+
+	errCode := iamError.Code
+	errMsg := iamError.Error.Error()
+	glog.Errorf("Response %+v", errMsg)
+
+	errorResp := newErrorResponse(errCode, errMsg, reqID)
+	internalErrorResponse := newErrorResponse(iam.ErrCodeServiceFailureException, "Internal server error", reqID)
+
 	switch errCode {
 	case iam.ErrCodeNoSuchEntityException:
-		msg := fmt.Sprintf("The %s with name %s cannot be found.", object, value)
-		errorResp.Error.Message = &msg
 		s3err.WriteXMLResponse(w, r, http.StatusNotFound, errorResp)
+	case iam.ErrCodeMalformedPolicyDocumentException, iam.ErrCodeInvalidInputException:
+		s3err.WriteXMLResponse(w, r, http.StatusBadRequest, errorResp)
+	case iam.ErrCodeDeleteConflictException, iam.ErrCodeEntityAlreadyExistsException:
+		s3err.WriteXMLResponse(w, r, http.StatusConflict, errorResp)
 	case iam.ErrCodeServiceFailureException:
-		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, errorResp)
+		// We do not want to expose internal server error to the client
+		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalErrorResponse)
 	default:
-		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, errorResp)
+		s3err.WriteXMLResponse(w, r, http.StatusInternalServerError, internalErrorResponse)
 	}
 }

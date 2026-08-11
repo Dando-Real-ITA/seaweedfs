@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,7 +54,17 @@ func (ms *MasterServer) dirLookupHandler(w http.ResponseWriter, r *http.Request)
 	location := ms.findVolumeLocation(collection, vid)
 	httpStatus := http.StatusOK
 	if location.Error != "" || location.Locations == nil {
-		httpStatus = http.StatusNotFound
+		if location.NotFound && ms.Topo.IsLeader() && ms.Topo.IsWarmingUp() {
+			httpStatus = http.StatusServiceUnavailable
+			remaining := ms.Topo.RemainingWarmupDuration()
+			if remaining < time.Second {
+				remaining = time.Second
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Ceil(remaining.Seconds()))))
+			location.Error = "service warming up, please retry"
+		} else {
+			httpStatus = http.StatusNotFound
+		}
 	} else {
 		forRead := r.FormValue("read")
 		isRead := forRead == "yes"
@@ -94,12 +105,15 @@ func (ms *MasterServer) findVolumeLocation(collection, vid string) operation.Loo
 		}
 		err = getVidLocationsErr
 	}
+	notFound := false
 	if len(locations) == 0 && err == nil {
 		err = fmt.Errorf("volume id %s not found", vid)
+		notFound = true
 	}
 	ret := operation.LookupResult{
 		VolumeOrFileId: vid,
 		Locations:      locations,
+		NotFound:       notFound,
 	}
 	if err != nil {
 		ret.Error = err.Error()
@@ -108,6 +122,17 @@ func (ms *MasterServer) findVolumeLocation(collection, vid string) operation.Loo
 }
 
 func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request) {
+	if ms.Topo.IsLeader() && ms.Topo.IsWarmingUp() {
+		remaining := ms.Topo.RemainingWarmupDuration()
+		if remaining < time.Second {
+			remaining = time.Second
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Ceil(remaining.Seconds()))))
+		writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+			Error: "master is warming up, topology is still loading",
+		})
+		return
+	}
 	stats.AssignRequest()
 	requestedCount, e := strconv.ParseUint(r.FormValue("count"), 10, 64)
 	if e != nil || requestedCount == 0 {
@@ -119,6 +144,11 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 		writableVolumeCount = 0
 	}
 
+	expectedDataSize, e := strconv.ParseUint(r.FormValue("dataSize"), 10, 64)
+	if e != nil {
+		expectedDataSize = 0
+	}
+
 	option, err := ms.getVolumeGrowOption(r)
 	if err != nil {
 		writeJsonQuiet(w, r, http.StatusNotAcceptable, operation.AssignResult{Error: err.Error()})
@@ -128,9 +158,11 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 	vl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, option.DiskType)
 
 	var (
-		lastErr    error
-		maxTimeout = time.Second * 10
-		startTime  = time.Now()
+		lastErr           error
+		maxTimeout        = time.Second * 10
+		startTime         = time.Now()
+		initiatedGrow     bool
+		repickedAfterGrow bool
 	)
 
 	if !ms.Topo.DataCenterExists(option.DataCenter) {
@@ -140,14 +172,14 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	for time.Now().Sub(startTime) < maxTimeout {
-		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(requestedCount, option, vl)
-		if shouldGrow && !vl.HasGrowRequest() {
+	for time.Since(startTime) < maxTimeout {
+		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(requestedCount, option, vl, expectedDataSize)
+		if shouldGrow && !initiatedGrow && !ms.option.VolumeGrowthDisabled && vl.AddGrowRequestIfAbsent() {
+			initiatedGrow = true
 			glog.V(0).Infof("dirAssign volume growth %v from %v", option.String(), r.RemoteAddr)
 			if err != nil && ms.Topo.AvailableSpaceFor(option) <= 0 {
 				err = fmt.Errorf("%s and no free volumes left for %s", err.Error(), option.String())
 			}
-			vl.AddGrowRequest()
 			ms.volumeGrowthRequestChan <- &topology.VolumeGrowRequest{
 				Option: option,
 				Count:  uint32(writableVolumeCount),
@@ -157,7 +189,31 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			stats.MasterPickForWriteErrorCounter.Inc()
 			lastErr = err
-			time.Sleep(200 * time.Millisecond)
+			if shouldGrow {
+				if ms.Topo.AvailableSpaceFor(option) <= 0 {
+					break // out of space: surface the real error (406 below)
+				}
+				// See Assign: only the initiator waits, and only while the
+				// growth it triggered is still pending.
+				if initiatedGrow != vl.HasGrowRequest() {
+					// See Assign: re-pick once after the growth concludes before
+					// shedding — the failed pick may predate the conclusion.
+					if initiatedGrow && !repickedAfterGrow {
+						repickedAfterGrow = true
+						continue
+					}
+					w.Header().Set("Retry-After", "1")
+					writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+						Error: fmt.Sprintf("no writable volumes for %s, volume growth in progress", option.String()),
+					})
+					return
+				}
+			}
+			select {
+			case <-r.Context().Done():
+				return // client gone
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		} else {
 			ms.maybeAddJwtAuthorization(w, fid, true)
@@ -170,6 +226,14 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// See Assign: initiator that timed out with growth still pending stays retryable.
+	if initiatedGrow && vl.HasGrowRequest() && ms.Topo.AvailableSpaceFor(option) > 0 {
+		w.Header().Set("Retry-After", "1")
+		writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+			Error: fmt.Sprintf("no writable volumes for %s, volume growth in progress", option.String()),
+		})
+		return
+	}
 	if lastErr != nil {
 		writeJsonQuiet(w, r, http.StatusNotAcceptable, operation.AssignResult{Error: lastErr.Error()})
 	} else {
@@ -183,13 +247,13 @@ func (ms *MasterServer) maybeAddJwtAuthorization(w http.ResponseWriter, fileId s
 	}
 	var encodedJwt security.EncodedJwt
 	if isWrite {
-		encodedJwt = security.GenJwtForVolumeServer(ms.guard.SigningKey, ms.guard.ExpiresAfterSec, fileId)
+		encodedJwt = security.GenJwtForVolumeServer(ms.guard.SigningKey(), ms.guard.ExpiresAfterSec(), fileId)
 	} else {
-		encodedJwt = security.GenJwtForVolumeServer(ms.guard.ReadSigningKey, ms.guard.ReadExpiresAfterSec, fileId)
+		encodedJwt = security.GenJwtForVolumeServer(ms.guard.ReadSigningKey(), ms.guard.ReadExpiresAfterSec(), fileId)
 	}
 	if encodedJwt == "" {
 		return
 	}
 
-	w.Header().Set("Authorization", "BEARER "+string(encodedJwt))
+	w.Header().Set("Authorization", security.BearerPrefix+string(encodedJwt))
 }

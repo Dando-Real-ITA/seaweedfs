@@ -1,6 +1,8 @@
 package shell
 
 import (
+	"compress/gzip"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -38,6 +40,10 @@ func (c *commandFsMetaLoad) Help() string {
 `
 }
 
+func (c *commandFsMetaLoad) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	if len(args) == 0 {
@@ -45,7 +51,7 @@ func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.
 		return nil
 	}
 
-	fileName := args[len(args)-1]
+	fileName := util.ResolvePath(args[len(args)-1])
 
 	metaLoadCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	c.dirPrefix = metaLoadCommand.String("dirPrefix", "", "load entries only with directories matching prefix")
@@ -55,11 +61,31 @@ func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.
 		return nil
 	}
 
-	dst, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
+	var dst io.Reader
+
+	f, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
 	if err != nil {
-		return nil
+		return fmt.Errorf("failed to open file %s: %v", fileName, err)
 	}
-	defer dst.Close()
+	defer f.Close()
+
+	dst = f
+
+	if strings.HasSuffix(fileName, ".gz") || strings.HasSuffix(fileName, ".gzip") {
+		var gr *gzip.Reader
+		gr, err = gzip.NewReader(dst)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			err1 := gr.Close()
+			if err == nil {
+				err = err1
+			}
+		}()
+
+		dst = gr
+	}
 
 	var dirCount, fileCount uint64
 	lastLogTime := time.Now()
@@ -72,7 +98,7 @@ func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.
 		var wg sync.WaitGroup
 
 		for {
-			if n, err := dst.Read(sizeBuf); n != 4 {
+			if _, err := io.ReadFull(dst, sizeBuf); err != nil {
 				if err == io.EOF {
 					return nil
 				}
@@ -83,7 +109,7 @@ func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.
 
 			data := make([]byte, int(size))
 
-			if n, err := dst.Read(data); n != len(data) {
+			if _, err := io.ReadFull(dst, data); err != nil {
 				return err
 			}
 
@@ -113,7 +139,7 @@ func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.
 			fullEntry.Entry.Name = strings.ReplaceAll(fullEntry.Entry.Name, "/", "x")
 			if fullEntry.Entry.IsDirectory {
 				wg.Wait()
-				if errEntry := filer_pb.CreateEntry(client, &filer_pb.CreateEntryRequest{
+				if errEntry := filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{
 					Directory: fullEntry.Dir,
 					Entry:     fullEntry.Entry,
 				}); errEntry != nil {
@@ -124,7 +150,7 @@ func (c *commandFsMetaLoad) Do(args []string, commandEnv *CommandEnv, writer io.
 				wg.Add(1)
 				waitChan <- struct{}{}
 				go func(entry *filer_pb.FullEntry) {
-					if errEntry := filer_pb.CreateEntry(client, &filer_pb.CreateEntryRequest{
+					if errEntry := filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{
 						Directory: entry.Dir,
 						Entry:     entry.Entry,
 					}); errEntry != nil {

@@ -2,9 +2,10 @@ package storage
 
 import (
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"io"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
@@ -20,6 +21,11 @@ const PagedReadLimit = 1024 * 1024
 func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSizeFn func(size Size)) (count int, err error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
+
+	if v.nm == nil {
+		glog.V(0).Infof("volume %d: needle map not loaded; read returns not-found", v.Id)
+		return -1, ErrorNotFound
+	}
 
 	nv, ok := v.nm.Get(n.Id)
 	if !ok || nv.Offset.IsZero() {
@@ -107,6 +113,13 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 	if readOption.HasSlowRead {
 		v.dataFileAccessLock.RLock()
 	}
+	if v.nm == nil {
+		if readOption.HasSlowRead {
+			v.dataFileAccessLock.RUnlock()
+		}
+		glog.V(0).Infof("volume %d: needle map not loaded; read returns not-found", v.Id)
+		return ErrorNotFound
+	}
 	nv, ok := v.nm.Get(n.Id)
 	if readOption.HasSlowRead {
 		v.dataFileAccessLock.RUnlock()
@@ -145,6 +158,13 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		}
 		// possibly re-read needle offset if volume is compacted
 		if readOption.VolumeRevision != v.SuperBlock.CompactionRevision {
+			if v.nm == nil {
+				if readOption.HasSlowRead {
+					v.dataFileAccessLock.RUnlock()
+				}
+				glog.V(0).Infof("volume %d: needle map not loaded mid-read", v.Id)
+				return ErrorNotFound
+			}
 			// the volume is compacted
 			nv, ok = v.nm.Get(n.Id)
 			if !ok || nv.Offset.IsZero() {
@@ -160,19 +180,22 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		if readOption.HasSlowRead {
 			v.dataFileAccessLock.RUnlock()
 		}
+		// Thread the underlying read error through the EIO tracker.
+		// Without this, large/range GETs through readNeedleDataInto
+		// would never trip IoErrorTolerance even on a failing disk.
+		// io.EOF is treated as a clean end-of-stream below, not an
+		// error.
+		if err != nil && err != io.EOF {
+			v.checkReadWriteError(err)
+		}
 
 		toWrite := min(count, int(offset+size-x))
 		if toWrite > 0 {
 			crc = crc.Update(buf[0:toWrite])
-			if offset == 0 && size == int64(n.DataSize) && int64(count) == size && (n.Checksum != crc) {
-				// This check works only if the buffer is big enough to hold the whole needle data
-				// and we ask for all needle data.
-				// Otherwise we cannot check the validity of partially aquired data.
-				stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorCRC).Inc()
-				return fmt.Errorf("ReadNeedleData checksum %v expected %v for Needle: %v,%v", crc, n.Checksum, v.Id, n)
-			}
+			// Note: CRC validation happens after the loop completes (see below)
+			// to avoid performance overhead in the hot read path
 			if _, err = writer.Write(buf[0:toWrite]); err != nil {
-				return fmt.Errorf("ReadNeedleData write: %v", err)
+				return fmt.Errorf("ReadNeedleData write: %w", err)
 			}
 		}
 		if err != nil {
@@ -180,14 +203,21 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 				err = nil
 				break
 			}
-			return fmt.Errorf("ReadNeedleData: %v", err)
+			return fmt.Errorf("ReadNeedleData: %w", err)
 		}
 		if count <= 0 {
 			break
 		}
 	}
+	// Whole-needle read completed without a backend error — clear any
+	// pending EIO streak. If a non-EIO failure happens later (CRC etc.)
+	// we still return that error to the caller, but the disk itself
+	// produced clean bytes.
+	v.checkReadWriteError(nil)
 	if offset == 0 && size == int64(n.DataSize) && (n.Checksum != crc && uint32(n.Checksum) != crc.Value()) {
-		// the crc.Value() function is to be deprecated. this double checking is for backward compatible.
+		// the crc.Value() function is to be deprecated. this double checking is for backward compatibility
+		// with seaweed version using crc.Value() instead of uint32(crc), which appears in commit 056c480eb
+		// and switch appeared in version 3.09.
 		stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorCRC).Inc()
 		return fmt.Errorf("ReadNeedleData checksum %v expected %v for Needle: %v,%v", crc, n.Checksum, v.Id, n)
 	}
@@ -207,7 +237,9 @@ func (v *Volume) ReadNeedleBlob(offset int64, size Size) ([]byte, error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 
-	return needle.ReadNeedleBlob(v.DataBackend, offset, size, v.Version())
+	blob, err := needle.ReadNeedleBlob(v.DataBackend, offset, size, v.Version())
+	v.checkReadWriteError(err)
+	return blob, err
 }
 
 type VolumeFileScanner interface {
@@ -220,11 +252,11 @@ func ScanVolumeFile(dirname string, collection string, id needle.VolumeId,
 	needleMapKind NeedleMapKind,
 	volumeFileScanner VolumeFileScanner) (err error) {
 	var v *Volume
-	if v, err = loadVolumeWithoutIndex(dirname, collection, id, needleMapKind); err != nil {
-		return fmt.Errorf("failed to load volume %d: %v", id, err)
+	if v, err = loadVolumeWithoutIndex(dirname, collection, id, needleMapKind, needle.GetCurrentVersion()); err != nil {
+		return fmt.Errorf("failed to load volume %d: %w", id, err)
 	}
 	if err = volumeFileScanner.VisitSuperBlock(v.SuperBlock); err != nil {
-		return fmt.Errorf("failed to process volume %d super block: %v", id, err)
+		return fmt.Errorf("failed to process volume %d super block: %w", id, err)
 	}
 	defer v.Close()
 
@@ -241,7 +273,7 @@ func ScanVolumeFileFrom(version needle.Version, datBackend backend.BackendStorag
 		if e == io.EOF {
 			return nil
 		}
-		return fmt.Errorf("cannot read %s at offset %d: %v", datBackend.Name(), offset, e)
+		return fmt.Errorf("cannot read %s at offset %d: %w", datBackend.Name(), offset, e)
 	}
 	for n != nil {
 		var needleBody []byte
@@ -259,7 +291,7 @@ func ScanVolumeFileFrom(version needle.Version, datBackend backend.BackendStorag
 		}
 		if err != nil {
 			glog.V(0).Infof("visit needle error: %v", err)
-			return fmt.Errorf("visit needle error: %v", err)
+			return fmt.Errorf("visit needle error: %w", err)
 		}
 		offset += NeedleHeaderSize + rest
 		glog.V(4).Infof("==> new entry offset %d", offset)
@@ -267,7 +299,7 @@ func ScanVolumeFileFrom(version needle.Version, datBackend backend.BackendStorag
 			if err == io.EOF {
 				return nil
 			}
-			return fmt.Errorf("cannot read needle header at offset %d: %v", offset, err)
+			return fmt.Errorf("cannot read needle header at offset %d: %w", offset, err)
 		}
 		glog.V(4).Infof("new entry needle size:%d rest:%d", n.Size, rest)
 	}

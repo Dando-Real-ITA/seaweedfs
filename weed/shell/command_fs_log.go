@@ -1,12 +1,14 @@
 package shell
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"io"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 func init() {
@@ -23,8 +25,12 @@ func (c *commandFsLogPurge) Name() string {
 func (c *commandFsLogPurge) Help() string {
 	return `purge filer logs
 
-	fs.log.purge [-v] [-modifyDayAgo 365]
+	fs.log.purge [-v] [-daysAgo 365]
 `
+}
+
+func (c *commandFsLogPurge) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandFsLogPurge) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -37,11 +43,11 @@ func (c *commandFsLogPurge) Do(args []string, commandEnv *CommandEnv, writer io.
 	}
 
 	modificationTimeAgo := time.Now().Add(-time.Hour * 24 * time.Duration(*daysAgo)).Unix()
-	err = filer_pb.ReadDirAllEntries(commandEnv, filer.SystemLogDir, "", func(entry *filer_pb.Entry, isLast bool) error {
+	err = filer_pb.ReadDirAllEntries(context.Background(), commandEnv, filer.SystemLogDir, "", func(entry *filer_pb.Entry, isLast bool) error {
 		if entry.Attributes.Mtime > modificationTimeAgo {
 			return nil
 		}
-		if errDel := filer_pb.Remove(commandEnv, filer.SystemLogDir, entry.Name, true, true, true, false, nil); errDel != nil {
+		if errDel := filer_pb.Remove(context.Background(), commandEnv, filer.SystemLogDir, entry.Name, true, true, true, false, nil); errDel != nil {
 			return errDel
 		}
 		if *verbose {

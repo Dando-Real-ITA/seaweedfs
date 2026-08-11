@@ -4,12 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"io"
-	"time"
 )
 
 func init() {
@@ -35,6 +36,10 @@ func (c *commandRemoteUnmount) Help() string {
 	remote.unmount -dir=/xxx
 
 `
+}
+
+func (c *commandRemoteUnmount) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandRemoteUnmount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -63,13 +68,13 @@ func (c *commandRemoteUnmount) Do(args []string, commandEnv *CommandEnv, writer 
 	// store a mount configuration in filer
 	fmt.Fprintf(writer, "deleting mount for %s ...\n", *dir)
 	if err = filer.DeleteMountMapping(commandEnv, *dir); err != nil {
-		return fmt.Errorf("delete mount mapping: %v", err)
+		return fmt.Errorf("delete mount mapping: %w", err)
 	}
 
 	// purge mounted data
 	fmt.Fprintf(writer, "purge %s ...\n", *dir)
 	if err = c.purgeMountedData(commandEnv, *dir); err != nil {
-		return fmt.Errorf("purge mounted data: %v", err)
+		return fmt.Errorf("purge mounted data: %w", err)
 	}
 
 	// reset remote sync offset in case the folder is mounted again
@@ -84,6 +89,7 @@ func (c *commandRemoteUnmount) purgeMountedData(commandEnv *CommandEnv, dir stri
 
 	// find existing directory, and ensure the directory is empty
 	err := commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		ctx := context.Background()
 		parent, name := util.FullPath(dir).DirAndName()
 		lookupResp, lookupErr := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
 			Directory: parent,
@@ -95,12 +101,12 @@ func (c *commandRemoteUnmount) purgeMountedData(commandEnv *CommandEnv, dir stri
 
 		oldEntry := lookupResp.Entry
 
-		deleteError := filer_pb.DoRemove(client, parent, name, true, true, true, false, nil)
+		deleteError := filer_pb.DoRemove(ctx, client, parent, name, true, true, true, false, nil)
 		if deleteError != nil {
 			return fmt.Errorf("delete %s: %v", dir, deleteError)
 		}
 
-		mkdirErr := filer_pb.DoMkdir(client, parent, name, func(entry *filer_pb.Entry) {
+		mkdirErr := filer_pb.DoMkdir(ctx, client, parent, name, func(entry *filer_pb.Entry) {
 			entry.Attributes = oldEntry.Attributes
 			entry.Extended = oldEntry.Extended
 			entry.Attributes.Crtime = time.Now().Unix()

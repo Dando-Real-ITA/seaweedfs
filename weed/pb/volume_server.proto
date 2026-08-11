@@ -7,6 +7,16 @@ import "remote.proto";
 
 //////////////////////////////////////////////////
 
+// Persistent state for volume servers.
+message VolumeServerState {
+    // whether the server is in maintenance (i.e. read-only) mode.
+    bool maintenance = 1;
+    // incremental version counter
+    uint32 version = 2;
+}
+
+//////////////////////////////////////////////////
+
 service VolumeServer {
     //Experts only: takes multiple fid parameters. This function does not propagate deletes to replicas.
     rpc BatchDelete (BatchDeleteRequest) returns (BatchDeleteResponse) {
@@ -46,12 +56,19 @@ service VolumeServer {
     rpc VolumeStatus (VolumeStatusRequest) returns (VolumeStatusResponse) {
     }
 
+    rpc GetState (GetStateRequest) returns (GetStateResponse) {
+    }
+    rpc SetState (SetStateRequest) returns (SetStateResponse) {
+    }
+
     // copy the .idx .dat files, and mount this volume
     rpc VolumeCopy (VolumeCopyRequest) returns (stream VolumeCopyResponse) {
     }
     rpc ReadVolumeFileStatus (ReadVolumeFileStatusRequest) returns (ReadVolumeFileStatusResponse) {
     }
     rpc CopyFile (CopyFileRequest) returns (stream CopyFileResponse) {
+    }
+    rpc ReceiveFile (stream ReceiveFileRequest) returns (ReceiveFileResponse) {
     }
 
     rpc ReadNeedleBlob (ReadNeedleBlobRequest) returns (ReadNeedleBlobResponse) {
@@ -87,6 +104,8 @@ service VolumeServer {
     }
     rpc VolumeEcShardsToVolume (VolumeEcShardsToVolumeRequest) returns (VolumeEcShardsToVolumeResponse) {
     }
+    rpc VolumeEcShardsInfo (VolumeEcShardsInfoRequest) returns (VolumeEcShardsInfoResponse) {
+    }
 
     // tiered storage
     rpc VolumeTierMoveDatToRemote (VolumeTierMoveDatToRemoteRequest) returns (stream VolumeTierMoveDatToRemoteResponse) {
@@ -101,6 +120,12 @@ service VolumeServer {
 
     // remote storage
     rpc FetchAndWriteNeedle (FetchAndWriteNeedleRequest) returns (FetchAndWriteNeedleResponse) {
+    }
+
+    // scrubbing
+    rpc ScrubVolume (ScrubVolumeRequest) returns (ScrubVolumeResponse) {
+    }
+    rpc ScrubEcVolume (ScrubEcVolumeRequest) returns (ScrubEcVolumeResponse) {
     }
 
     // <experimental> query
@@ -180,6 +205,7 @@ message AllocateVolumeRequest {
     string ttl = 5;
     uint32 memory_map_max_size_mb = 6;
     string disk_type = 7;
+    uint32 version = 8;
 }
 message AllocateVolumeResponse {
 }
@@ -195,6 +221,7 @@ message VolumeSyncStatusResponse {
     uint64 tail_offset = 6;
     uint32 compact_revision = 7;
     uint64 idx_file_size = 8;
+    uint32 version = 9;
 }
 
 message VolumeIncrementalCopyRequest {
@@ -220,12 +247,16 @@ message VolumeUnmountResponse {
 message VolumeDeleteRequest {
     uint32 volume_id = 1;
     bool only_empty = 2;
+    // when true, do not remove the cloud-tier object backing the volume.
+    // used for moves where another server is taking over the same .vif.
+    bool keep_remote_data = 3;
 }
 message VolumeDeleteResponse {
 }
 
 message VolumeMarkReadonlyRequest {
     uint32 volume_id = 1;
+    bool persist = 2;
 }
 message VolumeMarkReadonlyResponse {
 }
@@ -254,6 +285,21 @@ message VolumeStatusResponse {
     uint64 file_deleted_count = 4;
 }
 
+message GetStateRequest {
+}
+message GetStateResponse {
+    VolumeServerState state = 1;
+}
+
+message SetStateRequest {
+    // SetState updates *all* volume server flags at once. Retrieve state with GetState(),
+    // modify individual flags as required, then call this RPC to update.
+    VolumeServerState state = 1;
+}
+message SetStateResponse {
+    VolumeServerState state = 1;
+}
+
 message VolumeCopyRequest {
     uint32 volume_id = 1;
     string collection = 2;
@@ -280,6 +326,28 @@ message CopyFileRequest {
 message CopyFileResponse {
     bytes file_content = 1;
     int64 modified_ts_ns = 2;
+}
+
+message ReceiveFileRequest {
+    oneof data {
+        ReceiveFileInfo info = 1;
+        bytes file_content = 2;
+    }
+}
+
+message ReceiveFileInfo {
+    uint32 volume_id = 1;
+    string ext = 2;
+    string collection = 3;
+    bool is_ec_volume = 4;
+    uint32 shard_id = 5;
+    uint64 file_size = 6;
+    uint32 disk_id = 7;  // EC shard disk; 0 = auto-select (see VolumeEcShardsCopyRequest.disk_id)
+}
+
+message ReceiveFileResponse {
+    uint64 bytes_written = 1;
+    string error = 2;
 }
 
 message ReadNeedleBlobRequest {
@@ -338,6 +406,7 @@ message VolumeTailSenderResponse {
     bytes needle_header = 1;
     bytes needle_body = 2;
     bool is_last_chunk = 3;
+    uint32 version = 4;
 }
 
 message VolumeTailReceiverRequest {
@@ -359,6 +428,7 @@ message VolumeEcShardsGenerateResponse {
 message VolumeEcShardsRebuildRequest {
     uint32 volume_id = 1;
     string collection = 2;
+    bool unsafe_ignore_sidecar = 3; // bypass the bitrot-sidecar fail-closed guard (operator override; distinct from ec.rebuild -force)
 }
 message VolumeEcShardsRebuildResponse {
     repeated uint32 rebuilt_shard_ids = 1;
@@ -372,6 +442,8 @@ message VolumeEcShardsCopyRequest {
     string source_data_node = 5;
     bool copy_ecj_file = 6;
     bool copy_vif_file = 7;
+    uint32 disk_id = 8;  // Target disk ID for storing EC shards
+    bool copy_ecsum_file = 9; // copy the bitrot checksum sidecar (.ecsum) when present; tolerant of a missing source (no-op), since this non-2PC path has no Prepare backstop
 }
 message VolumeEcShardsCopyResponse {
 }
@@ -380,14 +452,19 @@ message VolumeEcShardsDeleteRequest {
     uint32 volume_id = 1;
     string collection = 2;
     repeated uint32 shard_ids = 3;
+    bool full_teardown = 4; // pre-encode cleanup: wipe every EC artifact + generation for this volume, not just shard_ids
+    int64 encode_ts_ns = 5; // full_teardown generation fence: delete only a disk whose .vif generation is strictly OLDER than this; preserve same-or-newer, generation 0, and an unreadable .vif. 0 => wipe-all (shell pre-encode / pre-upgrade)
 }
 message VolumeEcShardsDeleteResponse {
+    bool full_teardown_done = 1; // set by a new server that performed full_teardown; absent from an old server lets the caller detect the silent no-op
 }
 
 message VolumeEcShardsMountRequest {
     uint32 volume_id = 1;
     string collection = 2;
     repeated uint32 shard_ids = 3;
+    string source_disk_type = 4; // disk type of the source volume, applied to the in-memory EC volume so heartbeats report under it (#9423)
+    bool recover_missing_index = 5; // first fetch a missing .ecx index from a peer so on-disk shards without a local index become mountable (#10104)
 }
 message VolumeEcShardsMountResponse {
 }
@@ -395,6 +472,7 @@ message VolumeEcShardsMountResponse {
 message VolumeEcShardsUnmountRequest {
     uint32 volume_id = 1;
     repeated uint32 shard_ids = 3;
+    int64 encode_ts_ns = 4; // generation fence: skip a disk whose mounted EC volume is this generation or newer (0 = unfenced, unmount all)
 }
 message VolumeEcShardsUnmountResponse {
 }
@@ -405,10 +483,13 @@ message VolumeEcShardReadRequest {
     int64 offset = 3;
     int64 size = 4;
     uint64 file_key = 5;
+    reserved 6;
+    int64 encode_ts_ns = 7; // caller's expected encode time; the server rejects a shard from a different encode run
 }
 message VolumeEcShardReadResponse {
     bytes data = 1;
     bool is_deleted = 2;
+    int64 encode_ts_ns = 3; // identity of the shard actually served; client rejects a mismatch (0 = pre-upgrade server)
 }
 
 message VolumeEcBlobDeleteRequest {
@@ -427,6 +508,23 @@ message VolumeEcShardsToVolumeRequest {
 message VolumeEcShardsToVolumeResponse {
 }
 
+message VolumeEcShardsInfoRequest {
+    uint32 volume_id = 1;
+}
+message VolumeEcShardsInfoResponse {
+    repeated EcShardInfo ec_shard_infos = 1;
+    uint64 volume_size = 2;
+    uint64 file_count = 3;
+    uint64 file_deleted_count = 4;
+}
+
+message EcShardInfo {
+    uint32 shard_id = 1;
+    int64 size = 2;
+    string collection = 3;
+    uint32 volume_id = 4;
+}
+
 message ReadVolumeFileStatusRequest {
     uint32 volume_id = 1;
 }
@@ -441,6 +539,7 @@ message ReadVolumeFileStatusResponse {
     string collection = 8;
     string disk_type = 9;
     VolumeInfo volume_info = 10;
+    uint32 version = 11;
 }
 
 message DiskStatus {
@@ -451,6 +550,7 @@ message DiskStatus {
     float percent_free = 5;
     float percent_used = 6;
     string disk_type = 7;
+    string error = 8;
 }
 
 message MemStatus {
@@ -477,9 +577,50 @@ message VolumeInfo {
     repeated RemoteFile files = 1;
     uint32 version = 2;
     string replication = 3;
+    uint32 bytes_offset = 4;
+    int64 dat_file_size = 5; // store the original dat file size
+    uint64 expire_at_sec = 6; // expiration time of ec volume
+    bool read_only = 7;
+    EcShardConfig ec_shard_config = 8; // EC shard configuration (optional, null = use default 10+4)
+}
+
+// EcShardConfig specifies erasure coding shard configuration
+message EcShardConfig {
+    uint32 data_shards = 1;   // Number of data shards (e.g., 10)
+    uint32 parity_shards = 2; // Number of parity shards (e.g., 4)
+    int64 encode_ts_ns = 3;   // encode time (unix nanos); a read served from a shard of a different encode run is rejected
+}
+
+// EcBitrotProtection is the entire content of a bitrot checksum sidecar
+// (<base>.ecsum for the legacy generation, <base>.ecsum.v<N> for vacuum
+// generation N). On disk it is wrapped in a fixed header carrying a CRC32C
+// over this serialized payload (see weed/storage/erasure_coding/ec_bitrot.go).
+message EcBitrotProtection {
+    ChecksumAlgorithm algorithm = 1;       // CRC32C (Castagnoli)
+    uint32 block_size = 2;                  // bytes per checksum block; default 16777216 (16 MiB), a power-of-two multiple of 1 MiB
+    uint32 generation = 3;                  // EC vacuum generation these checksums describe (0 = legacy/fresh); must match the sidecar filename version
+    EcShardConfig ec_shard_config = 4;      // data/parity shard counts at encode time
+    repeated EcShardChecksums shards = 5;   // one entry per shard id in the active layout
+    bytes encode_uuid = 6;                  // random per-encode identity, for stale-sidecar detection across in-place re-encodes
+}
+
+message EcShardChecksums {
+    uint32 shard_id = 1;     // 0..MaxShardCount-1 (custom EC ratios go up to 32)
+    int64 covered_size = 2;  // shard byte length these checksums cover (must equal the on-disk shard length)
+    bytes block_crc32c = 3;  // packed little-endian uint32[] = ceil(covered_size/block_size) entries
+}
+
+enum ChecksumAlgorithm {
+    CHECKSUM_NONE = 0;
+    CHECKSUM_CRC32C = 1;
+}
+message OldVersionVolumeInfo {
+    repeated RemoteFile files = 1;
+    uint32 version = 2;
+    string replication = 3;
     uint32 BytesOffset = 4;
-    int64 dat_file_size = 5; // used for EC encoded volumes to store the original file size
-    uint64 DestroyTime = 6; // used to record the destruction time of ec volume
+    int64 dat_file_size = 5; // store the original dat file size
+    uint64 DestroyTime = 6; // expiration time of ec volume
     bool read_only = 7;
 }
 
@@ -514,6 +655,7 @@ message VolumeServerStatusResponse {
     string version = 3;
     string data_center = 4;
     string rack = 5;
+    VolumeServerState state = 6;
 }
 
 message VolumeServerLeaveRequest {
@@ -535,12 +677,48 @@ message FetchAndWriteNeedleRequest {
     }
     repeated Replica replicas = 6;
     string auth = 7;
+    int32 download_concurrency = 8; // multipart download concurrency if supported by the remote storage client; for S3, 0 = default (5)
     // remote conf
     remote_pb.RemoteConf remote_conf = 15;
     remote_pb.RemoteStorageLocation remote_location = 16;
 }
 message FetchAndWriteNeedleResponse {
     string e_tag = 1;
+}
+
+enum VolumeScrubMode {
+    UNKNOWN = 0;
+    INDEX = 1;
+    FULL = 2;
+    LOCAL = 3;
+    CHECKSUM = 4; // EC only: verify each local shard's raw bytes against the bitrot checksum sidecar
+}
+
+message ScrubVolumeRequest {
+    VolumeScrubMode mode = 1;
+    // optional list of volume IDs to scrub. if empty, all volumes for the server are scrubbed.
+    repeated uint32 volume_ids = 2;
+    bool mark_broken_volumes_readonly = 3;
+}
+message ScrubVolumeResponse {
+    uint64 total_volumes = 1;
+    uint64 total_files = 2;
+    repeated uint32 broken_volume_ids = 3;
+    repeated string details = 4;
+}
+
+message ScrubEcVolumeRequest {
+    VolumeScrubMode mode = 1;
+    // optional list of volume IDs to scrub. if empty, all EC volumes for the server are scrubbed.
+    repeated uint32 volume_ids = 2;
+    bool force_deleted_needles_check = 3; // FULL mode only; may report false positives when EC indexes disagree
+}
+message ScrubEcVolumeResponse {
+    uint64 total_volumes = 1;
+    uint64 total_files = 2;
+    repeated uint32 broken_volume_ids = 3;
+    repeated EcShardInfo broken_shard_infos = 4;
+    repeated string details = 5;
 }
 
 // select on volume servers

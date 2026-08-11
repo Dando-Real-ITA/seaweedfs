@@ -2,6 +2,7 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -40,10 +41,17 @@ func (c *commandFsConfigure) Help() string {
 	# apply the changes
 	fs.configure -locationPrefix=/my/folder -collection=abc -apply
 
+	# example: unlock a bucket that quota enforcement made read-only
+	fs.configure -locationPrefix=/buckets/my_bucket/ -readOnly=false -apply
+
 	# delete the changes
 	fs.configure -locationPrefix=/my/folder -delete -apply
 
 `
+}
+
+func (c *commandFsConfigure) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -56,7 +64,9 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 	diskType := fsConfigureCommand.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	fsync := fsConfigureCommand.Bool("fsync", false, "fsync for the writes")
 	isReadOnly := fsConfigureCommand.Bool("readOnly", false, "disable writes")
-	worm := fsConfigureCommand.Bool("worm", false, "worm mode, If true, a file can only be changed once, after which it becomes readonly and undeletable, see https://en.wikipedia.org/wiki/Write_once_read_many")
+	worm := fsConfigureCommand.Bool("worm", false, "write-once-read-many, written files are readonly")
+	wormGracePeriod := fsConfigureCommand.Uint64("wormGracePeriod", 0, "grace period before worm is enforced, in seconds")
+	wormRetentionTime := fsConfigureCommand.Uint64("wormRetentionTime", 0, "retention time for a worm enforced file, in seconds")
 	maxFileNameLength := fsConfigureCommand.Uint("maxFileNameLength", 0, "file name length limits in bytes for compatibility with Unix-based systems")
 	dataCenter := fsConfigureCommand.String("dataCenter", "", "assign writes to this dataCenter")
 	rack := fsConfigureCommand.String("rack", "", "assign writes to this rack")
@@ -76,19 +86,21 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 	if *locationPrefix != "" {
 		infoAboutSimulationMode(writer, *apply, "-apply")
 		locConf := &filer_pb.FilerConf_PathConf{
-			LocationPrefix:    *locationPrefix,
-			Collection:        *collection,
-			Replication:       *replication,
-			Ttl:               *ttl,
-			Fsync:             *fsync,
-			MaxFileNameLength: uint32(*maxFileNameLength),
-			DiskType:          *diskType,
-			VolumeGrowthCount: uint32(*volumeGrowthCount),
-			ReadOnly:          *isReadOnly,
-			DataCenter:        *dataCenter,
-			Rack:              *rack,
-			DataNode:          *dataNode,
-			Worm:              *worm,
+			LocationPrefix:           *locationPrefix,
+			Collection:               *collection,
+			Replication:              *replication,
+			Ttl:                      *ttl,
+			Fsync:                    *fsync,
+			MaxFileNameLength:        uint32(*maxFileNameLength),
+			DiskType:                 *diskType,
+			VolumeGrowthCount:        uint32(*volumeGrowthCount),
+			ReadOnly:                 *isReadOnly,
+			DataCenter:               *dataCenter,
+			Rack:                     *rack,
+			DataNode:                 *dataNode,
+			Worm:                     *worm,
+			WormGracePeriodSeconds:   *wormGracePeriod,
+			WormRetentionTimeSeconds: *wormRetentionTime,
 		}
 
 		// check collection
@@ -122,19 +134,34 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 			fc.DeleteLocationConf(*locationPrefix)
 		} else {
 			fc.AddLocationConf(locConf)
+			// AddLocationConf merges boolean fields with OR, which can never turn
+			// a flag off; let an explicitly passed false win, e.g. -readOnly=false
+			// to reopen a bucket that quota enforcement locked
+			if mergedConf, found := fc.GetLocationConf(*locationPrefix); found {
+				fsConfigureCommand.Visit(func(f *flag.Flag) {
+					switch f.Name {
+					case "readOnly":
+						mergedConf.ReadOnly = *isReadOnly
+					case "fsync":
+						mergedConf.Fsync = *fsync
+					case "worm":
+						mergedConf.Worm = *worm
+					}
+				})
+			}
 		}
 	}
 
 	var buf2 bytes.Buffer
 	fc.ToText(&buf2)
 
-	fmt.Fprintf(writer, string(buf2.Bytes()))
+	fmt.Fprint(writer, buf2.String())
 	fmt.Fprintln(writer)
 
 	if *apply {
 
 		if err = commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf2.Bytes())
+			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf2.Bytes())
 		}); err != nil && err != filer_pb.ErrNotFound {
 			return err
 		}
@@ -150,4 +177,29 @@ func infoAboutSimulationMode(writer io.Writer, forceMode bool, forceModeOption s
 		return
 	}
 	fmt.Fprintf(writer, "Running in simulation mode. Use \"%s\" option to apply the changes.\n", forceModeOption)
+}
+
+// handleDeprecatedForceFlag handles the deprecated -force flag by checking if it was
+// explicitly provided, printing a deprecation warning, and copying its
+// value to the new flag. This ensures that explicit -force=false takes precedence.
+func handleDeprecatedForceFlag(writer io.Writer, fs *flag.FlagSet, forceAlias *bool, applyFlag *bool) {
+	forceIsSet := false
+	applyIsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "force":
+			forceIsSet = true
+		case "apply":
+			applyIsSet = true
+		}
+	})
+
+	if forceIsSet {
+		if applyIsSet {
+			fmt.Fprintf(writer, "WARNING: both -force and -apply are set. -force is deprecated and takes precedence. Please use only -apply.\n")
+		} else {
+			fmt.Fprintf(writer, "WARNING: -force is deprecated, please use -apply instead.\n")
+		}
+		*applyFlag = *forceAlias
+	}
 }

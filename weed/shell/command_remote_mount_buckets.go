@@ -3,13 +3,14 @@ package shell
 import (
 	"flag"
 	"fmt"
+	"io"
+	"path/filepath"
+	"regexp"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"io"
-	"path/filepath"
-	"regexp"
 )
 
 func init() {
@@ -36,6 +37,10 @@ func (c *commandRemoteMountBuckets) Help() string {
 	weed filer.remote.gateway -filer=<filerHost>:<filerPort> -createBucketAt=cloud1
 
 `
+}
+
+func (c *commandRemoteMountBuckets) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandRemoteMountBuckets) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -75,7 +80,7 @@ func (c *commandRemoteMountBuckets) Do(args []string, commandEnv *CommandEnv, wr
 
 	fillerBucketsPath, err := readFilerBucketsPath(commandEnv)
 	if err != nil {
-		return fmt.Errorf("read filer buckets path: %v", err)
+		return fmt.Errorf("read filer buckets path: %w", err)
 	}
 
 	hasSuffixPattern, _ := regexp.Compile(".+-[0-9][0-9][0-9][0-9]")
@@ -104,9 +109,11 @@ func (c *commandRemoteMountBuckets) Do(args []string, commandEnv *CommandEnv, wr
 				Path:   "/",
 			}
 
-			// sync metadata from remote
-			if err = syncMetadata(commandEnv, writer, string(dir), true, remoteConf, remoteStorageLocation); err != nil {
-				return fmt.Errorf("pull metadata on %+v: %v", remoteStorageLocation, err)
+			if err = ensureMountDirectory(commandEnv, string(dir), true, remoteConf); err != nil {
+				return fmt.Errorf("mount setup on %+v: %v", remoteStorageLocation, err)
+			}
+			if err = pullMetadata(commandEnv, writer, dir, remoteStorageLocation, dir, remoteConf, true, false); err != nil {
+				return fmt.Errorf("cache metadata on %+v: %v", remoteStorageLocation, err)
 			}
 
 			// store a mount configuration in filer

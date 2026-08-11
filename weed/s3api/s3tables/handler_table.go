@@ -1,0 +1,1658 @@
+package s3tables
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+)
+
+// handleCreateTable creates a new table in a namespace
+func (h *S3TablesHandler) handleCreateTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+
+	var req CreateTableRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.TableBucketARN == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tableBucketARN is required")
+		return fmt.Errorf("tableBucketARN is required")
+	}
+
+	namespaceName, err := validateNamespace(req.Namespace)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.Name == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "name is required")
+		return fmt.Errorf("name is required")
+	}
+
+	if req.Format == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "format is required")
+		return fmt.Errorf("format is required")
+	}
+
+	// Validate format
+	if req.Format != "ICEBERG" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "only ICEBERG format is supported")
+		return fmt.Errorf("invalid format")
+	}
+
+	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	// Validate table name
+	tableName, err := validateTableName(req.Name)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	// Check if namespace exists
+	namespacePath := GetNamespacePath(bucketName, namespaceName)
+	var namespaceMetadata namespaceMetadata
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &namespaceMetadata); err != nil {
+			return fmt.Errorf("failed to unmarshal namespace metadata: %w", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", namespaceName))
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check namespace: %v", err))
+		}
+		return err
+	}
+
+	// Authorize table creation using policy framework (namespace + bucket policies)
+	accountID := h.getAccountID(r)
+	bucketPath := GetTableBucketPath(bucketName)
+	namespacePolicy := ""
+	bucketPolicy := ""
+	bucketTags := map[string]string{}
+	var data []byte
+	var bucketMetadata tableBucketMetadata
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		// Fetch bucket metadata to use correct owner for bucket policy evaluation
+		data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+		if err == nil {
+			if err := json.Unmarshal(data, &bucketMetadata); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket metadata: %v", err)
+		}
+
+		// Fetch namespace policy if it exists
+		policyData, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyPolicy)
+		if err == nil {
+			namespacePolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch namespace policy: %v", err)
+		}
+
+		// Fetch bucket policy if it exists
+		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err == nil {
+			bucketPolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket policy: %v", err)
+		}
+		if tags, err := h.readTags(r.Context(), client, bucketPath); err != nil {
+			return err
+		} else if tags != nil {
+			bucketTags = tags
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to fetch policies: %v", err))
+		return err
+	}
+
+	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+	identityActions := getIdentityActions(r)
+	nsAllowed := CheckPermissionWithContext("CreateTable", accountID, namespaceMetadata.OwnerAccountID, namespacePolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		RequestTags:     req.Tags,
+		TagKeys:         mapKeys(req.Tags),
+		TableBucketTags: bucketTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	bucketAllowed := CheckPermissionWithContext("CreateTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		RequestTags:     req.Tags,
+		TagKeys:         mapKeys(req.Tags),
+		TableBucketTags: bucketTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+
+	if !nsAllowed && !bucketAllowed {
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table in this namespace")
+		return ErrAccessDenied
+	}
+
+	tablePath := GetTablePath(bucketName, namespaceName, tableName)
+
+	// Check if a table or view already exists at this name. Names are unique
+	// across tables and views in a namespace.
+	var existingMetadata tableMetadataInternal
+	var existingIsView bool
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		entry, err := h.lookupEntry(r.Context(), client, tablePath)
+		if err != nil {
+			return err
+		}
+		if entryType(entry.Extended) == EntryTypeView {
+			existingIsView = true
+			return nil
+		}
+		data, ok := entry.Extended[ExtendedKeyMetadata]
+		if !ok {
+			return fmt.Errorf("%w: %s", ErrAttributeNotFound, ExtendedKeyMetadata)
+		}
+		if unmarshalErr := json.Unmarshal(data, &existingMetadata); unmarshalErr != nil {
+			return fmt.Errorf("failed to parse existing table metadata: %w", unmarshalErr)
+		}
+		return nil
+	})
+
+	if err == nil {
+		if existingIsView {
+			h.writeError(w, http.StatusConflict, ErrCodeTableAlreadyExists, fmt.Sprintf("a view named %s already exists", tableName))
+			return fmt.Errorf("view name conflict: %s", tableName)
+		}
+		tableARN := h.generateTableARN(existingMetadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+		h.writeJSON(w, http.StatusOK, &CreateTableResponse{
+			TableARN:         tableARN,
+			VersionToken:     existingMetadata.VersionToken,
+			MetadataLocation: existingMetadata.MetadataLocation,
+		})
+		return nil
+	} else if !errors.Is(err, filer_pb.ErrNotFound) && !errors.Is(err, ErrAttributeNotFound) {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check table: %v", err))
+		return err
+	}
+
+	// Create the table
+	now := time.Now()
+	versionToken := generateVersionToken()
+
+	metadata := &tableMetadataInternal{
+		Name:             tableName,
+		Namespace:        namespaceName,
+		Format:           req.Format,
+		CreatedAt:        now,
+		ModifiedAt:       now,
+		OwnerAccountID:   namespaceMetadata.OwnerAccountID, // Inherit namespace owner for consistency
+		VersionToken:     versionToken,
+		MetadataVersion:  max(req.MetadataVersion, 1),
+		MetadataLocation: req.MetadataLocation,
+		Metadata:         req.Metadata,
+	}
+
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to marshal table metadata")
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		// Ensure table directory exists (may already be created by object storage clients)
+		if err := h.ensureDirectory(r.Context(), client, tablePath); err != nil {
+			return err
+		}
+
+		// Create data subdirectory for Iceberg files
+		dataPath := tablePath + "/data"
+		if err := h.ensureDirectory(r.Context(), client, dataPath); err != nil {
+			return err
+		}
+
+		// Set metadata as extended attribute
+		if err := h.setExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata, metadataBytes); err != nil {
+			return err
+		}
+
+		// Tag the entry as a table so view listings can exclude it.
+		if err := h.setExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyEntryType, []byte(EntryTypeTable)); err != nil {
+			return err
+		}
+
+		// Set tags if provided
+		if len(req.Tags) > 0 {
+			tagsBytes, err := json.Marshal(req.Tags)
+			if err != nil {
+				return fmt.Errorf("failed to marshal tags: %w", err)
+			}
+			if err := h.setExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyTags, tagsBytes); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to create table")
+		return err
+	}
+
+	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+
+	resp := &CreateTableResponse{
+		TableARN:     tableARN,
+		VersionToken: versionToken,
+	}
+
+	h.writeJSON(w, http.StatusOK, resp)
+	return nil
+}
+
+// metadataVersionFromLocation parses the version N from a metadata location.
+// SeaweedFS writes v{N}.metadata.json; Iceberg engines (Spark/Trino/Flink/Java)
+// write {NNNNN}-{uuid}.metadata.json with a zero-padded leading version. Returns
+// 1 when no version can be parsed.
+func metadataVersionFromLocation(metadataLocation string) int {
+	name := metadataLocation
+	if idx := strings.LastIndex(name, "/"); idx != -1 {
+		name = name[idx+1:]
+	}
+	name = strings.TrimSuffix(name, ".metadata.json")
+	// v{N} form
+	if v, err := strconv.Atoi(strings.TrimPrefix(name, "v")); err == nil && v > 0 {
+		return v
+	}
+	// {NNNNN}-{uuid} form: the leading integer before the first '-'
+	if idx := strings.IndexByte(name, '-'); idx != -1 {
+		if v, err := strconv.Atoi(name[:idx]); err == nil && v > 0 {
+			return v
+		}
+	}
+	return 1
+}
+
+// handleRegisterTable registers an existing Iceberg metadata.json under a new
+// catalog entry. Unlike CreateTable it does not generate metadata: it points the
+// table at the caller-supplied MetadataLocation.
+func (h *S3TablesHandler) handleRegisterTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+
+	var req RegisterTableRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.TableBucketARN == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tableBucketARN is required")
+		return fmt.Errorf("tableBucketARN is required")
+	}
+
+	namespaceName, err := validateNamespace(req.Namespace)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.Name == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "name is required")
+		return fmt.Errorf("name is required")
+	}
+
+	if req.MetadataLocation == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "metadataLocation is required")
+		return fmt.Errorf("metadataLocation is required")
+	}
+
+	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	tableName, err := validateTableName(req.Name)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	// Namespace must exist.
+	namespacePath := GetNamespacePath(bucketName, namespaceName)
+	var namespaceMetadata namespaceMetadata
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &namespaceMetadata); err != nil {
+			return fmt.Errorf("failed to unmarshal namespace metadata: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", namespaceName))
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check namespace: %v", err))
+		}
+		return err
+	}
+
+	// Authorize using policy framework (namespace + bucket policies).
+	accountID := h.getAccountID(r)
+	bucketPath := GetTableBucketPath(bucketName)
+	namespacePolicy := ""
+	bucketPolicy := ""
+	bucketTags := map[string]string{}
+	var bucketMetadata tableBucketMetadata
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+		if err == nil {
+			if err := json.Unmarshal(data, &bucketMetadata); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket metadata: %v", err)
+		}
+
+		policyData, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyPolicy)
+		if err == nil {
+			namespacePolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch namespace policy: %v", err)
+		}
+
+		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err == nil {
+			bucketPolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket policy: %v", err)
+		}
+		if tags, err := h.readTags(r.Context(), client, bucketPath); err != nil {
+			return err
+		} else if tags != nil {
+			bucketTags = tags
+		}
+
+		return nil
+	})
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to fetch policies: %v", err))
+		return err
+	}
+
+	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+	identityActions := getIdentityActions(r)
+	nsAllowed := CheckPermissionWithContext("CreateTable", accountID, namespaceMetadata.OwnerAccountID, namespacePolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	bucketAllowed := CheckPermissionWithContext("CreateTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	if !nsAllowed && !bucketAllowed {
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to register table in this namespace")
+		return ErrAccessDenied
+	}
+
+	tablePath := GetTablePath(bucketName, namespaceName, tableName)
+
+	// Table must be absent.
+	var existingMetadata tableMetadataInternal
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(data, &existingMetadata)
+	})
+	if err == nil {
+		h.writeError(w, http.StatusConflict, ErrCodeTableAlreadyExists, fmt.Sprintf("table %s already exists", tableName))
+		return fmt.Errorf("table %s already exists", tableName)
+	} else if !errors.Is(err, filer_pb.ErrNotFound) && !errors.Is(err, ErrAttributeNotFound) {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check table: %v", err))
+		return err
+	}
+
+	now := time.Now()
+	versionToken := generateVersionToken()
+	metadata := &tableMetadataInternal{
+		Name:             tableName,
+		Namespace:        namespaceName,
+		Format:           "ICEBERG",
+		CreatedAt:        now,
+		ModifiedAt:       now,
+		OwnerAccountID:   namespaceMetadata.OwnerAccountID,
+		VersionToken:     versionToken,
+		MetadataVersion:  metadataVersionFromLocation(req.MetadataLocation),
+		MetadataLocation: req.MetadataLocation,
+	}
+
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to marshal table metadata")
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		if err := h.ensureDirectory(r.Context(), client, tablePath); err != nil {
+			return err
+		}
+		return h.setExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata, metadataBytes)
+	})
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to register table")
+		return err
+	}
+
+	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+	h.writeJSON(w, http.StatusOK, &RegisterTableResponse{
+		TableARN:         tableARN,
+		VersionToken:     versionToken,
+		MetadataLocation: metadata.MetadataLocation,
+	})
+	return nil
+}
+
+// handleGetTable gets details of a table
+func (h *S3TablesHandler) handleGetTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+
+	var req GetTableRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	var bucketName, namespace, tableName string
+	var err error
+
+	// Support getting by ARN or by bucket/namespace/name
+	if req.TableARN != "" {
+		bucketName, namespace, tableName, err = parseTableFromARN(req.TableARN)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+			return err
+		}
+	} else if req.TableBucketARN != "" && len(req.Namespace) > 0 && req.Name != "" {
+		bucketName, err = parseBucketNameFromARN(req.TableBucketARN)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+			return err
+		}
+		namespace, err = validateNamespace(req.Namespace)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+			return err
+		}
+		tableName, err = validateTableName(req.Name)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+			return err
+		}
+	} else {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "either tableARN or (tableBucketARN, namespace, name) is required")
+		return fmt.Errorf("missing required parameters")
+	}
+
+	tablePath := GetTablePath(bucketName, namespace, tableName)
+
+	var metadata tableMetadataInternal
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		entry, err := h.lookupEntry(r.Context(), client, tablePath)
+		if err != nil {
+			return err
+		}
+		if entryType(entry.Extended) == EntryTypeView {
+			return filer_pb.ErrNotFound
+		}
+		data, ok := entry.Extended[ExtendedKeyMetadata]
+		if !ok {
+			return fmt.Errorf("%w: %s", ErrAttributeNotFound, ExtendedKeyMetadata)
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return fmt.Errorf("failed to unmarshal table metadata: %w", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		// A directory without the table-metadata xattr is not a table (e.g. a renamed-away source).
+		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrAttributeNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", tableName))
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to get table: %v", err))
+		}
+		return err
+	}
+
+	// Authorize access to the table using policy framework
+	accountID := h.getAccountID(r)
+	bucketPath := GetTableBucketPath(bucketName)
+	tablePolicy := ""
+	bucketPolicy := ""
+	bucketTags := map[string]string{}
+	tableTags := map[string]string{}
+	var bucketMetadata tableBucketMetadata
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		// Fetch bucket metadata to use correct owner for bucket policy evaluation
+		data, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+		if err == nil {
+			if err := json.Unmarshal(data, &bucketMetadata); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket metadata: %v", err)
+		}
+
+		// Fetch table policy if it exists
+		policyData, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyPolicy)
+		if err == nil {
+			tablePolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch table policy: %v", err)
+		}
+		if tags, err := h.readTags(r.Context(), client, tablePath); err != nil {
+			return err
+		} else if tags != nil {
+			tableTags = tags
+		}
+
+		// Fetch bucket policy if it exists
+		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err == nil {
+			bucketPolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket policy: %v", err)
+		}
+		if tags, err := h.readTags(r.Context(), client, bucketPath); err != nil {
+			return err
+		} else if tags != nil {
+			bucketTags = tags
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to fetch policies: %v", err))
+		return err
+	}
+
+	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespace+"/"+tableName)
+	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+	identityActions := getIdentityActions(r)
+	tableAllowed := CheckPermissionWithContext("GetTable", accountID, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespace,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	bucketAllowed := CheckPermissionWithContext("GetTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespace,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+
+	if !tableAllowed && !bucketAllowed {
+		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", tableName))
+		return ErrAccessDenied
+	}
+
+	resp := &GetTableResponse{
+		Name:             metadata.Name,
+		TableARN:         tableARN,
+		Namespace:        expandNamespace(metadata.Namespace),
+		Format:           metadata.Format,
+		CreatedAt:        metadata.CreatedAt,
+		ModifiedAt:       metadata.ModifiedAt,
+		OwnerAccountID:   metadata.OwnerAccountID,
+		MetadataLocation: metadata.MetadataLocation,
+		MetadataVersion:  metadata.MetadataVersion,
+		VersionToken:     metadata.VersionToken,
+		Metadata:         metadata.Metadata,
+	}
+
+	h.writeJSON(w, http.StatusOK, resp)
+	return nil
+}
+
+// handleListTables lists all tables in a namespace or bucket
+func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+
+	var req ListTablesRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.TableBucketARN == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tableBucketARN is required")
+		return fmt.Errorf("tableBucketARN is required")
+	}
+
+	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	maxTables := req.MaxTables
+	if maxTables <= 0 {
+		maxTables = 100
+	}
+	// Cap to prevent uint32 overflow when used in uint32(maxTables*2)
+	const maxTablesLimit = 1000
+	if maxTables > maxTablesLimit {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "MaxTables exceeds maximum allowed value")
+		return fmt.Errorf("invalid maxTables value: %d", maxTables)
+	}
+
+	// Pre-validate namespace before calling WithFilerClient to return 400 on validation errors
+	var namespaceName string
+	if len(req.Namespace) > 0 {
+		var err error
+		namespaceName, err = validateNamespace(req.Namespace)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+			return err
+		}
+	}
+
+	var tables []TableSummary
+	var paginationToken string
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		var err error
+		accountID := h.getAccountID(r)
+
+		if len(req.Namespace) > 0 {
+			// Namespace has already been validated above
+			namespacePath := GetNamespacePath(bucketName, namespaceName)
+			bucketPath := GetTableBucketPath(bucketName)
+			var nsMeta namespaceMetadata
+			var bucketMeta tableBucketMetadata
+			var namespacePolicy, bucketPolicy string
+			bucketTags := map[string]string{}
+
+			// Fetch namespace metadata and policy
+			data, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+			if err != nil {
+				return err // Not Found handled by caller
+			}
+			if err := json.Unmarshal(data, &nsMeta); err != nil {
+				return err
+			}
+
+			// Fetch namespace policy if it exists
+			policyData, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyPolicy)
+			if err == nil {
+				namespacePolicy = string(policyData)
+			} else if !errors.Is(err, ErrAttributeNotFound) {
+				return fmt.Errorf("failed to fetch namespace policy: %w", err)
+			}
+
+			// Fetch bucket metadata and policy
+			data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+			if err == nil {
+				if err := json.Unmarshal(data, &bucketMeta); err != nil {
+					return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+				}
+			} else if !errors.Is(err, ErrAttributeNotFound) {
+				return fmt.Errorf("failed to fetch bucket metadata: %w", err)
+			}
+
+			policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+			if err == nil {
+				bucketPolicy = string(policyData)
+			} else if !errors.Is(err, ErrAttributeNotFound) {
+				return fmt.Errorf("failed to fetch bucket policy: %w", err)
+			}
+			if tags, err := h.readTags(r.Context(), client, bucketPath); err != nil {
+				return fmt.Errorf("failed to read bucket tags: %w", err)
+			} else if tags != nil {
+				bucketTags = tags
+			}
+
+			bucketARN := h.generateTableBucketARN(bucketMeta.OwnerAccountID, bucketName)
+			identityActions := getIdentityActions(r)
+			nsAllowed := CheckPermissionWithContext("ListTables", accountID, nsMeta.OwnerAccountID, namespacePolicy, bucketARN, &PolicyContext{
+				TableBucketName: bucketName,
+				Namespace:       namespaceName,
+				TableBucketTags: bucketTags,
+				IdentityActions: identityActions,
+				DefaultAllow:    h.defaultAllowFor(r),
+			})
+			bucketAllowed := CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+				TableBucketName: bucketName,
+				Namespace:       namespaceName,
+				TableBucketTags: bucketTags,
+				IdentityActions: identityActions,
+				DefaultAllow:    h.defaultAllowFor(r),
+			})
+			if !nsAllowed && !bucketAllowed {
+				return ErrAccessDenied
+			}
+
+			tables, paginationToken, err = h.listTablesInNamespaceWithClient(r, client, bucketName, namespaceName, req.Prefix, req.ContinuationToken, maxTables)
+			if err != nil {
+				return fmt.Errorf("list tables in namespace %v: %w", namespaceName, err)
+			}
+		} else {
+			// List tables across all namespaces in bucket
+			bucketPath := GetTableBucketPath(bucketName)
+			var bucketMeta tableBucketMetadata
+			var bucketPolicy string
+			bucketTags := map[string]string{}
+
+			// Fetch bucket metadata and policy
+			data, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+			if err != nil {
+				return fmt.Errorf("failed to fetch bucket metadata: %w", err)
+			}
+			if err := json.Unmarshal(data, &bucketMeta); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+
+			// Fetch bucket policy if it exists
+			policyData, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+			if err == nil {
+				bucketPolicy = string(policyData)
+			} else if !errors.Is(err, ErrAttributeNotFound) {
+				return fmt.Errorf("failed to fetch bucket policy: %w", err)
+			}
+			if tags, err := h.readTags(r.Context(), client, bucketPath); err != nil {
+				return fmt.Errorf("failed to read bucket tags: %w", err)
+			} else if tags != nil {
+				bucketTags = tags
+			}
+
+			bucketARN := h.generateTableBucketARN(bucketMeta.OwnerAccountID, bucketName)
+			identityActions := getIdentityActions(r)
+			if !CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+				TableBucketName: bucketName,
+				TableBucketTags: bucketTags,
+				IdentityActions: identityActions,
+				DefaultAllow:    h.defaultAllowFor(r),
+			}) {
+				return ErrAccessDenied
+			}
+
+			tables, paginationToken, err = h.listTablesInAllNamespaces(r, client, bucketName, req.Prefix, req.ContinuationToken, maxTables)
+			if err != nil {
+				return fmt.Errorf("list tables in all namespaces: %w", err)
+			}
+		}
+		return err
+	})
+
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			// If the bucket or namespace directory is not found, return an empty result
+			tables = []TableSummary{}
+			paginationToken = ""
+		} else if isAuthError(err) {
+			h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "Access Denied")
+			return err
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to list tables: %v", err))
+			return err
+		}
+	}
+
+	resp := &ListTablesResponse{
+		Tables:            tables,
+		ContinuationToken: paginationToken,
+	}
+
+	h.writeJSON(w, http.StatusOK, resp)
+	return nil
+}
+
+// listTablesInNamespaceWithClient lists tables in a specific namespace
+func (h *S3TablesHandler) listTablesInNamespaceWithClient(r *http.Request, client filer_pb.SeaweedFilerClient, bucketName, namespaceName, prefix, continuationToken string, maxTables int) ([]TableSummary, string, error) {
+	namespacePath := GetNamespacePath(bucketName, namespaceName)
+	return h.listTablesWithClient(r, client, namespacePath, bucketName, namespaceName, prefix, continuationToken, maxTables)
+}
+
+func (h *S3TablesHandler) listTablesWithClient(r *http.Request, client filer_pb.SeaweedFilerClient, dirPath, bucketName, namespaceName, prefix, continuationToken string, maxTables int) ([]TableSummary, string, error) {
+	var tables []TableSummary
+	lastFileName := continuationToken
+	ctx := r.Context()
+
+	for len(tables) < maxTables {
+		resp, err := client.ListEntries(ctx, &filer_pb.ListEntriesRequest{
+			Directory:          dirPath,
+			Limit:              uint32(maxTables * 2),
+			StartFromFileName:  lastFileName,
+			InclusiveStartFrom: lastFileName == "" || lastFileName == continuationToken,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+
+		hasMore := false
+		for {
+			entry, respErr := resp.Recv()
+			if respErr != nil {
+				if respErr == io.EOF {
+					break
+				}
+				return nil, "", respErr
+			}
+			if entry.Entry == nil {
+				continue
+			}
+
+			// Skip the start item if it was included in the previous page
+			if len(tables) == 0 && continuationToken != "" && entry.Entry.Name == continuationToken {
+				continue
+			}
+
+			hasMore = true
+			lastFileName = entry.Entry.Name
+
+			if !entry.Entry.IsDirectory {
+				continue
+			}
+
+			// Skip hidden entries
+			if strings.HasPrefix(entry.Entry.Name, ".") {
+				continue
+			}
+
+			// Apply prefix filter
+			if prefix != "" && !strings.HasPrefix(entry.Entry.Name, prefix) {
+				continue
+			}
+
+			// Views share the table layout; exclude them from table listings.
+			if entryType(entry.Entry.Extended) == EntryTypeView {
+				continue
+			}
+
+			// Read table metadata from extended attribute
+			data, ok := entry.Entry.Extended[ExtendedKeyMetadata]
+			if !ok {
+				continue
+			}
+
+			var metadata tableMetadataInternal
+			if err := json.Unmarshal(data, &metadata); err != nil {
+				continue
+			}
+
+			// Note: Authorization (ownership or policy-based access) is checked at the handler level
+			// before calling this function. This filter is removed to allow policy-based sharing.
+			// The caller has already been verified to have ListTables permission for this namespace/bucket.
+
+			tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+entry.Entry.Name)
+
+			tables = append(tables, TableSummary{
+				Name:       entry.Entry.Name,
+				TableARN:   tableARN,
+				Namespace:  expandNamespace(namespaceName),
+				CreatedAt:  metadata.CreatedAt,
+				ModifiedAt: metadata.ModifiedAt,
+			})
+
+			if len(tables) >= maxTables {
+				return tables, lastFileName, nil
+			}
+		}
+
+		if !hasMore {
+			break
+		}
+	}
+
+	if len(tables) < maxTables {
+		lastFileName = ""
+	}
+	return tables, lastFileName, nil
+}
+
+func (h *S3TablesHandler) listTablesInAllNamespaces(r *http.Request, client filer_pb.SeaweedFilerClient, bucketName, prefix, continuationToken string, maxTables int) ([]TableSummary, string, error) {
+	bucketPath := GetTableBucketPath(bucketName)
+	ctx := r.Context()
+
+	var continuationNamespace string
+	var startTableName string
+	if continuationToken != "" {
+		if parts := strings.SplitN(continuationToken, "/", 2); len(parts) == 2 {
+			continuationNamespace = parts[0]
+			startTableName = parts[1]
+		} else {
+			continuationNamespace = continuationToken
+		}
+	}
+
+	var tables []TableSummary
+	lastNamespace := continuationNamespace
+	for {
+		// List namespaces in batches
+		resp, err := client.ListEntries(ctx, &filer_pb.ListEntriesRequest{
+			Directory:          bucketPath,
+			Limit:              100,
+			StartFromFileName:  lastNamespace,
+			InclusiveStartFrom: (lastNamespace == continuationNamespace && startTableName != "") || (lastNamespace == "" && continuationNamespace == ""),
+		})
+		if err != nil {
+			return nil, "", err
+		}
+
+		hasMore := false
+		for {
+			entry, respErr := resp.Recv()
+			if respErr != nil {
+				if respErr == io.EOF {
+					break
+				}
+				return nil, "", respErr
+			}
+			if entry.Entry == nil {
+				continue
+			}
+
+			hasMore = true
+			lastNamespace = entry.Entry.Name
+
+			if !entry.Entry.IsDirectory || strings.HasPrefix(entry.Entry.Name, ".") {
+				continue
+			}
+
+			namespace := entry.Entry.Name
+			tableNameFilter := ""
+			if namespace == continuationNamespace {
+				tableNameFilter = startTableName
+			}
+
+			nsTables, nsToken, err := h.listTablesInNamespaceWithClient(r, client, bucketName, namespace, prefix, tableNameFilter, maxTables-len(tables))
+			if err != nil {
+				return nil, "", fmt.Errorf("list tables in namespace %s: %w", namespace, err)
+			}
+
+			tables = append(tables, nsTables...)
+
+			if namespace == continuationNamespace {
+				startTableName = ""
+			}
+
+			if len(tables) >= maxTables {
+				paginationToken := namespace + "/" + nsToken
+				if nsToken == "" {
+					// If we hit the limit exactly at the end of a namespace, the next token should be the next namespace
+					paginationToken = namespace // This will start from the NEXT namespace in the outer loop
+				}
+				return tables, paginationToken, nil
+			}
+		}
+
+		if !hasMore {
+			break
+		}
+	}
+
+	return tables, "", nil
+}
+
+// handleDeleteTable deletes a table from a namespace
+func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+
+	var req DeleteTableRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.TableBucketARN == "" || len(req.Namespace) == 0 || req.Name == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tableBucketARN, namespace, and name are required")
+		return fmt.Errorf("missing required parameters")
+	}
+
+	namespaceName, err := validateNamespace(req.Namespace)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	tableName, err := validateTableName(req.Name)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	tablePath := GetTablePath(bucketName, namespaceName, tableName)
+
+	// Check if table exists and enforce VersionToken if provided
+	var metadata tableMetadataInternal
+	var tablePolicy string
+	var bucketPolicy string
+	var bucketTags map[string]string
+	var tableTags map[string]string
+	var bucketMetadata tableBucketMetadata
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return fmt.Errorf("failed to unmarshal table metadata: %w", err)
+		}
+
+		if req.VersionToken != "" {
+			if metadata.VersionToken != req.VersionToken {
+				return ErrVersionTokenMismatch
+			}
+		}
+
+		// Fetch table policy if it exists
+		policyData, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyPolicy)
+		if err != nil {
+			if errors.Is(err, ErrAttributeNotFound) {
+				// No table policy set; proceed with empty policy
+			} else {
+				return fmt.Errorf("failed to fetch table policy: %w", err)
+			}
+		} else {
+			tablePolicy = string(policyData)
+		}
+
+		tableTags, err = h.readTags(r.Context(), client, tablePath)
+		if err != nil {
+			return err
+		}
+
+		bucketPath := GetTableBucketPath(bucketName)
+		data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+		if err == nil {
+			if err := json.Unmarshal(data, &bucketMetadata); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket metadata: %w", err)
+		}
+		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err != nil {
+			if !errors.Is(err, ErrAttributeNotFound) {
+				return fmt.Errorf("failed to fetch bucket policy: %w", err)
+			}
+		} else {
+			bucketPolicy = string(policyData)
+		}
+		bucketTags, err = h.readTags(r.Context(), client, bucketPath)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", tableName))
+		} else if errors.Is(err, ErrVersionTokenMismatch) {
+			h.writeError(w, http.StatusConflict, ErrCodeConflict, "version token mismatch")
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check table: %v", err))
+		}
+		return err
+	}
+
+	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+	principal := h.getAccountID(r)
+	identityActions := getIdentityActions(r)
+	tableAllowed := CheckPermissionWithContext("DeleteTable", principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	bucketAllowed := CheckPermissionWithContext("DeleteTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	if !tableAllowed && !bucketAllowed {
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to delete table")
+		return NewAuthError("DeleteTable", principal, "not authorized to delete table")
+	}
+
+	// Delete the table
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		dataPath := tableDataDirFromMetadataLocation(metadata.MetadataLocation)
+		if dataPath != "" && dataPath != tablePath && strings.HasPrefix(dataPath+"/", GetTableBucketPath(bucketName)+"/") {
+			// Refuse to purge a data path that is an ancestor of the table's own
+			// name path (e.g. corrupt metadata resolving to the bucket or
+			// namespace root): the bucket-scope check above still admits the
+			// bucket root, and a recursive delete there would take out unrelated
+			// tables.
+			if strings.HasPrefix(tablePath+"/", dataPath+"/") {
+				return fmt.Errorf("refusing to delete table %s: data path %q is an ancestor of catalog path %q", tableName, dataPath, tablePath)
+			}
+			// Decoupled table (renamed, or created over a leftover): its data
+			// lives elsewhere. Purge the data, then clear the catalog marker
+			// without deleting the name path -- it may still hold another
+			// table's data that was left when this name was reused.
+			if err := h.deleteDirectory(r.Context(), client, dataPath); err != nil {
+				return err
+			}
+			return h.removeExtendedAttributes(r.Context(), client, tablePath,
+				ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags, ExtendedKeyEntryType)
+		}
+		// Colocated table: the name path holds the data.
+		return h.deleteDirectory(r.Context(), client, tablePath)
+	})
+
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to delete table")
+		return err
+	}
+
+	h.writeJSON(w, http.StatusOK, nil)
+	return nil
+}
+
+// handleRenameTable moves a table's catalog entry to a new namespace/name within
+// the same bucket. It is catalog-only: the metadata.json and data files stay put,
+// the destination keeps the source's MetadataLocation, and the source name is
+// soft-deleted in place (its catalog xattrs are dropped, its data is left intact).
+func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+	var req RenameTableRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.TableBucketARN == "" || len(req.SourceNamespace) == 0 || req.SourceName == "" || len(req.DestNamespace) == 0 || req.DestName == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tableBucketARN, sourceNamespace, sourceName, destNamespace, and destName are required")
+		return fmt.Errorf("missing required parameters")
+	}
+
+	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	srcNamespace, err := validateNamespace(req.SourceNamespace)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+	srcName, err := validateTableName(req.SourceName)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+	destNamespace, err := validateNamespace(req.DestNamespace)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+	destName, err := validateTableName(req.DestName)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	srcPath := GetTablePath(bucketName, srcNamespace, srcName)
+	destPath := GetTablePath(bucketName, destNamespace, destName)
+
+	var metadata tableMetadataInternal
+	var metadataVersionXattr []byte
+	var tablePolicy string
+	var bucketPolicy string
+	var bucketTags map[string]string
+	var tableTags map[string]string
+	var bucketMetadata tableBucketMetadata
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, srcPath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return fmt.Errorf("failed to unmarshal table metadata: %w", err)
+		}
+
+		if versionData, err := h.getExtendedAttribute(r.Context(), client, srcPath, ExtendedKeyMetadataVersion); err == nil {
+			metadataVersionXattr = versionData
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch metadata version: %w", err)
+		}
+
+		policyData, err := h.getExtendedAttribute(r.Context(), client, srcPath, ExtendedKeyPolicy)
+		if err == nil {
+			tablePolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch table policy: %w", err)
+		}
+		tableTags, err = h.readTags(r.Context(), client, srcPath)
+		if err != nil {
+			return err
+		}
+
+		bucketPath := GetTableBucketPath(bucketName)
+		data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+		if err == nil {
+			if err := json.Unmarshal(data, &bucketMetadata); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket metadata: %w", err)
+		}
+		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err == nil {
+			bucketPolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket policy: %w", err)
+		}
+		bucketTags, err = h.readTags(r.Context(), client, bucketPath)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", srcName))
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check table: %v", err))
+		}
+		return err
+	}
+
+	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, srcNamespace+"/"+srcName)
+	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+	principal := h.getAccountID(r)
+	identityActions := getIdentityActions(r)
+	tableAllowed := CheckPermissionWithContext("RenameTable", principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       srcNamespace,
+		TableName:       srcName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	bucketAllowed := CheckPermissionWithContext("RenameTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       srcNamespace,
+		TableName:       srcName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	if !tableAllowed && !bucketAllowed {
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to rename table")
+		return NewAuthError("RenameTable", principal, "not authorized to rename table")
+	}
+
+	// Require the destination namespace to exist and the destination table to be free.
+	destNamespacePath := GetNamespacePath(bucketName, destNamespace)
+	var destNamespaceMetadata namespaceMetadata
+	var destNamespacePolicy string
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		data, err := h.getExtendedAttribute(r.Context(), client, destNamespacePath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &destNamespaceMetadata); err != nil {
+			return fmt.Errorf("failed to unmarshal destination namespace metadata: %w", err)
+		}
+		policyData, err := h.getExtendedAttribute(r.Context(), client, destNamespacePath, ExtendedKeyPolicy)
+		if err == nil {
+			destNamespacePolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch destination namespace policy: %w", err)
+		}
+		if _, err := h.getExtendedAttribute(r.Context(), client, destPath, ExtendedKeyMetadata); err == nil {
+			return ErrTableAlreadyExists
+		} else if !errors.Is(err, filer_pb.ErrNotFound) && !errors.Is(err, ErrAttributeNotFound) {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, ErrTableAlreadyExists) {
+			h.writeError(w, http.StatusConflict, ErrCodeTableAlreadyExists, fmt.Sprintf("table %s already exists", destName))
+		} else if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", destNamespace))
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check destination: %v", err))
+		}
+		return err
+	}
+
+	// Renaming places the table into the destination namespace, so the principal
+	// must also be allowed to create a table there (the source check alone lets a
+	// caller move tables into namespaces they don't control).
+	destNamespaceAllowed := CheckPermissionWithContext("CreateTable", principal, destNamespaceMetadata.OwnerAccountID, destNamespacePolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       destNamespace,
+		TableName:       destName,
+		TableBucketTags: bucketTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	destBucketAllowed := CheckPermissionWithContext("CreateTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       destNamespace,
+		TableName:       destName,
+		TableBucketTags: bucketTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	if !destNamespaceAllowed && !destBucketAllowed {
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table in the destination namespace")
+		return NewAuthError("RenameTable", principal, "not authorized to create table in the destination namespace")
+	}
+
+	metadata.Name = destName
+	metadata.Namespace = destNamespace
+	metadata.ModifiedAt = time.Now()
+
+	metadataBytes, err := json.Marshal(&metadata)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to marshal table metadata")
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	// Write the destination entry before deleting the source so a mid-rename
+	// failure can never lose the table.
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		if err := h.createDirectory(r.Context(), client, destPath); err != nil {
+			return err
+		}
+		if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyMetadata, metadataBytes); err != nil {
+			return err
+		}
+		if len(metadataVersionXattr) > 0 {
+			if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyMetadataVersion, metadataVersionXattr); err != nil {
+				return err
+			}
+		}
+		if len(tableTags) > 0 {
+			tagsBytes, err := json.Marshal(tableTags)
+			if err != nil {
+				return fmt.Errorf("failed to marshal tags: %w", err)
+			}
+			if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyTags, tagsBytes); err != nil {
+				return err
+			}
+		}
+		if tablePolicy != "" {
+			if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyPolicy, []byte(tablePolicy)); err != nil {
+				return err
+			}
+		}
+		// Soft-delete the source catalog identity in place: drop its catalog xattrs
+		// so the name stops resolving while the metadata/ and data/ children stay put
+		// (manifests embed absolute paths, so the data must not move).
+		return h.removeExtendedAttributes(r.Context(), client, srcPath,
+			ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags)
+	})
+
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to rename table")
+		return err
+	}
+
+	h.writeJSON(w, http.StatusOK, &RenameTableResponse{
+		TableARN:         h.generateTableARN(metadata.OwnerAccountID, bucketName, destNamespace+"/"+destName),
+		MetadataLocation: metadata.MetadataLocation,
+	})
+	return nil
+}
+
+// handleUpdateTable updates table metadata
+func (h *S3TablesHandler) handleUpdateTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+	var req UpdateTableRequest
+	if err := h.readRequestBody(r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	if req.TableBucketARN == "" || len(req.Namespace) == 0 || req.Name == "" {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tableBucketARN, namespace, and name are required")
+		return fmt.Errorf("missing required parameters")
+	}
+
+	namespaceName, err := validateNamespace(req.Namespace)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	tableName, err := validateTableName(req.Name)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
+	tablePath := GetTablePath(bucketName, namespaceName, tableName)
+
+	// Load existing metadata and policies for authorization
+	var metadata tableMetadataInternal
+	var tablePolicy string
+	var bucketPolicy string
+	var bucketTags map[string]string
+	var tableTags map[string]string
+	var bucketMetadata tableBucketMetadata
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		// 1. Get Table Metadata
+		data, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return fmt.Errorf("failed to unmarshal table metadata: %w", err)
+		}
+
+		// 2. Get Table Policy & Tags
+		policyData, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyPolicy)
+		if err == nil {
+			tablePolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch table policy: %w", err)
+		}
+		tableTags, err = h.readTags(r.Context(), client, tablePath)
+		if err != nil {
+			return err
+		}
+
+		// 3. Get Bucket Metadata, Policy & Tags
+		bucketPath := GetTableBucketPath(bucketName)
+		data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+		if err == nil {
+			if err := json.Unmarshal(data, &bucketMetadata); err != nil {
+				return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
+			}
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket metadata: %w", err)
+		}
+		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err == nil {
+			bucketPolicy = string(policyData)
+		} else if !errors.Is(err, ErrAttributeNotFound) {
+			return fmt.Errorf("failed to fetch bucket policy: %w", err)
+		}
+		bucketTags, err = h.readTags(r.Context(), client, bucketPath)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, "table not found")
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error())
+		}
+		return err
+	}
+
+	// Authorization Check
+	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+	principal := h.getAccountID(r)
+	identityActions := getIdentityActions(r)
+
+	tableAllowed := CheckPermissionWithContext("UpdateTable", principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+	bucketAllowed := CheckPermissionWithContext("UpdateTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+		TableBucketName: bucketName,
+		Namespace:       namespaceName,
+		TableName:       tableName,
+		TableBucketTags: bucketTags,
+		ResourceTags:    tableTags,
+		IdentityActions: identityActions,
+		DefaultAllow:    h.defaultAllowFor(r),
+	})
+
+	if !tableAllowed && !bucketAllowed {
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to update table")
+		return NewAuthError("UpdateTable", principal, "not authorized to update table")
+	}
+
+	// Check version token if provided
+	if req.VersionToken != "" && req.VersionToken != metadata.VersionToken {
+		h.writeError(w, http.StatusConflict, ErrCodeConflict, "Version token mismatch")
+		return ErrVersionTokenMismatch
+	}
+
+	// Update metadata
+	if req.Metadata != nil {
+		if metadata.Metadata == nil {
+			metadata.Metadata = &TableMetadata{}
+		}
+		if req.Metadata.Iceberg != nil {
+			if metadata.Metadata.Iceberg == nil {
+				metadata.Metadata.Iceberg = &IcebergMetadata{}
+			}
+			if req.Metadata.Iceberg.TableUUID != "" {
+				metadata.Metadata.Iceberg.TableUUID = req.Metadata.Iceberg.TableUUID
+			}
+		}
+		if len(req.Metadata.FullMetadata) > 0 {
+			metadata.Metadata.FullMetadata = req.Metadata.FullMetadata
+		}
+	}
+	if req.MetadataLocation != "" {
+		metadata.MetadataLocation = req.MetadataLocation
+	}
+	if req.MetadataVersion > 0 {
+		metadata.MetadataVersion = req.MetadataVersion
+	} else if metadata.MetadataVersion == 0 {
+		metadata.MetadataVersion = 1
+	}
+	metadata.ModifiedAt = time.Now()
+	metadata.VersionToken = generateVersionToken()
+
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to marshal metadata")
+		return err
+	}
+
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		if err := h.setExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata, metadataBytes); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update metadata")
+		return err
+	}
+
+	h.writeJSON(w, http.StatusOK, &UpdateTableResponse{
+		TableARN:         tableARN,
+		MetadataLocation: metadata.MetadataLocation,
+		VersionToken:     metadata.VersionToken,
+	})
+	return nil
+}

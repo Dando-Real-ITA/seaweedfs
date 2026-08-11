@@ -2,10 +2,11 @@ package filer_ui
 
 import (
 	_ "embed"
-	"github.com/dustin/go-humanize"
 	"html/template"
 	"net/url"
 	"strings"
+
+	"github.com/dustin/go-humanize"
 )
 
 func printpath(parts ...string) string {
@@ -17,6 +18,7 @@ func printpath(parts ...string) string {
 var funcMap = template.FuncMap{
 	"humanizeBytes": humanize.Bytes,
 	"printpath":     printpath,
+	"queryEscape":   url.QueryEscape,
 }
 
 //go:embed filer.html

@@ -3,9 +3,11 @@ package weed_server
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
-	"time"
 
 	"github.com/seaweedfs/raft"
 
@@ -15,6 +17,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (ms *MasterServer) StreamAssign(server master_pb.Seaweed_StreamAssignServer) error {
@@ -24,10 +28,18 @@ func (ms *MasterServer) StreamAssign(server master_pb.Seaweed_StreamAssignServer
 			glog.Errorf("StreamAssign failed to receive: %v", err)
 			return err
 		}
-		resp, err := ms.Assign(context.Background(), req)
+		resp, err := ms.Assign(server.Context(), req)
 		if err != nil {
-			glog.Errorf("StreamAssign failed to assign: %v", err)
-			return err
+			// Return transient errors (warmup, growth-in-progress shed) as in-band
+			// error responses instead of killing the stream, so pooled connections
+			// survive.
+			if st, ok := status.FromError(err); ok && (st.Code() == codes.Unavailable || st.Code() == codes.ResourceExhausted) {
+				glog.V(1).Infof("StreamAssign transient error: %v", err)
+				resp = &master_pb.AssignResponse{Error: st.Message()}
+			} else {
+				glog.Errorf("StreamAssign failed to assign: %v", err)
+				return err
+			}
 		}
 		if err = server.Send(resp); err != nil {
 			glog.Errorf("StreamAssign failed to send: %v", err)
@@ -56,8 +68,13 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	if err != nil {
 		return nil, err
 	}
+
+	if ms.Topo.IsWarmingUp() {
+		return nil, status.Errorf(codes.Unavailable, "master is warming up, topology is still loading")
+	}
 	diskType := types.ToDiskType(req.DiskType)
 
+	ver := needle.GetCurrentVersion()
 	option := &topology.VolumeGrowOption{
 		Collection:         req.Collection,
 		ReplicaPlacement:   replicaPlacement,
@@ -68,6 +85,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		Rack:               req.Rack,
 		DataNode:           req.DataNode,
 		MemoryMapMaxSizeMb: req.MemoryMapMaxSizeMb,
+		Version:            uint32(ver),
 	}
 
 	if !ms.Topo.DataCenterExists(option.DataCenter) {
@@ -75,21 +93,33 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	}
 
 	vl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, option.DiskType)
+	if req.DiskType == "" {
+		if writable, _ := vl.GetWritableVolumeCount(); writable == 0 {
+			if hddVl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, types.ToDiskType(types.HddType)); hddVl != nil {
+				if writable, _ := hddVl.GetWritableVolumeCount(); writable > 0 {
+					option.DiskType = types.ToDiskType(types.HddType)
+					vl = hddVl
+				}
+			}
+		}
+	}
 	vl.SetLastGrowCount(req.WritableVolumeCount)
 
 	var (
-		lastErr    error
-		maxTimeout = time.Second * 10
-		startTime  = time.Now()
+		lastErr           error
+		maxTimeout        = time.Second * 10
+		startTime         = time.Now()
+		initiatedGrow     bool
+		repickedAfterGrow bool
 	)
 
 	for time.Now().Sub(startTime) < maxTimeout {
-		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(req.Count, option, vl)
-		if shouldGrow && !vl.HasGrowRequest() {
+		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(req.Count, option, vl, req.ExpectedDataSize)
+		if shouldGrow && !initiatedGrow && !ms.option.VolumeGrowthDisabled && vl.AddGrowRequestIfAbsent() {
+			initiatedGrow = true
 			if err != nil && ms.Topo.AvailableSpaceFor(option) <= 0 {
 				err = fmt.Errorf("%s and no free volumes left for %s", err.Error(), option.String())
 			}
-			vl.AddGrowRequest()
 			ms.volumeGrowthRequestChan <- &topology.VolumeGrowRequest{
 				Option: option,
 				Count:  req.WritableVolumeCount,
@@ -100,7 +130,38 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 			glog.V(1).Infof("assign %v %v: %v", req, option.String(), err)
 			stats.MasterPickForWriteErrorCounter.Inc()
 			lastErr = err
-			time.Sleep(200 * time.Millisecond)
+			if (req.DataCenter != "" || req.Rack != "") && strings.Contains(err.Error(), topology.NoWritableVolumes) {
+				glog.V(0).Infof("assign %v %v: %v", req, option.String(), err)
+				return nil, err
+			}
+			if shouldGrow {
+				if ms.Topo.AvailableSpaceFor(option) <= 0 {
+					break // out of space: surface the real error, not a retryable shed
+				}
+				// Only the initiator waits, and only while the growth it triggered
+				// is still pending: followers shed fast so a herd doesn't pin a
+				// goroutine each, and an initiator whose growth concluded without
+				// yielding a writable volume sheds so client retries re-trigger
+				// growth instead of looping it here. ResourceExhausted, not
+				// Unavailable: clients retry it (assign_file_id.go) without
+				// invalidating the shared master connection.
+				if initiatedGrow != vl.HasGrowRequest() {
+					// The failed pick above may predate the growth concluding, so
+					// re-pick once before shedding: growth registers its volumes
+					// before clearing the flag, and shedding here would bounce the
+					// client off a volume that just landed.
+					if initiatedGrow && !repickedAfterGrow {
+						repickedAfterGrow = true
+						continue
+					}
+					return nil, status.Errorf(codes.ResourceExhausted, "no writable volumes for %s, volume growth in progress", option.String())
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		}
 		dn := dnList.Head()
@@ -125,9 +186,14 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 				DataCenter: dn.GetDataCenterId(),
 			},
 			Count:    count,
-			Auth:     string(security.GenJwtForVolumeServer(ms.guard.SigningKey, ms.guard.ExpiresAfterSec, fid)),
+			Auth:     string(security.GenJwtForVolumeServer(ms.guard.SigningKey(), ms.guard.ExpiresAfterSec(), fid)),
 			Replicas: replicas,
 		}, nil
+	}
+	// The initiator timed out with its growth still pending: shed retryably
+	// rather than failing the write that growth is about to satisfy.
+	if initiatedGrow && vl.HasGrowRequest() && ms.Topo.AvailableSpaceFor(option) > 0 {
+		return nil, status.Errorf(codes.ResourceExhausted, "no writable volumes for %s, volume growth in progress", option.String())
 	}
 	if lastErr != nil {
 		glog.V(0).Infof("assign %v %v: %v", req, option.String(), lastErr)

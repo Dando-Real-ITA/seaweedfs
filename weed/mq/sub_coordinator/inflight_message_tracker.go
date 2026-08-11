@@ -28,28 +28,6 @@ func (imt *InflightMessageTracker) EnflightMessage(key []byte, tsNs int64) {
 	imt.timestamps.EnflightTimestamp(tsNs)
 }
 
-// IsMessageAcknowledged returns true if the message has been acknowledged.
-// If the message is older than the oldest inflight messages, returns false.
-// returns false if the message is inflight.
-// Otherwise, returns false if the message is old and can be ignored.
-func (imt *InflightMessageTracker) IsMessageAcknowledged(key []byte, tsNs int64) bool {
-	imt.mu.Lock()
-	defer imt.mu.Unlock()
-
-	if tsNs <= imt.timestamps.OldestAckedTimestamp() {
-		return true
-	}
-	if tsNs > imt.timestamps.Latest() {
-		return false
-	}
-
-	if _, found := imt.messages[string(key)]; found {
-		return false
-	}
-
-	return true
-}
-
 // AcknowledgeMessage acknowledges the message with the key and timestamp.
 func (imt *InflightMessageTracker) AcknowledgeMessage(key []byte, tsNs int64) bool {
 	// fmt.Printf("AcknowledgeMessage(%s,%d)\n", string(key), tsNs)
@@ -77,6 +55,17 @@ func (imt *InflightMessageTracker) IsInflight(key []byte) bool {
 	return found
 }
 
+// Cleanup clears all in-flight messages. This should be called when a subscriber disconnects
+// to prevent messages from being stuck in the in-flight state indefinitely.
+func (imt *InflightMessageTracker) Cleanup() int {
+	imt.mu.Lock()
+	defer imt.mu.Unlock()
+	count := len(imt.messages)
+	// Clear all in-flight messages
+	imt.messages = make(map[string]int64)
+	return count
+}
+
 type TimestampStatus struct {
 	Timestamp int64
 	Acked     bool
@@ -84,9 +73,9 @@ type TimestampStatus struct {
 
 // RingBuffer represents a circular buffer to hold timestamps.
 type RingBuffer struct {
-	buffer       []*TimestampStatus
-	head         int
-	size         int
+	buffer        []*TimestampStatus
+	head          int
+	size          int
 	maxTimestamp  int64
 	maxAllAckedTs int64
 }
@@ -111,7 +100,7 @@ func (rb *RingBuffer) EnflightTimestamp(timestamp int64) {
 	if rb.size < len(rb.buffer) {
 		rb.size++
 	} else {
-		newBuf := newBuffer(2*len(rb.buffer))
+		newBuf := newBuffer(2 * len(rb.buffer))
 		for i := 0; i < rb.size; i++ {
 			newBuf[i] = rb.buffer[(rb.head+len(rb.buffer)-rb.size+i)%len(rb.buffer)]
 		}
@@ -152,9 +141,4 @@ func (rb *RingBuffer) AckTimestamp(timestamp int64) {
 // OldestAckedTimestamp returns the oldest that is already acked timestamp in the ring buffer.
 func (rb *RingBuffer) OldestAckedTimestamp() int64 {
 	return rb.maxAllAckedTs
-}
-
-// Latest returns the most recently known timestamp in the ring buffer.
-func (rb *RingBuffer) Latest() int64 {
-	return rb.maxTimestamp
 }

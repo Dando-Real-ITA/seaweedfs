@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"io"
 	"math"
 	"math/rand"
@@ -15,14 +14,15 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc"
-
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
+	"google.golang.org/grpc"
 )
 
 type BenchmarkOptions struct {
@@ -31,9 +31,9 @@ type BenchmarkOptions struct {
 	numberOfFiles    *int
 	fileSize         *int
 	idListFile       *string
-	write            *bool
 	deletePercentage *int
-	read             *bool
+	readOnly         *bool
+	writeOnly        *bool
 	sequentialRead   *bool
 	collection       *string
 	replication      *string
@@ -59,9 +59,9 @@ func init() {
 	b.fileSize = cmdBenchmark.Flag.Int("size", 1024, "simulated file size in bytes, with random(0~63) bytes padding")
 	b.numberOfFiles = cmdBenchmark.Flag.Int("n", 1024*1024, "number of files to write for each thread")
 	b.idListFile = cmdBenchmark.Flag.String("list", os.TempDir()+"/benchmark_list.txt", "list of uploaded file ids")
-	b.write = cmdBenchmark.Flag.Bool("write", true, "enable write")
 	b.deletePercentage = cmdBenchmark.Flag.Int("deletePercent", 0, "the percent of writes that are deletes")
-	b.read = cmdBenchmark.Flag.Bool("read", true, "enable read")
+	b.readOnly = cmdBenchmark.Flag.Bool("readOnly", false, "only benchmark read operations")
+	b.writeOnly = cmdBenchmark.Flag.Bool("writeOnly", false, "only benchmark write operations")
 	b.sequentialRead = cmdBenchmark.Flag.Bool("readSequentially", false, "randomly read by ids from \"-list\" specified file")
 	b.collection = cmdBenchmark.Flag.String("collection", "benchmark", "write data to this collection")
 	b.replication = cmdBenchmark.Flag.String("replication", "000", "replication type")
@@ -83,7 +83,10 @@ var cmdBenchmark = &Command{
 
   The file content is mostly zeros, but no compression is done.
 
-  You can choose to only benchmark read or write.
+  You can choose to only benchmark read or write:
+    -readOnly   only benchmark read operations
+    -writeOnly  only benchmark write operations
+
   During write, the list of uploaded file ids is stored in "-list" specified file.
   You can also use your own list of file ids to run read test.
 
@@ -115,18 +118,40 @@ func runBenchmark(cmd *Command, args []string) bool {
 	util.LoadSecurityConfiguration()
 	b.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 
-	fmt.Printf("This is SeaweedFS version %s %s %s\n", util.Version(), runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("This is SeaweedFS version %s %s %s\n", version.Version(), runtime.GOOS, runtime.GOARCH)
 	if *b.maxCpu < 1 {
 		*b.maxCpu = runtime.NumCPU()
 	}
 	runtime.GOMAXPROCS(*b.maxCpu)
+	*b.cpuprofile = util.ResolvePath(*b.cpuprofile)
+	*b.idListFile = util.ResolvePath(*b.idListFile)
 	if *b.cpuprofile != "" {
 		f, err := os.Create(*b.cpuprofile)
 		if err != nil {
 			glog.Fatal(err)
 		}
 		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+		}()
+	}
+
+	// Determine what operations to perform
+	// Default: both write and read
+	// -readOnly: only read
+	// -writeOnly: only write
+	if *b.readOnly && *b.writeOnly {
+		fmt.Fprintln(os.Stderr, "Error: -readOnly and -writeOnly are mutually exclusive.")
+		return false
+	}
+
+	doWrite := true
+	doRead := true
+	if *b.readOnly {
+		doWrite = false
+	} else if *b.writeOnly {
+		doRead = false
 	}
 
 	b.masterClient = wdclient.NewMasterClient(b.grpcDialOption, "", "client", "", "", "", *pb.ServerAddresses(*b.masters).ToServiceDiscovery())
@@ -134,11 +159,11 @@ func runBenchmark(cmd *Command, args []string) bool {
 	go b.masterClient.KeepConnectedToMaster(ctx)
 	b.masterClient.WaitUntilConnected(ctx)
 
-	if *b.write {
+	if doWrite {
 		benchWrite()
 	}
 
-	if *b.read {
+	if doRead {
 		benchRead()
 	}
 
@@ -236,13 +261,14 @@ func writeFiles(idChan chan int, fileIdLineChan chan string, s *stat) {
 			Fsync:    *b.fsync,
 		}
 		ar := &operation.VolumeAssignRequest{
-			Count:       1,
-			Collection:  *b.collection,
-			Replication: *b.replication,
-			DiskType:    *b.diskType,
+			Count:            1,
+			Collection:       *b.collection,
+			Replication:      *b.replication,
+			DiskType:         *b.diskType,
+			ExpectedDataSize: uint64(fileSize),
 		}
-		if assignResult, err := operation.Assign(b.masterClient.GetMaster, b.grpcDialOption, ar); err == nil {
-			fp.Server, fp.Fid, fp.Collection = assignResult.Url, assignResult.Fid, *b.collection
+		if assignResult, err := operation.Assign(context.Background(), b.masterClient.GetMaster, b.grpcDialOption, ar); err == nil {
+			fp.Server, fp.Fid, fp.Pref.Collection = assignResult.Url, assignResult.Fid, *b.collection
 			if !isSecure && assignResult.Auth != "" {
 				isSecure = true
 			}
@@ -288,7 +314,7 @@ func readFiles(fileIdLineChan chan string, s *stat) {
 		start := time.Now()
 		var bytesRead int
 		var err error
-		urls, err := b.masterClient.LookupFileId(fid)
+		urls, err := b.masterClient.LookupFileId(context.Background(), fid)
 		if err != nil {
 			s.failed++
 			println("!!!! ", fid, " location not found!!!!!")

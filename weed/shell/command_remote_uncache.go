@@ -36,9 +36,14 @@ func (c *commandRemoteUncache) Help() string {
 	remote.uncache -dir=/xxx/some/sub/dir -include=*.pdf
 	remote.uncache -dir=/xxx/some/sub/dir -exclude=*.txt
 	remote.uncache -minSize=1024000    # uncache files larger than 100K
-	remote.uncache -minAge=3600        # uncache files older than 1 hour
+	remote.uncache -minAge=3600        # uncache files older than 1 hour (created time)
+	remote.uncache -minCacheAge=3600   # uncache files older than 1 hour (cached time)
 
 `
+}
+
+func (c *commandRemoteUncache) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandRemoteUncache) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -71,7 +76,7 @@ func (c *commandRemoteUncache) Do(args []string, commandEnv *CommandEnv, writer 
 
 		// pull content from remote
 		if err = c.uncacheContentData(commandEnv, writer, util.FullPath(*dir), fileFiler); err != nil {
-			return fmt.Errorf("uncache content data: %v", err)
+			return fmt.Errorf("uncache content data: %w", err)
 		}
 		return nil
 	}
@@ -124,12 +129,14 @@ func (c *commandRemoteUncache) uncacheContentData(commandEnv *CommandEnv, writer
 }
 
 type FileFilter struct {
-	include *string
-	exclude *string
-	minSize *int64
-	maxSize *int64
-	minAge  *int64
-	maxAge  *int64
+	include     *string
+	exclude     *string
+	minSize     *int64
+	maxSize     *int64
+	minAge      *int64
+	maxAge      *int64
+	minCacheAge *int64
+	now         int64
 }
 
 func newFileFilter(remoteMountCommand *flag.FlagSet) (ff *FileFilter) {
@@ -138,21 +145,35 @@ func newFileFilter(remoteMountCommand *flag.FlagSet) (ff *FileFilter) {
 	ff.exclude = remoteMountCommand.String("exclude", "", "pattens of file names, e.g., *.pdf, *.html, ab?d.txt")
 	ff.minSize = remoteMountCommand.Int64("minSize", -1, "minimum file size in bytes")
 	ff.maxSize = remoteMountCommand.Int64("maxSize", -1, "maximum file size in bytes")
-	ff.minAge = remoteMountCommand.Int64("minAge", -1, "minimum file age in seconds")
-	ff.maxAge = remoteMountCommand.Int64("maxAge", -1, "maximum file age in seconds")
+	ff.minAge = remoteMountCommand.Int64("minAge", -1, "minimum file age in seconds (created time)")
+	ff.maxAge = remoteMountCommand.Int64("maxAge", -1, "maximum file age in seconds (created time)")
+	ff.minCacheAge = remoteMountCommand.Int64("minCacheAge", -1, "minimum file cache age in seconds (last cached time)")
+	ff.now = time.Now().Unix()
 	return
 }
 
-func (ff *FileFilter) matches(entry *filer_pb.Entry) bool {
+// matchesName applies only the name-based include/exclude patterns,
+// usable for remote entries where local attributes are not available.
+func (ff *FileFilter) matchesName(name string) bool {
 	if *ff.include != "" {
-		if ok, _ := filepath.Match(*ff.include, entry.Name); !ok {
+		if ok, _ := filepath.Match(*ff.include, name); !ok {
 			return false
 		}
 	}
 	if *ff.exclude != "" {
-		if ok, _ := filepath.Match(*ff.exclude, entry.Name); ok {
+		if ok, _ := filepath.Match(*ff.exclude, name); ok {
 			return false
 		}
+	}
+	return true
+}
+
+func (ff *FileFilter) matches(entry *filer_pb.Entry) bool {
+	if entry.Attributes == nil {
+		return false
+	}
+	if !ff.matchesName(entry.Name) {
+		return false
 	}
 	if *ff.minSize != -1 {
 		if int64(entry.Attributes.FileSize) < *ff.minSize {
@@ -165,12 +186,21 @@ func (ff *FileFilter) matches(entry *filer_pb.Entry) bool {
 		}
 	}
 	if *ff.minAge != -1 {
-		if entry.Attributes.Crtime + *ff.minAge > time.Now().Unix() {
+		if entry.Attributes.Crtime+*ff.minAge > ff.now {
 			return false
 		}
 	}
 	if *ff.maxAge != -1 {
-		if entry.Attributes.Crtime + *ff.maxAge < time.Now().Unix() {
+		if entry.Attributes.Crtime+*ff.maxAge < ff.now {
+			return false
+		}
+	}
+	if *ff.minCacheAge != -1 {
+		lastCachedTime := entry.Attributes.Crtime
+		if entry.RemoteEntry != nil && entry.RemoteEntry.LastLocalSyncTsNs > 0 {
+			lastCachedTime = entry.RemoteEntry.LastLocalSyncTsNs / 1e9
+		}
+		if lastCachedTime+*ff.minCacheAge > ff.now {
 			return false
 		}
 	}

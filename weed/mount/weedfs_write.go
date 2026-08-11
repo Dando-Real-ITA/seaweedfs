@@ -13,10 +13,33 @@ import (
 
 func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFunctionType {
 
-	return func(reader io.Reader, filename string, offset int64, tsNs int64) (chunk *filer_pb.FileChunk, err error) {
+	// Backstop: FUSE entry points sanitize names before they reach
+	// inodeToPath, but async flush paths (e.g. writebackCache, handles whose
+	// RememberPath was set from an older code path) may still carry bytes
+	// that predate sanitization. Proto3 string fields require valid UTF-8,
+	// so scrub the full path once here before every AssignVolume call.
+	assignPath := fullPath.Sanitized()
+
+	return func(reader io.Reader, filename string, offset int64, tsNs int64, _ uint64) (chunk *filer_pb.FileChunk, err error) {
 		uploader, err := operation.NewUploader()
 		if err != nil {
 			return
+		}
+
+		// WantMd5 gives mount writes a real filer.ETag (server echoes Content-MD5 back).
+		uploadOption := &operation.UploadOption{
+			Filename:          filename,
+			Cipher:            wfs.option.Cipher,
+			IsInputCompressed: false,
+			MimeType:          "",
+			PairMap:           nil,
+			WantMd5:           true,
+		}
+		if wfs.option.VolumeServerAccess == "filerProxy" {
+			// getCurrentFiler() can change on failover, so read it per attempt.
+			uploadOption.GenUploadUrl = func(host, fileId string) string {
+				return fmt.Sprintf("http://%s/?proxyChunkId=%s", wfs.getCurrentFiler(), fileId)
+			}
 		}
 
 		fileId, uploadResult, err, data := uploader.UploadWithRetry(
@@ -28,36 +51,42 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 				TtlSec:      wfs.option.TtlSec,
 				DiskType:    string(wfs.option.DiskType),
 				DataCenter:  wfs.option.DataCenter,
-				Path:        string(fullPath),
+				Path:        assignPath,
 			},
-			&operation.UploadOption{
-				Filename:          filename,
-				Cipher:            wfs.option.Cipher,
-				IsInputCompressed: false,
-				MimeType:          "",
-				PairMap:           nil,
-			},
-			func(host, fileId string) string {
-				fileUrl := fmt.Sprintf("http://%s/%s", host, fileId)
-				if wfs.option.VolumeServerAccess == "filerProxy" {
-					fileUrl = fmt.Sprintf("http://%s/?proxyChunkId=%s", wfs.getCurrentFiler(), fileId)
-				}
-				return fileUrl
-			},
-			reader,
+			uploadOption, reader,
 		)
 
 		if err != nil {
 			glog.V(0).Infof("upload data %v: %v", filename, err)
-			return nil, fmt.Errorf("upload data: %v", err)
+			return nil, fmt.Errorf("upload data: %w", err)
 		}
 		if uploadResult.Error != "" {
 			glog.V(0).Infof("upload failure %v: %v", filename, err)
 			return nil, fmt.Errorf("upload result: %v", uploadResult.Error)
 		}
 
-		if offset == 0 {
+		// When peer sharing is enabled we need EVERY chunk in the
+		// local cache so we can actually serve it back to peers on
+		// FetchChunk — otherwise the directory would advertise us as
+		// a holder and the fetcher would get NOT_FOUND from our
+		// chunk cache. When peer sharing is off we preserve the
+		// original behavior of caching only the first chunk (small
+		// files) to avoid blowing the cache on large uploads. Both
+		// paths gate on chunkCache != nil: -cacheCapacityMB=0 disables
+		// the cache entirely, in which case SetChunk would panic.
+		shouldCache := wfs.chunkCache != nil && (offset == 0 || wfs.peerAnnouncer != nil)
+		if shouldCache {
 			wfs.chunkCache.SetChunk(fileId, data)
+		}
+		// Announce every uploaded chunk so the tier-2 directory fills
+		// in as the file is written. Without this, the per-fetch
+		// announce path only bootstraps after someone else has already
+		// pulled a chunk via peer — which can't happen if nobody has
+		// told the directory who holds the chunk. Skip the announce
+		// when we couldn't cache (no point advertising bytes we can't
+		// actually serve back).
+		if wfs.peerAnnouncer != nil && shouldCache {
+			wfs.peerAnnouncer.EnqueueAnnounce(fileId)
 		}
 
 		chunk = uploadResult.ToPbFileChunk(fileId, offset, tsNs)

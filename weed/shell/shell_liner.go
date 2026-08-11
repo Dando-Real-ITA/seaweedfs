@@ -1,48 +1,57 @@
 package shell
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
+	"math/rand/v2"
+	"os"
+	"path"
+	"slices"
+	"strings"
+
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
-	"golang.org/x/exp/slices"
-	"io"
-	"math/rand"
-	"os"
-	"path"
-	"regexp"
-	"strings"
 
 	"github.com/peterh/liner"
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
+	"golang.org/x/term"
 )
 
-var (
-	line        *liner.State
-	historyPath = path.Join(os.TempDir(), "weed-shell")
-)
+var historyPath = path.Join(os.TempDir(), "weed-shell")
 
 func RunShell(options ShellOptions) {
 	slices.SortFunc(Commands, func(a, b command) int {
 		return strings.Compare(a.Name(), b.Name())
 	})
-	line = liner.NewLiner()
-	defer line.Close()
-	grace.OnInterrupt(func() {
-		line.Close()
-	})
 
-	line.SetCtrlCAborts(true)
-	line.SetTabCompletionStyle(liner.TabPrints)
+	if !options.Debug {
+		flag.Set("alsologtostderr", "false")
+		flag.Set("logtostderr", "false")
+	}
 
-	setCompletionHandler()
-	loadHistory()
+	interactive := liner.TerminalSupported() && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 
-	defer saveHistory()
+	var line *liner.State
+	if interactive {
+		line = liner.NewLiner()
+		defer line.Close()
+		grace.OnInterrupt(func() {
+			line.Close()
+		})
 
-	reg, _ := regexp.Compile(`'.*?'|".*?"|\S+`)
+		line.SetCtrlCAborts(true)
+		line.SetTabCompletionStyle(liner.TabPrints)
+
+		setCompletionHandler(line)
+		loadHistory(line)
+
+		defer saveHistory(line)
+	}
 
 	commandEnv := NewCommandEnv(&options)
 
@@ -66,45 +75,62 @@ func RunShell(options ShellOptions) {
 			}
 			return nil
 		})
-		fmt.Printf("master: %s ", *options.Masters)
 		if len(filers) > 0 {
-			fmt.Printf("filers: %v", filers)
-			commandEnv.option.FilerAddress = filers[rand.Intn(len(filers))]
+			commandEnv.option.FilerAddress = filers[rand.IntN(len(filers))]
 		}
-		fmt.Println()
+		if options.Debug {
+			if len(filers) > 0 {
+				fmt.Fprintf(os.Stderr, "master: %s filers: %v\n", *options.Masters, filers)
+			} else {
+				fmt.Fprintf(os.Stderr, "master: %s\n", *options.Masters)
+			}
+		}
 	}
 
-	for {
-		cmd, err := line.Prompt("> ")
-		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("%v\n", err)
-			}
-			return
-		}
-
-		for _, c := range util.StringSplit(cmd, ";") {
-			if processEachCmd(reg, c, commandEnv) {
+	if interactive {
+		for {
+			cmd, err := line.Prompt("> ")
+			if err != nil {
+				if err != io.EOF {
+					fmt.Fprintf(os.Stderr, "%v\n", err)
+				}
 				return
 			}
+
+			if strings.TrimSpace(cmd) != "" {
+				line.AppendHistory(cmd)
+			}
+
+			for _, c := range util.StringSplit(cmd, ";") {
+				if processEachCmd(c, commandEnv) {
+					return
+				}
+			}
+		}
+	} else {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			cmd := scanner.Text()
+			for _, c := range util.StringSplit(cmd, ";") {
+				if processEachCmd(c, commandEnv) {
+					return
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
 		}
 	}
 }
 
-func processEachCmd(reg *regexp.Regexp, cmd string, commandEnv *CommandEnv) bool {
-	cmds := reg.FindAllString(cmd, -1)
-
-	line.AppendHistory(cmd)
+func processEachCmd(cmd string, commandEnv *CommandEnv) bool {
+	cmds := splitCommandLine(cmd)
 
 	if len(cmds) == 0 {
 		return false
 	} else {
 
-		args := make([]string, len(cmds[1:]))
-
-		for i := range args {
-			args[i] = strings.Trim(string(cmds[1+i]), "\"'")
-		}
+		args := cmds[1:]
 
 		cmd := cmds[0]
 		if cmd == "help" || cmd == "?" {
@@ -130,6 +156,59 @@ func processEachCmd(reg *regexp.Regexp, cmd string, commandEnv *CommandEnv) bool
 	return false
 }
 
+func splitCommandLine(line string) []string {
+	tokens, _ := parseShellInput(line, true)
+	return tokens
+}
+
+func parseShellInput(line string, split bool) (args []string, unbalanced bool) {
+	var current strings.Builder
+	inDoubleQuotes := false
+	inSingleQuotes := false
+	escaped := false
+
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+
+		if escaped {
+			current.WriteByte(c)
+			escaped = false
+			continue
+		}
+
+		if c == '\\' && !inSingleQuotes {
+			escaped = true
+			continue
+		}
+
+		if c == '"' && !inSingleQuotes {
+			inDoubleQuotes = !inDoubleQuotes
+			continue
+		}
+
+		if c == '\'' && !inDoubleQuotes {
+			inSingleQuotes = !inSingleQuotes
+			continue
+		}
+
+		if split && (c == ' ' || c == '\t' || c == '\n' || c == '\r') && !inDoubleQuotes && !inSingleQuotes {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+
+		current.WriteByte(c)
+	}
+
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+
+	return args, inDoubleQuotes || inSingleQuotes || escaped
+}
+
 func printGenericHelp() {
 	msg :=
 		`Type:	"help <command>" for help on <command>. Most commands support "<command> -h" also for options. 
@@ -137,6 +216,9 @@ func printGenericHelp() {
 	fmt.Print(msg)
 
 	for _, c := range Commands {
+		if c.HasTag(Hidden) {
+			continue
+		}
 		helpTexts := strings.SplitN(c.Help(), "\n", 2)
 		fmt.Printf("  %-30s\t# %s \n", c.Name(), helpTexts[0])
 	}
@@ -154,12 +236,13 @@ func printHelp(cmds []string) {
 		for _, c := range Commands {
 			if strings.ToLower(c.Name()) == cmd {
 				fmt.Printf("  %s\t# %s\n", c.Name(), c.Help())
+				fmt.Printf("use \"%s -h\" for more details\n", c.Name())
 			}
 		}
 	}
 }
 
-func setCompletionHandler() {
+func setCompletionHandler(line *liner.State) {
 	line.SetCompleter(func(line string) (c []string) {
 		for _, i := range Commands {
 			if strings.HasPrefix(i.Name(), strings.ToLower(line)) {
@@ -170,19 +253,19 @@ func setCompletionHandler() {
 	})
 }
 
-func loadHistory() {
+func loadHistory(line *liner.State) {
 	if f, err := os.Open(historyPath); err == nil {
 		line.ReadHistory(f)
 		f.Close()
 	}
 }
 
-func saveHistory() {
+func saveHistory(line *liner.State) {
 	if f, err := os.Create(historyPath); err != nil {
-		fmt.Printf("Error creating history file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating history file: %v\n", err)
 	} else {
 		if _, err = line.WriteHistory(f); err != nil {
-			fmt.Printf("Error writing history file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error writing history file: %v\n", err)
 		}
 		f.Close()
 	}

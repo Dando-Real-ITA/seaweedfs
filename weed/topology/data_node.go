@@ -2,6 +2,7 @@ package topology
 
 import (
 	"fmt"
+	"slices"
 	"sync/atomic"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -22,6 +23,17 @@ type DataNode struct {
 	LastSeen      int64 // unix time in seconds
 	Counter       int   // in race condition, the previous dataNode was not dead
 	IsTerminating bool
+
+	MaintenanceMode bool
+	// diskMetas holds each physical disk's tags, type, and capacity from the
+	// heartbeat DiskTags, including disks with no volumes or EC shards.
+	diskMetas map[uint32]diskMeta
+}
+
+type diskMeta struct {
+	tags           []string
+	diskType       types.DiskType
+	maxVolumeCount int64
 }
 
 func NewDataNode(id string) *DataNode {
@@ -30,6 +42,7 @@ func NewDataNode(id string) *DataNode {
 	dn.nodeType = "DataNode"
 	dn.diskUsages = newDiskUsages()
 	dn.children = make(map[NodeId]Node)
+	dn.capacityReservations = newCapacityReservations()
 	dn.NodeImpl.value = dn
 	return dn
 }
@@ -83,8 +96,7 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 			disk.DeleteVolumeById(vid)
 			deletedVolumes = append(deletedVolumes, v)
 
-			deltaDiskUsages := newDiskUsages()
-			deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+			deltaDiskUsage := &DiskUsageCounts{}
 			deltaDiskUsage.volumeCount = -1
 			if v.IsRemote() {
 				deltaDiskUsage.remoteVolumeCount = -1
@@ -92,7 +104,7 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 			if !v.ReadOnly {
 				deltaDiskUsage.activeVolumeCount = -1
 			}
-			disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
 	}
 	for _, v := range actualVolumes {
@@ -120,8 +132,7 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 		}
 		disk.DeleteVolumeById(v.Id)
 
-		deltaDiskUsages := newDiskUsages()
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+		deltaDiskUsage := &DiskUsageCounts{}
 		deltaDiskUsage.volumeCount = -1
 		if v.IsRemote() {
 			deltaDiskUsage.remoteVolumeCount = -1
@@ -129,7 +140,7 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 		if !v.ReadOnly {
 			deltaDiskUsage.activeVolumeCount = -1
 		}
-		disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 	}
 	for _, v := range newVolumes {
 		dn.doAddOrUpdateVolume(v)
@@ -143,7 +154,6 @@ func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
 			// the volume server may have set the max to zero
 			continue
 		}
-		deltaDiskUsages := newDiskUsages()
 		dt := types.ToDiskType(diskType)
 		currentDiskUsage := dn.diskUsages.getOrCreateDisk(dt)
 		currentDiskUsageMaxVolumeCount := atomic.LoadInt64(&currentDiskUsage.maxVolumeCount)
@@ -151,9 +161,36 @@ func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
 			continue
 		}
 		disk := dn.getOrCreateDisk(dt.String())
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(dt)
-		deltaDiskUsage.maxVolumeCount = int64(maxVolumeCount) - currentDiskUsageMaxVolumeCount
-		disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
+			maxVolumeCount: int64(maxVolumeCount) - currentDiskUsageMaxVolumeCount,
+		})
+	}
+}
+
+// AdjustDiskUsageBytes records the physical filesystem capacity a volume server
+// reports per disk type, applied as a delta so it flows through the same
+// aggregation as the volume counts. Mirrors AdjustMaxVolumeCounts; entries with a
+// zero total are treated as "not reported" and skipped.
+func (dn *DataNode) AdjustDiskUsageBytes(diskTotalBytes, diskFreeBytes map[string]uint64) {
+	for diskType, totalBytes := range diskTotalBytes {
+		// Unlike maxVolumeCount, a 0 here is not "unset" but "not reported": let it
+		// flow through so a later heartbeat that drops physical-capacity reporting
+		// (e.g. statfs starts failing) clears the stale bytes and the gate falls
+		// back to slot-only instead of trusting outdated capacity.
+		dt := types.ToDiskType(diskType)
+		currentDiskUsage := dn.diskUsages.getOrCreateDisk(dt)
+		currentTotal := atomic.LoadInt64(&currentDiskUsage.diskTotalBytes)
+		currentFree := atomic.LoadInt64(&currentDiskUsage.diskFreeBytes)
+		newTotal := int64(totalBytes)
+		newFree := int64(diskFreeBytes[diskType])
+		if currentTotal == newTotal && currentFree == newFree {
+			continue
+		}
+		disk := dn.getOrCreateDisk(dt.String())
+		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
+			diskTotalBytes: newTotal - currentTotal,
+			diskFreeBytes:  newFree - currentFree,
+		})
 	}
 }
 
@@ -268,15 +305,84 @@ func (dn *DataNode) ToInfo() (info DataNodeInfo) {
 
 func (dn *DataNode) ToDataNodeInfo() *master_pb.DataNodeInfo {
 	m := &master_pb.DataNodeInfo{
-		Id:        string(dn.Id()),
-		DiskInfos: make(map[string]*master_pb.DiskInfo),
+		Id: string(dn.Id()),
+		// Start from disk usage counters so empty disks are still represented
+		// even when there are no volumes/EC shards on this data node yet.
+		DiskInfos: dn.diskUsages.ToDiskInfo(),
 		GrpcPort:  uint32(dn.GrpcPort),
+		Address:   dn.Url(), // ip:port for connecting to the volume server
 	}
+	if m.DiskInfos == nil {
+		m.DiskInfos = make(map[string]*master_pb.DiskInfo)
+	}
+	for diskType, diskInfo := range m.DiskInfos {
+		if diskInfo == nil {
+			m.DiskInfos[diskType] = &master_pb.DiskInfo{Type: diskType}
+			continue
+		}
+		diskInfo.Type = diskType
+	}
+
 	for _, c := range dn.Children() {
 		disk := c.(*Disk)
 		m.DiskInfos[string(disk.Id())] = disk.ToDiskInfo()
 	}
+
+	dn.RLock()
+	metas := make(map[uint32]diskMeta, len(dn.diskMetas))
+	for diskID, meta := range dn.diskMetas {
+		metas[diskID] = meta
+	}
+	dn.RUnlock()
+	for _, diskInfo := range m.DiskInfos {
+		if diskInfo == nil {
+			continue
+		}
+		if meta, found := metas[diskInfo.DiskId]; found {
+			diskInfo.Tags = append([]string(nil), meta.tags...)
+		}
+		// Max per physical disk of this type, empty and unavailable (max 0) ones
+		// included. Emit only when some disk reports capacity, so an older server
+		// sending all zeros leaves the map nil and falls back.
+		diskType := types.ToDiskType(diskInfo.Type)
+		maxByDisk := make(map[uint32]int64)
+		anyCapacity := false
+		for diskID, meta := range metas {
+			if meta.diskType != diskType {
+				continue
+			}
+			if meta.maxVolumeCount > 0 {
+				anyCapacity = true
+			}
+			maxByDisk[diskID] = meta.maxVolumeCount
+		}
+		if anyCapacity {
+			diskInfo.MaxVolumeCountByDisk = maxByDisk
+		}
+	}
 	return m
+}
+
+func (dn *DataNode) UpdateDiskTags(tags []*master_pb.DiskTag) {
+	if len(tags) == 0 {
+		return
+	}
+	// DiskTags is the full list on each full heartbeat; rebuild fresh to drop
+	// removed disks.
+	metas := make(map[uint32]diskMeta, len(tags))
+	for _, tagInfo := range tags {
+		if tagInfo == nil {
+			continue
+		}
+		metas[tagInfo.DiskId] = diskMeta{
+			tags:           append([]string(nil), tagInfo.Tags...),
+			diskType:       types.ToDiskType(tagInfo.Type),
+			maxVolumeCount: tagInfo.MaxVolumeCount,
+		}
+	}
+	dn.Lock()
+	dn.diskMetas = metas
+	dn.Unlock()
 }
 
 // GetVolumeIds returns the human readable volume ids limited to count of max 100.
@@ -289,6 +395,8 @@ func (dn *DataNode) GetVolumeIds() string {
 	for k := range existingVolumes {
 		ids = append(ids, int(k))
 	}
+
+	slices.Sort(ids)
 
 	return util.HumanReadableIntsMax(100, ids...)
 }

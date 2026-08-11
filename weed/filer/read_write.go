@@ -2,6 +2,7 @@ package filer
 
 import (
 	"bytes"
+	"context"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -14,7 +15,7 @@ func ReadEntry(masterClient *wdclient.MasterClient, filerClient filer_pb.Seaweed
 		Directory: dir,
 		Name:      name,
 	}
-	respLookupEntry, err := filer_pb.LookupEntry(filerClient, request)
+	respLookupEntry, err := filer_pb.LookupEntry(context.Background(), filerClient, request)
 	if err != nil {
 		return err
 	}
@@ -27,12 +28,12 @@ func ReadEntry(masterClient *wdclient.MasterClient, filerClient filer_pb.Seaweed
 
 }
 
-func ReadInsideFiler(filerClient filer_pb.SeaweedFilerClient, dir, name string) (content []byte, err error) {
+func ReadInsideFiler(ctx context.Context, filerClient filer_pb.SeaweedFilerClient, dir, name string) (content []byte, err error) {
 	request := &filer_pb.LookupDirectoryEntryRequest{
 		Directory: dir,
 		Name:      name,
 	}
-	respLookupEntry, err := filer_pb.LookupEntry(filerClient, request)
+	respLookupEntry, err := filer_pb.LookupEntry(ctx, filerClient, request)
 	if err != nil {
 		return
 	}
@@ -40,15 +41,15 @@ func ReadInsideFiler(filerClient filer_pb.SeaweedFilerClient, dir, name string) 
 	return
 }
 
-func SaveInsideFiler(client filer_pb.SeaweedFilerClient, dir, name string, content []byte) error {
+func SaveInsideFiler(ctx context.Context, client filer_pb.SeaweedFilerClient, dir, name string, content []byte) error {
 
-	resp, err := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
+	resp, err := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
 		Directory: dir,
 		Name:      name,
 	})
 
 	if err == filer_pb.ErrNotFound {
-		err = filer_pb.CreateEntry(client, &filer_pb.CreateEntryRequest{
+		err = filer_pb.CreateEntry(ctx, client, &filer_pb.CreateEntryRequest{
 			Directory: dir,
 			Entry: &filer_pb.Entry{
 				Name:        name,
@@ -68,7 +69,7 @@ func SaveInsideFiler(client filer_pb.SeaweedFilerClient, dir, name string, conte
 		entry.Content = content
 		entry.Attributes.Mtime = time.Now().Unix()
 		entry.Attributes.FileSize = uint64(len(content))
-		err = filer_pb.UpdateEntry(client, &filer_pb.UpdateEntryRequest{
+		err = filer_pb.UpdateEntry(ctx, client, &filer_pb.UpdateEntryRequest{
 			Directory: dir,
 			Entry:     entry,
 		})

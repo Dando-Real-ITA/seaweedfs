@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -110,7 +111,8 @@ func CreateNeedleFromRequest(r *http.Request, fixJpgOrientation bool, sizeLimit 
 	commaSep := strings.LastIndex(r.URL.Path, ",")
 	dotSep := strings.LastIndex(r.URL.Path, ".")
 	fid := r.URL.Path[commaSep+1:]
-	if dotSep > 0 {
+	// dot must be after comma; otherwise path[commaSep+1:dotSep] panics
+	if dotSep > commaSep {
 		fid = r.URL.Path[commaSep+1 : dotSep]
 	}
 
@@ -134,6 +136,9 @@ func (n *Needle) ParsePath(fid string) (err error) {
 	}
 	if delta != "" {
 		if d, e := strconv.ParseUint(delta, 10, 64); e == nil {
+			if d > math.MaxUint64-uint64(n.Id) {
+				return fmt.Errorf("delta %d overflows needle id %x", d, n.Id)
+			}
 			n.Id += Uint64ToNeedleId(d)
 		} else {
 			return e
@@ -160,11 +165,11 @@ func ParseNeedleIdCookie(key_hash_string string) (NeedleId, Cookie, error) {
 	split := len(key_hash_string) - CookieSize*2
 	needleId, err := ParseNeedleId(key_hash_string[:split])
 	if err != nil {
-		return NeedleIdEmpty, 0, fmt.Errorf("Parse needleId error: %v", err)
+		return NeedleIdEmpty, 0, fmt.Errorf("Parse needleId error: %w", err)
 	}
 	cookie, err := ParseCookie(key_hash_string[split:])
 	if err != nil {
-		return NeedleIdEmpty, 0, fmt.Errorf("Parse cookie error: %v", err)
+		return NeedleIdEmpty, 0, fmt.Errorf("Parse cookie error: %w", err)
 	}
 	return needleId, cookie, nil
 }

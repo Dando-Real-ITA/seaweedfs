@@ -1,27 +1,89 @@
 package repl_util
 
 import (
+	"context"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-func CopyFromChunkViews(chunkViews *filer.IntervalList[*filer.ChunkView], filerSource *source.FilerSource, writeFunc func(data []byte) error) error {
+// CopyFromChunkViews copies chunk data with optional SSE decryption.
+// If entry has SSE-encrypted chunks, data is decrypted before writing.
+func CopyFromChunkViews(chunkViews *filer.IntervalList[*filer.ChunkView], filerSource *source.FilerSource, writeFunc func(data []byte) error, entry *filer_pb.Entry) error {
+	if entry != nil {
+		sseType, err := detectSSEType(entry)
+		if err != nil {
+			return err
+		}
+		if sseType != filer_pb.SSEType_NONE {
+			return copyWithDecryption(filerSource, entry, writeFunc)
+		}
+	}
+	return copyChunkViews(chunkViews, filerSource, writeFunc)
+}
+
+func copyWithDecryption(filerSource *source.FilerSource, entry *filer_pb.Entry, writeFunc func(data []byte) error) error {
+	reader := filer.NewFileReader(filerSource, entry)
+	decrypted, err := MaybeDecryptReader(reader, entry)
+	if err != nil {
+		CloseReader(reader)
+		return err
+	}
+	defer CloseMaybeDecryptedReader(reader, decrypted)
+	buf := make([]byte, 128*1024)
+	for {
+		n, readErr := decrypted.Read(buf)
+		if n > 0 {
+			if writeErr := writeFunc(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+// CloseReader closes r if it implements io.Closer.
+func CloseReader(r io.Reader) {
+	if closer, ok := r.(io.Closer); ok {
+		closer.Close()
+	}
+}
+
+// CloseMaybeDecryptedReader closes the decrypted reader if it implements io.Closer,
+// otherwise falls back to closing the original reader.
+func CloseMaybeDecryptedReader(original, decrypted io.Reader) {
+	if closer, ok := decrypted.(io.Closer); ok {
+		closer.Close()
+	} else {
+		CloseReader(original)
+	}
+}
+
+func copyChunkViews(chunkViews *filer.IntervalList[*filer.ChunkView], filerSource *source.FilerSource, writeFunc func(data []byte) error) error {
 
 	for x := chunkViews.Front(); x != nil; x = x.Next {
 		chunk := x.Value
 
-		fileUrls, err := filerSource.LookupFileId(chunk.FileId)
+		fileUrls, err := filerSource.LookupFileId(context.Background(), chunk.FileId)
 		if err != nil {
 			return err
 		}
 
 		var writeErr error
 		var shouldRetry bool
+		jwt := filer.JwtForVolumeServer(chunk.FileId)
 
 		for _, fileUrl := range fileUrls {
-			shouldRetry, err = util_http.ReadUrlAsStream(fileUrl, chunk.CipherKey, chunk.IsGzipped, chunk.IsFullChunk(), chunk.OffsetInChunk, int(chunk.ViewSize), func(data []byte) {
+			shouldRetry, err = util_http.ReadUrlAsStream(context.Background(), fileUrl, jwt, chunk.CipherKey, chunk.IsGzipped, chunk.IsFullChunk(), chunk.OffsetInChunk, int(chunk.ViewSize), func(data []byte) {
 				writeErr = writeFunc(data)
 			})
 			if err != nil {

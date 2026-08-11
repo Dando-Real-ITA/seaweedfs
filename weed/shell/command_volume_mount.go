@@ -3,10 +3,10 @@ package shell
 import (
 	"context"
 	"flag"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"io"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"google.golang.org/grpc"
@@ -31,6 +31,10 @@ func (c *commandVolumeMount) Help() string {
 	This command mounts a volume from one volume server.
 
 `
+}
+
+func (c *commandVolumeMount) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandVolumeMount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {

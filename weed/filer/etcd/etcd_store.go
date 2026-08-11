@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"go.etcd.io/etcd/client/pkg/v3/transport"
 	"strings"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -47,7 +48,7 @@ func (store *EtcdStore) Initialize(configuration weed_util.Configuration, prefix
 	timeoutStr := configuration.GetString(prefix + "timeout")
 	timeout, err := time.ParseDuration(timeoutStr)
 	if err != nil {
-		return fmt.Errorf("parse etcd store timeout: %v", err)
+		return fmt.Errorf("parse etcd store timeout: %w", err)
 	}
 	store.timeout = timeout
 
@@ -65,7 +66,7 @@ func (store *EtcdStore) Initialize(configuration weed_util.Configuration, prefix
 		var err error
 		tlsConfig, err = tlsInfo.ClientConfig()
 		if err != nil {
-			return fmt.Errorf("TLS client configuration error: %v", err)
+			return fmt.Errorf("TLS client configuration error: %w", err)
 		}
 	}
 
@@ -95,7 +96,7 @@ func (store *EtcdStore) initialize(servers, username, password string, timeout t
 		return fmt.Errorf("error checking etcd connection: %s", err)
 	}
 
-	glog.V(0).Infof("сonnection to etcd has been successfully verified. etcd version: %s", resp.Version)
+	glog.V(0).InfofCtx(ctx, "сonnection to etcd has been successfully verified. etcd version: %s", resp.Version)
 	store.client = client
 
 	return nil
@@ -208,12 +209,20 @@ func (store *EtcdStore) ListDirectoryPrefixedEntries(ctx context.Context, dirPat
 		}
 		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(kv.Value)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
 			break
 		}
+
+		if !resEachEntryFunc {
+			break
+		}
+
 		lastFileName = fileName
 	}
 

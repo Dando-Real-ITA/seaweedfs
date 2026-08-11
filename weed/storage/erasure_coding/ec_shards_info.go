@@ -1,0 +1,442 @@
+package erasure_coding
+
+import (
+	"fmt"
+	"iter"
+	"math/bits"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/dustin/go-humanize"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+)
+
+// ShardBits is a bitmap representing which shards are present (bit 0 = shard 0, etc.)
+type ShardBits uint32
+
+// Has checks if a shard ID is present in the bitmap
+func (sb ShardBits) Has(id ShardId) bool {
+	return id < MaxShardCount && sb&(1<<id) != 0
+}
+
+// Set sets a shard ID in the bitmap
+func (sb ShardBits) Set(id ShardId) ShardBits {
+	if id >= MaxShardCount {
+		return sb
+	}
+	return sb | (1 << id)
+}
+
+// Clear clears a shard ID from the bitmap
+func (sb ShardBits) Clear(id ShardId) ShardBits {
+	if id >= MaxShardCount {
+		return sb
+	}
+	return sb &^ (1 << id)
+}
+
+// Count returns the number of set bits using popcount
+func (sb ShardBits) Count() int {
+	return bits.OnesCount32(uint32(sb))
+}
+
+// All iterates the shard ids present in the bitmap, in ascending order. It walks
+// only the set bits (trailing-zero scan), so cost scales with the number of
+// shards present rather than the full id range. Prefer this over scanning
+// 0..MaxShardCount and calling Has on each id.
+func (sb ShardBits) All() iter.Seq[ShardId] {
+	return func(yield func(ShardId) bool) {
+		for b := uint32(sb); b != 0; b &= b - 1 {
+			if !yield(ShardId(bits.TrailingZeros32(b))) {
+				return
+			}
+		}
+	}
+}
+
+// ShardsInfo encapsulates information for EC shards with memory-efficient storage
+type ShardsInfo struct {
+	mu        sync.RWMutex
+	shards    []ShardInfo // Sorted by Id
+	shardBits ShardBits
+}
+
+func NewShardsInfo() *ShardsInfo {
+	return &ShardsInfo{
+		shards: make([]ShardInfo, 0, TotalShardsCount),
+	}
+}
+
+// Initializes a ShardsInfo from a VolumeEcShardInformationMessage proto.
+func ShardsInfoFromVolumeEcShardInformationMessage(vi *master_pb.VolumeEcShardInformationMessage) *ShardsInfo {
+	res := NewShardsInfo()
+	if vi == nil {
+		return res
+	}
+
+	var id ShardId
+	var j int
+	// Build shards directly to avoid locking in Set() since res is not yet shared
+	newShards := make([]ShardInfo, 0, 8)
+	for bitmap := vi.EcIndexBits; bitmap != 0; bitmap >>= 1 {
+		if bitmap&1 != 0 {
+			var size ShardSize
+			if j < len(vi.ShardSizes) {
+				size = ShardSize(vi.ShardSizes[j])
+			}
+			j++
+			newShards = append(newShards, NewShardInfo(id, size))
+		}
+		id++
+	}
+	res.shards = newShards
+	res.shardBits = ShardBits(vi.EcIndexBits)
+
+	return res
+}
+
+// Returns a count of shards from a VolumeEcShardInformationMessage proto.
+func GetShardCount(vi *master_pb.VolumeEcShardInformationMessage) int {
+	if vi == nil {
+		return 0
+	}
+	return ShardBits(vi.EcIndexBits).Count()
+}
+
+// EcShardsTotalSize returns the sum of all shard sizes (data + parity) in
+// the message. Walks vi.ShardSizes directly rather than materializing a
+// ShardsInfo, which is significantly cheaper for callers that only need the
+// aggregate size.
+func EcShardsTotalSize(vi *master_pb.VolumeEcShardInformationMessage) int64 {
+	if vi == nil {
+		return 0
+	}
+	var total int64
+	for _, s := range vi.ShardSizes {
+		total += s
+	}
+	return total
+}
+
+// EcShardsVolumeDataShards returns the number of data shards for the EC volume
+// described by vi. Open-source SeaweedFS always uses the fixed 10+4 layout, so
+// this returns DataShardsCount. It is defined as a per-volume accessor (rather
+// than referencing DataShardsCount directly at every call site) so callers such
+// as ec.check.replication stay correct when a build derives the ratio per volume instead
+// of from the global constant.
+func EcShardsVolumeDataShards(vi *master_pb.VolumeEcShardInformationMessage) int {
+	return DataShardsCount
+}
+
+// EcShardsVolumeParityShards returns the number of parity shards for the EC
+// volume described by vi. As with EcShardsVolumeDataShards, open-source
+// SeaweedFS uses the fixed 10+4 layout, so this returns ParityShardsCount.
+func EcShardsVolumeParityShards(vi *master_pb.VolumeEcShardInformationMessage) int {
+	return ParityShardsCount
+}
+
+// EcShardsDataSize returns the sum of sizes for data shards only (parity
+// shards excluded). Data shards are those with id < dataShards; all higher
+// shard ids are treated as parity. Passing dataShards <= 0 falls back to
+// the upstream default of DataShardsCount (10), which is correct for the
+// fixed 10+4 layout. Forks with per-volume ratio metadata (e.g. the
+// data_shards field carried on an extended VolumeEcShardInformationMessage)
+// should pass the per-volume value so logical sizes remain accurate under
+// custom EC policies like 6+3 or 16+6.
+func EcShardsDataSize(vi *master_pb.VolumeEcShardInformationMessage, dataShards int) int64 {
+	if vi == nil {
+		return 0
+	}
+	if dataShards <= 0 {
+		dataShards = DataShardsCount
+	}
+	var total int64
+	var id ShardId
+	var j int
+	for bitmap := vi.EcIndexBits; bitmap != 0; bitmap >>= 1 {
+		if bitmap&1 != 0 {
+			if int(id) < dataShards && j < len(vi.ShardSizes) {
+				total += vi.ShardSizes[j]
+			}
+			j++
+		}
+		id++
+	}
+	return total
+}
+
+// Returns a string representation for a ShardsInfo.
+func (sp *ShardsInfo) String() string {
+	sp.mu.RLock()
+	defer sp.mu.RUnlock()
+	var sb strings.Builder
+	for i, s := range sp.shards {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		fmt.Fprintf(&sb, "%d:%s", s.Id, humanize.Bytes(uint64(s.Size)))
+	}
+	return sb.String()
+}
+
+// AsSlice converts a ShardsInfo to a slice of ShardInfo structs, ordered by shard ID.
+func (si *ShardsInfo) AsSlice() []ShardInfo {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	res := make([]ShardInfo, len(si.shards))
+	copy(res, si.shards)
+	return res
+}
+
+// Count returns the number of EC shards using popcount on the bitmap.
+func (si *ShardsInfo) Count() int {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	return si.shardBits.Count()
+}
+
+// Has verifies if a shard ID is present using bitmap check.
+func (si *ShardsInfo) Has(id ShardId) bool {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	return si.shardBits.Has(id)
+}
+
+// Ids returns a list of shard IDs, in ascending order.
+func (si *ShardsInfo) Ids() []ShardId {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	ids := make([]ShardId, len(si.shards))
+	for i, s := range si.shards {
+		ids[i] = s.Id
+	}
+	return ids
+}
+
+// IdsInt returns a list of shards ID as int, in ascending order.
+func (si *ShardsInfo) IdsInt() []int {
+	ids := si.Ids()
+	res := make([]int, len(ids))
+	for i, id := range ids {
+		res[i] = int(id)
+	}
+	return res
+}
+
+// IdsUint32 returns a list of shards ID as uint32, in ascending order.
+func (si *ShardsInfo) IdsUint32() []uint32 {
+	return ShardIdsToUint32(si.Ids())
+}
+
+// Set sets or updates a shard's information.
+func (si *ShardsInfo) Set(shard ShardInfo) {
+	if shard.Id >= MaxShardCount {
+		return
+	}
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	// Check if already exists
+	if si.shardBits.Has(shard.Id) {
+		// Find and update
+		idx := si.findIndex(shard.Id)
+		if idx >= 0 {
+			si.shards[idx] = shard
+		}
+		return
+	}
+
+	// Add new shard
+	si.shardBits = si.shardBits.Set(shard.Id)
+
+	// Find insertion point to keep sorted
+	idx := sort.Search(len(si.shards), func(i int) bool {
+		return si.shards[i].Id > shard.Id
+	})
+
+	// Insert at idx
+	si.shards = append(si.shards, ShardInfo{})
+	copy(si.shards[idx+1:], si.shards[idx:])
+	si.shards[idx] = shard
+}
+
+// Delete deletes a shard by ID.
+func (si *ShardsInfo) Delete(id ShardId) {
+	if id >= MaxShardCount {
+		return
+	}
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	if !si.shardBits.Has(id) {
+		return // Not present
+	}
+
+	si.shardBits = si.shardBits.Clear(id)
+
+	// Find and remove from slice
+	idx := si.findIndex(id)
+	if idx >= 0 {
+		si.shards = append(si.shards[:idx], si.shards[idx+1:]...)
+	}
+}
+
+// Bitmap returns a bitmap for all existing shard IDs.
+func (si *ShardsInfo) Bitmap() uint32 {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	return uint32(si.shardBits)
+}
+
+// Size returns the size of a given shard ID, if present.
+func (si *ShardsInfo) Size(id ShardId) ShardSize {
+	if id >= MaxShardCount {
+		return 0
+	}
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+
+	if !si.shardBits.Has(id) {
+		return 0
+	}
+
+	idx := si.findIndex(id)
+	if idx >= 0 {
+		return si.shards[idx].Size
+	}
+	return 0
+}
+
+// TotalSize returns the size for all shards.
+func (si *ShardsInfo) TotalSize() ShardSize {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	var total ShardSize
+	for _, s := range si.shards {
+		total += s.Size
+	}
+	return total
+}
+
+// Sizes returns a compact slice of present shard sizes, from first to last.
+func (si *ShardsInfo) Sizes() []ShardSize {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+
+	res := make([]ShardSize, len(si.shards))
+	for i, s := range si.shards {
+		res[i] = s.Size
+	}
+	return res
+}
+
+// SizesInt64 returns a compact slice of present shard sizes, from first to last, as int64.
+func (si *ShardsInfo) SizesInt64() []int64 {
+	sizes := si.Sizes()
+	res := make([]int64, len(sizes))
+	for i, s := range sizes {
+		res[i] = int64(s)
+	}
+	return res
+}
+
+// Copy creates a copy of a ShardInfo.
+func (si *ShardsInfo) Copy() *ShardsInfo {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+
+	newShards := make([]ShardInfo, len(si.shards))
+	copy(newShards, si.shards)
+
+	return &ShardsInfo{
+		shards:    newShards,
+		shardBits: si.shardBits,
+	}
+}
+
+// DeleteParityShards removes parity shards (those with id >= dataShards) from
+// a ShardInfo. dataShards is the volume's data-shard count; passing <= 0 falls
+// back to DataShardsCount (the fixed 10+4 layout). The upper bound is
+// MaxShardCount, not TotalShardsCount, so a custom ratio's high parity ids
+// (e.g. 16+6 reaches id 21) are cleared too; Delete no-ops on absent ids.
+func (si *ShardsInfo) DeleteParityShards(dataShards int) {
+	if dataShards <= 0 {
+		dataShards = DataShardsCount
+	}
+	if dataShards >= MaxShardCount {
+		return // every id is a data shard; nothing to remove
+	}
+	si.mu.Lock()
+	defer si.mu.Unlock()
+
+	// Parity ids are >= dataShards. shards stays sorted by Id and shardBits is
+	// a bitmap, so clear them in one locked pass instead of a per-id Delete:
+	// mask off the high bits, then truncate the sorted slice at the first
+	// parity id via binary search.
+	si.shardBits &= ShardBits((uint32(1) << uint(dataShards)) - 1)
+	idx := sort.Search(len(si.shards), func(i int) bool {
+		return si.shards[i].Id >= ShardId(dataShards)
+	})
+	si.shards = si.shards[:idx]
+}
+
+// MinusParityShards creates a ShardInfo copy with parity shards removed for the
+// given data-shard count (<= 0 falls back to DataShardsCount).
+func (si *ShardsInfo) MinusParityShards(dataShards int) *ShardsInfo {
+	result := si.Copy()
+	result.DeleteParityShards(dataShards)
+	return result
+}
+
+// Add merges all shards from another ShardInfo into this one.
+func (si *ShardsInfo) Add(other *ShardsInfo) {
+	other.mu.RLock()
+	// Copy shards to avoid holding lock on 'other' while calling si.Set, which could deadlock.
+	shardsToAdd := make([]ShardInfo, len(other.shards))
+	copy(shardsToAdd, other.shards)
+	other.mu.RUnlock()
+
+	for _, s := range shardsToAdd {
+		si.Set(s)
+	}
+}
+
+// Subtract removes all shards present on another ShardInfo.
+func (si *ShardsInfo) Subtract(other *ShardsInfo) {
+	other.mu.RLock()
+	// Copy shards to avoid holding lock on 'other' while calling si.Delete, which could deadlock.
+	shardsToRemove := make([]ShardInfo, len(other.shards))
+	copy(shardsToRemove, other.shards)
+	other.mu.RUnlock()
+
+	for _, s := range shardsToRemove {
+		si.Delete(s.Id)
+	}
+}
+
+// Plus returns a new ShardInfo consisting of (this + other).
+func (si *ShardsInfo) Plus(other *ShardsInfo) *ShardsInfo {
+	result := si.Copy()
+	result.Add(other)
+	return result
+}
+
+// Minus returns a new ShardInfo consisting of (this - other).
+func (si *ShardsInfo) Minus(other *ShardsInfo) *ShardsInfo {
+	result := si.Copy()
+	result.Subtract(other)
+	return result
+}
+
+// findIndex finds the index of a shard by ID using binary search.
+// Must be called with lock held. Returns -1 if not found.
+func (si *ShardsInfo) findIndex(id ShardId) int {
+	idx := sort.Search(len(si.shards), func(i int) bool {
+		return si.shards[i].Id >= id
+	})
+	if idx < len(si.shards) && si.shards[idx].Id == id {
+		return idx
+	}
+	return -1
+}

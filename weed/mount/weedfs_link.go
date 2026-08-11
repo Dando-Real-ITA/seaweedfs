@@ -1,15 +1,17 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"syscall"
 	"time"
 
-	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/seaweedfs/go-fuse/v2/fuse"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 /*
@@ -25,11 +27,12 @@ When creating a link:
 
 /** Create a hard link to a file */
 func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *fuse.EntryOut) (code fuse.Status) {
-	if wfs.IsOverQuota {
+	if wfs.IsOverQuotaWithUncommitted() {
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	if s := checkName(name); s != fuse.OK {
+	var s fuse.Status
+	if name, s = checkName(name); s != fuse.OK {
 		return s
 	}
 
@@ -49,16 +52,50 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	// hardlink is not allowed in WORM mode
-	if wfs.wormEnabledForEntry(oldEntryPath, oldEntry) {
+	if wormEnforced, _ := wfs.wormEnforcedForEntry(oldEntryPath, oldEntry); wormEnforced {
 		return fuse.EPERM
 	}
 
+	// If the source is already a hard link, serialize on its HardLinkId
+	// so concurrent Link/Unlink operations on different siblings cannot
+	// both compute a new counter from a stale base. Re-load the entry
+	// under the lock to pick up any prior holder's sibling update.
+	if len(oldEntry.HardLinkId) > 0 {
+		hlKey := string(oldEntry.HardLinkId)
+		lock := wfs.hardLinkLockTable.AcquireLock("link", hlKey, util.ExclusiveLock)
+		defer wfs.hardLinkLockTable.ReleaseLock(hlKey, lock)
+		// Under the lock, re-resolve the source alias from the inode.
+		// A concurrent Unlink that held this same lock may have removed
+		// the specific alias we picked pre-lock even though other
+		// sibling hard links for the same inode are still around;
+		// GetPath(Oldnodeid) returns whichever alias is still active.
+		refreshedPath, refreshedStatus := wfs.inodeToPath.GetPath(in.Oldnodeid)
+		if refreshedStatus != fuse.OK {
+			return refreshedStatus
+		}
+		oldEntryPath = refreshedPath
+		oldParentPath, _ = oldEntryPath.DirAndName()
+		// Do not fall back to the pre-lock snapshot: if every alias
+		// was deleted while we waited, abort instead of deriving the
+		// next counter from a stale entry.
+		fresh, freshStatus := wfs.maybeLoadEntry(oldEntryPath)
+		if freshStatus != fuse.OK {
+			return freshStatus
+		}
+		oldEntry = fresh
+	}
+
 	// update old file to hardlink mode
+	origHardLinkId := oldEntry.HardLinkId
+	origHardLinkCounter := oldEntry.HardLinkCounter
 	if len(oldEntry.HardLinkId) == 0 {
 		oldEntry.HardLinkId = filer.NewHardLinkId()
 		oldEntry.HardLinkCounter = 1
+		glog.V(4).Infof("Link: new HardLinkId %x for %s", oldEntry.HardLinkId, oldEntryPath)
 	}
 	oldEntry.HardLinkCounter++
+	glog.V(4).Infof("Link: %s -> %s/%s HardLinkId %x counter=%d",
+		oldEntryPath, newParentPath, name, oldEntry.HardLinkId, oldEntry.HardLinkCounter)
 	updateOldEntryRequest := &filer_pb.UpdateEntryRequest{
 		Directory:  oldParentPath,
 		Entry:      oldEntry,
@@ -66,7 +103,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	// CreateLink 1.2 : update new file to hardlink mode
-	oldEntry.Attributes.Mtime = time.Now().Unix()
+	linkNow := time.Now()
+	oldEntry.Attributes.Mtime = linkNow.Unix()
+	oldEntry.Attributes.MtimeNs = int32(linkNow.Nanosecond())
+	oldEntry.Attributes.Ctime = linkNow.Unix()
+	oldEntry.Attributes.CtimeNs = int32(linkNow.Nanosecond())
 	request := &filer_pb.CreateEntryRequest{
 		Directory: string(newParentPath),
 		Entry: &filer_pb.Entry{
@@ -83,26 +124,52 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	// apply changes to the filer, and also apply to local metaCache
-	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-		wfs.mapPbIdFromLocalToFiler(request.Entry)
-		defer wfs.mapPbIdFromFilerToLocal(request.Entry)
-
-		if err := filer_pb.UpdateEntry(client, updateOldEntryRequest); err != nil {
-			return err
+	ctx := context.Background()
+	updateResp, err := wfs.streamUpdateEntry(ctx, updateOldEntryRequest)
+	if err == nil {
+		updateEvent := updateResp.GetMetadataEvent()
+		if updateEvent == nil {
+			updateEvent = metadataUpdateEvent(oldParentPath, updateOldEntryRequest.Entry)
 		}
-		wfs.metaCache.UpdateEntry(context.Background(), filer.FromPbEntry(updateOldEntryRequest.Directory, updateOldEntryRequest.Entry))
-
-		if err := filer_pb.CreateEntry(client, request); err != nil {
-			return err
+		if applyErr := wfs.applyLocalMetadataEvent(ctx, updateEvent); applyErr != nil {
+			glog.Warningf("link %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
+			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
 		}
-
-		wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry))
-
-		return nil
-	})
+	}
+	if err == nil {
+		var createResp *filer_pb.CreateEntryResponse
+		createResp, err = wfs.streamCreateEntry(ctx, request)
+		if err != nil {
+			// Rollback: restore original HardLinkId/Counter on the source entry
+			oldEntry.HardLinkId = origHardLinkId
+			oldEntry.HardLinkCounter = origHardLinkCounter
+			rollbackReq := &filer_pb.UpdateEntryRequest{
+				Directory:  oldParentPath,
+				Entry:      oldEntry,
+				Signatures: []int32{wfs.signature},
+			}
+			if _, rollbackErr := wfs.streamUpdateEntry(ctx, rollbackReq); rollbackErr != nil {
+				glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
+			}
+		} else {
+			createEvent := createResp.GetMetadataEvent()
+			if createEvent == nil {
+				createEvent = metadataCreateEvent(string(newParentPath), request.Entry)
+			}
+			if applyErr := wfs.applyLocalMetadataEvent(ctx, createEvent); applyErr != nil {
+				glog.Warningf("link %s: best-effort metadata apply failed: %v", newParentPath.Child(name), applyErr)
+				wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
+			}
+			wfs.touchDirMtimeCtimeBest(newParentPath)
+		}
+	}
 
 	newEntryPath := newParentPath.Child(name)
+
+	// Map back to local uid/gid before writing attributes to the kernel.
+	wfs.mapPbIdFromFilerToLocal(request.Entry)
 
 	if err != nil {
 		glog.V(0).Infof("Link %v -> %s: %v", oldEntryPath, newEntryPath, err)
@@ -111,7 +178,63 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 
 	wfs.inodeToPath.AddPath(oldEntry.Attributes.Inode, newEntryPath)
 
+	// Propagate the new HardLinkCounter to sibling cache entries and
+	// invalidate the kernel's inode attr cache. Without this, `stat` on any
+	// existing sibling link (other than the source we just wrote) returns
+	// the old nlink from the local metacache — pjdfstest link/00.t catches
+	// this after `link n1 n2` when it stats n0.
+	wfs.syncHardLinkSiblings(oldEntry.Attributes.Inode, oldEntry, oldEntryPath, newEntryPath)
+
 	wfs.outputPbEntry(out, oldEntry.Attributes.Inode, request.Entry)
 
 	return fuse.OK
+}
+
+// syncHardLinkSiblings rewrites the cached HardLinkCounter (and ctime) on
+// every sibling link of the given inode, and invalidates the kernel's inode
+// attr cache. `authoritativeEntry` carries the counter/ctime that should be
+// propagated. `skipPaths` are the link paths already updated by the caller
+// (typically the source and/or the newly created/removed link).
+func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.Entry, skipPaths ...util.FullPath) {
+	if authoritativeEntry == nil || len(authoritativeEntry.HardLinkId) == 0 {
+		return
+	}
+	paths := wfs.inodeToPath.GetAllPaths(inode)
+	if len(paths) == 0 {
+		return
+	}
+	skip := make(map[util.FullPath]struct{}, len(skipPaths))
+	for _, p := range skipPaths {
+		skip[p] = struct{}{}
+	}
+	ctx := context.Background()
+	for _, p := range paths {
+		if _, skipped := skip[p]; skipped {
+			continue
+		}
+		sibling, err := wfs.metaCache.FindEntry(ctx, p)
+		if err != nil || sibling == nil {
+			continue
+		}
+		// Only touch siblings that genuinely share the same hard-link id.
+		// inodeToPath's shared-inode invariant should already guarantee
+		// this, but a mismatch can occur transiently (e.g. a rename
+		// replaced one of the paths), and blindly stamping an unrelated
+		// entry's counter would corrupt it.
+		if !bytes.Equal(sibling.HardLinkId, authoritativeEntry.HardLinkId) {
+			continue
+		}
+		sibling.HardLinkCounter = authoritativeEntry.HardLinkCounter
+		if authoritativeEntry.Attributes != nil {
+			sibling.Attr.Ctime = time.Unix(authoritativeEntry.Attributes.Ctime, int64(authoritativeEntry.Attributes.CtimeNs))
+		}
+		if err := wfs.metaCache.UpdateEntry(ctx, sibling); err != nil {
+			glog.V(4).Infof("syncHardLinkSiblings update %s: %v", p, err)
+		}
+	}
+	// Note: we deliberately do NOT call fuseServer.InodeNotify here. That
+	// call would be made from the FUSE Link request handler goroutine, and
+	// writes onto the same /dev/fuse fd that the kernel is still waiting to
+	// read the Link reply from — causing a self-notify deadlock. The kernel
+	// will re-stat siblings once its attr-cache TTL expires.
 }

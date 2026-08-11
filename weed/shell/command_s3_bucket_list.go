@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 )
 
 func init() {
@@ -25,6 +27,10 @@ func (c *commandS3BucketList) Help() string {
 	return `list all buckets
 
 `
+}
+
+func (c *commandS3BucketList) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3BucketList) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -50,28 +56,35 @@ func (c *commandS3BucketList) Do(args []string, commandEnv *CommandEnv, writer i
 	var filerBucketsPath string
 	filerBucketsPath, err = readFilerBucketsPath(commandEnv)
 	if err != nil {
-		return fmt.Errorf("read buckets: %v", err)
+		return fmt.Errorf("read buckets: %w", err)
 	}
 
-	err = filer_pb.List(commandEnv, filerBucketsPath, "", func(entry *filer_pb.Entry, isLast bool) error {
-		if !entry.IsDirectory {
+	err = filer_pb.List(context.Background(), commandEnv, filerBucketsPath, "", func(entry *filer_pb.Entry, isLast bool) error {
+		if !entry.IsDirectory || strings.HasPrefix(entry.Name, ".") {
 			return nil
 		}
 		collection := getCollectionName(commandEnv, entry.Name)
-		var collectionSize, fileCount float64
+		var collectionSize, logicalSize, fileCount float64
 		if collectionInfo, found := collectionInfos[collection]; found {
 			collectionSize = collectionInfo.Size
+			logicalSize = collectionInfo.LogicalSize()
 			fileCount = collectionInfo.FileCount - collectionInfo.DeleteCount
 		}
-		fmt.Fprintf(writer, "  %s\tsize:%.0f\tchunk:%.0f", entry.Name, collectionSize, fileCount)
+		fmt.Fprintf(writer, "  %s\tsize:%.0f\tlogical:%.0f\tchunk:%.0f", entry.Name, collectionSize, logicalSize, fileCount)
 		if entry.Quota > 0 {
-			fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, float64(collectionSize)*100/float64(entry.Quota))
+			fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, logicalSize*100/float64(entry.Quota))
+		}
+		// Show bucket owner (use %q to escape special characters)
+		if entry.Extended != nil {
+			if owner, ok := entry.Extended[s3_constants.AmzIdentityId]; ok && len(owner) > 0 {
+				fmt.Fprintf(writer, "\towner:%q", string(owner))
+			}
 		}
 		fmt.Fprintln(writer)
 		return nil
 	}, "", false, math.MaxUint32)
 	if err != nil {
-		return fmt.Errorf("list buckets under %v: %v", filerBucketsPath, err)
+		return fmt.Errorf("list buckets under %v: %w", filerBucketsPath, err)
 	}
 
 	return err
@@ -83,7 +96,7 @@ func readFilerBucketsPath(filerClient filer_pb.FilerClient) (filerBucketsPath st
 
 		resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 		if err != nil {
-			return fmt.Errorf("get filer configuration: %v", err)
+			return fmt.Errorf("get filer configuration: %w", err)
 		}
 		filerBucketsPath = resp.DirBuckets
 

@@ -12,6 +12,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -40,7 +41,7 @@ type LevelDbNeedleMap struct {
 	recordCount uint64
 }
 
-func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Options, ldbTimeout int64) (m *LevelDbNeedleMap, err error) {
+func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Options, ldbTimeout int64, version needle.Version) (m *LevelDbNeedleMap, err error) {
 	m = &LevelDbNeedleMap{dbFileName: dbFileName}
 	m.indexFile = indexFile
 	if !isLevelDbFresh(dbFileName, indexFile) {
@@ -64,7 +65,7 @@ func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Option
 				return
 			}
 		}
-		glog.V(0).Infof("Loading %s... , watermark: %d", dbFileName, getWatermark(m.db))
+		glog.V(1).Infof("Loading %s... , watermark: %d", dbFileName, getWatermark(m.db))
 		m.recordCount = uint64(m.indexFileOffset / NeedleMapEntrySize)
 		watermark := (m.recordCount / watermarkBatchSize) * watermarkBatchSize
 		err = setWatermark(m.db, watermark)
@@ -73,7 +74,7 @@ func NewLevelDbNeedleMap(dbFileName string, indexFile *os.File, opts *opt.Option
 			return
 		}
 	}
-	mm, indexLoadError := newNeedleMapMetricFromIndexFile(indexFile)
+	mm, indexLoadError := newNeedleMapMetricFromIndexFile(indexFile, version)
 	if indexLoadError != nil {
 		return nil, indexLoadError
 	}
@@ -117,13 +118,21 @@ func generateLevelDbFile(dbFileName string, indexFile *os.File) error {
 		glog.Fatalf("stat file %s: %v", indexFile.Name(), err)
 		return err
 	} else {
-		if watermark*NeedleMapEntrySize > uint64(stat.Size()) {
-			glog.Warningf("wrong watermark %d for filesize %d", watermark, stat.Size())
+		// A watermark past the end of the .idx means the .ldb is stale relative
+		// to the index it must mirror (e.g. an interrupted compaction left the
+		// old .ldb beside a freshly swapped, shorter .idx). Trusting it would
+		// replay zero entries and silently poison the needle map, so rebuild
+		// from offset 0 instead.
+		// Compare in entries, not bytes: watermark*NeedleMapEntrySize can
+		// overflow uint64 for a corrupted watermark and wrap past the size check.
+		if watermark > uint64(stat.Size())/NeedleMapEntrySize {
+			glog.Warningf("stale watermark %d for %s (filesize %d); rebuilding leveldb from start", watermark, dbFileName, stat.Size())
+			watermark = 0
 		}
-		glog.V(0).Infof("generateLevelDbFile %s, watermark %d, num of entries:%d", dbFileName, watermark, (uint64(stat.Size())-watermark*NeedleMapEntrySize)/NeedleMapEntrySize)
+		glog.V(1).Infof("generateLevelDbFile %s, watermark %d, num of entries:%d", dbFileName, watermark, (uint64(stat.Size())-watermark*NeedleMapEntrySize)/NeedleMapEntrySize)
 	}
 	return idx.WalkIndexFile(indexFile, watermark, func(key NeedleId, offset Offset, size Size) error {
-		if !offset.IsZero() && size.IsValid() {
+		if !offset.IsZero() && !size.IsDeleted() {
 			levelDbWrite(db, key, offset, size, false, 0)
 		} else {
 			levelDbDelete(db, key)
@@ -133,15 +142,17 @@ func generateLevelDbFile(dbFileName string, indexFile *os.File) error {
 }
 
 func (m *LevelDbNeedleMap) Get(key NeedleId) (element *needle_map.NeedleValue, ok bool) {
-	bytes := make([]byte, NeedleIdSize)
 	if m.ldbTimeout > 0 {
-		m.ldbAccessLock.RLock()
-		defer m.ldbAccessLock.RUnlock()
-		loadErr := reloadLdb(m)
-		if loadErr != nil {
+		if err := m.ensureLdbLoaded(); err != nil {
 			return nil, false
 		}
+		defer m.ldbAccessLock.RUnlock()
 	}
+	return m.getFromDb(key)
+}
+
+func (m *LevelDbNeedleMap) getFromDb(key NeedleId) (element *needle_map.NeedleValue, ok bool) {
+	bytes := make([]byte, NeedleIdSize)
 	NeedleIdToBytes(bytes[0:NeedleIdSize], key)
 	data, err := m.db.Get(bytes, nil)
 	if err != nil || len(data) != OffsetSize+SizeSize {
@@ -156,14 +167,12 @@ func (m *LevelDbNeedleMap) Put(key NeedleId, offset Offset, size Size) error {
 	var oldSize Size
 	var watermark uint64
 	if m.ldbTimeout > 0 {
-		m.ldbAccessLock.RLock()
-		defer m.ldbAccessLock.RUnlock()
-		loadErr := reloadLdb(m)
-		if loadErr != nil {
-			return loadErr
+		if err := m.ensureLdbLoaded(); err != nil {
+			return err
 		}
+		defer m.ldbAccessLock.RUnlock()
 	}
-	if oldNeedle, ok := m.Get(key); ok {
+	if oldNeedle, ok := m.getFromDb(key); ok {
 		oldSize = oldNeedle.Size
 	}
 	m.logPut(key, oldSize, size)
@@ -195,7 +204,7 @@ func setWatermark(db *leveldb.DB, watermark uint64) error {
 	var wmBytes = make([]byte, 8)
 	util.Uint64toBytes(wmBytes, watermark)
 	if err := db.Put(watermarkKey, wmBytes, nil); err != nil {
-		return fmt.Errorf("failed to setWatermark: %v", err)
+		return fmt.Errorf("failed to setWatermark: %w", err)
 	}
 	return nil
 }
@@ -205,7 +214,7 @@ func levelDbWrite(db *leveldb.DB, key NeedleId, offset Offset, size Size, update
 	bytes := needle_map.ToBytes(key, offset, size)
 
 	if err := db.Put(bytes[0:NeedleIdSize], bytes[NeedleIdSize:NeedleIdSize+OffsetSize+SizeSize], nil); err != nil {
-		return fmt.Errorf("failed to write leveldb: %v", err)
+		return fmt.Errorf("failed to write leveldb: %w", err)
 	}
 	// set watermark
 	if updateWatermark {
@@ -223,14 +232,12 @@ func levelDbDelete(db *leveldb.DB, key NeedleId) error {
 func (m *LevelDbNeedleMap) Delete(key NeedleId, offset Offset) error {
 	var watermark uint64
 	if m.ldbTimeout > 0 {
-		m.ldbAccessLock.RLock()
-		defer m.ldbAccessLock.RUnlock()
-		loadErr := reloadLdb(m)
-		if loadErr != nil {
-			return loadErr
+		if err := m.ensureLdbLoaded(); err != nil {
+			return err
 		}
+		defer m.ldbAccessLock.RUnlock()
 	}
-	oldNeedle, found := m.Get(key)
+	oldNeedle, found := m.getFromDb(key)
 	if !found || oldNeedle.Size.IsDeleted() {
 		return nil
 	}
@@ -337,6 +344,10 @@ func (m *LevelDbNeedleMap) UpdateNeedleMap(v *Volume, indexFile *os.File, opts *
 
 func (m *LevelDbNeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startFrom uint64) (err error) {
 	glog.V(0).Infof("loading idx to leveldb from offset %d for file: %s", startFrom, indexFile.Name())
+	version := needle.GetCurrentVersion()
+	if v != nil {
+		version = v.Version()
+	}
 	dbFileName := v.FileName(".cpldb")
 	db, dbErr := leveldb.OpenFile(dbFileName, nil)
 	defer func() {
@@ -359,6 +370,7 @@ func (m *LevelDbNeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startF
 
 	err = idx.WalkIndexFile(indexFile, startFrom, func(key NeedleId, offset Offset, size Size) (e error) {
 		m.mapMetric.FileCounter++
+		m.mapMetric.MaybeSetMaxNeedleEnd(offset, size, version)
 		bytes := make([]byte, NeedleIdSize)
 		NeedleIdToBytes(bytes[0:NeedleIdSize], key)
 		// fresh loading
@@ -381,10 +393,10 @@ func (m *LevelDbNeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startF
 			// needle is found
 			oldSize := BytesToSize(data[OffsetSize : OffsetSize+SizeSize])
 			oldOffset := BytesToOffset(data[0:OffsetSize])
-			if !offset.IsZero() && size.IsValid() {
+			if !offset.IsZero() && !size.IsDeleted() {
 				// updated needle
 				m.mapMetric.FileByteCounter += uint64(size)
-				if !oldOffset.IsZero() && oldSize.IsValid() {
+				if !oldOffset.IsZero() && !oldSize.IsDeleted() {
 					m.mapMetric.DeletionCounter++
 					m.mapMetric.DeletionByteCounter += uint64(oldSize)
 				}
@@ -399,6 +411,24 @@ func (m *LevelDbNeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startF
 		return e
 	})
 	return err
+}
+
+func (m *LevelDbNeedleMap) ensureLdbLoaded() error {
+	for {
+		m.ldbAccessLock.RLock()
+		if m.db != nil {
+			return nil
+		}
+		m.ldbAccessLock.RUnlock()
+		m.ldbAccessLock.Lock()
+		if m.db == nil {
+			if err := reloadLdb(m); err != nil {
+				m.ldbAccessLock.Unlock()
+				return err
+			}
+		}
+		m.ldbAccessLock.Unlock()
+	}
 }
 
 func reloadLdb(m *LevelDbNeedleMap) (err error) {
@@ -461,6 +491,7 @@ func lazyLoadingRoutine(m *LevelDbNeedleMap) (err error) {
 				glog.V(1).Infof("reset accessRecord %s", m.dbFileName)
 				// reset accessRecord
 				accessRecord = 0
+				m.accessFlag = 0
 			}
 			continue
 		}

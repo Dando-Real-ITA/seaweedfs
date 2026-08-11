@@ -21,6 +21,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	swv "github.com/seaweedfs/seaweedfs/weed/util/version"
 	"golang.org/x/net/context/ctxhttp"
 )
 
@@ -84,8 +85,9 @@ func runUpdate(cmd *Command, args []string) bool {
 	path, _ := os.Executable()
 	_, name := filepath.Split(path)
 
+	*updateOpt.dir = util.ResolvePath(*updateOpt.dir)
 	if *updateOpt.dir != "" {
-		if err := util.TestFolderWritable(util.ResolvePath(*updateOpt.dir)); err != nil {
+		if err := util.TestFolderWritable(*updateOpt.dir); err != nil {
 			glog.Fatalf("Check Folder(-dir) Writable %s : %s", *updateOpt.dir, err)
 			return false
 		}
@@ -117,7 +119,7 @@ func runUpdate(cmd *Command, args []string) bool {
 }
 
 func downloadRelease(ctx context.Context, target string, ver string) (version string, err error) {
-	currentVersion := util.Version()
+	currentVersion := swv.VERSION_NUMBER
 	rel, err := GitHubLatestRelease(ctx, ver, "seaweedfs", "seaweedfs")
 	if err != nil {
 		return "", err

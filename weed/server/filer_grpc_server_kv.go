@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"context"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
@@ -30,6 +31,7 @@ func (fs *FilerServer) KvPut(ctx context.Context, req *filer_pb.KvPutRequest) (*
 		if err := fs.filer.Store.KvDelete(ctx, req.Key); err != nil {
 			return &filer_pb.KvPutResponse{Error: err.Error()}, nil
 		}
+		return &filer_pb.KvPutResponse{}, nil
 	}
 
 	err := fs.filer.Store.KvPut(ctx, req.Key, req.Value)
