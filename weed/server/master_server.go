@@ -159,7 +159,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.telemetryCollector.SetMasterServer(ms)
 
 		// Set version and OS information
-		ms.telemetryCollector.SetVersion(version.VERSION_NUMBER)
+		ms.telemetryCollector.SetVersion(version.Version())
 		ms.telemetryCollector.SetOS(runtime.GOOS + "/" + runtime.GOARCH)
 
 		// Start periodic telemetry collection (every 24 hours)

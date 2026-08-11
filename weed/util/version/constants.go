@@ -13,6 +13,8 @@ var (
 	VERSION_NUMBER = fmt.Sprintf("%d.%02d", MAJOR_VERSION, MINOR_VERSION)
 	VERSION        = util.SizeLimit + " " + VERSION_NUMBER
 	COMMIT         = ""
+	PRIVATE         = "Katapy"
+	PRIVATE_VERSION = ""
 )
 
 func init() {
@@ -21,5 +23,5 @@ func init() {
 }
 
 func Version() string {
-	return VERSION + " " + COMMIT
+	return VERSION + " " + COMMIT + " ( " + PRIVATE + " " + PRIVATE_VERSION + " )"
 }

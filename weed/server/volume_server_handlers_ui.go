@@ -16,7 +16,7 @@ import (
 )
 
 func (vs *VolumeServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+version.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+version.Version())
 	infos := make(map[string]interface{})
 	infos["Up Time"] = time.Since(startTime).Truncate(time.Second).String()
 	var ds []*volume_server_pb.DiskStatus

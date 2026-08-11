@@ -468,7 +468,7 @@ func (s *PostgreSQLServer) handleStartup(session *PostgreSQLSession) error {
 	}
 
 	// Send parameter status messages
-	err = s.sendParameterStatus(session, "server_version", fmt.Sprintf("%s (SeaweedFS)", version.VERSION_NUMBER))
+	err = s.sendParameterStatus(session, "server_version", fmt.Sprintf("%s (SeaweedFS)", version.Version()))
 	if err != nil {
 		return err
 	}

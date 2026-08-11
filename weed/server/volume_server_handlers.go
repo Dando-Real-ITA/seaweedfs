@@ -256,7 +256,7 @@ func (vs *VolumeServer) privateStoreHandler(w http.ResponseWriter, r *http.Reque
 
 	statusRecorder := stats.NewStatusResponseWriter(w)
 	w = statusRecorder
-	w.Header().Set("Server", "SeaweedFS Volume "+version.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+version.Version())
 	if r.Header.Get("Origin") != "" {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -302,7 +302,7 @@ func getContentLength(r *http.Request) int64 {
 func (vs *VolumeServer) publicReadOnlyHandler(w http.ResponseWriter, r *http.Request) {
 	statusRecorder := stats.NewStatusResponseWriter(w)
 	w = statusRecorder
-	w.Header().Set("Server", "SeaweedFS Volume "+version.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+version.Version())
 	if r.Header.Get("Origin") != "" {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")

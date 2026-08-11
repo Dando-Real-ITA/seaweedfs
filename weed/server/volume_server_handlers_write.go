@@ -173,14 +173,6 @@ func SetEtag(w http.ResponseWriter, etag string) {
 	}
 }
 
-func getEtag(resp *http.Response) (etag string) {
-	etag = resp.Header.Get("ETag")
-	if strings.HasPrefix(etag, "\"") && strings.HasSuffix(etag, "\"") {
-		return etag[1 : len(etag)-1]
-	}
-	return
-}
-
 func SetCache(w http.ResponseWriter, ext string) {
 	if len(ext) > 0 {
 		ext = strings.ToLower(ext)

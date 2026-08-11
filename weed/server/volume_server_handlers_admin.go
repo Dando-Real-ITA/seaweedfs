@@ -17,7 +17,7 @@ import (
 // servers to fail health checks when a peer went down.
 // See https://github.com/seaweedfs/seaweedfs/issues/6823
 func (vs *VolumeServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+version.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+version.Version())
 
 	// Check if the server is shutting down
 	if vs.store.IsStopping() {
@@ -35,7 +35,7 @@ func (vs *VolumeServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (vs *VolumeServer) statusHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "SeaweedFS Volume "+version.VERSION)
+	w.Header().Set("Server", "SeaweedFS Volume "+version.Version())
 	m := make(map[string]interface{})
 	m["Version"] = version.Version()
 	var ds []*volume_server_pb.DiskStatus

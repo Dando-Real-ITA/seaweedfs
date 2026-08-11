@@ -312,7 +312,7 @@ func (s *PostgreSQLServer) handleSystemQuery(session *PostgreSQLSession, query s
 	case "select version()":
 		return &SystemQueryResult{
 			Columns: []string{"version"},
-			Rows:    [][]string{{fmt.Sprintf("SeaweedFS %s (PostgreSQL 14.0 compatible)", version.VERSION_NUMBER)}},
+			Rows:    [][]string{{fmt.Sprintf("SeaweedFS %s (PostgreSQL 14.0 compatible)", version.Version())}},
 		}
 	case "select current_database()":
 		return &SystemQueryResult{
@@ -327,7 +327,7 @@ func (s *PostgreSQLServer) handleSystemQuery(session *PostgreSQLSession, query s
 	case "select current_setting('server_version')":
 		return &SystemQueryResult{
 			Columns: []string{"server_version"},
-			Rows:    [][]string{{fmt.Sprintf("%s (SeaweedFS)", version.VERSION_NUMBER)}},
+			Rows:    [][]string{{fmt.Sprintf("%s (SeaweedFS)", version.Version())}},
 		}
 	case "select current_setting('server_encoding')":
 		return &SystemQueryResult{

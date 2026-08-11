@@ -43,7 +43,7 @@ func createSession(awsAccessKeyId, awsSecretAccessKey, region, endpoint string, 
 		return nil, fmt.Errorf("create aws session in region %s: %v", region, err)
 	}
 	sess.Handlers.Build.PushBack(func(r *request.Request) {
-		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+version.VERSION_NUMBER)
+		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS "+version.Version())
 	})
 
 	t := s3.New(sess)

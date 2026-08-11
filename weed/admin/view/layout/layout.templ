@@ -336,7 +336,7 @@ templ Layout(view ViewContext, content templ.Component) {
     <footer class="footer mt-auto py-3 bg-light">
         <div class="container-fluid text-center">
             <small class="text-muted">
-                &copy; {fmt.Sprintf("%d", time.Now().Year())} SeaweedFS Admin v{version.VERSION_NUMBER}
+                &copy; {fmt.Sprintf("%d", time.Now().Year())} SeaweedFS Admin {version.Version()}
                 if version.COMMIT != "" {
                     <span class="mx-1">({version.COMMIT})</span>
                 }

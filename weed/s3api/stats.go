@@ -19,7 +19,7 @@ func track(f http.HandlerFunc, action string) http.HandlerFunc {
 		defer inFlightGauge.Dec()
 
 		bucket, _ := s3_constants.GetBucketAndObject(r)
-		w.Header().Set("Server", "SeaweedFS "+version.VERSION)
+		w.Header().Set("Server", "SeaweedFS "+version.Version())
 		recorder := stats_collect.NewStatusResponseWriter(w)
 		// Attach an audit-tracking flag to the request so handlers that call
 		// PostLog directly mark it; we emit a fallback entry afterward for

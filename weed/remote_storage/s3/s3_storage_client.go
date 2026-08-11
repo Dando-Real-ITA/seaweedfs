@@ -74,7 +74,7 @@ func MakeWithHTTPClient(conf *remote_pb.RemoteConf, httpClient *http.Client) (re
 		sess.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
 	}
 	sess.Handlers.Build.PushBack(func(r *request.Request) {
-		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+version.VERSION_NUMBER)
+		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS "+version.Version())
 	})
 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
 	client.conn = s3.New(sess)
