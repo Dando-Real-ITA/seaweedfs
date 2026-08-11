@@ -553,6 +553,7 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 		glog.V(2).Infof("WebDavFileSystem.Read %v: %d offset of filesize %d, faked readSize: %d", f.name, f.off, fileSize, readSize)
 	} else {
 		readSize, err = f.reader.ReadAt(p, f.off)
+
 		glog.V(3).Infof("WebDavFileSystem.Read %v: [%d,%d)", f.name, f.off, f.off+int64(readSize))
 	}
 

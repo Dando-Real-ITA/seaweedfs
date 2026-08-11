@@ -149,14 +149,9 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 
 	// mime type
 	mimeType := entry.Attr.Mime
-	if mimeType == "" {
-		if ext := filepath.Ext(entry.Name()); ext != "" {
-			mimeType = mime.TypeByExtension(ext)
-		}
-	}
 	filename := entry.Name()
 	ext := filepath.Ext(filename)
-	if ext != "" {
+	if mimeType == "" && ext != "" {
 		mimeType = mime.TypeByExtension(ext)
 	}
 	if mimeType != "" {
