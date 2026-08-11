@@ -2,7 +2,6 @@ package topology
 
 import (
 	"fmt"
-	"slices"
 	"sync/atomic"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -25,6 +24,12 @@ type DataNode struct {
 	IsTerminating bool
 
 	MaintenanceMode bool
+	// lookupDigest covers the volumes reachable through this node in the volume
+	// layouts, for comparison against what its disks actually hold.
+	lookupDigest atomic.Uint64
+	// duplicateVolumeIds records that the node last reported one volume id more
+	// than once, which the master cannot represent.
+	duplicateVolumeIds atomic.Bool
 	// diskMetas holds each physical disk's tags, type, and capacity from the
 	// heartbeat DiskTags, including disks with no volumes or EC shards.
 	diskMetas map[uint32]diskMeta
@@ -74,26 +79,39 @@ func (dn *DataNode) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged 
 	return disk.AddOrUpdateVolume(v)
 }
 
+// AddProvisionalVolume records a volume the master registered on its own,
+// ahead of any server report naming it. See Disk.AddProvisionalVolume.
+func (dn *DataNode) AddProvisionalVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
+	dn.Lock()
+	defer dn.Unlock()
+	disk := dn.getOrCreateDisk(v.DiskType)
+	return disk.AddProvisionalVolume(v)
+}
+
 // UpdateVolumes detects new/deleted/changed volumes on a volume server
 // used in master to notify master clients of these changes.
 func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolumes, deletedVolumes, changedVolumes []storage.VolumeInfo) {
 
-	actualVolumeMap := make(map[needle.VolumeId]storage.VolumeInfo)
+	reported := newReportedVolumes(len(actualVolumes))
 	for _, v := range actualVolumes {
-		actualVolumeMap[v.Id] = v
+		reported.add(v.Id, v.DiskType)
 	}
+
+	// A volume id mounted on two disks of one server -- a stale twin re-attached
+	// after a disk repair -- is reported twice, but the master keys volumes by
+	// id alone and keeps only the last copy. Its digest can then never equal the
+	// server's however often the list is resent, so record it and let the
+	// heartbeat fall back to the full list for this node.
+	dn.duplicateVolumeIds.Store(reported.duplicated)
 
 	dn.Lock()
 	defer dn.Unlock()
 
-	existingVolumes := dn.getVolumes()
-
-	for _, v := range existingVolumes {
-		vid := v.Id
-		if _, ok := actualVolumeMap[vid]; !ok {
-			glog.V(0).Infoln("Deleting volume id:", vid)
-			disk := dn.getOrCreateDisk(v.DiskType)
-			disk.DeleteVolumeById(vid)
+	keptCount := 0
+	for _, c := range dn.children {
+		disk := c.(*Disk)
+		for _, v := range disk.RemoveVolumesNotIn(reported) {
+			glog.V(0).Infoln("Deleting volume id:", v.Id)
 			deletedVolumes = append(deletedVolumes, v)
 
 			deltaDiskUsage := &DiskUsageCounts{}
@@ -106,6 +124,13 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 			}
 			disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
+		keptCount += disk.VolumeCount()
+	}
+	// Everything still on the node is also in this heartbeat, so the remainder
+	// is what the node is about to gain. A steady-state heartbeat gains nothing
+	// and must not allocate here; a reconnecting server gains all of them.
+	if addedCount := reported.count() - keptCount; addedCount > 0 {
+		newVolumes = make([]storage.VolumeInfo, 0, addedCount)
 	}
 	for _, v := range actualVolumes {
 		isNew, isChanged := dn.doAddOrUpdateVolume(v)
@@ -194,14 +219,48 @@ func (dn *DataNode) AdjustDiskUsageBytes(diskTotalBytes, diskFreeBytes map[strin
 	}
 }
 
+// AppendVolumeIds appends the ids of this node's volumes to dst, without
+// copying the volume records to read them.
+func (dn *DataNode) AppendVolumeIds(dst []uint32) []uint32 {
+	dn.RLock()
+	defer dn.RUnlock()
+	for _, c := range dn.children {
+		dst = c.(*Disk).AppendVolumeIds(dst)
+	}
+	return dst
+}
+
 func (dn *DataNode) GetVolumes() (ret []storage.VolumeInfo) {
 	dn.RLock()
+	defer dn.RUnlock()
+	total := 0
 	for _, c := range dn.children {
-		disk := c.(*Disk)
-		ret = append(ret, disk.GetVolumes()...)
+		total += c.(*Disk).VolumeCount()
 	}
-	dn.RUnlock()
+	ret = make([]storage.VolumeInfo, 0, total)
+	for _, c := range dn.children {
+		ret = c.(*Disk).AppendVolumes(ret)
+	}
 	return ret
+}
+
+// HasDuplicateVolumeIds reports whether the node's last full report named one
+// volume id more than once. While it does, the node's digest is not meaningful.
+func (dn *DataNode) HasDuplicateVolumeIds() bool {
+	return dn.duplicateVolumeIds.Load()
+}
+
+// VolumeDigest summarises every volume the master believes this node holds. A
+// volume server that reports a different digest has drifted from the master and
+// needs to resend its volume list.
+func (dn *DataNode) VolumeDigest() uint64 {
+	dn.RLock()
+	defer dn.RUnlock()
+	var digest uint64
+	for _, c := range dn.children {
+		digest ^= c.(*Disk).VolumeDigest()
+	}
+	return digest
 }
 
 func (dn *DataNode) GetVolumesById(id needle.VolumeId) (vInfo storage.VolumeInfo, err error) {
@@ -303,7 +362,7 @@ func (dn *DataNode) ToInfo() (info DataNodeInfo) {
 	return
 }
 
-func (dn *DataNode) ToDataNodeInfo() *master_pb.DataNodeInfo {
+func (dn *DataNode) ToDataNodeInfo(filter VolumeFilter) *master_pb.DataNodeInfo {
 	m := &master_pb.DataNodeInfo{
 		Id: string(dn.Id()),
 		// Start from disk usage counters so empty disks are still represented
@@ -325,7 +384,7 @@ func (dn *DataNode) ToDataNodeInfo() *master_pb.DataNodeInfo {
 
 	for _, c := range dn.Children() {
 		disk := c.(*Disk)
-		m.DiskInfos[string(disk.Id())] = disk.ToDiskInfo()
+		m.DiskInfos[string(disk.Id())] = disk.ToDiskInfo(filter)
 	}
 
 	dn.RLock()
@@ -383,29 +442,4 @@ func (dn *DataNode) UpdateDiskTags(tags []*master_pb.DiskTag) {
 	dn.Lock()
 	dn.diskMetas = metas
 	dn.Unlock()
-}
-
-// GetVolumeIds returns the human readable volume ids limited to count of max 100.
-func (dn *DataNode) GetVolumeIds() string {
-	dn.RLock()
-	defer dn.RUnlock()
-	existingVolumes := dn.getVolumes()
-	ids := make([]int, 0, len(existingVolumes))
-
-	for k := range existingVolumes {
-		ids = append(ids, int(k))
-	}
-
-	slices.Sort(ids)
-
-	return util.HumanReadableIntsMax(100, ids...)
-}
-
-func (dn *DataNode) getVolumes() []storage.VolumeInfo {
-	var existingVolumes []storage.VolumeInfo
-	for _, c := range dn.children {
-		disk := c.(*Disk)
-		existingVolumes = append(existingVolumes, disk.GetVolumes()...)
-	}
-	return existingVolumes
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 #[cfg(test)]
 use crate::storage::idx;
@@ -227,6 +227,7 @@ impl OldVersionVifVolumeInfo {
             expire_at_sec: self.destroy_time,
             read_only: self.read_only,
             ec_shard_config: None,
+            read_only_can_delete: false,
         }
     }
 }
@@ -255,6 +256,8 @@ pub struct VifVolumeInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub ec_shard_config: Option<VifEcShardConfig>,
+    #[serde(default, rename = "readOnlyCanDelete")]
+    pub read_only_can_delete: bool,
 }
 
 impl VifVolumeInfo {
@@ -285,6 +288,7 @@ impl VifVolumeInfo {
                 parity_shards: c.parity_shards,
                 encode_ts_ns: c.encode_ts_ns,
             }),
+            read_only_can_delete: pb.read_only_can_delete,
         }
     }
 
@@ -317,6 +321,7 @@ impl VifVolumeInfo {
                     encode_ts_ns: c.encode_ts_ns,
                 }
             }),
+            read_only_can_delete: self.read_only_can_delete,
         }
     }
 }
@@ -684,7 +689,11 @@ impl Volume {
         let has_volume_info_file = self.load_vif()?;
 
         if self.volume_info.read_only && !self.has_remote_file {
-            self.no_write_or_delete = true;
+            if self.volume_info.read_only_can_delete {
+                self.no_write_can_delete = true;
+            } else {
+                self.no_write_or_delete = true;
+            }
         }
 
         if self.has_remote_file {
@@ -771,6 +780,23 @@ impl Volume {
         }
 
         if also_load_index {
+            // Recover rows that deletes on a tiered read-only volume overwrote
+            // at the front of .idx. Best effort: a volume that cannot be
+            // repaired is still servable for everything the surviving rows
+            // index.
+            match self.repair_idx_head_tombstones() {
+                Ok(0) => {}
+                Ok(restored) => info!(
+                    volume_id = self.id.0,
+                    restored, "recovered overwritten .idx rows from .dat"
+                ),
+                Err(e) => warn!(
+                    volume_id = self.id.0,
+                    error = %e,
+                    "recover overwritten .idx rows"
+                ),
+            }
+
             self.load_index()?;
 
             // Match Go: CheckVolumeDataIntegrity after loading index (volume_loading.go L154-159)
@@ -990,7 +1016,11 @@ impl Volume {
         Ok(())
     }
 
-    fn read_exact_at_backend(&self, buf: &mut [u8], offset: u64) -> Result<(), VolumeError> {
+    pub(crate) fn read_exact_at_backend(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<(), VolumeError> {
         if let Some(dat_file) = self.dat_file.as_ref() {
             #[cfg(unix)]
             {
@@ -1949,11 +1979,13 @@ impl Volume {
     }
 
     /// Verify the live needle at the .dat tail: its header must match the
-    /// .idx entry and the .dat must end exactly at its on-disk end. Extra
-    /// bytes mean an unindexed trailing record (a torn append); appending
-    /// after one would place the next needle at an offset the 8-byte .idx
-    /// encoding may not represent, so the volume is quarantined read-only
-    /// instead. Mirrors Go's verifyNeedleIntegrity.
+    /// .idx entry and, on v3, the .dat must end exactly at its on-disk end.
+    /// Extra bytes mean an unindexed trailing record (a torn append);
+    /// appending after one would place the next needle at an offset the
+    /// 8-byte .idx encoding may not represent, so the volume is quarantined
+    /// read-only instead. Mirrors Go's verifyNeedleIntegrity, whose tail
+    /// check is v3-only -- a v1/v2 volume Go serves read-write must not go
+    /// read-only here.
     fn verify_needle_integrity(
         &mut self,
         actual_offset: i64,
@@ -1992,15 +2024,16 @@ impl Volume {
             )));
         }
 
-        if version == VERSION_3 {
-            let ts_offset =
-                checked_offset as u64 + NEEDLE_HEADER_SIZE as u64 + size.0 as u64 + 4; // skip checksum
-            let mut ts_buf = [0u8; 8];
-            self.read_exact_at_backend(&mut ts_buf, ts_offset)?;
-            let ts = u64::from_be_bytes(ts_buf);
-            if ts > 0 {
-                self.last_append_at_ns = ts;
-            }
+        if version != VERSION_3 {
+            return Ok(());
+        }
+
+        let ts_offset = checked_offset as u64 + NEEDLE_HEADER_SIZE as u64 + size.0 as u64 + 4; // skip checksum
+        let mut ts_buf = [0u8; 8];
+        self.read_exact_at_backend(&mut ts_buf, ts_offset)?;
+        let ts = u64::from_be_bytes(ts_buf);
+        if ts > 0 {
+            self.last_append_at_ns = ts;
         }
 
         self.verify_dat_ends_at(checked_offset + get_actual_size(size, version))
@@ -2275,34 +2308,39 @@ impl Volume {
         Ok(())
     }
 
-    /// Mark this volume as read-only (no writes or deletes).
-    /// If `persist` is true, the readonly state is saved to the .vif file.
+    /// Mark this volume as read-only (no writes or deletes) and persist.
     pub fn set_read_only(&mut self) -> Result<(), VolumeError> {
-        self.no_write_or_delete = true;
-        self.save_vif()
+        self.set_read_only_persist(false, true)
     }
 
     /// Mark this volume as read-only, optionally persisting to .vif.
-    pub fn set_read_only_persist(&mut self, persist: bool) -> Result<(), VolumeError> {
-        self.no_write_or_delete = true;
+    /// With `can_delete`, deletes still land so expiring data drains the volume.
+    pub fn set_read_only_persist(
+        &mut self,
+        can_delete: bool,
+        persist: bool,
+    ) -> Result<(), VolumeError> {
+        if can_delete && !self.has_remote_file {
+            // deletes append tombstones to .idx; a read-only boot attached no writer
+            self.attach_idx_writer_if_missing()?;
+        }
+        self.no_write_or_delete = !can_delete;
+        if can_delete {
+            self.no_write_can_delete = true;
+        } else if !self.has_remote_file {
+            // downgrading a canDelete mark; remote volumes keep their derived flag
+            self.no_write_can_delete = false;
+        }
         if persist {
             self.save_vif()?;
         }
         Ok(())
     }
 
-    /// Mark this volume as writable (allow writes and deletes).
-    ///
-    /// If the volume booted with .vif ReadOnly=true, `load_index` built the
-    /// needle map without an .idx writer attached, so subsequent puts would
-    /// silently skip the on-disk append and only mutate in-memory state —
-    /// surviving until the next restart, then vanishing. Re-attach a writer
-    /// here so writes persist again.
-    pub fn set_writable(&mut self) -> Result<(), VolumeError> {
-        // Attach the writer (if missing) before flipping the flag — otherwise
-        // a transient open/metadata failure would leave the volume marked
-        // writable with no .idx writer, and subsequent puts would silently
-        // skip the on-disk append and vanish on the next restart.
+    /// Attach an append-only .idx writer when missing (read-only boot). Runs
+    /// before any flag flips so a failure cannot leave puts silently skipping
+    /// the on-disk append.
+    fn attach_idx_writer_if_missing(&mut self) -> Result<(), VolumeError> {
         let needs_idx_writer = self
             .nm
             .as_ref()
@@ -2320,7 +2358,23 @@ impl Volume {
                 nm.set_idx_file(Box::new(write_file), idx_size);
             }
         }
+        Ok(())
+    }
+
+    /// Mark this volume as writable (allow writes and deletes).
+    ///
+    /// If the volume booted with .vif ReadOnly=true, `load_index` built the
+    /// needle map without an .idx writer attached, so subsequent puts would
+    /// silently skip the on-disk append and only mutate in-memory state —
+    /// surviving until the next restart, then vanishing. Re-attach a writer
+    /// here so writes persist again.
+    pub fn set_writable(&mut self) -> Result<(), VolumeError> {
+        self.attach_idx_writer_if_missing()?;
         self.no_write_or_delete = false;
+        // Remote-tiered volumes must stay no_write_can_delete regardless of marks.
+        if !self.has_remote_file {
+            self.no_write_can_delete = false;
+        }
         self.save_vif()
     }
 
@@ -2330,7 +2384,8 @@ impl Volume {
         if self.has_remote_file {
             self.no_write_can_delete = true;
             self.no_write_or_delete = false;
-        } else {
+        } else if !self.volume_info.read_only_can_delete {
+            // only clear the remoteness-derived flag, not an operator mark
             self.no_write_can_delete = false;
         }
     }
@@ -2365,7 +2420,11 @@ impl Volume {
             if let Ok(vif_info) = serde_json::from_str::<VifVolumeInfo>(&content) {
                 let pb_info = vif_info.to_pb();
                 if pb_info.read_only {
-                    self.no_write_or_delete = true;
+                    if pb_info.read_only_can_delete {
+                        self.no_write_can_delete = true;
+                    } else {
+                        self.no_write_or_delete = true;
+                    }
                 }
                 self.volume_info = pb_info;
                 self.refresh_remote_write_mode();
@@ -2430,7 +2489,7 @@ impl Volume {
 
     /// Save volume info to .vif file in protobuf-JSON format (Go-compatible).
     /// Matches Go's SaveVolumeInfo: checks writability before writing and propagates errors.
-    fn save_vif(&self) -> Result<(), VolumeError> {
+    fn save_vif(&mut self) -> Result<(), VolumeError> {
         let vif_path = self.vif_path();
 
         // Match Go: if file exists but is not writable, return an error
@@ -2445,8 +2504,13 @@ impl Volume {
             }
         }
 
+        // remoteness-derived no_write_can_delete is not an operator mark; sync
+        // volume_info so refresh_remote_write_mode sees a real mark
+        let marked_can_delete =
+            self.no_write_can_delete && !self.has_remote_file && !self.no_write_or_delete;
+        self.volume_info.read_only = self.no_write_or_delete || marked_can_delete;
+        self.volume_info.read_only_can_delete = marked_can_delete;
         let mut vif = VifVolumeInfo::from_pb(&self.volume_info);
-        vif.read_only = self.no_write_or_delete;
 
         // Match Go's SaveVolumeInfo: compute ExpireAtSec from TTL
         let ttl_seconds = self.super_block.ttl.to_seconds();
@@ -2467,7 +2531,10 @@ impl Volume {
     /// Save full VolumeInfo to .vif file (for tiered storage).
     /// Matches Go's SaveVolumeInfo which computes ExpireAtSec from TTL.
     pub fn save_volume_info(&mut self) -> Result<(), VolumeError> {
-        self.volume_info.read_only = self.no_write_or_delete;
+        let marked_can_delete =
+            self.no_write_can_delete && !self.has_remote_file && !self.no_write_or_delete;
+        self.volume_info.read_only = self.no_write_or_delete || marked_can_delete;
+        self.volume_info.read_only_can_delete = marked_can_delete;
 
         // Compute ExpireAtSec from TTL (matches Go's SaveVolumeInfo)
         let ttl_seconds = self.super_block.ttl.to_seconds();
@@ -2713,6 +2780,34 @@ impl Volume {
         needle_blob: &[u8],
         size: Size,
     ) -> Result<(), VolumeError> {
+        // nm.put on a read-only volume fails only after the blob is appended to .dat.
+        if self.is_read_only() {
+            return Err(VolumeError::ReadOnly);
+        }
+
+        // size indexes the needle and places the v3 append timestamp, so a caller using
+        // the payload-only DataSize corrupts both, silently until the needle is read back.
+        if needle_blob.len() < NEEDLE_HEADER_SIZE {
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "needle {} blob of {} bytes is shorter than a needle header",
+                    needle_id.0,
+                    needle_blob.len()
+                ),
+            )));
+        }
+        let (_, _, header_size) = Needle::parse_header(needle_blob);
+        if header_size != size {
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "needle {} size {} does not match its blob header size {}",
+                    needle_id.0, size.0, header_size.0
+                ),
+            )));
+        }
+
         // Dedup check: if the same needle already exists with matching content, skip the write.
         // Matches Go's WriteNeedleBlob which reads existing needle and compares cookie+checksum+data.
         if let Some(nm) = &self.nm {
@@ -3578,7 +3673,7 @@ fn get_append_at_ns(last: u64) -> u64 {
 /// durable, propagating a sync failure so the commit path can abort rather than
 /// proceed with an undurable rename or marker. A path with no openable parent is
 /// tolerated; directory fsync is unsupported on Windows, so it is a no-op there
-/// (matching the Go fsyncDir helper, which ignores that error).
+/// (matching the Go fsyncDir helper, which skips it too).
 pub(crate) fn fsync_dir(path: &str) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -4066,6 +4161,54 @@ mod tests {
         );
     }
 
+    // Go's tail check is v3-only, so it serves a v1/v2 volume with an
+    // unindexed tail read-write. Checking it here flipped whole legacy disks
+    // read-only on their first boot under this server.
+    #[test]
+    fn test_integrity_skips_dat_tail_check_before_v3() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        {
+            let mut v = Volume::new(
+                dir,
+                dir,
+                "",
+                VolumeId(1),
+                NeedleMapKind::InMemory,
+                None,
+                None,
+                0,
+                VERSION_2,
+            )
+            .unwrap();
+            for i in 1..=3u64 {
+                let data = format!("data {}", i);
+                let mut n = Needle {
+                    id: NeedleId(i),
+                    cookie: Cookie(i as u32),
+                    data: data.as_bytes().to_vec(),
+                    data_size: data.len() as u32,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true).unwrap();
+            }
+            v.sync_to_disk().unwrap();
+        }
+
+        let dat_path = volume_file_name(dir, "", VolumeId(1)) + ".dat";
+        let mut f = OpenOptions::new().append(true).open(&dat_path).unwrap();
+        f.write_all(&[0xFFu8; 96]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let v = reload_volume(dir);
+        assert_eq!(v.version(), VERSION_2, "volume should reload as v2");
+        assert!(
+            !v.is_no_write_or_delete(),
+            "v2 volume with unindexed .dat tail must stay writable, as in Go"
+        );
+    }
+
     // Same torn tail, but with a deletion tombstone as the last indexed
     // record — the tombstone path must also verify the .dat ends at it.
     #[test]
@@ -4417,6 +4560,39 @@ mod tests {
         };
         let err = v.write_needle(&mut n2, true).unwrap_err();
         assert!(matches!(err, VolumeError::CookieMismatch(_)));
+    }
+
+    // A size disagreeing with the blob's own header indexes the needle at the wrong
+    // length and, on v3, stamps the append timestamp into the middle of the needle.
+    #[test]
+    fn test_write_needle_blob_rejects_size_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut v = make_test_volume(dir);
+
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(0x12345678),
+            data: b"the merged payload".to_vec(),
+            data_size: 18,
+            ..Needle::default()
+        };
+        n.checksum = CRC::new(&n.data);
+        let (offset, _, _) = v.write_needle(&mut n, true).unwrap();
+        let blob = v.read_needle_blob(offset as i64, n.size).unwrap();
+
+        let dat_size_before = v.dat_file_size().unwrap();
+
+        // Size(n.data_size) is what append reports, and what a caller following the
+        // payload-size convention would send.
+        let err = v
+            .write_needle_blob_and_index(NeedleId(2), &blob, Size(n.data_size as i32))
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::Io(_)), "got {err:?}");
+        assert_eq!(v.dat_file_size().unwrap(), dat_size_before);
+
+        v.write_needle_blob_and_index(NeedleId(2), &blob, n.size)
+            .unwrap();
     }
 
     #[test]
@@ -4963,7 +5139,7 @@ mod tests {
                 ..Needle::default()
             };
             v.write_needle(&mut n, true).unwrap();
-            v.set_read_only_persist(true).unwrap();
+            v.set_read_only_persist(false, true).unwrap();
             v.sync_to_disk().unwrap();
         }
 
@@ -5026,6 +5202,178 @@ mod tests {
         };
         v.read_needle(&mut probe).unwrap();
         assert_eq!(std::str::from_utf8(&probe.data).unwrap(), "after-mark-writable");
+    }
+
+    // readOnlyCanDelete rejects writes, keeps accepting deletes, and survives
+    // a restart.
+    #[test]
+    fn test_read_only_can_delete_persists_and_keeps_deletes_working() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        {
+            let mut v = make_test_volume(dir);
+            for id in 1..=2u64 {
+                let mut n = Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(id as u32),
+                    data: b"payload".to_vec(),
+                    data_size: 7,
+                    ..Needle::default()
+                };
+                v.write_needle(&mut n, true).unwrap();
+            }
+            v.set_read_only_persist(true, true).unwrap();
+            assert!(v.no_write_can_delete);
+            assert!(!v.no_write_or_delete);
+            assert!(v.is_read_only());
+
+            let err = v
+                .write_needle(
+                    &mut Needle {
+                        id: NeedleId(3),
+                        cookie: Cookie(3),
+                        data: b"blocked".to_vec(),
+                        data_size: 7,
+                        ..Needle::default()
+                    },
+                    true,
+                )
+                .unwrap_err();
+            assert!(matches!(err, VolumeError::ReadOnly));
+
+            let deleted = v
+                .delete_needle(&mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(1),
+                    ..Needle::default()
+                })
+                .unwrap();
+            assert!(deleted.0 > 0, "deletes must still land");
+            v.sync_to_disk().unwrap();
+        }
+
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        assert!(v.no_write_can_delete, "state must survive a restart");
+        assert!(!v.no_write_or_delete);
+        assert!(
+            v.nm.as_ref().unwrap().has_idx_writer(),
+            "canDelete boot must attach an .idx writer for delete tombstones"
+        );
+
+        let err = v
+            .write_needle(
+                &mut Needle {
+                    id: NeedleId(4),
+                    cookie: Cookie(4),
+                    data: b"blocked".to_vec(),
+                    data_size: 7,
+                    ..Needle::default()
+                },
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::ReadOnly));
+
+        let deleted = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(2),
+                cookie: Cookie(2),
+                ..Needle::default()
+            })
+            .unwrap();
+        assert!(deleted.0 > 0, "deletes must still land after restart");
+
+        // downgrading to plain readonly clears the canDelete flag
+        v.set_read_only_persist(false, true).unwrap();
+        assert!(v.no_write_or_delete);
+        assert!(!v.no_write_can_delete);
+
+        // -writable clears the state again.
+        v.set_writable().unwrap();
+        assert!(!v.is_read_only());
+        let mut n = Needle {
+            id: NeedleId(5),
+            cookie: Cookie(5),
+            data: b"writable-again".to_vec(),
+            data_size: 14,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true).unwrap();
+    }
+
+    // Upgrading a volume that booted plain persisted-readonly to canDelete
+    // must attach the missing .idx writer, or delete tombstones cannot append.
+    #[test]
+    fn test_read_only_can_delete_upgrade_after_readonly_boot() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+
+        {
+            let mut v = make_test_volume(dir);
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                data: b"payload".to_vec(),
+                data_size: 7,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true).unwrap();
+            v.set_read_only_persist(false, true).unwrap();
+            v.sync_to_disk().unwrap();
+        }
+
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        assert!(v.no_write_or_delete);
+        let err = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                ..Needle::default()
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, VolumeError::ReadOnly),
+            "plain readonly must reject deletes"
+        );
+
+        v.set_read_only_persist(true, true).unwrap();
+        assert!(!v.no_write_or_delete);
+        assert!(v.no_write_can_delete);
+        assert!(
+            v.nm.as_ref().unwrap().has_idx_writer(),
+            "upgrade to canDelete must attach the .idx writer"
+        );
+        let deleted = v
+            .delete_needle(&mut Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                ..Needle::default()
+            })
+            .unwrap();
+        assert!(deleted.0 > 0, "deletes must land once canDelete is set");
     }
 
     #[test]

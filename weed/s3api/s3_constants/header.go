@@ -106,6 +106,13 @@ const (
 	AmzCopySourceIfModifiedSince   = "X-Amz-Copy-Source-If-Modified-Since"
 	AmzCopySourceIfUnmodifiedSince = "X-Amz-Copy-Source-If-Unmodified-Since"
 
+	// RenameObject
+	AmzRenameSource                  = "X-Amz-Rename-Source"
+	AmzRenameSourceIfMatch           = "X-Amz-Rename-Source-If-Match"
+	AmzRenameSourceIfNoneMatch       = "X-Amz-Rename-Source-If-None-Match"
+	AmzRenameSourceIfModifiedSince   = "X-Amz-Rename-Source-If-Modified-Since"
+	AmzRenameSourceIfUnmodifiedSince = "X-Amz-Rename-Source-If-Unmodified-Since"
+
 	// S3 Server-Side Encryption with Customer-provided Keys (SSE-C)
 	AmzServerSideEncryptionCustomerAlgorithm = "X-Amz-Server-Side-Encryption-Customer-Algorithm"
 	AmzServerSideEncryptionCustomerKey       = "X-Amz-Server-Side-Encryption-Customer-Key"
@@ -302,6 +309,7 @@ const (
 	contextKeyIdentityName   contextKey = "s3-identity-name"
 	contextKeyIdentityObject contextKey = "s3-identity-object"
 	contextKeyIdentityHolder contextKey = "s3-identity-holder"
+	contextKeyPrincipalArn   contextKey = "s3-principal-arn"
 )
 
 // identityHolder is a mutable container for the authenticated identity name,
@@ -312,7 +320,8 @@ const (
 // holder installed before authentication is shared across all copies, so the
 // name written by the inner handler is readable by the outer middleware.
 type identityHolder struct {
-	name atomic.Pointer[string]
+	name         atomic.Pointer[string]
+	principalArn atomic.Pointer[string]
 }
 
 // EnsureIdentityHolder attaches a mutable identity holder to the request context
@@ -358,6 +367,34 @@ func GetIdentityNameFromContext(r *http.Request) string {
 	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
 		if name := h.name.Load(); name != nil {
 			return *name
+		}
+	}
+	return ""
+}
+
+// SetPrincipalArnInContext stores the authenticated principal ARN in the request
+// context. For an STS session the identity name is an opaque session subject, so
+// the ARN is the only place the assumed role and session name survive to the
+// audit log.
+func SetPrincipalArnInContext(ctx context.Context, principalArn string) context.Context {
+	if principalArn == "" {
+		return ctx
+	}
+	if h, ok := ctx.Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		h.principalArn.Store(&principalArn)
+	}
+	return context.WithValue(ctx, contextKeyPrincipalArn, principalArn)
+}
+
+// GetPrincipalArnFromContext retrieves the authenticated principal ARN from the
+// request context, or "" when the request is unauthenticated.
+func GetPrincipalArnFromContext(r *http.Request) string {
+	if arn, ok := r.Context().Value(contextKeyPrincipalArn).(string); ok && arn != "" {
+		return arn
+	}
+	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		if arn := h.principalArn.Load(); arn != nil {
+			return *arn
 		}
 	}
 	return ""

@@ -23,16 +23,30 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+// fencedFindEntry reads an entry with an exact log-position fence: the stamp
+// and the read share the path lock mutations hold across write and notify, so
+// every event at or below the fence is in the entry and none above it are.
+// Any read whose result a client versions must go through here.
+func (fs *FilerServer) fencedFindEntry(ctx context.Context, path util.FullPath) (entry *filer.Entry, logTsNs int64, err error) {
+	pathLock := fs.entryLockTable.AcquireLock("fencedFindEntry", path, util.SharedLock)
+	logTsNs = time.Now().UnixNano()
+	entry, err = fs.filer.FindEntry(ctx, path)
+	fs.entryLockTable.ReleaseLock(path, pathLock)
+	return
+}
 
 func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "LookupDirectoryEntry %s", filepath.Join(req.Directory, req.Name))
 
-	entry, err := fs.filer.FindEntry(ctx, util.JoinPath(req.Directory, req.Name))
+	entry, logTsNs, err := fs.fencedFindEntry(ctx, util.JoinPath(req.Directory, req.Name))
+
 	if err == filer_pb.ErrNotFound {
-		return &filer_pb.LookupDirectoryEntryResponse{}, err
+		return &filer_pb.LookupDirectoryEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}, err
 	}
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "LookupDirectoryEntry %s: %+v, ", filepath.Join(req.Directory, req.Name), err)
@@ -40,7 +54,9 @@ func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.L
 	}
 
 	return &filer_pb.LookupDirectoryEntryResponse{
-		Entry: entry.ToProtoEntry(),
+		Entry:        entry.ToProtoEntry(),
+		LogTsNs:      logTsNs,
+		LogSignature: fs.filer.Signature,
 	}, nil
 }
 
@@ -70,8 +86,21 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 		var hasEntries bool
 		lastFileName, listErr = fs.filer.StreamListDirectoryEntries(stream.Context(), util.FullPath(req.Directory), lastFileName, includeLastFile, int64(paginationLimit), req.Prefix, "", "", func(entry *filer.Entry) (bool, error) {
 			hasEntries = true
+			pbEntry := entry.ToProtoEntry()
+			if req.OmitChunks {
+				// Stamp the size before dropping the only other thing carrying
+				// it. Most stores fold the chunk extents into FileSize when they
+				// decode, but one that keeps entries as JSON rather than as an
+				// encoded Entry never re-derives it, and the caller would be
+				// left with a zero. The entries are still read whole, because
+				// expiring one here deletes its data and that needs the chunks.
+				if pbEntry.Attributes != nil {
+					pbEntry.Attributes.FileSize = filer.FileSize(pbEntry)
+				}
+				pbEntry.Chunks = nil
+			}
 			resp := &filer_pb.ListEntriesResponse{
-				Entry: entry.ToProtoEntry(),
+				Entry: pbEntry,
 			}
 			if !sentSnapshot {
 				resp.SnapshotTsNs = snapshotTsNs
@@ -102,12 +131,10 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 
 	}
 
-	// For empty directories we intentionally do NOT send a snapshot-only
-	// response (Entry == nil). Many consumers (Java FilerClient, S3 listing,
-	// etc.) treat any received response as an entry. The Go client-side
-	// DoSeaweedListWithSnapshot generates a client-side cutoff when the
-	// server sends no snapshot, so snapshot consistency is preserved
-	// without a server-side send.
+	// No snapshot-only response for empty directories: many consumers (Java
+	// FilerClient, S3 listing) treat any response as an entry. The trailer
+	// carries it instead; older clients ignore trailers.
+	stream.SetTrailer(metadata.Pairs(filer_pb.ListSnapshotTsNsTrailerKey, strconv.FormatInt(snapshotTsNs, 10)))
 
 	return nil
 }
@@ -187,6 +214,11 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	fullpath := newEntry.FullPath
 	pathLock := fs.entryLockTable.AcquireLock("CreateEntry", fullpath, util.ExclusiveLock)
 	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+
+	// Fence stamped under the lock: a no-op create returns no event, but the
+	// acknowledged state still reflects everything at or below this.
+	resp.LogTsNs = time.Now().UnixNano()
+	resp.LogSignature = fs.filer.Signature
 
 	// Evaluate the optional precondition against the current entry while the
 	// path lock is held, so the check and the write are atomic on this filer.
@@ -368,6 +400,7 @@ func (fs *FilerServer) applyStorageDefaultsToEntry(ctx context.Context, entry *f
 	} else if entry.TtlSec == 0 {
 		entry.TtlSec = so.TtlSeconds
 	}
+	entry.ApplyS3ExpiryMetadata()
 	return so, nil
 }
 
@@ -594,12 +627,29 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	}
 
 	fullpath := util.Join(req.Directory, req.Entry.Name)
-	entry, err := fs.filer.FindEntry(ctx, util.FullPath(fullpath))
+
+	// Serialize concurrent mutations to the same path on this filer so the
+	// read (preconditions, garbage diff) and the write are atomic. Callers
+	// route a key's writes to this owner filer, making this local lock
+	// sufficient.
+	lockPath := util.FullPath(fullpath)
+	pathLock := fs.entryLockTable.AcquireLock("UpdateEntry", lockPath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(lockPath, pathLock)
+
+	// Fence stamped under the lock: the no-change path below returns no event,
+	// but the acknowledged state still reflects everything at or below this.
+	logTsNs := time.Now().UnixNano()
+
+	entry, err := fs.filer.FindEntry(ctx, lockPath)
 	if err != nil {
 		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("not found %s: %v", fullpath, err)
 	}
 	if err := validateUpdateEntryPreconditions(entry, req.ExpectedExtended); err != nil {
 		return &filer_pb.UpdateEntryResponse{}, err
+	}
+	if conditionIsSet(req.Condition) && !writeConditionSatisfied(req.Condition, entry) {
+		glog.V(3).InfofCtx(ctx, "UpdateEntry %s: precondition failed: %v", fullpath, req.Condition)
+		return &filer_pb.UpdateEntryResponse{}, status.Errorf(codes.FailedPrecondition, "precondition failed: %s", fullpath)
 	}
 
 	chunks, garbage, err2 := fs.cleanupChunks(ctx, fullpath, entry, req.Entry)
@@ -616,11 +666,11 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	}
 
 	if filer.EqualEntry(entry, newEntry) {
-		return &filer_pb.UpdateEntryResponse{}, err
+		return &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}, err
 	}
 
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
-	resp := &filer_pb.UpdateEntryResponse{}
+	resp := &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
 	if err = fs.filer.UpdateEntry(ctx, entry, newEntry); err == nil {
 		fs.filer.DeleteChunksNotRecursive(garbage)
 
@@ -706,6 +756,12 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 	lock := lockClient.NewShortLivedLock(string(fullpath), string(fs.option.Host))
 	defer lock.StopShortLivedLock()
 
+	// The cluster lock serializes appenders across filers; the path lock makes
+	// this read-modify-write atomic against conditional updates and deletes on
+	// the owner filer.
+	pathLock := fs.entryLockTable.AcquireLock("AppendToEntry", fullpath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+
 	var offset int64 = 0
 	entry, err := fs.filer.FindEntry(ctx, fullpath)
 	if err == filer_pb.ErrNotFound {
@@ -749,8 +805,16 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 
 	glog.V(4).InfofCtx(ctx, "DeleteEntry %v", req)
 
+	// A delete queues the entry's chunks for deletion, so it must not
+	// interleave with a conditional update's check-then-write on the same
+	// path: the update would pass its precondition and then resurrect fids
+	// that are already on the deletion queue.
+	fullpath := util.JoinPath(req.Directory, req.Name)
+	pathLock := fs.entryLockTable.AcquireLock("DeleteEntry", fullpath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
-	err = fs.filer.DeleteEntryMetaAndData(ctx, util.JoinPath(req.Directory, req.Name), req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, req.IfNotModifiedAfter)
+	err = fs.filer.DeleteEntryMetaAndData(ctx, fullpath, req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, req.IfNotModifiedAfter)
 	resp = &filer_pb.DeleteEntryResponse{}
 	if err != nil && err != filer_pb.ErrNotFound {
 		resp.Error = err.Error()

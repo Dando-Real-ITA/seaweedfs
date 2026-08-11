@@ -25,7 +25,8 @@ func (s3a *S3ApiServer) getObjectEntryRoutedByKey(bucket, object string) (*filer
 
 	owner := s3a.routableWriteOwner(bucket, object)
 	if owner == "" || s3a.filerClient == nil {
-		return filer_pb.GetEntry(context.Background(), s3a, fullPath)
+		entry, _, _, err := filer_pb.GetEntry(context.Background(), s3a, fullPath)
+		return entry, err
 	}
 
 	// Skip an owner whose recent read hit a transport error; read local-first until
@@ -77,6 +78,16 @@ func (s3a *S3ApiServer) ownerRecentlyUnreachable(owner pb.ServerAddress) bool {
 		return time.Now().Before(v.(time.Time))
 	}
 	return false
+}
+
+// lookupEntryPreferringOwner reads an entry back from a known write owner, so a
+// caller that just wrote there sees its own write. Unlike getObjectEntryRoutedByKey
+// it never drops the owner for a healthier peer, which would read behind the write.
+func (s3a *S3ApiServer) lookupEntryPreferringOwner(owner pb.ServerAddress, dir, name string) (*filer_pb.Entry, error) {
+	if owner == "" {
+		return s3a.getEntry(dir, name)
+	}
+	return s3a.lookupEntryOnFiler(owner, dir, name)
 }
 
 // lookupEntryOnFiler resolves dir/name against a single filer, without failover.

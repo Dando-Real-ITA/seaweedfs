@@ -28,6 +28,26 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 )
 
+// A volume moved between the node's disks appears in both lists, and clients
+// apply additions before deletions, so passing the removal on would drop a
+// location that is still good. Not HasVolumesById, which answers for ec shards
+// too: clients hold those separately and prefer the normal location, so a
+// replica that became ec shards has to be reported gone.
+func shouldBroadcastVolumeRemoval(dn *topology.DataNode, vid needle.VolumeId) bool {
+	_, err := dn.GetVolumesById(vid)
+	return err != nil
+}
+
+// heartbeatResponse carries the options a volume server takes from every
+// response it receives. A response that left them out would be read as the
+// master turning them off, so anything sent mid-stream has to start here.
+func (ms *MasterServer) heartbeatResponse() *master_pb.HeartbeatResponse {
+	return &master_pb.HeartbeatResponse{
+		VolumeSizeLimit: uint64(ms.option.VolumeSizeLimitMB) * 1024 * 1024,
+		Preallocate:     ms.preallocateSize > 0,
+	}
+}
+
 func (ms *MasterServer) RegisterUuids(heartbeat *master_pb.Heartbeat) (duplicated_uuids []string, err error) {
 	ms.Topo.UuidAccessLock.Lock()
 	defer ms.Topo.UuidAccessLock.Unlock()
@@ -160,10 +180,9 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 				return err
 			}
 
-			if err := stream.Send(&master_pb.HeartbeatResponse{
-				VolumeSizeLimit: uint64(ms.option.VolumeSizeLimitMB) * 1024 * 1024,
-				Preallocate:     ms.preallocateSize > 0,
-			}); err != nil {
+			response := ms.heartbeatResponse()
+			response.VolumeDigestSupported = true
+			if err := stream.Send(response); err != nil {
 				glog.Warningf("SendHeartbeat.Send volume size to %s:%d %v", dn.Ip, dn.Port, err)
 				return err
 			}
@@ -207,15 +226,26 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			stats.MasterReceivedHeartbeatCounter.WithLabelValues("deletedVolumes").Inc()
 		}
 		if len(heartbeat.NewVolumes) > 0 || len(heartbeat.DeletedVolumes) > 0 {
+			// first, so the removals below see where the volumes ended up
+			ms.Topo.IncrementalSyncDataNodeRegistration(heartbeat.NewVolumes, heartbeat.DeletedVolumes, dn)
+
 			// process delta volume ids if exists for fast volume id updates
 			for _, volInfo := range heartbeat.NewVolumes {
 				message.NewVids = append(message.NewVids, volInfo.Id)
 			}
 			for _, volInfo := range heartbeat.DeletedVolumes {
+				if !shouldBroadcastVolumeRemoval(dn, needle.VolumeId(volInfo.Id)) {
+					continue
+				}
 				message.DeletedVids = append(message.DeletedVids, volInfo.Id)
 			}
-			// update master internal volume layouts
-			ms.Topo.IncrementalSyncDataNodeRegistration(heartbeat.NewVolumes, heartbeat.DeletedVolumes, dn)
+		}
+
+		if len(heartbeat.ChangedVolumes) > 0 {
+			stats.MasterReceivedHeartbeatCounter.WithLabelValues("changedVolumes").Inc()
+			for _, v := range ms.Topo.ApplyVolumeChanges(heartbeat.ChangedVolumes, dn) {
+				message.NewVids = append(message.NewVids, uint32(v.Id))
+			}
 		}
 
 		if len(heartbeat.Volumes) > 0 || heartbeat.HasNoVolumes {
@@ -234,6 +264,9 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			}
 			for _, v := range deletedVolumes {
 				glog.V(1).Infof("master see deleted volume %d from %s", uint32(v.Id), dn.Url())
+				if !shouldBroadcastVolumeRemoval(dn, v.Id) {
+					continue
+				}
 				message.DeletedVids = append(message.DeletedVids, uint32(v.Id))
 			}
 		}
@@ -275,7 +308,66 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 		if len(message.NewVids) > 0 || len(message.DeletedVids) > 0 || len(message.NewEcVids) > 0 || len(message.DeletedEcVids) > 0 {
 			ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: message})
 		}
+
+		// Checked after everything the heartbeat carried has been applied, so a
+		// match means the master is current, not that nothing changed.
+		if resend := ms.checkVolumeDigest(heartbeat, dn); resend {
+			response := ms.heartbeatResponse()
+			response.ResendFullVolumeList = true
+			if err := stream.Send(response); err != nil {
+				glog.Warningf("SendHeartbeat.Send resend request to %s:%d %v", dn.Ip, dn.Port, err)
+				return err
+			}
+		}
 	}
+}
+
+// checkVolumeDigest compares the digest a volume server reported against the
+// master's own, and reports whether the master needs the full volume list to
+// recover. Servers that report no digest are left alone: they still send the
+// whole list every time.
+func (ms *MasterServer) checkVolumeDigest(heartbeat *master_pb.Heartbeat, dn *topology.DataNode) bool {
+	if heartbeat.VolumeDigest == nil {
+		return false
+	}
+
+	reported := heartbeat.GetVolumeDigest()
+	held := dn.VolumeDigest()
+	needsFullList, reason := true, ""
+	switch {
+	case dn.HasDuplicateVolumeIds():
+		// Reported twice but stored once, so the digests can never agree. The
+		// server has to keep sending its whole list, since nothing else would
+		// tell the master what it had stopped holding.
+		stats.MasterReceivedHeartbeatCounter.WithLabelValues("volumeDigestNotComparable").Inc()
+	case !dn.HasConsistentVolumeIndex():
+		// The lookup index has drifted from the disks, which the server cannot
+		// see and its digest cannot show. Only a full report re-registers the
+		// volumes that stopped being servable.
+		stats.MasterReceivedHeartbeatCounter.WithLabelValues("volumeIndexInconsistent").Inc()
+		reason = "lookup index disagrees with the volumes held"
+	case held != reported:
+		stats.MasterReceivedHeartbeatCounter.WithLabelValues("volumeDigestMismatch").Inc()
+		reason = fmt.Sprintf("reported digest %d, master holds %d", reported, held)
+	default:
+		stats.MasterReceivedHeartbeatCounter.WithLabelValues("volumeDigestMatch").Inc()
+		needsFullList = false
+	}
+	if !needsFullList {
+		return false
+	}
+
+	// A heartbeat that already carried the full list has nothing more to give.
+	if len(heartbeat.Volumes) > 0 || heartbeat.HasNoVolumes {
+		if reason != "" {
+			glog.Warningf("volume server %s still disagrees after a full volume list: %s", dn.Url(), reason)
+		}
+		return false
+	}
+	if reason != "" {
+		glog.V(0).Infof("volume server %s: %s, requesting the full volume list", dn.Url(), reason)
+	}
+	return true
 }
 
 // KeepConnected keep a stream gRPC call to the master. Used by clients to know the master is up.
@@ -345,6 +437,14 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		}
 	}
 
+	// Cluster node changes are only broadcast to the clients connected at that
+	// moment, so a client that reconnects has to be told who is around now.
+	for _, update := range ms.Cluster.ListClusterNodeUpdates(cluster.FilerGroupName(req.FilerGroup), cluster.FilerType) {
+		if sendErr := stream.Send(update); sendErr != nil {
+			return sendErr
+		}
+	}
+
 	if initialLockRingUpdate := ms.initialLockRingUpdate(req.ClientType, req.FilerGroup); initialLockRingUpdate != nil {
 		if sendErr := stream.Send(initialLockRingUpdate); sendErr != nil {
 			return sendErr
@@ -374,7 +474,10 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		select {
 		case message := <-messageChan:
 			if err := stream.Send(message); err != nil {
-				glog.V(0).Infof("=> client %v: %+v", clientName, message)
+				// The error, not the message: it carries every volume id on a
+				// newly connected node, and formatting a proto that size to
+				// say a client went away costs more than the send did.
+				glog.V(0).Infof("=> client %v: %v", clientName, err)
 				return err
 			}
 		case <-ticker.C:

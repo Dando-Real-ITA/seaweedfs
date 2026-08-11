@@ -363,6 +363,27 @@ type putFinalize struct {
 	afterCreate func(entry *filer_pb.Entry) s3err.ErrorCode
 }
 
+const (
+	// defaultUploadChunkSizeMB applies when the filer reports no -maxMB.
+	defaultUploadChunkSizeMB = 8
+	// maxUploadChunkSizeMB keeps the byte count inside int32.
+	maxUploadChunkSizeMB = 2047
+)
+
+// uploadChunkSize is how large a chunk the S3 write path cuts. It follows the
+// filer's -maxMB so an object written through S3 chunks the same way the same
+// bytes written through the filer, WebDAV or a mount would.
+func (s3a *S3ApiServer) uploadChunkSize() int32 {
+	sizeMB := s3a.option.MaxMB
+	if sizeMB <= 0 {
+		sizeMB = defaultUploadChunkSizeMB
+	}
+	if sizeMB > maxUploadChunkSizeMB {
+		sizeMB = maxUploadChunkSizeMB
+	}
+	return sizeMB * 1024 * 1024
+}
+
 // putToFiler writes one chunk of object bytes (a full PutObject body, a
 // single MPU part, a copy-part destination). lifecycleTTLSec is non-zero
 // only for top-level PutObject paths where the lifecycle XML's
@@ -466,8 +487,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// filePath is already provided directly - no URL parsing needed
 	// Step 1 & 2: Use auto-chunking to handle large files without OOM
-	// This splits large uploads into 8MB chunks, preventing memory issues on both S3 API and volume servers
-	const chunkSize = 8 * 1024 * 1024 // 8MB chunks (S3 standard)
+	chunkSize := s3a.uploadChunkSize()
 	const smallFileLimit = 256 * 1024 // 256KB - store inline in filer
 
 	collection := ""
@@ -545,7 +565,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
 		}
 
-		return "", mapChunkedUploadErrorToS3Error(err), SSEResponseMetadata{}
+		return "", mapChunkedUploadErrorToS3Error(r.Context(), err), SSEResponseMetadata{}
 	}
 
 	// Step 3: Calculate MD5 hash and add SSE metadata to chunks
@@ -1184,11 +1204,27 @@ func filerErrorToS3Error(err error) s3err.ErrorCode {
 // IncompleteBody (400) rather than a 500 a reverse proxy would relay as a confusing
 // 502. Only the source read is tagged, so a volume-server upload fault still maps to
 // InternalError.
-func mapChunkedUploadErrorToS3Error(err error) s3err.ErrorCode {
+//
+// reqCtx is the request context, which separates the two ways a body ends early: a
+// peer that went away, and a body that arrived short while the peer was still there.
+// Both surface as the same read error, so without this they are indistinguishable in
+// logs even though they point at opposite causes — a network path versus a client.
+// The upload itself deliberately runs on a background context, so cancellation of
+// reqCtx races the read error; a missed signal degrades to IncompleteBody as before.
+//
+// This reads cancellation as "the peer is gone", which is what net/http means by it
+// today: nothing on the S3 request path cancels reqCtx for its own reasons. Anything
+// added later that does — a request budget, an auth deadline, shutdown draining —
+// would have to cancel with its own cause and be excluded here, otherwise a body
+// truncated at that instant gets attributed to the peer.
+func mapChunkedUploadErrorToS3Error(reqCtx context.Context, err error) s3err.ErrorCode {
 	switch {
 	case strings.Contains(err.Error(), s3err.ErrMsgPayloadChecksumMismatch):
 		return s3err.ErrInvalidDigest
 	case errors.Is(err, operation.ErrTruncatedBody):
+		if errors.Is(reqCtx.Err(), context.Canceled) {
+			return s3err.ErrClientDisconnected
+		}
 		return s3err.ErrIncompleteBody
 	default:
 		return s3err.ErrInternalError
@@ -1257,40 +1293,6 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 	glog.V(3).Infof("putSuspendedVersioningObject: START bucket=%s, object=%s, normalized=%s",
 		bucket, object, normalizedObject)
 
-	bucketDir := s3a.bucketDir(bucket)
-
-	// Check if there's an existing null version in .versions directory and delete it
-	// This ensures suspended versioning properly overwrites the null version as per S3 spec
-	// Note: We only delete null versions, NOT regular versions (those should be preserved)
-	versionsObjectPath := normalizedObject + s3_constants.VersionsFolder
-	versionsDir := bucketDir + "/" + versionsObjectPath
-	entries, _, err := s3a.list(versionsDir, "", "", false, 1000)
-	if err == nil {
-		// .versions directory exists
-		glog.V(3).Infof("putSuspendedVersioningObject: found %d entries in .versions for %s/%s", len(entries), bucket, object)
-		for _, entry := range entries {
-			if entry.Extended != nil {
-				if versionIdBytes, ok := entry.Extended[s3_constants.ExtVersionIdKey]; ok {
-					versionId := string(versionIdBytes)
-					glog.V(3).Infof("putSuspendedVersioningObject: found version '%s' in .versions", versionId)
-					if versionId == "null" {
-						// Only delete null version - preserve real versioned entries
-						glog.V(3).Infof("putSuspendedVersioningObject: deleting null version from .versions")
-						err := s3a.rm(versionsDir, entry.Name, true, false)
-						if err != nil {
-							glog.Warningf("putSuspendedVersioningObject: failed to delete null version: %v", err)
-						} else {
-							glog.V(3).Infof("putSuspendedVersioningObject: successfully deleted null version")
-						}
-						break
-					}
-				}
-			}
-		}
-	} else {
-		glog.V(3).Infof("putSuspendedVersioningObject: no .versions directory for %s/%s", bucket, object)
-	}
-
 	filePath := s3a.toFilerPath(bucket, normalizedObject)
 
 	body := dataReader
@@ -1354,15 +1356,18 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 	}
 
 	// Versioned/suspended bucket → resolver returns 0; pass it directly.
-	// afterCreate clears the prior latest pointer and stamps the displaced version
-	// with NoncurrentSinceNs — off-ring under the write lock, routed off-lock after
-	// the PUT. Best-effort either way: a stale flag self-heals on the next list.
+	// afterCreate retires the null delete marker a preceding DELETE left, clears the
+	// prior latest pointer and stamps the displaced version with NoncurrentSinceNs —
+	// off-ring under the write lock, routed off-lock after the PUT. Only once the write
+	// has committed: retiring the marker for a write that then fails leaves the pointer
+	// naming a marker that is gone, and the read path heals that by promoting an older
+	// version, republishing the deleted key. Best-effort, as a stale flag self-heals on
+	// the next list.
 	etag, errCode, sseMetadata = s3a.putToFiler(r, filePath, body, bucket, normalizedObject, 1, 0, &putFinalize{
-		afterCreate: func(_ *filer_pb.Entry) s3err.ErrorCode {
-			if err := s3a.updateIsLatestFlagsForSuspendedVersioning(bucket, normalizedObject); err != nil {
-				// Best-effort: a stale IsLatest flag is recoverable on the
-				// next list-versions resync, so don't fail the PUT.
-				glog.Warningf("putSuspendedVersioningObject: failed to update IsLatest flags: %v", err)
+		afterCreate: func(entry *filer_pb.Entry) s3err.ErrorCode {
+			writtenETag := string(entry.Extended[s3_constants.ExtETagKey])
+			if err := s3a.finalizeSuspendedNullWrite("", bucket, normalizedObject, s3_constants.ExtETagKey, writtenETag); err != nil {
+				glog.Warningf("putSuspendedVersioningObject: failed to retire the null delete marker: %v", err)
 			}
 			return s3err.ErrNone
 		},
@@ -1375,6 +1380,26 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 	glog.V(2).Infof("putSuspendedVersioningObject: successfully created null version for %s/%s", bucket, object)
 
 	return etag, s3err.ErrNone, sseMetadata
+}
+
+// removeNullVersionFile deletes the "null" version file from an object's .versions
+// directory, leaving real versions alone. Best-effort: a leftover null version is
+// superseded by the object at the regular path on the next read.
+func (s3a *S3ApiServer) removeNullVersionFile(bucket, object string) {
+	versionsDir := s3a.bucketDir(bucket) + "/" + object + s3_constants.VersionsFolder
+	entries, _, err := s3a.list(versionsDir, "", "", false, 1000)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if string(entry.Extended[s3_constants.ExtVersionIdKey]) != "null" {
+			continue
+		}
+		if rmErr := s3a.rm(versionsDir, entry.Name, true, false); rmErr != nil {
+			glog.Warningf("removeNullVersionFile: %s/%s: %v", bucket, object, rmErr)
+		}
+		return
+	}
 }
 
 // updateIsLatestFlagsForSuspendedVersioning sets IsLatest=false on all existing versions/delete markers
@@ -1449,6 +1474,9 @@ func (s3a *S3ApiServer) updateIsLatestFlagsForSuspendedVersioning(bucket, object
 		delete(versionsEntry.Extended, s3_constants.ExtLatestVersionIdKey)
 		delete(versionsEntry.Extended, s3_constants.ExtLatestVersionFileNameKey)
 		clearCachedVersionMetadata(versionsEntry.Extended)
+		// Record that the null object is current explicitly: an absent pointer
+		// alone also looks like replication lag to a reader.
+		versionsEntry.Extended[s3_constants.ExtNullVersionIsLatestKey] = []byte("true")
 
 		// Update the .versions directory entry
 		err = s3a.mkFile(bucketDir, versionsObjectPath, versionsEntry.Chunks, func(updatedEntry *filer_pb.Entry) {
@@ -1599,6 +1627,7 @@ func (s3a *S3ApiServer) updateLatestVersionInDirectory(bucket, object, versionId
 
 	versionsEntry.Extended[s3_constants.ExtLatestVersionIdKey] = []byte(versionId)
 	versionsEntry.Extended[s3_constants.ExtLatestVersionFileNameKey] = []byte(versionFileName)
+	delete(versionsEntry.Extended, s3_constants.ExtNullVersionIsLatestKey)
 
 	// Cache list metadata for single-scan efficiency (avoids extra getEntry per object during list)
 	setCachedListMetadata(versionsEntry, versionEntry)

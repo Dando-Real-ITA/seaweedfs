@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
@@ -116,7 +117,7 @@ func (s *AdminServer) getTopologyViaGRPC(topology *ClusterTopology) error {
 
 	// Get cluster status from master
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.VolumeList(context.Background(), &master_pb.VolumeListRequest{})
+		resp, err := pb.CollectVolumeList(context.Background(), client, &master_pb.VolumeListRequest{})
 		if err != nil {
 			currentMaster := s.masterClient.GetMaster(context.Background())
 			glog.Errorf("Failed to get volume list from master %s: %v", currentMaster, err)
@@ -124,13 +125,6 @@ func (s *AdminServer) getTopologyViaGRPC(topology *ClusterTopology) error {
 		}
 
 		if resp.TopologyInfo != nil {
-			// Dedupe EC volume file counts across the nodes that report
-			// shards for the same volume: every shard holder reports the
-			// same .ecx-derived file_count, so we keep the max and sum
-			// node-local tombstones.
-			ecFile := make(map[uint32]uint64)
-			ecDel := make(map[uint32]uint64)
-
 			// Process gRPC response
 			for _, dc := range resp.TopologyInfo.DataCenterInfos {
 				dataCenter := DataCenter{
@@ -149,7 +143,6 @@ func (s *AdminServer) getTopologyViaGRPC(topology *ClusterTopology) error {
 						var totalVolumes int64
 						var totalMaxVolumes int64
 						var totalSize int64
-						var totalFiles int64
 						// Prefer the real physical disk capacity the volume server
 						// reports per disk; the slot-based estimate overstates capacity
 						// when maxVolumeCount is configured higher than the disk holds.
@@ -167,23 +160,14 @@ func (s *AdminServer) getTopologyViaGRPC(topology *ClusterTopology) error {
 							// Sum up individual volume information
 							for _, volInfo := range diskInfo.VolumeInfos {
 								totalSize += int64(volInfo.Size)
-								totalFiles += int64(volInfo.FileCount)
 							}
 
-							// Sum up EC shard sizes on this node and collect
-							// volume-wide file/delete counts for later folding
-							// into topology.TotalFiles. ShardSizes is local to
-							// this node, so summing across nodes is correct;
-							// FileCount/DeleteCount are per-volume and must be
-							// deduped per volume id.
+							// ShardSizes is local to this node, so summing
+							// across nodes gives the physical footprint.
 							for _, ecShardInfo := range diskInfo.EcShardInfos {
 								for _, shardSize := range ecShardInfo.ShardSizes {
 									totalSize += shardSize
 								}
-								if ecShardInfo.FileCount > ecFile[ecShardInfo.Id] {
-									ecFile[ecShardInfo.Id] = ecShardInfo.FileCount
-								}
-								ecDel[ecShardInfo.Id] += ecShardInfo.DeleteCount
 							}
 						}
 
@@ -214,7 +198,6 @@ func (s *AdminServer) getTopologyViaGRPC(topology *ClusterTopology) error {
 						rackObj.Nodes = append(rackObj.Nodes, vs)
 						topology.VolumeServers = append(topology.VolumeServers, vs)
 						topology.TotalVolumes += vs.Volumes
-						topology.TotalFiles += totalFiles
 						topology.TotalSize += totalSize
 					}
 
@@ -224,17 +207,10 @@ func (s *AdminServer) getTopologyViaGRPC(topology *ClusterTopology) error {
 				topology.DataCenters = append(topology.DataCenters, dataCenter)
 			}
 
-			// Fold deduped EC file counts into the cluster total so the
-			// dashboard header does not drop after volumes are converted
-			// to erasure coding.
-			for vid, fc := range ecFile {
-				dc := ecDel[vid]
-				if fc >= dc {
-					topology.TotalFiles += int64(fc - dc)
-				} else {
-					glog.Warningf("ec volume %d: summed delete_count=%d exceeds file_count=%d; skipping from TotalFiles", vid, dc, fc)
-				}
-			}
+			// Chunk counts come from the shared collection aggregation, which
+			// nets out tombstones and counts a chunk once no matter how many
+			// volume replicas or EC shard holders report it.
+			topology.TotalChunks = totalCollectionFileCount(resp.TopologyInfo)
 		}
 
 		return nil

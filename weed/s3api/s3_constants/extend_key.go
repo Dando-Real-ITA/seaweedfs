@@ -1,6 +1,7 @@
 package s3_constants
 
 const (
+	ExtAmzPrefix                = "Seaweed-X-Amz-"
 	ExtAmzOwnerKey              = "Seaweed-X-Amz-Owner"
 	ExtAmzAclKey                = "Seaweed-X-Amz-Acl"
 	ExtOwnershipKey             = "Seaweed-X-Amz-Ownership"
@@ -13,18 +14,25 @@ const (
 	ExtLatestVersionFileNameKey = "Seaweed-X-Amz-Latest-Version-File-Name"
 	ExtAllowEmptyFolders        = "Seaweed-X-Amz-Allow-Empty-Folders"
 	// Cached list metadata in .versions directory for single-scan efficiency
-	ExtLatestVersionSizeKey        = "Seaweed-X-Amz-Latest-Version-Size"
-	ExtLatestVersionETagKey        = "Seaweed-X-Amz-Latest-Version-ETag"
-	ExtLatestVersionMtimeKey       = "Seaweed-X-Amz-Latest-Version-Mtime"
-	ExtLatestVersionOwnerKey       = "Seaweed-X-Amz-Latest-Version-Owner"
-	ExtLatestVersionIsDeleteMarker = "Seaweed-X-Amz-Latest-Version-Is-Delete-Marker"
-	ExtMultipartObjectKey          = "key"
+	ExtLatestVersionSizeKey         = "Seaweed-X-Amz-Latest-Version-Size"
+	ExtLatestVersionETagKey         = "Seaweed-X-Amz-Latest-Version-ETag"
+	ExtLatestVersionMtimeKey        = "Seaweed-X-Amz-Latest-Version-Mtime"
+	ExtLatestVersionOwnerKey        = "Seaweed-X-Amz-Latest-Version-Owner"
+	ExtLatestVersionIsDeleteMarker  = "Seaweed-X-Amz-Latest-Version-Is-Delete-Marker"
+	ExtLatestVersionStorageClassKey = "Seaweed-X-Amz-Latest-Version-Storage-Class"
+	ExtMultipartObjectKey           = "key"
 	// Wall-clock nanoseconds (int64 as decimal string) captured at the
 	// moment a versioned entry was demoted from current to noncurrent
 	// by a later PUT or delete marker. Read by the s3 lifecycle engine
 	// to compute NoncurrentDays due time; zero/missing falls back to
 	// the entry's own mtime so legacy data still expires.
 	ExtNoncurrentSinceNsKey = "Seaweed-X-Amz-Noncurrent-Since-Ns"
+
+	// Set on a .versions directory when a suspended-versioning write made the
+	// base-path null object the current version; cleared whenever a version in
+	// the directory becomes current. Unlike an absent latest pointer, which a
+	// replica may simply not have received yet, this is an explicit signal.
+	ExtNullVersionIsLatestKey = "Seaweed-X-Amz-Null-Version-Is-Latest"
 
 	// Per-bucket opt-in for the PutObject lifecycle TTL fast path ("true"
 	// to enable). When on, an Expiration.Days rule is stamped as a volume

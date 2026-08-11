@@ -154,7 +154,11 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 
 	if v.volumeInfo.ReadOnly && !v.HasRemoteFile() {
 		// this covers the case where the volume is marked as read-only and has no remote file
-		v.noWriteOrDelete = true
+		if v.volumeInfo.ReadOnlyCanDelete {
+			v.noWriteCanDelete = true
+		} else {
+			v.noWriteOrDelete = true
+		}
 	}
 
 	if v.HasRemoteFile() {
@@ -251,6 +255,14 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				return fmt.Errorf("check volume idx file %s: %w", v.FileName(".idx"), err)
 			}
 			glog.Fatalf("check volume idx file %s: %v", v.FileName(".idx"), err)
+		}
+		// Recover rows that deletes on a tiered read-only volume overwrote at
+		// the front of .idx. Best effort: a volume that cannot be repaired is
+		// still servable for everything the surviving rows index.
+		if restored, repairErr := v.repairIdxHeadTombstones(); repairErr != nil {
+			glog.Warningf("volume %d: recover overwritten %s rows: %v", v.Id, v.FileName(".idx"), repairErr)
+		} else if restored > 0 {
+			glog.V(0).Infof("volume %d: recovered %d overwritten %s rows from %s", v.Id, restored, v.FileName(".idx"), v.FileName(".dat"))
 		}
 		var indexFile *os.File
 		if v.noWriteOrDelete {

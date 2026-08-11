@@ -161,6 +161,30 @@ func (vs *VolumeServer) VolumeUnmount(ctx context.Context, req *volume_server_pb
 
 }
 
+func (vs *VolumeServer) VolumeConsolidateIndex(ctx context.Context, req *volume_server_pb.VolumeConsolidateIndexRequest) (*volume_server_pb.VolumeConsolidateIndexResponse, error) {
+
+	resp := &volume_server_pb.VolumeConsolidateIndexResponse{}
+
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return resp, err
+	}
+
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return resp, err
+	}
+
+	err := vs.store.ConsolidateVolumeIndex(needle.VolumeId(req.VolumeId))
+
+	if err != nil {
+		glog.Errorf("volume consolidate index %v: %v", req, err)
+	} else {
+		glog.V(2).Infof("volume consolidate index %v", req)
+	}
+
+	return resp, err
+
+}
+
 func (vs *VolumeServer) VolumeDelete(ctx context.Context, req *volume_server_pb.VolumeDeleteRequest) (*volume_server_pb.VolumeDeleteResponse, error) {
 	resp := &volume_server_pb.VolumeDeleteResponse{}
 
@@ -232,7 +256,7 @@ func (vs *VolumeServer) VolumeConfigure(ctx context.Context, req *volume_server_
 
 }
 
-func (vs *VolumeServer) makeVolumeReadonly(ctx context.Context, v *storage.Volume, persist bool) error {
+func (vs *VolumeServer) makeVolumeReadonly(ctx context.Context, v *storage.Volume, canDelete bool, persist bool) error {
 	if err := vs.CheckMaintenanceMode(); err != nil {
 		return err
 	}
@@ -245,7 +269,7 @@ func (vs *VolumeServer) makeVolumeReadonly(ctx context.Context, v *storage.Volum
 	// rare case 1.5: it will be unlucky if heartbeat happened between step 1 and 2.
 
 	// step 2: mark local volume as readonly
-	if err := vs.store.MarkVolumeReadonly(v.Id, persist); err != nil {
+	if err := vs.store.MarkVolumeReadonly(v.Id, canDelete, persist); err != nil {
 		glog.Errorf("mark volume %d readonly: %v", v.Id, err)
 		return err
 	} else {
@@ -333,7 +357,7 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 		return resp, fmt.Errorf("volume %d not found", req.VolumeId)
 	}
 
-	if err := vs.makeVolumeReadonly(ctx, v, req.GetPersist()); err != nil {
+	if err := vs.makeVolumeReadonly(ctx, v, req.GetCanDelete(), req.GetPersist()); err != nil {
 		return resp, err
 	}
 

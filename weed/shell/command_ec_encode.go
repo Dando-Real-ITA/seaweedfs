@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -162,7 +163,7 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 		if *volumeId != 0 {
 			volumeIds = append(volumeIds, needle.VolumeId(*volumeId))
 		} else {
-			volumeIds, err = parseEcEncodeVolumeIds(*volumeIdsStr)
+			volumeIds, err = parseVolumeIdsFlag(*volumeIdsStr)
 			if err != nil {
 				return err
 			}
@@ -199,33 +200,6 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	}
 
 	return nil
-}
-
-func parseEcEncodeVolumeIds(volumeIdsStr string) ([]needle.VolumeId, error) {
-	var volumeIds []needle.VolumeId
-	seen := make(map[needle.VolumeId]bool)
-	for _, part := range strings.Split(volumeIdsStr, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		vidValue, err := strconv.ParseUint(part, 10, 32)
-		if err != nil || vidValue == 0 {
-			return nil, fmt.Errorf("invalid volume id %q in -volumeIds", part)
-		}
-		// ParseUint with bitSize 32 bounds the value; convert through uint32
-		// (matching the rest of the codebase) so the narrowing is provably safe.
-		vid := needle.VolumeId(uint32(vidValue))
-		if seen[vid] {
-			continue
-		}
-		seen[vid] = true
-		volumeIds = append(volumeIds, vid)
-	}
-	if len(volumeIds) == 0 {
-		return nil, fmt.Errorf("-volumeIds does not contain any valid volume id")
-	}
-	return volumeIds, nil
 }
 
 func chunkVolumeIds(volumeIds []needle.VolumeId, batchSize int) [][]needle.VolumeId {
@@ -287,7 +261,7 @@ func processEcEncodeBatch(commandEnv *CommandEnv, writer io.Writer, volumeIds []
 	// safely verified and deleted without waiting for all batches to finish.
 	// skippedNodes are excluded so a recovered node's stale orphan is never
 	// paired with a new-generation shard.
-	if err := EcBalance(commandEnv, balanceCollections, "", rp, diskType, maxParallelization, applyBalancing, skippedNodes); err != nil {
+	if err := EcBalance(commandEnv, balanceCollections, "", rp, diskType, maxParallelization, applyBalancing, skippedNodes, nil); err != nil {
 		return fmt.Errorf("re-balance ec shards for collection(s) %v: %w", balanceCollections, err)
 	}
 	if err := verifyEcShardsBeforeDelete(commandEnv, volumeIds, diskType, applyBalancing); err != nil {
@@ -403,7 +377,7 @@ func doEcEncode(commandEnv *CommandEnv, writer io.Writer, volumeIdToCollection m
 	for _, vid := range volumeIds {
 		for _, l := range locations[vid] {
 			ewg.Add(func() error {
-				if err := markVolumeReplicaWritable(commandEnv.option.GrpcDialOption, vid, l, false, false); err != nil {
+				if err := markVolumeReplicaWritable(context.Background(), commandEnv.option.GrpcDialOption, vid, l, false, false); err != nil {
 					return fmt.Errorf("mark volume %d as readonly on %s: %v", vid, l.Url, err)
 				}
 				return nil
@@ -517,7 +491,7 @@ func clearPreexistingEcShards(commandEnv *CommandEnv, topologyInfo *master_pb.To
 	// it. Always delete the full shard-id range so a wider custom ratio's
 	// leftovers are covered too.
 	reportedKey := func(addr pb.ServerAddress, vid uint32) string {
-		return string(addr) + "\x00" + strconv.Itoa(int(vid))
+		return string(addr) + "\x00" + strconv.FormatUint(uint64(vid), 10)
 	}
 	reported := make(map[string]struct{})
 	var nodes []pb.ServerAddress
@@ -801,6 +775,19 @@ func ecShardsClumpedOnOneNode(topoInfo *master_pb.TopologyInfo, vid needle.Volum
 	return "", false
 }
 
+// ecShardSummaryByNode says where a volume's shards are, one entry per node,
+// sorted so the message is stable. It names the ids and not just the count: a
+// set holding shards 0-9 and one holding 4-13 are both "10 shards", and which
+// ones survived is what says whether the set is recoverable and from where.
+func ecShardSummaryByNode(byNode map[pb.ServerAddress]erasure_coding.ShardBits) []string {
+	summary := make([]string, 0, len(byNode))
+	for node, bits := range byNode {
+		summary = append(summary, fmt.Sprintf("%s=%d shards %v", node, bits.Count(), slices.Collect(bits.All())))
+	}
+	sort.Strings(summary)
+	return summary
+}
+
 func verifyEcShardsBeforeDelete(commandEnv *CommandEnv, volumeIds []needle.VolumeId, diskType types.DiskType, expectSpread bool) error {
 	// Shard relocations from the preceding EC balance reach the master via
 	// volume-server heartbeats, so freshly distributed shards may not all be
@@ -830,22 +817,24 @@ func verifyEcShardsBeforeDelete(commandEnv *CommandEnv, volumeIds []needle.Volum
 		lastDegraded = lastDegraded[:0]
 		lastClumped = lastClumped[:0]
 		for _, vid := range volumeIds {
-			nodeShards, _ := collectEcNodeShardsInfo(topoInfo, vid, diskType)
+			// Count the shards wherever they landed, as waitForEcShardsToRegister
+			// above already does. generateEcShards writes them beside the source
+			// volume, so encoding a volume that lives on a non-default medium
+			// puts them on that medium while -diskType still says hdd. Counting
+			// only the -diskType bucket then reports a complete set as entirely
+			// missing and aborts an encode that in fact succeeded, leaving the
+			// volume as both a .dat and a full set of shards.
+			byNode := collectEcShardBitsByNode(topoInfo, vid)
 
 			var union erasure_coding.ShardBits
-			for _, info := range nodeShards {
-				union = erasure_coding.ShardBits(uint32(union) | info.Bitmap())
+			for _, bits := range byNode {
+				union |= bits
 			}
 
 			totalShards := erasure_coding.TotalShardsCount
 			degraded, err := erasure_coding.RequireRecoverableShardSet(uint32(vid), union, erasure_coding.DataShardsCount, totalShards)
 			if err != nil {
-				summary := make([]string, 0, len(nodeShards))
-				for node, info := range nodeShards {
-					summary = append(summary, fmt.Sprintf("%s=%s", node, info.String()))
-				}
-				sort.Strings(summary)
-				lastErr = fmt.Errorf("volume %d: %w (observed: %v)", vid, err, summary)
+				lastErr = fmt.Errorf("volume %d: %w (observed: %v)", vid, err, ecShardSummaryByNode(byNode))
 				break
 			}
 			if expectSpread {
@@ -859,8 +848,8 @@ func verifyEcShardsBeforeDelete(commandEnv *CommandEnv, volumeIds []needle.Volum
 				continue
 			}
 
-			glog.V(0).Infof("EC shard verification ok for volume %d on diskType %q: %d/%d shards present across %d nodes",
-				vid, diskType.ReadableString(), union.Count(), totalShards, len(nodeShards))
+			glog.V(0).Infof("EC shard verification ok for volume %d: %d/%d shards present across %d nodes",
+				vid, union.Count(), totalShards, len(byNode))
 		}
 
 		if lastErr == nil && len(lastDegraded) == 0 && len(lastClumped) == 0 {
@@ -902,7 +891,7 @@ func doDeleteVolumesWithLocations(commandEnv *CommandEnv, volumeIds []needle.Vol
 
 		for _, l := range locations {
 			ewg.Add(func() error {
-				if err := deleteVolume(commandEnv.option.GrpcDialOption, vid, l.ServerAddress(), false, false); err != nil {
+				if err := deleteVolume(context.Background(), commandEnv.option.GrpcDialOption, vid, l.ServerAddress(), false, false); err != nil {
 					return fmt.Errorf("deleteVolume %s volume %d: %v", l.Url, vid, err)
 				}
 				fmt.Printf("deleted volume %d from %s\n", vid, l.Url)
@@ -975,11 +964,11 @@ func selectVolumeIdsFromTopology(topologyInfo *master_pb.TopologyInfo, volumeSiz
 				totalVolumes++
 
 				// ignore remote volumes
-				if v.RemoteStorageName != "" && v.RemoteStorageKey != "" {
+				if v.RemoteStorageName != "" {
 					remoteVolumes++
 					if verbose {
-						fmt.Printf("skip volume %d on %s: remote volume (storage: %s, key: %s)\n",
-							v.Id, dn.Id, v.RemoteStorageName, v.RemoteStorageKey)
+						fmt.Printf("skip volume %d on %s: remote volume (storage: %s)\n",
+							v.Id, dn.Id, v.RemoteStorageName)
 					}
 					continue
 				}

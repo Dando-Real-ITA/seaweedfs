@@ -77,6 +77,22 @@ func (r *BucketRegistry) LoadBucketMetadata(entry *filer_pb.Entry) {
 	r.unMarkNotFound(entry.Name)
 }
 
+// bucketOwnerAccountId returns the account id owning the bucket entry. A bucket
+// created outside the S3 API (the admin UI, weed shell) records only its owning
+// identity, so that identity is resolved to its account. Without this such a
+// bucket looks unowned: it reports the default admin account as its ACL owner,
+// and under BucketOwnerEnforced every object written to it is stamped with that
+// account instead of the bucket owner.
+func bucketOwnerAccountId(accountManager AccountManager, entry *filer_pb.Entry) string {
+	if ownerAccountId := string(entry.Extended[s3_constants.ExtAmzOwnerKey]); ownerAccountId != "" {
+		return ownerAccountId
+	}
+	if identityName := string(entry.Extended[s3_constants.AmzIdentityId]); identityName != "" {
+		return accountManager.GetAccountIdByIdentityName(identityName)
+	}
+	return ""
+}
+
 func buildBucketMetadata(accountManager AccountManager, entry *filer_pb.Entry) *BucketMetaData {
 	entryJson, _ := json.Marshal(entry)
 	glog.V(3).Infof("build bucket metadata,entry=%s", entryJson)
@@ -85,7 +101,7 @@ func buildBucketMetadata(accountManager AccountManager, entry *filer_pb.Entry) *
 		IsTableBucket: s3tables.IsTableBucketEntry(entry),
 
 		//Default ownership: OwnershipBucketOwnerEnforced, which means Acl is disabled
-		ObjectOwnership: s3_constants.OwnershipBucketOwnerEnforced,
+		ObjectOwnership: s3_constants.DefaultOwnershipForExists,
 
 		// Default owner: `AccountAdmin`
 		Owner: &s3.Owner{
@@ -95,22 +111,17 @@ func buildBucketMetadata(accountManager AccountManager, entry *filer_pb.Entry) *
 	}
 	if entry.Extended != nil {
 		//ownership control
-		ownership, ok := entry.Extended[s3_constants.ExtOwnershipKey]
-		if ok {
-			ownership := string(ownership)
-			valid := s3_constants.ValidateOwnership(ownership)
-			if valid {
-				bucketMetadata.ObjectOwnership = ownership
-			} else {
-				glog.Warningf("Invalid ownership: %s, bucket: %s", ownership, bucketMetadata.Name)
+		if ownership, ok := entry.Extended[s3_constants.ExtOwnershipKey]; ok {
+			if !s3_constants.ValidateOwnership(string(ownership)) {
+				glog.Warningf("Invalid ownership: %s, bucket: %s", string(ownership), bucketMetadata.Name)
 			}
+			bucketMetadata.ObjectOwnership = s3_constants.EffectiveOwnership(string(ownership))
 		}
 
 		//access control policy
 		//owner
-		acpOwnerBytes, ok := entry.Extended[s3_constants.ExtAmzOwnerKey]
-		if ok && len(acpOwnerBytes) > 0 {
-			ownerAccountId := string(acpOwnerBytes)
+		ownerAccountId := bucketOwnerAccountId(accountManager, entry)
+		if ownerAccountId != "" {
 			ownerAccountName := accountManager.GetAccountNameById(ownerAccountId)
 			if ownerAccountName == "" {
 				glog.Warningf("owner[id=%s] is invalid, bucket: %s", ownerAccountId, bucketMetadata.Name)

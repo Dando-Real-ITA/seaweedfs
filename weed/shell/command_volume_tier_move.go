@@ -1,8 +1,10 @@
 package shell
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/placement"
 	"io"
 	"path/filepath"
 	"sync"
@@ -316,7 +318,7 @@ func (c *commandVolumeTierMove) doMoveOneVolume(commandEnv *CommandEnv, writer i
 	}
 
 	// mark all replicas as read only
-	if err = markVolumeReplicasWritable(commandEnv.option.GrpcDialOption, vid, locations, false, false); err != nil {
+	if err = markVolumeReplicasWritable(context.Background(), commandEnv.option.GrpcDialOption, vid, locations, false, false); err != nil {
 		return fmt.Errorf("mark volume %d as readonly on %s: %v", vid, locations[0].Url, err)
 	}
 	newAddress := pb.NewServerAddressFromDataNode(dst.dataNode)
@@ -325,9 +327,9 @@ func (c *commandVolumeTierMove) doMoveOneVolume(commandEnv *CommandEnv, writer i
 	deletedSource := sourceVolumeServer
 	if alreadyPlaced {
 		deletedSource = ""
-	} else if err = LiveMoveVolume(commandEnv.option.GrpcDialOption, writer, vid, sourceVolumeServer, newAddress, 5*time.Second, toDiskType.ReadableString(), ioBytePerSecond, true); err != nil {
+	} else if err = LiveMoveVolume(context.Background(), commandEnv.option.GrpcDialOption, writer, vid, sourceVolumeServer, newAddress, 5*time.Second, toDiskType.ReadableString(), ioBytePerSecond, true); err != nil {
 		// mark all replicas as writable
-		if err = markVolumeReplicasWritable(commandEnv.option.GrpcDialOption, vid, locations, true, false); err != nil {
+		if err = markVolumeReplicasWritable(context.Background(), commandEnv.option.GrpcDialOption, vid, locations, true, false); err != nil {
 			glog.Errorf("mark volume %d as writable on %s: %v", vid, locations[0].Url, err)
 		}
 
@@ -336,7 +338,7 @@ func (c *commandVolumeTierMove) doMoveOneVolume(commandEnv *CommandEnv, writer i
 
 	// If move is successful and replication is not empty, alter moved volume's replication setting
 	if *replicationString != "" {
-		if err = configureVolumeReplication(commandEnv.option.GrpcDialOption, vid, newAddress, *replicationString); err != nil {
+		if err = configureVolumeReplication(context.Background(), commandEnv.option.GrpcDialOption, vid, newAddress, *replicationString); err != nil {
 			// LiveMoveVolume already deleted sourceVolumeServer; mark surviving
 			// old replicas writable before aborting so the volume stays accessible.
 			restoreSurvivingReplicasWritable(commandEnv, vid, locations, deletedSource)
@@ -360,7 +362,7 @@ func (c *commandVolumeTierMove) doMoveOneVolume(commandEnv *CommandEnv, writer i
 	// stay read-only since we're keeping rather than deleting them.
 	for _, loc := range locations {
 		if preserveServers[loc.Url] {
-			if markErr := markVolumeWritable(commandEnv.option.GrpcDialOption, vid, loc.ServerAddress(), true, false); markErr != nil {
+			if markErr := markVolumeWritable(context.Background(), commandEnv.option.GrpcDialOption, vid, loc.ServerAddress(), true, false); markErr != nil {
 				glog.Errorf("mark volume %d as writable on preserved replica %s: %v", vid, loc.Url, markErr)
 			}
 		}
@@ -378,7 +380,7 @@ func (c *commandVolumeTierMove) doMoveOneVolume(commandEnv *CommandEnv, writer i
 		}
 		// keepRemoteData=true: remote-tiered replicas share one cloud object, so
 		// deleting a replica must not delete the object the survivors still point at.
-		if err = deleteVolume(commandEnv.option.GrpcDialOption, vid, loc.ServerAddress(), false, true); err != nil {
+		if err = deleteVolume(context.Background(), commandEnv.option.GrpcDialOption, vid, loc.ServerAddress(), false, true); err != nil {
 			fmt.Fprintf(writer, "failed to delete volume %d on %s: %v\n", vid, loc.Url, err)
 		}
 	}
@@ -392,7 +394,7 @@ func restoreSurvivingReplicasWritable(commandEnv *CommandEnv, vid needle.VolumeI
 		if loc.ServerAddress() == deletedSource {
 			continue
 		}
-		if markErr := markVolumeWritable(commandEnv.option.GrpcDialOption, vid, loc.ServerAddress(), true, false); markErr != nil {
+		if markErr := markVolumeWritable(context.Background(), commandEnv.option.GrpcDialOption, vid, loc.ServerAddress(), true, false); markErr != nil {
 			glog.Errorf("mark volume %d as writable on %s: %v", vid, loc.Url, markErr)
 		}
 	}
@@ -475,7 +477,7 @@ func (c *commandVolumeTierMove) ensureReplicationFulfilled(commandEnv *CommandEn
 	if replicationString != "" {
 		for _, r := range targetTierReplicas {
 			addr := pb.NewServerAddressFromDataNode(r.location.dataNode)
-			if configErr := configureVolumeReplication(commandEnv.option.GrpcDialOption, vid, addr, replicationString); configErr != nil {
+			if configErr := configureVolumeReplication(context.Background(), commandEnv.option.GrpcDialOption, vid, addr, replicationString); configErr != nil {
 				return nil, fmt.Errorf("volume %d: failed to configure replication on existing replica %s: %v", vid, r.location.dataNode.Id, configErr)
 			}
 		}
@@ -488,35 +490,45 @@ func (c *commandVolumeTierMove) ensureReplicationFulfilled(commandEnv *CommandEn
 
 	fmt.Fprintf(writer, "volume %d: creating %d additional replica(s) for replication %s\n", vid, additionalCopiesNeeded, replicaPlacement)
 
-	fn := capacityByFreeVolumeCount(toDiskType)
+	// One picker decides where copies go, so this command spreads and stays near
+	// the source the same way every other mover does. Constraints it cannot model
+	// -- replica placement, and a node already holding the volume -- stay here.
+	topo := topologyFromLocations(allLocations)
+	// The picker answers with a node; replica placement is judged on where that
+	// node sits, so keep the mapping back to its rack and data center.
+	placeOf := make(map[string]location, len(allLocations))
+	for _, l := range allLocations {
+		placeOf[l.dataNode.Id] = l
+	}
+	taken := make(map[string]bool)
 	copiesMade := 0
-	for _, candidateDst := range allLocations {
-		if copiesMade >= additionalCopiesNeeded {
+	for copiesMade < additionalCopiesNeeded {
+		dst := placement.PickTarget(topo, placement.PlacementPreference{
+			Source:   sourceAddress.String(),
+			DiskType: toDiskType,
+			Exclude:  taken,
+			Accept: func(dn *master_pb.DataNodeInfo, dc, rack string) bool {
+				if nodesWithVolume[dn.Id] {
+					return false
+				}
+				return satisfyReplicaPlacement(replicaPlacement, targetTierReplicas, newLocation(dc, rack, dn))
+			},
+		})
+		if dst == nil {
 			break
 		}
-		if fn(candidateDst.dataNode) <= 0 {
-			continue
-		}
-		// Skip nodes that already host this volume on any disk type to avoid
-		// VolumeCopy conflicts (e.g., same volume on source tier and target tier).
-		if nodesWithVolume[candidateDst.dataNode.Id] {
-			continue
-		}
-		if !satisfyReplicaPlacement(replicaPlacement, targetTierReplicas, candidateDst) {
-			continue
-		}
+		taken[dst.Id] = true
+		candidateDst := placeOf[dst.Id]
+		candidateAddress := pb.NewServerAddressFromDataNode(dst)
 
-		candidateAddress := pb.NewServerAddressFromDataNode(candidateDst.dataNode)
-		fmt.Fprintf(writer, "volume %d: replicating from %s to %s\n", vid, sourceAddress, candidateDst.dataNode.Id)
-
-		if copyErr := replicateVolumeToServer(commandEnv.option.GrpcDialOption, writer, vid, sourceAddress, candidateAddress, toDiskType.ReadableString()); copyErr != nil {
+		if copyErr := replicateVolumeToServer(context.Background(), commandEnv.option.GrpcDialOption, writer, vid, sourceAddress, candidateAddress, toDiskType.ReadableString()); copyErr != nil {
 			return nil, fmt.Errorf("replicate volume %d to %s: %v", vid, candidateDst.dataNode.Id, copyErr)
 		}
 
 		// Configure replication on the new replica if an explicit -toReplication was given.
 		// Without it, VolumeCopy already preserves the source's replication from the super block.
 		if replicationString != "" {
-			if configErr := configureVolumeReplication(commandEnv.option.GrpcDialOption, vid, candidateAddress, replicationString); configErr != nil {
+			if configErr := configureVolumeReplication(context.Background(), commandEnv.option.GrpcDialOption, vid, candidateAddress, replicationString); configErr != nil {
 				return nil, fmt.Errorf("volume %d: failed to configure replication on %s: %v", vid, candidateDst.dataNode.Id, configErr)
 			}
 		}
@@ -526,7 +538,8 @@ func (c *commandVolumeTierMove) ensureReplicationFulfilled(commandEnv *CommandEn
 			location: &candidateDst,
 			info:     targetTierReplicas[0].info,
 		})
-		addVolumeCount(candidateDst.dataNode.DiskInfos[string(toDiskType)], 1)
+		// PickTarget already spent the slot in topo, which shares these DataNodeInfo
+		// pointers with allLocations, so counting it again here would double it.
 		copiesMade++
 	}
 
@@ -589,4 +602,32 @@ func collectVolumeIdsForTierChange(topologyInfo *master_pb.TopologyInfo, volumeS
 	}
 
 	return
+}
+
+// topologyFromLocations rebuilds a topology snapshot from the locations a
+// command already collected, so placement sees exactly the candidate set the
+// command would have iterated.
+func topologyFromLocations(locations []location) *master_pb.TopologyInfo {
+	dcs := make(map[string]map[string][]*master_pb.DataNodeInfo)
+	var dcOrder []string
+	rackOrder := make(map[string][]string)
+	for _, l := range locations {
+		if _, ok := dcs[l.dc]; !ok {
+			dcs[l.dc] = make(map[string][]*master_pb.DataNodeInfo)
+			dcOrder = append(dcOrder, l.dc)
+		}
+		if _, ok := dcs[l.dc][l.rack]; !ok {
+			rackOrder[l.dc] = append(rackOrder[l.dc], l.rack)
+		}
+		dcs[l.dc][l.rack] = append(dcs[l.dc][l.rack], l.dataNode)
+	}
+	topo := &master_pb.TopologyInfo{}
+	for _, dc := range dcOrder {
+		dcInfo := &master_pb.DataCenterInfo{Id: dc}
+		for _, rack := range rackOrder[dc] {
+			dcInfo.RackInfos = append(dcInfo.RackInfos, &master_pb.RackInfo{Id: rack, DataNodeInfos: dcs[dc][rack]})
+		}
+		topo.DataCenterInfos = append(topo.DataCenterInfos, dcInfo)
+	}
+	return topo
 }

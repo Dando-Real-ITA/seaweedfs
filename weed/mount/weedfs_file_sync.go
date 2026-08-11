@@ -210,6 +210,14 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
+	// Re-check under the lock: Unlink sets the flag under it, so a flush that
+	// was already past the earlier check cannot write the entry back after
+	// the delete removed it.
+	if fh.isDeleted {
+		glog.V(3).Infof("flushMetadataToFiler %s fh %d: file was unlinked, skipping", fileFullPath, fh.fh)
+		return nil
+	}
+
 	entry := fh.GetEntry()
 	entry.Name = name // this flush may be just after a rename operation
 
@@ -258,6 +266,9 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 		SkipCheckParentDirectory: true,
 	}
 
+	// Snapshot with local ids before the request mapping mutates the clone:
+	// on ack this becomes the handle's base, judged against future events.
+	baseSnapshot := proto.Clone(requestEntry).(*filer_pb.Entry)
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
 	resp, err := wfs.streamCreateEntry(ctx, request)
@@ -269,7 +280,15 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	event := resp.GetMetadataEvent()
 	if event == nil {
 		event = metadataUpdateEvent(string(dir), request.Entry)
+		if event != nil {
+			event.TsNs = ackVersionTsNs(resp)
+		}
 	}
+	// The filer acknowledged this state at the event's log position (or, for
+	// a no-op create, at the response's log position); older queued
+	// subscription events must not roll the handle back.
+	fh.setAuthoritativeBase(baseSnapshot)
+	fh.advanceEntryVersion(ackVersionTsNs(resp), resp.GetLogSignature())
 	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 		glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))

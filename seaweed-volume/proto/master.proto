@@ -59,6 +59,8 @@ service Seaweed {
   }
   rpc VolumeGrow (VolumeGrowRequest) returns (VolumeGrowResponse) {
   }
+  rpc CollectionStatistics (CollectionStatisticsRequest) returns (CollectionStatisticsResponse) {
+  }
 }
 
 //////////////////////////////////////////////////
@@ -105,6 +107,16 @@ message Heartbeat {
   // physical disk capacity per disk type, in bytes, from the underlying filesystem
   map<string, uint64> disk_total_bytes = 25;
   map<string, uint64> disk_free_bytes = 26;
+
+  // Digest of every volume in this heartbeat's view of the server, letting the
+  // master check its copy is current without being sent the whole list. Absent
+  // from servers that do not compute it, and distinct from a digest of 0, which
+  // is what a server holding no volumes reports.
+  optional uint64 volume_digest = 27;
+  // Volumes whose reported state changed since the last heartbeat, sent in
+  // place of `volumes`. A master that does not understand this never sets
+  // volume_digest_supported, so it keeps being sent the whole list.
+  repeated VolumeInformationMessage changed_volumes = 28;
 }
 
 message HeartbeatResponse {
@@ -115,6 +127,12 @@ message HeartbeatResponse {
   repeated StorageBackend storage_backends = 5;
   repeated string duplicated_uuids = 6;
   bool preallocate = 7;
+  // The master's view of this server's volumes disagrees with the reported
+  // digest, so it needs the full volume list rather than changes alone.
+  bool resend_full_volume_list = 8;
+  // The master compares volume digests, so a server that reports one may send
+  // changed_volumes in place of its whole list.
+  bool volume_digest_supported = 9;
 }
 
 message VolumeInformationMessage {
@@ -294,6 +312,11 @@ message StatisticsResponse {
   uint64 total_size = 4;
   uint64 used_size = 5;
   uint64 file_count = 6;
+  // sizes counting one copy of the data: a single replica of a regular volume,
+  // the data shards of an ec volume. logical_total_size scales the free space
+  // by the copies the requested replication makes.
+  uint64 logical_total_size = 7;
+  uint64 logical_used_size = 8;
 }
 
 //
@@ -308,6 +331,26 @@ message CollectionListRequest {
 }
 message CollectionListResponse {
   repeated Collection collections = 1;
+}
+
+// Summarises what each collection holds, so a caller tracking usage does not
+// have to be sent every volume in the cluster to add it up itself.
+message CollectionStatisticsRequest {
+}
+message CollectionStatisticsResponse {
+  repeated CollectionStatistics collections = 1;
+}
+message CollectionStatistics {
+  string collection = 1;
+  uint64 file_count = 2;
+  uint64 delete_count = 3;
+  uint64 deleted_byte_count = 4;
+  // one copy of the data: a single replica of a regular volume, the data
+  // shards of an ec volume
+  uint64 size = 5;
+  // what is on disk: every replica, and parity shards
+  uint64 physical_size = 6;
+  uint64 volume_count = 7;
 }
 
 message CollectionDeleteRequest {

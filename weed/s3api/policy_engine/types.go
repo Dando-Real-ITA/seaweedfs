@@ -7,7 +7,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	s3const "github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -50,6 +49,15 @@ var (
 		s3const.S3_ACTION_LIST_PARTS:             true,
 		s3const.S3_ACTION_LIST_MULTIPART_UPLOADS: true,
 	}
+
+	// lowerMultipartActionSet keys the same actions for case-insensitive lookup.
+	lowerMultipartActionSet = func() map[string]bool {
+		lowered := make(map[string]bool, len(multipartActionSet))
+		for action := range multipartActionSet {
+			lowered[strings.ToLower(action)] = true
+		}
+		return lowered
+	}()
 )
 
 // StringOrStringSlice represents a value that can be either a string or []string
@@ -311,8 +319,7 @@ type PolicyEvaluationArgs struct {
 
 // PolicyCache for caching compiled policies
 type PolicyCache struct {
-	policies   map[string]*CompiledPolicy
-	lastUpdate time.Time
+	policies map[string]*CompiledPolicy
 }
 
 // CompiledPolicy represents a policy that has been compiled for efficient evaluation
@@ -681,6 +688,38 @@ func (cs *CompiledStatement) MatchesAction(action string) bool {
 	}
 
 	return false
+}
+
+// statementMayAllowAction reports whether a statement's actions can match the
+// action, including the multipart operations that ride on s3:PutObject. It is
+// looser than either evaluator on purpose: the IAM authorizer matches action
+// names case-insensitively and a policy variable resolves per request, so a
+// classifier that reads them strictly would miss a grant that is really there.
+func statementMayAllowAction(actions []string, action string) bool {
+	for _, pattern := range actions {
+		if actionPatternMayMatch(pattern, action) {
+			return true
+		}
+	}
+	if !lowerMultipartActionSet[strings.ToLower(action)] {
+		return false
+	}
+	for _, pattern := range actions {
+		if actionPatternMayMatch(pattern, s3const.S3_ACTION_PUT_OBJECT) {
+			return true
+		}
+	}
+	return false
+}
+
+func actionPatternMayMatch(pattern, action string) bool {
+	if PolicyVariableRegex.MatchString(pattern) {
+		return true
+	}
+	if strings.EqualFold(pattern, action) {
+		return true
+	}
+	return wildcard.MatchesWildcard(strings.ToLower(pattern), strings.ToLower(action))
 }
 
 // MatchesResource checks if a resource matches any of the compiled resource matchers

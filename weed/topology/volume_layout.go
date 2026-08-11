@@ -35,73 +35,6 @@ const (
 	NoWritableVolumes             = "No writable volumes"
 )
 
-type stateIndicator func(copyState) bool
-
-func ExistCopies() stateIndicator {
-	return func(state copyState) bool { return state != noCopies }
-}
-
-type volumesBinaryState struct {
-	rp        *super_block.ReplicaPlacement
-	name      volumeState    // the name for volume state (eg. "Readonly", "Oversized")
-	indicator stateIndicator // indicate whether the volumes should be marked as `name`
-	copyMap   map[needle.VolumeId]*VolumeLocationList
-}
-
-func NewVolumesBinaryState(name volumeState, rp *super_block.ReplicaPlacement, indicator stateIndicator) *volumesBinaryState {
-	return &volumesBinaryState{
-		rp:        rp,
-		name:      name,
-		indicator: indicator,
-		copyMap:   make(map[needle.VolumeId]*VolumeLocationList),
-	}
-}
-
-func (v *volumesBinaryState) Dump() (res []uint32) {
-	for vid, list := range v.copyMap {
-		if v.indicator(v.copyState(list)) {
-			res = append(res, uint32(vid))
-		}
-	}
-	return
-}
-
-func (v *volumesBinaryState) IsTrue(vid needle.VolumeId) bool {
-	list, _ := v.copyMap[vid]
-	return v.indicator(v.copyState(list))
-}
-
-func (v *volumesBinaryState) Add(vid needle.VolumeId, dn *DataNode) {
-	list, _ := v.copyMap[vid]
-	if list != nil {
-		list.Set(dn)
-		return
-	}
-	list = NewVolumeLocationList()
-	list.Set(dn)
-	v.copyMap[vid] = list
-}
-
-func (v *volumesBinaryState) Remove(vid needle.VolumeId, dn *DataNode) {
-	list, _ := v.copyMap[vid]
-	if list != nil {
-		list.Remove(dn)
-		if list.Length() == 0 {
-			delete(v.copyMap, vid)
-		}
-	}
-}
-
-func (v *volumesBinaryState) copyState(list *VolumeLocationList) copyState {
-	if list == nil {
-		return noCopies
-	}
-	if list.Length() < v.rp.GetCopyCount() {
-		return insufficientCopies
-	}
-	return enoughCopies
-}
-
 // volumeSizeTracking holds per-volume size accounting for weighted assignment.
 type volumeSizeTracking struct {
 	effectiveSize   uint64    // reported + pending assigned bytes
@@ -128,19 +61,22 @@ type VolumeLayout struct {
 	vid2location     map[needle.VolumeId]*VolumeLocationList
 	writables        []needle.VolumeId // transient array of writable volume id
 	crowded          map[needle.VolumeId]struct{}
-	readonlyVolumes  *volumesBinaryState // readonly volumes
-	oversizedVolumes *volumesBinaryState // oversized volumes
 	vacuumedVolumes  map[needle.VolumeId]time.Time
 	volumeSizeLimit  uint64
 	replicationAsMin bool
 	accessLock       sync.RWMutex
 	sizeTracking     map[needle.VolumeId]*volumeSizeTracking
+	// dropped: the layout went away with its collection; late registrations must re-resolve.
+	dropped bool
 }
 
 type VolumeLayoutStats struct {
 	TotalSize uint64
 	UsedSize  uint64
-	FileCount uint64
+	// LogicalUsedSize counts one copy of the data: a single replica of a
+	// regular volume, the data shards of an EC volume.
+	LogicalUsedSize uint64
+	FileCount       uint64
 }
 
 func NewVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType, volumeSizeLimit uint64, replicationAsMin bool) *VolumeLayout {
@@ -151,8 +87,6 @@ func NewVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType
 		vid2location:     make(map[needle.VolumeId]*VolumeLocationList),
 		writables:        *new([]needle.VolumeId),
 		crowded:          make(map[needle.VolumeId]struct{}),
-		readonlyVolumes:  NewVolumesBinaryState(readOnlyState, rp, ExistCopies()),
-		oversizedVolumes: NewVolumesBinaryState(oversizedState, rp, ExistCopies()),
 		vacuumedVolumes:  make(map[needle.VolumeId]time.Time),
 		volumeSizeLimit:  volumeSizeLimit,
 		replicationAsMin: replicationAsMin,
@@ -187,40 +121,46 @@ func (vl *VolumeLayout) initSizeTracking(vid needle.VolumeId, size uint64, compa
 	}
 }
 
-func (vl *VolumeLayout) RegisterVolume(v *storage.VolumeInfo, dn *DataNode) {
+// RegisterVolume records a volume location. It refuses a layout dropped with
+// its collection — the caller must re-resolve, or the bits it sets would leak.
+func (vl *VolumeLayout) RegisterVolume(v *storage.VolumeInfo, dn *DataNode) bool {
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
 
+	if vl.dropped {
+		return false
+	}
+
 	defer vl.rememberOversizedVolume(v, dn)
 
-	vl.getOrCreateLocationList(v.Id).Set(dn)
-	vl.initSizeTracking(v.Id, v.Size, v.CompactRevision)
+	moveLookupOwnership(v.Id, vl.getOrCreateLocationList(v.Id).Set(dn), dn)
+	if !v.ReadOnly {
+		vl.initSizeTracking(v.Id, v.Size, v.CompactRevision)
+	}
 	// glog.V(4).Infof("volume %d added to %s len %d copy %d", v.Id, dn.Id(), vl.vid2location[v.Id].Length(), v.ReplicaPlacement.GetCopyCount())
-	for _, dn := range vl.vid2location[v.Id].list {
+	location := vl.vid2location[v.Id]
+	for _, dn := range location.list {
 		if vInfo, err := dn.GetVolumesById(v.Id); err == nil {
 			if vInfo.ReadOnly {
 				glog.V(1).Infof("vid %d removed from writable", v.Id)
 				vl.removeFromWritable(v.Id)
-				vl.readonlyVolumes.Add(v.Id, dn)
-				return
-			} else {
-				vl.readonlyVolumes.Remove(v.Id, dn)
+				location.SetReadOnly(dn, true)
+				return true
 			}
+			location.SetReadOnly(dn, false)
 		} else {
 			glog.V(1).Infof("vid %d removed from writable", v.Id)
 			vl.removeFromWritable(v.Id)
-			vl.readonlyVolumes.Remove(v.Id, dn)
-			return
+			location.SetReadOnly(dn, false)
+			return true
 		}
 	}
-
+	return true
 }
 
 func (vl *VolumeLayout) rememberOversizedVolume(v *storage.VolumeInfo, dn *DataNode) {
-	if vl.isOversized(v) {
-		vl.oversizedVolumes.Add(v.Id, dn)
-	} else {
-		vl.oversizedVolumes.Remove(v.Id, dn)
+	if location, ok := vl.vid2location[v.Id]; ok {
+		location.SetOversized(dn, vl.isOversized(v))
 	}
 }
 
@@ -239,6 +179,19 @@ func (vl *VolumeLayout) rememberOversizedVolume(v *storage.VolumeInfo, dn *DataN
 func (vl *VolumeLayout) UpdateVolumeSize(vid needle.VolumeId, reportedSize uint64, compactRevision uint32) (recoveredToWritable bool) {
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
+
+	// Tracking exists to place writes, and nothing is written to a volume any
+	// replica reports read-only. Most volumes in a tiered cluster are read-only,
+	// so an entry each is the layout's largest cost. Asked of the volume rather
+	// than of the replica reporting, so which replica arrives first cannot
+	// decide the answer. A volume held out of the writable list for capacity is
+	// still all-writable and keeps its entry, which is what enforces the
+	// recovery delay.
+	if !vl.isAllWritable(vid) {
+		delete(vl.sizeTracking, vid)
+		vl.removeFromCrowded(vid)
+		return false
+	}
 
 	now := time.Now()
 	st := vl.sizeTracking[vid]
@@ -287,7 +240,7 @@ func (vl *VolumeLayout) UpdateVolumeSize(vid needle.VolumeId, reportedSize uint6
 	if reportedSize >= vl.volumeSizeLimit {
 		return false // actual on-disk size still over limit; stay out
 	}
-	if vl.oversizedVolumes.IsTrue(vid) {
+	if vl.vid2location[vid].AnyOversized() {
 		return false
 	}
 	if !vl.enoughCopies(vid) || !vl.isAllWritable(vid) {
@@ -312,10 +265,9 @@ func (vl *VolumeLayout) UnRegisterVolume(v *storage.VolumeInfo, dn *DataNode) {
 		return
 	}
 
-	if location.Remove(dn) {
+	if removed := location.Remove(dn); removed != nil {
+		moveLookupOwnership(v.Id, removed, nil)
 
-		vl.readonlyVolumes.Remove(v.Id, dn)
-		vl.oversizedVolumes.Remove(v.Id, dn)
 		vl.ensureCorrectWritables(v.Id)
 
 		if location.Length() == 0 {
@@ -337,21 +289,25 @@ func (vl *VolumeLayout) EnsureCorrectWritables(v *storage.VolumeInfo) {
 func (vl *VolumeLayout) ensureCorrectWritables(vid needle.VolumeId) {
 	isEnoughCopies := vl.enoughCopies(vid)
 	isAllWritable := vl.isAllWritable(vid)
-	isOversizedVolume := vl.oversizedVolumes.IsTrue(vid)
+	isOversizedVolume := vl.vid2location[vid].AnyOversized()
 	if isEnoughCopies && isAllWritable && !isOversizedVolume {
 		vl.setVolumeWritable(vid)
-	} else {
-		if !isEnoughCopies {
-			glog.V(0).Infof("volume %d does not have enough copies", vid)
-		}
-		if !isAllWritable {
-			glog.V(0).Infof("volume %d are not all writable", vid)
-		}
-		if isOversizedVolume {
-			glog.V(1).Infof("volume %d are oversized", vid)
-		}
-		glog.V(0).Infof("volume %d remove from writable", vid)
-		vl.removeFromWritable(vid)
+		return
+	}
+	// removeFromWritable reports the transition itself, and only when there is
+	// one. Explain it only then: every heartbeat re-runs this for every volume,
+	// so a volume that is simply staying read-only must not log.
+	if !vl.removeFromWritable(vid) {
+		return
+	}
+	if !isEnoughCopies {
+		glog.V(0).Infof("volume %d does not have enough copies", vid)
+	}
+	if !isAllWritable {
+		glog.V(0).Infof("volume %d is not fully writable", vid)
+	}
+	if isOversizedVolume {
+		glog.V(0).Infof("volume %d is oversized", vid)
 	}
 }
 
@@ -780,7 +736,17 @@ func ceilDiv(a, b uint32) uint32 {
 func (vl *VolumeLayout) GetWritableVolumeCount() (active, crowded int) {
 	vl.accessLock.RLock()
 	defer vl.accessLock.RUnlock()
-	return len(vl.writables), len(vl.crowded)
+	// The crowded map retains volumes that later became unwritable (full,
+	// read-only), so their state survives transient writability flips. Count
+	// only the writable ones: growth decisions compare crowded against
+	// writables, and a raw len(vl.crowded) can exceed len(vl.writables)
+	// permanently, demanding growth forever.
+	for _, vid := range vl.writables {
+		if _, ok := vl.crowded[vid]; ok {
+			crowded++
+		}
+	}
+	return len(vl.writables), crowded
 }
 
 func (vl *VolumeLayout) CloneWritableVolumes() (writables []needle.VolumeId) {
@@ -836,8 +802,8 @@ func (vl *VolumeLayout) SetVolumeReadOnly(dn *DataNode, vid needle.VolumeId) boo
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
 
-	if _, ok := vl.vid2location[vid]; ok {
-		vl.readonlyVolumes.Add(vid, dn)
+	if location, ok := vl.vid2location[vid]; ok {
+		location.SetReadOnly(dn, true)
 		return vl.removeFromWritable(vid)
 	}
 	return true
@@ -847,8 +813,8 @@ func (vl *VolumeLayout) SetVolumeWritable(dn *DataNode, vid needle.VolumeId) boo
 	vl.accessLock.Lock()
 	defer vl.accessLock.Unlock()
 
-	if _, ok := vl.vid2location[vid]; ok {
-		vl.readonlyVolumes.Remove(vid, dn)
+	if location, ok := vl.vid2location[vid]; ok {
+		location.SetReadOnly(dn, false)
 	}
 
 	if vl.enoughCopies(vid) {
@@ -862,9 +828,8 @@ func (vl *VolumeLayout) SetVolumeUnavailable(dn *DataNode, vid needle.VolumeId) 
 	defer vl.accessLock.Unlock()
 
 	if location, ok := vl.vid2location[vid]; ok {
-		if location.Remove(dn) {
-			vl.readonlyVolumes.Remove(vid, dn)
-			vl.oversizedVolumes.Remove(vid, dn)
+		if removed := location.Remove(dn); removed != nil {
+			moveLookupOwnership(vid, removed, nil)
 			wasWritable := false
 			if location.Length() < vl.rp.GetCopyCount() {
 				glog.V(0).Infoln("Volume", vid, "has", location.Length(), "replica, less than required", vl.rp.GetCopyCount())
@@ -898,16 +863,19 @@ func (vl *VolumeLayout) SetVolumeAvailable(dn *DataNode, vid needle.VolumeId, is
 	if err != nil {
 		return false
 	}
+	if vl.dropped {
+		return false
+	}
 
 	// A disconnect during a long vacuum can drop the entry while the volume is
-	// still on the node; re-create it (and seed size tracking) instead of
-	// dereferencing a nil location, so the commit also repairs the split.
-	vl.getOrCreateLocationList(vid).Set(dn)
-	vl.initSizeTracking(vid, vInfo.Size, vInfo.CompactRevision)
+	// still on the node; re-create it instead of dereferencing a nil location,
+	// so the commit also repairs the split.
+	moveLookupOwnership(vid, vl.getOrCreateLocationList(vid).Set(dn), dn)
 
 	if vInfo.ReadOnly || isReadOnly || isFullCapacity {
 		return false
 	}
+	vl.initSizeTracking(vid, vInfo.Size, vInfo.CompactRevision)
 
 	if vl.enoughCopies(vid) {
 		becameWritable = vl.setVolumeWritable(vid)
@@ -1009,7 +977,8 @@ func (vl *VolumeLayout) Stats() *VolumeLayoutStats {
 		size, fileCount := vll.Stats(vid, freshThreshold)
 		ret.FileCount += uint64(fileCount)
 		ret.UsedSize += size * uint64(vll.Length())
-		if vl.readonlyVolumes.IsTrue(vid) {
+		ret.LogicalUsedSize += size
+		if vll.AnyReadOnly() {
 			ret.TotalSize += size * uint64(vll.Length())
 		} else {
 			ret.TotalSize += vl.volumeSizeLimit * uint64(vll.Length())

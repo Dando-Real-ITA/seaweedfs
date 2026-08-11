@@ -120,7 +120,7 @@ func (c *commandVolumeMerge) Do(args []string, commandEnv *CommandEnv, writer io
 		if !cleanupTarget {
 			return
 		}
-		if delErr := deleteVolume(commandEnv.option.GrpcDialOption, volumeId, targetServer, false, false); delErr != nil {
+		if delErr := deleteVolume(context.Background(), commandEnv.option.GrpcDialOption, volumeId, targetServer, false, false); delErr != nil {
 			glog.Warningf("failed to clean up temporary merge volume %d on %s: %v", volumeId, targetServer, delErr)
 		}
 	}()
@@ -187,12 +187,12 @@ func (c *commandVolumeMerge) Do(args []string, commandEnv *CommandEnv, writer io
 
 	for i, replica := range replicas {
 		sourceServer := pb.NewServerAddressFromDataNode(replica.location.dataNode)
-		if _, err = copyVolume(commandEnv.option.GrpcDialOption, writer, volumeId, targetServer, sourceServer, "", 0, false); err != nil {
+		if _, _, err = copyVolume(context.Background(), commandEnv.option.GrpcDialOption, writer, volumeId, targetServer, sourceServer, "", 0, false); err != nil {
 			return fmt.Errorf("rebuild replica %d/%d on %s from merged volume %d: %w; merged copy kept on %s, re-run to finish", i+1, len(replicas), sourceServer, volumeId, err, targetServer)
 		}
 	}
 
-	if err = deleteVolume(commandEnv.option.GrpcDialOption, volumeId, targetServer, false, false); err != nil {
+	if err = deleteVolume(context.Background(), commandEnv.option.GrpcDialOption, volumeId, targetServer, false, false); err != nil {
 		return err
 	}
 
@@ -423,7 +423,9 @@ func needleBlobFromNeedle(n *needle.Needle, version needle.Version) ([]byte, typ
 	memFile := newMemoryBackendFile()
 	defer memFile.Close()
 
-	_, size, actualSize, err := n.Append(memFile, version)
+	// Append reports Size(n.DataSize); the .dat header and the needle map both use
+	// n.Size, which Append fills in as it serializes.
+	_, _, actualSize, err := n.Append(memFile, version)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -433,7 +435,7 @@ func needleBlobFromNeedle(n *needle.Needle, version needle.Version) ([]byte, typ
 	if err != nil && err != io.EOF {
 		return nil, 0, err
 	}
-	return buf[:read], size, nil
+	return buf[:read], n.Size, nil
 }
 
 func allocateMergeVolumeOnThirdLocation(grpcDialOption grpc.DialOption, allLocations []location, replicas []*VolumeReplica, info *master_pb.VolumeInformationMessage, replicaPlacement *super_block.ReplicaPlacement) (pb.ServerAddress, error) {

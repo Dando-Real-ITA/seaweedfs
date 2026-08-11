@@ -234,6 +234,30 @@ var (
 			Help:      "The last send timestamp of the filer subscription.",
 		}, []string{"sourceFiler", "clientName", "path"})
 
+	FilerSubscribeUnprovenGapCrossings = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "subscribe_unproven_gap_crossings",
+			Help:      "Times a metadata subscriber moved past a log range without proof it was persisted: scope=aggregated means a peer may not have flushed it, scope=local means this filer's own log flush was wedged past the give-up bound.",
+		}, []string{"scope"})
+
+	FilerSubscribeGapStalledGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "subscribe_gap_stalled",
+			Help:      "Number of metadata subscribers currently parked waiting to read past a gap in the metadata log.",
+		}, []string{"scope"})
+
+	FilerMetaAggregatorReplayFailures = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "meta_aggregator_replay_failures",
+			Help:      "Number of peer metadata events skipped after replay retries were exhausted, leaving that entry diverged from the peer.",
+		}, []string{"peer"})
+
 	// Sampled only on first creation, so counts track distinct objects.
 	FilerObjectSizeBytesHistogram = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
@@ -881,6 +905,9 @@ func init() {
 	Gather.MustRegister(FilerStoreHistogram)
 	Gather.MustRegister(FilerSyncOffsetGauge)
 	Gather.MustRegister(FilerServerLastSendTsOfSubscribeGauge)
+	Gather.MustRegister(FilerSubscribeGapStalledGauge)
+	Gather.MustRegister(FilerSubscribeUnprovenGapCrossings)
+	Gather.MustRegister(FilerMetaAggregatorReplayFailures)
 	Gather.MustRegister(FilerObjectSizeBytesHistogram)
 	Gather.MustRegister(collectors.NewGoCollector())
 	Gather.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))

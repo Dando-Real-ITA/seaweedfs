@@ -160,6 +160,12 @@ const (
 
 	// Truncated request body (fewer bytes than Content-Length)
 	ErrIncompleteBody
+
+	// Peer went away before the request body was fully received
+	ErrClientDisconnected
+
+	ErrInvalidRenameSource
+	ErrRenameDestinationSameAsSource
 )
 
 // Error message constants for checksum validation
@@ -317,6 +323,13 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "You did not provide the number of bytes specified by the Content-Length HTTP header.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	// 499 has no RFC; it is nginx's code for a client that went away, and is what
+	// log pipelines already recognise for this case.
+	ErrClientDisconnected: {
+		Code:           "ClientDisconnected",
+		Description:    "The client disconnected before the request body was fully received.",
+		HTTPStatusCode: 499,
+	},
 
 	ErrInvalidPart: {
 		Code:           "InvalidPart",
@@ -337,6 +350,16 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrInvalidCopySource: {
 		Code:           "InvalidArgument",
 		Description:    "Copy Source must mention the source bucket and key: sourcebucket/sourcekey.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidRenameSource: {
+		Code:           "InvalidArgument",
+		Description:    "Rename Source must mention the source bucket and key: sourcebucket/sourcekey.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrRenameDestinationSameAsSource: {
+		Code:           "InvalidRequest",
+		Description:    "This rename request is illegal because it is trying to rename an object to itself.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidTag: {

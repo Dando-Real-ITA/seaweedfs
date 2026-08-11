@@ -137,6 +137,35 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	return inode
 }
 
+// IncrementNlookup takes one more reference on an inode already in the table,
+// reporting false if it is not there.
+func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
+	i.Lock()
+	defer i.Unlock()
+	entry, found := i.inode2path[inode]
+	if !found {
+		return false
+	}
+	entry.nlookup++
+	return true
+}
+
+// InodeForListing returns the inode number a readdir should report for path
+// without entering it in the table. Nothing is reserved, so the collision probe
+// Lookup does is skipped: the worst case is a repeated st_ino in one listing.
+func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, possibleInode uint64) uint64 {
+	i.RLock()
+	inode, found := i.path2inode[path]
+	i.RUnlock()
+	if found {
+		return inode
+	}
+	if possibleInode != 0 {
+		return possibleInode
+	}
+	return path.AsInode(unixTime)
+}
+
 func (i *InodeToPath) AllocateInode(path util.FullPath, unixTime int64) uint64 {
 	if path == "/" {
 		return 1
@@ -510,7 +539,11 @@ func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (sourceInod
 	return
 }
 
-func (i *InodeToPath) Forget(inode, nlookup uint64, onForgetDir func(dir util.FullPath)) {
+// Forget drops nlookup references. onRelease, if given, runs at the moment the
+// inode is released and while the table is still locked: state keyed by the
+// inode number has to be dropped there, because the number is derived from the
+// path and a lookup arriving after the unlock would be handed the same one.
+func (i *InodeToPath) Forget(inode, nlookup uint64, onRelease func(inode uint64), onForgetDir func(dir util.FullPath)) {
 	var dirPaths []util.FullPath
 	callOnForgetDir := false
 
@@ -525,6 +558,9 @@ func (i *InodeToPath) Forget(inode, nlookup uint64, onForgetDir func(dir util.Fu
 		}
 		glog.V(4).Infof("kernel forget: inode %d paths %v nlookup %d", inode, path.paths, path.nlookup)
 		if path.nlookup == 0 {
+			if onRelease != nil {
+				onRelease(inode)
+			}
 			if _, isDir := i.dirStates[inode]; isDir && onForgetDir != nil {
 				dirPaths = append([]util.FullPath(nil), path.paths...)
 				callOnForgetDir = true

@@ -200,7 +200,9 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	sameDestination := srcBucket == dstBucket && srcObject == dstObject
-	if sameDestination && !(replaceMeta || replaceTagging) {
+	// A self-copy into a versioned bucket writes a new version instead of overwriting in
+	// place, so it is not the no-op AWS rejects. It is how an earlier version is restored.
+	if sameDestination && !(replaceMeta || replaceTagging) && srcVersioningState != s3_constants.VersioningEnabled {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopyDest)
 		return
 	}
@@ -230,12 +232,13 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if sameDestination && (replaceMeta || replaceTagging) && s3a.canUseMetadataOnlySelfCopy(entry, r, dstBucket, dstObject) {
+	replacesSource := copyReplacesSourceEntry(sameDestination, dstVersioningState, srcVersionId)
+
+	if replacesSource && (replaceMeta || replaceTagging) && s3a.canUseMetadataOnlySelfCopy(entry, r, dstBucket, dstObject) {
 		var dstVersionId string
 		var etag string
-		// A non-versioned in-place metadata replace routes to the owner as a
-		// serialized PATCH (off the distributed lock); versioned/suspended (which
-		// create a new version) and the no-owner bootstrap keep the lock.
+		// An in-place metadata replace routes to the owner as a serialized PATCH
+		// (off the distributed lock); the no-owner bootstrap keeps the lock.
 		//
 		// REPLACE can also change Content-Type, which lives on Attributes.Mime,
 		// not Extended. The routed PATCH only carries Extended keys, so when the
@@ -244,7 +247,7 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		owner := s3a.objectWriteOwner(dstBucket, dstObject)
 		sourceMime := entry.GetAttributes().GetMime()
 		mimeChanged := resolveDestinationMime(r.Header, sourceMime, replaceMeta) != sourceMime
-		routeInPlace := owner != "" && dstVersioningState == "" && !mimeChanged
+		routeInPlace := owner != "" && !mimeChanged
 		selfCopyBody := func() s3err.ErrorCode {
 			currentEntry, currentErr := s3a.resolveCopySourceEntry(srcBucket, srcObject, srcVersionId, srcVersioningState)
 			if errCode := classifyCopySourceError(currentEntry, currentErr); errCode != s3err.ErrNone {
@@ -414,7 +417,7 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		}
 	} else {
 		// Use unified copy strategy approach
-		dstChunks, dstMetadata, copyErr := s3a.executeUnifiedCopyStrategy(entry, r, srcBucket, dstBucket, srcObject, dstObject)
+		dstChunks, dstMetadata, copyErr := s3a.executeUnifiedCopyStrategy(entry, r, srcBucket, dstBucket, srcObject, dstObject, replacesSource)
 		if copyErr != nil {
 			glog.Errorf("CopyObjectHandler unified copy error: %v", copyErr)
 			// Map errors to appropriate S3 errors
@@ -470,6 +473,18 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 
 	writeSuccessResponseXML(w, r, response)
 
+}
+
+// copyReplacesSourceEntry reports whether a copy writes back to the very entry it
+// read, which is what lets a strategy hand the source's chunk fids to the
+// destination instead of copying the data. Nothing refcounts a plain shared chunk
+// list, so a second live entry on the same chunks loses its data as soon as either
+// side is deleted. A versioned destination writes a new version file, a suspended
+// one writes the null version next to a .versions/ entry that stays live, and a
+// source pinned to a versionId reads a version file that outlives the copy — those
+// all need the chunks copied for real, as does any copy to a different key.
+func copyReplacesSourceEntry(sameDestination bool, dstVersioningState, srcVersionId string) bool {
+	return sameDestination && dstVersioningState == "" && srcVersionId == ""
 }
 
 func cloneProtoEntry(entry *filer_pb.Entry) *filer_pb.Entry {
@@ -581,8 +596,9 @@ func (s3a *S3ApiServer) finalizeCopyDestination(dstBucket, dstObject, dstVersion
 			return "", "", err
 		}
 
-		if err = s3a.updateIsLatestFlagsForSuspendedVersioning(dstBucket, normalizedObject); err != nil {
-			glog.Warningf("CopyObjectHandler: failed to update suspended version latest flags for %s/%s: %v", dstBucket, normalizedObject, err)
+		// mkFile writes through the default filer, so the ownership check reads there too.
+		if err = s3a.finalizeSuspendedNullWrite("", dstBucket, normalizedObject, s3_constants.ExtETagKey, etag); err != nil {
+			glog.Warningf("CopyObjectHandler: failed to retire the null delete marker for %s/%s: %v", dstBucket, normalizedObject, err)
 		}
 
 		return "", etag, nil
@@ -1486,56 +1502,72 @@ func (s3a *S3ApiServer) copyChunksForRange(entry *filer_pb.Entry, startOffset, e
 
 // Helper methods for copy operations to avoid code duplication
 
+// sourceConditionalHeaderNames names the four headers an operation uses to make
+// itself conditional on the state of its source object. CopyObject spells them
+// x-amz-copy-source-if-*, RenameObject x-amz-rename-source-if-*.
+type sourceConditionalHeaderNames struct {
+	ifMatch           string
+	ifNoneMatch       string
+	ifModifiedSince   string
+	ifUnmodifiedSince string
+}
+
+var copySourceConditionalHeaders = sourceConditionalHeaderNames{
+	ifMatch:           s3_constants.AmzCopySourceIfMatch,
+	ifNoneMatch:       s3_constants.AmzCopySourceIfNoneMatch,
+	ifModifiedSince:   s3_constants.AmzCopySourceIfModifiedSince,
+	ifUnmodifiedSince: s3_constants.AmzCopySourceIfUnmodifiedSince,
+}
+
 // validateConditionalCopyHeaders validates the conditional copy headers against the source entry
 func (s3a *S3ApiServer) validateConditionalCopyHeaders(r *http.Request, entry *filer_pb.Entry) s3err.ErrorCode {
-	sourceETag := copyEntryETag(entry)
+	return validateSourceConditionalHeaders(r, entry, copySourceConditionalHeaders)
+}
 
-	// Check X-Amz-Copy-Source-If-Match
-	if ifMatch := r.Header.Get(s3_constants.AmzCopySourceIfMatch); ifMatch != "" {
-		// Remove quotes if present
-		ifMatch = strings.Trim(ifMatch, `"`)
-		sourceETag = strings.Trim(sourceETag, `"`)
-		glog.V(3).Infof("CopyObjectHandler: If-Match check - expected %s, got %s", ifMatch, sourceETag)
-		if ifMatch != sourceETag {
-			glog.V(3).Infof("CopyObjectHandler: If-Match failed - expected %s, got %s", ifMatch, sourceETag)
-			return s3err.ErrPreconditionFailed
-		}
+// validateSourceConditionalHeaders evaluates the conditional headers against an
+// already-resolved source entry, so the source is known to exist here.
+//
+// The evaluation order is RFC 7232's, the same one validateConditionalHeadersForReads
+// applies: an ETag precondition wins over the date precondition on its own side, so a
+// matched If-Match makes If-Unmodified-Since moot and a passed If-None-Match makes
+// If-Modified-Since moot. AWS documents that precedence for CopyObject too — a
+// matching x-amz-copy-source-if-match with a failing x-amz-copy-source-if-unmodified-since
+// copies rather than returning 412.
+func validateSourceConditionalHeaders(r *http.Request, entry *filer_pb.Entry, names sourceConditionalHeaderNames) s3err.ErrorCode {
+	sourceETag := strings.Trim(copyEntryETag(entry), `"`)
+	ifMatch := strings.Trim(r.Header.Get(names.ifMatch), `"`)
+	ifNoneMatch := strings.Trim(r.Header.Get(names.ifNoneMatch), `"`)
+
+	if ifMatch != "" && ifMatch != "*" && ifMatch != sourceETag {
+		glog.V(3).Infof("%s failed - expected %s, got %s", names.ifMatch, ifMatch, sourceETag)
+		return s3err.ErrPreconditionFailed
 	}
 
-	// Check X-Amz-Copy-Source-If-None-Match
-	if ifNoneMatch := r.Header.Get(s3_constants.AmzCopySourceIfNoneMatch); ifNoneMatch != "" {
-		// Remove quotes if present
-		ifNoneMatch = strings.Trim(ifNoneMatch, `"`)
-		sourceETag = strings.Trim(sourceETag, `"`)
-		glog.V(3).Infof("CopyObjectHandler: If-None-Match check - comparing %s with %s", ifNoneMatch, sourceETag)
-		if ifNoneMatch == sourceETag {
-			glog.V(3).Infof("CopyObjectHandler: If-None-Match failed - matched %s", sourceETag)
-			return s3err.ErrPreconditionFailed
-		}
+	if ifNoneMatch != "" && (ifNoneMatch == "*" || ifNoneMatch == sourceETag) {
+		glog.V(3).Infof("%s failed - matched %s", names.ifNoneMatch, sourceETag)
+		return s3err.ErrPreconditionFailed
 	}
 
-	// Check X-Amz-Copy-Source-If-Modified-Since
-	if ifModifiedSince := r.Header.Get(s3_constants.AmzCopySourceIfModifiedSince); ifModifiedSince != "" {
+	if ifModifiedSince := r.Header.Get(names.ifModifiedSince); ifModifiedSince != "" && ifNoneMatch == "" {
 		t, err := parseHTTPDate(ifModifiedSince)
 		if err != nil {
-			glog.V(3).Infof("CopyObjectHandler: Invalid If-Modified-Since header: %v", err)
+			glog.V(3).Infof("invalid %s header: %v", names.ifModifiedSince, err)
 			return s3err.ErrInvalidRequest
 		}
 		if !time.Unix(entry.Attributes.Mtime, 0).After(t) {
-			glog.V(3).Infof("CopyObjectHandler: If-Modified-Since failed")
+			glog.V(3).Infof("%s failed", names.ifModifiedSince)
 			return s3err.ErrPreconditionFailed
 		}
 	}
 
-	// Check X-Amz-Copy-Source-If-Unmodified-Since
-	if ifUnmodifiedSince := r.Header.Get(s3_constants.AmzCopySourceIfUnmodifiedSince); ifUnmodifiedSince != "" {
+	if ifUnmodifiedSince := r.Header.Get(names.ifUnmodifiedSince); ifUnmodifiedSince != "" && ifMatch == "" {
 		t, err := parseHTTPDate(ifUnmodifiedSince)
 		if err != nil {
-			glog.V(3).Infof("CopyObjectHandler: Invalid If-Unmodified-Since header: %v", err)
+			glog.V(3).Infof("invalid %s header: %v", names.ifUnmodifiedSince, err)
 			return s3err.ErrInvalidRequest
 		}
 		if time.Unix(entry.Attributes.Mtime, 0).After(t) {
-			glog.V(3).Infof("CopyObjectHandler: If-Unmodified-Since failed")
+			glog.V(3).Infof("%s failed", names.ifUnmodifiedSince)
 			return s3err.ErrPreconditionFailed
 		}
 	}

@@ -433,7 +433,7 @@ func initMiniMasterFlags() {
 	miniMasterOptions.raftHashicorp = cmdMini.Flag.Bool("master.raftHashicorp", false, "use hashicorp raft")
 	miniMasterOptions.raftBootstrap = cmdMini.Flag.Bool("master.raftBootstrap", false, "whether to bootstrap the Raft cluster")
 	miniMasterOptions.telemetryUrl = cmdMini.Flag.String("master.telemetry.url", "https://telemetry.seaweedfs.com/api/collect", "telemetry server URL")
-	miniMasterOptions.telemetryEnabled = cmdMini.Flag.Bool("master.telemetry", false, "enable telemetry reporting")
+	miniMasterOptions.telemetryEnabled = cmdMini.Flag.Bool("master.telemetry", true, "report anonymous cluster statistics to master.telemetry.url, use -master.telemetry=false to opt out")
 }
 
 // initMiniFilerFlags initializes Filer server flag options
@@ -458,6 +458,8 @@ func initMiniFilerFlags() {
 	miniFilerOptions.allowedOrigins = cmdMini.Flag.String("filer.allowedOrigins", "*", "comma separated list of allowed origins")
 	miniFilerOptions.exposeDirectoryData = cmdMini.Flag.Bool("filer.exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
 	miniFilerOptions.tusBasePath = cmdMini.Flag.String("filer.tusBasePath", "/.tus", "TUS resumable upload endpoint base path")
+	miniFilerOptions.tusMaxSizeMB = cmdMini.Flag.Int("filer.tusMaxSizeMB", 5*1024, "maximum TUS upload size in MB")
+	miniFilerOptions.tusSessionExpiry = cmdMini.Flag.Duration("filer.tusSessionExpiry", 24*time.Hour, "incomplete TUS upload sessions are cleaned up after this duration")
 }
 
 // initMiniVolumeFlags initializes Volume server flag options
@@ -1223,6 +1225,7 @@ func runMini(cmd *Command, args []string) bool {
 	miniFilerOptions.masters = pb.ServerAddresses(actualPeersForComponents).ToServiceDiscovery()
 	miniFilerOptions.ip = miniIp
 	miniFilerOptions.bindIp = miniBindIp
+	miniS3Options.ip = miniIp
 	miniS3Options.bindIp = miniBindIp
 	miniWebDavOptions.ipBind = miniBindIp
 	miniOptions.v.ip = miniIp
@@ -1341,6 +1344,10 @@ func runMini(cmd *Command, args []string) bool {
 	tableBucketSpec := *miniTableBucket
 	if tableBucketSpec == "" {
 		tableBucketSpec = os.Getenv("S3_TABLE_BUCKET")
+	} else if os.Getenv("S3_TABLE_BUCKET") == "" {
+		// The catalog routes unprefixed requests to the first S3_TABLE_BUCKET
+		// entry; let the -tableBucket flag mean the same thing.
+		os.Setenv("S3_TABLE_BUCKET", tableBucketSpec)
 	}
 	if err := ensureMiniTableBuckets(tableBucketSpec); err != nil {
 		glog.Warningf("failed to ensure table buckets %q: %v", tableBucketSpec, err)

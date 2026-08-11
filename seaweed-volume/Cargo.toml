@@ -75,6 +75,9 @@ serde_urlencoded = "0.7"
 crc32c = "0.6"
 crc32fast = "1"
 
+# xxhash64 - must match Go's cespare/xxhash for the heartbeat volume digest
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
 # Memory-mapped files
 memmap2 = "0.9"
 
@@ -103,7 +106,7 @@ mime_guess = "2"
 
 # Misc
 bytes = "1"
-rand = "0.8"
+rand = "0.10"
 chrono = "0.4"
 hex = "0.4"
 parking_lot = "0.12"

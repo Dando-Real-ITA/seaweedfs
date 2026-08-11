@@ -17,6 +17,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type OptionalString struct {
@@ -298,30 +300,200 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 		return
 	}
 
+	alignedMarker := marker
+
 	// check filer
 	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		// The failover wrapper retries this callback on another filer after a
+		// transport error, so every attempt rebuilds the page from scratch: a
+		// partially built page must not leak into the retry.
+		contents = nil
+		commonPrefixes = nil
+		doErr = nil
+		nextMarker = ""
+		marker = alignedMarker
+		*cursor = ListingCursor{
+			maxKeys:               maxKeys,
+			prefixEndsOnDelimiter: strings.HasSuffix(originalPrefix, "/") && len(originalMarker) == 0,
+		}
+
 		var lastEntryWasCommonPrefix bool
-		var lastCommonPrefixName string
+		var lastCommonPrefix string
+		// Backing for the newest CommonPrefix: which unsettled null objects stand
+		// behind it, and whether anything definitely listable does. A prefix whose
+		// null backers all settle as delete-marked names nothing and is retracted;
+		// tracking backers by key keeps a marker that never joined the prefix (a
+		// version-only key with no base object) from debiting it. Contributors to
+		// a prefix stream contiguously, so only the newest prefix needs this.
+		var lastPrefixNullBackers map[string]bool
+		var lastPrefixConfirmed bool
 
 		// Hoist versioning check out of per-entry callback
 		versioningState, _ := s3a.getVersioningState(bucket)
-		versioningEnabled := versioningState == "Enabled"
+		// Suspending versioning keeps the .versions directories already written, so both
+		// states can emit a key twice (base-path null object plus its .versions sibling)
+		// and can hold a directory whose objects are all gone from the current-version view.
+		versioningConfigured := versioningState != ""
+		cursor.hideDeletedPrefixes = versioningConfigured
 
 		// Helper function to handle dedup/append logic
 		appendOrDedup := func(newEntry ListEntry) {
-			if versioningEnabled {
-				// For versioned buckets, we need to handle duplicates between the main file and the .versions directory
-				if len(contents) > 0 && contents[len(contents)-1].Key == newEntry.Key {
-					glog.V(3).Infof("listFilerEntries deduplicating versioned entry: %s", newEntry.Key)
-					contents[len(contents)-1] = newEntry
-				} else {
-					contents = append(contents, newEntry)
-					cursor.maxKeys--
+			if versioningConfigured {
+				// A key's .versions sibling resolves after every key that sorts between
+				// them ("k.bak" lists between "k" and "k.versions"), so the base entry is
+				// found by scanning back through the page and a late resolution is
+				// inserted where it keeps the page sorted, not at the end.
+				insertAt := len(contents)
+				for insertAt > 0 && contents[insertAt-1].Key > newEntry.Key {
+					insertAt--
 				}
+				if insertAt > 0 && contents[insertAt-1].Key == newEntry.Key {
+					glog.V(3).Infof("listFilerEntries deduplicating versioned entry: %s", newEntry.Key)
+					contents[insertAt-1] = newEntry
+					return
+				}
+				contents = append(contents, ListEntry{})
+				copy(contents[insertAt+1:], contents[insertAt:])
+				contents[insertAt] = newEntry
+				cursor.maxKeys--
 			} else {
 				contents = append(contents, newEntry)
 				cursor.maxKeys--
 			}
+		}
+
+		// Null objects whose .versions sibling has not streamed yet, and so may still
+		// turn out to be shadowed by a delete marker. Entries stream in order, so a
+		// pending null is dropped once the stream passes its sibling's name; the cap
+		// only binds on pathological prefix nests and falls back to sibling-adjacent
+		// behavior for the evicted oldest.
+		type pendingNull struct{ dir, name string }
+		var pendingNulls []pendingNull
+		prunePendingNulls := func(dir, passedName string) {
+			kept := pendingNulls[:0]
+			for _, p := range pendingNulls {
+				if p.dir != dir || p.name+s3_constants.VersionsFolder >= passedName {
+					kept = append(kept, p)
+				}
+			}
+			pendingNulls = kept
+		}
+		dropPendingNull := func(dir, name string) {
+			kept := pendingNulls[:0]
+			for _, p := range pendingNulls {
+				if p.dir != dir || p.name != name {
+					kept = append(kept, p)
+				}
+			}
+			pendingNulls = kept
+		}
+		// prefixForKey returns the CommonPrefix a key folds into under the request's
+		// delimiter, derived exactly as the emission sites derive it, or "".
+		prefixForKey := func(dir, name string) string {
+			if delimiter == "" {
+				return ""
+			}
+			undelimited := strings.TrimPrefix((dir + "/" + name)[len(bucketPrefix):], originalPrefix)
+			if parts := strings.SplitN(undelimited, delimiter, 2); len(parts) == 2 {
+				return originalPrefix + parts[0] + delimiter
+			}
+			return ""
+		}
+
+		retractPrefixBacking := func(prefix, dir, name string) {
+			if prefix != lastCommonPrefix || !lastPrefixNullBackers[dir+"/"+name] {
+				return
+			}
+			delete(lastPrefixNullBackers, dir+"/"+name)
+			if len(lastPrefixNullBackers) == 0 && !lastPrefixConfirmed &&
+				len(commonPrefixes) > 0 && commonPrefixes[len(commonPrefixes)-1].Prefix == prefix {
+				commonPrefixes = commonPrefixes[:len(commonPrefixes)-1]
+				cursor.maxKeys++
+				lastEntryWasCommonPrefix = false
+				lastCommonPrefix = ""
+			}
+		}
+
+		// The null object for a key lists before its .versions sibling can reveal
+		// that the current version is a delete marker, so the reveal retracts it -
+		// from the page's keys, or from the CommonPrefix it was folded into.
+		cursor.retractEntry = func(dir, name string) {
+			dropPendingNull(dir, name)
+			dirName, entryName, _ := entryUrlEncode(dir, name, encodingTypeUrl)
+			key := fmt.Sprintf("%s/%s", dirName, entryName)[len(bucketPrefix):]
+			for i := len(contents) - 1; i >= 0 && contents[i].Key >= key; i-- {
+				if contents[i].Key == key {
+					contents = append(contents[:i], contents[i+1:]...)
+					cursor.maxKeys++
+					return
+				}
+			}
+			if prefix := prefixForKey(dir, name); prefix != "" {
+				retractPrefixBacking(prefix, dir, name)
+			}
+		}
+
+		// Only a definitive not-found means the null object is live; a transient
+		// failure leaves the entry unsettled and must not commit it to the page,
+		// since the next page would then skip the sibling for good.
+		settlePendingNull := func(p pendingNull) error {
+			versionsEntry, err := s3a.getEntry(p.dir, p.name+s3_constants.VersionsFolder)
+			if err != nil {
+				if errors.Is(err, filer_pb.ErrNotFound) || status.Code(err) == codes.NotFound {
+					return nil
+				}
+				return fmt.Errorf("settle null object %s/%s: %w", p.dir, p.name, err)
+			}
+			fullObjectPath := strings.TrimPrefix(p.dir+"/"+p.name, bucketPrefix)
+			latest, lerr := s3a.getLatestVersionEntryFromDirectoryEntry(bucket, fullObjectPath, versionsEntry)
+			switch {
+			case lerr == nil:
+				if prefix := prefixForKey(p.dir, p.name); prefix != "" {
+					// The key folds into a CommonPrefix; a live current version
+					// confirms the prefix rather than surfacing the key.
+					if prefix == lastCommonPrefix {
+						lastPrefixConfirmed = true
+					}
+				} else {
+					dirName, entryName, _ := entryUrlEncode(p.dir, latest.Name, encodingTypeUrl)
+					appendOrDedup(newListEntry(s3a, latest, "", dirName, entryName, bucketPrefix, fetchOwner, false, false))
+				}
+			case errors.Is(lerr, ErrDeleteMarker), errors.Is(lerr, filer_pb.ErrNotFound):
+				cursor.retractEntry(p.dir, p.name)
+			default:
+				return fmt.Errorf("settle null object %s/%s: %w", p.dir, p.name, lerr)
+			}
+			return nil
+		}
+
+		addPendingNull := func(dir, name string) {
+			if len(pendingNulls) >= 8 {
+				// Settle rather than silently evict: an unsettled null would leak past
+				// the page, and the resume skip would then keep it stale for good. A
+				// failed settlement is retained for page-close resolution to retry.
+				settled := pendingNulls[0]
+				pendingNulls = pendingNulls[1:]
+				if settleErr := settlePendingNull(settled); settleErr != nil {
+					pendingNulls = append([]pendingNull{settled}, pendingNulls...)
+				}
+			}
+			pendingNulls = append(pendingNulls, pendingNull{dir, name})
+		}
+
+		// A page may fill while a trailing null object's .versions sibling is still
+		// unstreamed; settle each one by direct lookup before the page is declared
+		// final. A retraction here reopens the page's quota, and a failure fails the
+		// listing rather than committing an unsettled entry.
+		cursor.resolvePendingNulls = func() error {
+			for len(pendingNulls) > 0 {
+				p := pendingNulls[0]
+				pendingNulls = pendingNulls[1:]
+				if settleErr := settlePendingNull(p); settleErr != nil {
+					pendingNulls = append([]pendingNull{p}, pendingNulls...)
+					return settleErr
+				}
+			}
+			return nil
 		}
 
 		for {
@@ -329,6 +501,7 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 
 			nextMarker, doErr = s3a.doListFilerEntries(ctx, client, listDirectoryRequest{dir: reqDir, prefix: prefix, marker: marker, delimiter: delimiter, bucket: bucket}, cursor, func(dir string, entry *filer_pb.Entry) {
 				empty = false
+				prunePendingNulls(dir, entry.Name)
 				dirName, entryName, _ := entryUrlEncode(dir, entry.Name, encodingTypeUrl)
 				if entry.IsDirectory {
 					if originalPrefix != "" {
@@ -358,7 +531,7 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 							delimitedPrefix := originalPrefix + delimitedPath[0] + delimiter
 
 							// Check if this CommonPrefix already exists
-							if !lastEntryWasCommonPrefix || lastCommonPrefixName != delimitedPath[0] {
+							if !lastEntryWasCommonPrefix || lastCommonPrefix != delimitedPrefix {
 								// New CommonPrefix found
 								commonPrefixes = append(commonPrefixes, PrefixEntry{
 									Prefix: delimitedPrefix,
@@ -366,10 +539,12 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 								cursor.maxKeys--
 								delimiterFound = true
 								lastEntryWasCommonPrefix = true
-								lastCommonPrefixName = delimitedPath[0]
+								lastCommonPrefix = delimitedPrefix
+								lastPrefixNullBackers, lastPrefixConfirmed = nil, true
 							} else {
 								// This directory object belongs to an existing CommonPrefix, skip it
 								delimiterFound = true
+								lastPrefixConfirmed = true
 							}
 						}
 
@@ -388,13 +563,15 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 					} else if delimiter != "" { // A response can contain CommonPrefixes only if you specify a delimiter.
 						// Use raw dir and entry.Name (not encoded) to ensure consistent handling
 						// Encoding will be applied after sorting if encodingTypeUrl is set
+						dirPrefix := fmt.Sprintf("%s/%s/", dir, entry.Name)[len(bucketPrefix):]
 						commonPrefixes = append(commonPrefixes, PrefixEntry{
-							Prefix: fmt.Sprintf("%s/%s/", dir, entry.Name)[len(bucketPrefix):],
+							Prefix: dirPrefix,
 						})
 						//All of the keys (up to 1,000) rolled up into a common prefix count as a single return when calculating the number of returns.
 						cursor.maxKeys--
 						lastEntryWasCommonPrefix = true
-						lastCommonPrefixName = entry.Name
+						lastCommonPrefix = dirPrefix
+						lastPrefixNullBackers, lastPrefixConfirmed = nil, true
 					}
 				} else {
 					var delimiterFound bool
@@ -412,6 +589,15 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 							// S3 clients expect the delimited prefix to contain the delimiter and prefix.
 							delimitedPrefix := originalPrefix + delimitedPath[0] + delimiter
 
+							// A null object rolled into a prefix still awaits its .versions
+							// sibling, and the prefix must not outlive its only backers.
+							isNullBacker := false
+							if versioningConfigured {
+								if vid := string(entry.Extended[s3_constants.ExtVersionIdKey]); vid == "" || vid == "null" {
+									isNullBacker = true
+								}
+							}
+
 							for i := range commonPrefixes {
 								if commonPrefixes[i].Prefix == delimitedPrefix {
 									delimiterFound = true
@@ -426,11 +612,28 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 								cursor.maxKeys--
 								delimiterFound = true
 								lastEntryWasCommonPrefix = true
-								lastCommonPrefixName = delimitedPath[0]
+								lastCommonPrefix = delimitedPrefix
+								lastPrefixNullBackers, lastPrefixConfirmed = nil, !isNullBacker
+								if isNullBacker {
+									lastPrefixNullBackers = map[string]bool{dir + "/" + entry.Name: true}
+									addPendingNull(dir, entry.Name)
+								}
 							} else {
 								// This object belongs to an existing CommonPrefix, skip it
 								// but continue processing to maintain correct flow
 								delimiterFound = true
+								if delimitedPrefix == lastCommonPrefix {
+									if isNullBacker {
+										if lastPrefixNullBackers == nil {
+											lastPrefixNullBackers = map[string]bool{}
+										}
+										lastPrefixNullBackers[dir+"/"+entry.Name] = true
+										addPendingNull(dir, entry.Name)
+									} else {
+										lastPrefixConfirmed = true
+										dropPendingNull(dir, entry.Name)
+									}
+								}
 							}
 						}
 					}
@@ -439,6 +642,15 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 						newEntry := newListEntry(s3a, entry, "", dirName, entryName, bucketPrefix, fetchOwner, false, false)
 						appendOrDedup(newEntry)
 						lastEntryWasCommonPrefix = false
+						if versioningConfigured {
+							// A real version id means the .versions sibling resolved this
+							// key; anything else is a null object the sibling may shadow.
+							if vid := string(entry.Extended[s3_constants.ExtVersionIdKey]); vid == "" || vid == "null" {
+								addPendingNull(dir, entry.Name)
+							} else {
+								dropPendingNull(dir, entry.Name)
+							}
+						}
 					}
 				}
 			})
@@ -451,9 +663,8 @@ func (s3a *S3ApiServer) listFilerEntries(ctx context.Context, req listObjectsReq
 				return doErr
 			}
 
-			// Adjust nextMarker for CommonPrefixes to include trailing slash (AWS S3 compliance)
 			if cursor.isTruncated {
-				nextMarker = buildTruncatedNextMarker(requestDir, prefix, nextMarker, lastEntryWasCommonPrefix, lastCommonPrefixName)
+				nextMarker = buildTruncatedNextMarker(requestDir, nextMarker, lastEntryWasCommonPrefix, lastCommonPrefix)
 			}
 
 			if cursor.isTruncated {
@@ -504,6 +715,16 @@ type ListingCursor struct {
 	maxKeys               uint16
 	isTruncated           bool
 	prefixEndsOnDelimiter bool
+	// hideDeletedPrefixes turns on the dirHoldsOnlyHiddenEntries probe, which only has
+	// something to find once a bucket has version history to leave behind.
+	hideDeletedPrefixes bool
+	probedEntries       int
+	// retractEntry undoes the listing of a base-path null object once its .versions
+	// sibling reveals that the current version is a delete marker.
+	retractEntry func(dir, name string)
+	// resolvePendingNulls settles trailing null objects whose .versions sibling
+	// has not streamed yet before a page is declared full.
+	resolvePendingNulls func() error
 }
 
 // the prefix and marker may be in different directories
@@ -528,13 +749,9 @@ func normalizePrefixMarker(prefix, marker string) (alignedDir, alignedPrefix, al
 		// something wrong
 		return "", prefix, marker
 	}
-	if strings.HasPrefix(marker, prefix+"/") {
-		alignedDir = prefix
-		alignedPrefix = ""
-		alignedMarker = marker[len(alignedDir)+1:]
-		return
-	}
-
+	// Resolve the listing dir from the prefix, not the marker: a partial name prefix like
+	// "data/a" also matches siblings such as "data/ab/", which narrowing to the marker's
+	// subtree would drop.
 	alignedDir, alignedPrefix = toDirAndName(prefix)
 	if alignedDir != "" {
 		alignedMarker = marker[len(alignedDir)+1:]
@@ -564,19 +781,12 @@ func toParentAndDescendants(dirAndName string) (dir, name string) {
 	return
 }
 
-func buildTruncatedNextMarker(requestDir, prefix, nextMarker string, lastEntryWasCommonPrefix bool, lastCommonPrefixName string) string {
-	if lastEntryWasCommonPrefix && lastCommonPrefixName != "" {
-		// For CommonPrefixes, NextMarker should include the trailing slash
-		if requestDir != "" {
-			if prefix != "" {
-				return requestDir + "/" + prefix + "/" + lastCommonPrefixName + "/"
-			}
-			return requestDir + "/" + lastCommonPrefixName + "/"
-		}
-		if prefix != "" {
-			return prefix + "/" + lastCommonPrefixName + "/"
-		}
-		return lastCommonPrefixName + "/"
+func buildTruncatedNextMarker(requestDir, nextMarker string, lastEntryWasCommonPrefix bool, lastCommonPrefix string) string {
+	// The emitted CommonPrefix is already the full key path with its trailing delimiter.
+	// Rebuilding it from requestDir plus the listing prefix breaks when that prefix is a
+	// partial name, not a directory.
+	if lastEntryWasCommonPrefix && lastCommonPrefix != "" {
+		return lastCommonPrefix
 	}
 
 	if requestDir != "" {
@@ -628,6 +838,10 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The marker this page started from, unlike marker below, which advances with
+	// each request window inside the page.
+	pageMarker := marker
+
 	// Entries that emit nothing (empty directories, the .uploads folder, the marker
 	// echo) consume the request window without consuming maxKeys, so one window may
 	// end before maxKeys is satisfied. Keep requesting from the last received entry
@@ -671,13 +885,31 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 			// listFilerEntries always calls doListFilerEntries with inclusiveStartFrom=false
 			// (S3 marker semantics are exclusive), but keep the guard explicit to preserve
 			// behavior if inclusive callers are introduced in the future.
-			if !inclusiveStartFrom && marker != "" && entry.Name == marker {
+			// A versioned object lives in a "<key>.versions" directory, so the marker also
+			// has to be matched against the object name that directory stands for.
+			markerName := entry.Name
+			if entry.IsDirectory {
+				markerName = strings.TrimSuffix(markerName, s3_constants.VersionsFolder)
+			}
+			if !inclusiveStartFrom && marker != "" && (entry.Name == marker || markerName == marker) {
 				continue
 			}
 
-			if cursor.maxKeys <= 0 {
-				cursor.isTruncated = true
-				break
+			// The .versions sibling of the key just emitted still decides that key's
+			// fate (metadata replacement or retraction) and consumes no quota of its
+			// own, so it must not be pushed past the page boundary.
+			versionsSiblingOfLast := cursor.hideDeletedPrefixes && entry.IsDirectory &&
+				entry.Name == nextMarker+s3_constants.VersionsFolder
+			if cursor.maxKeys <= 0 && !versionsSiblingOfLast {
+				if cursor.resolvePendingNulls != nil {
+					if err = cursor.resolvePendingNulls(); err != nil {
+						return
+					}
+				}
+				if cursor.maxKeys <= 0 {
+					cursor.isTruncated = true
+					break
+				}
 			}
 
 			// Set nextMarker only when we have quota to process this entry
@@ -704,8 +936,24 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 				// Process .versions directories immediately to create logical versioned object entries
 				// These directories are never traversed (we continue here), so each is only encountered once
 				if strings.HasSuffix(entry.Name, s3_constants.VersionsFolder) {
+					if entry.Name == s3_constants.VersionsFolder {
+						// The history of the key "<dir>/", not of a child. The parent
+						// listing decides that key when it reaches the directory entry.
+						continue
+					}
 					// Extract object name from .versions directory name
 					baseObjectName := strings.TrimSuffix(entry.Name, s3_constants.VersionsFolder)
+					// A page resuming from a marker inside the base key's extension
+					// region ("k.bak" sorts between "k" and "k.versions") means an
+					// earlier page already listed and settled the base null object;
+					// resolving this directory again would duplicate the key. Without
+					// a base object the key has not been listed yet, so it still
+					// resolves here.
+					if pageMarker != "" && baseObjectName < pageMarker {
+						if _, baseErr := s3a.getEntry(dir, baseObjectName); baseErr == nil {
+							continue
+						}
+					}
 					// Construct full object path relative to bucket
 					bucketFullPath := s3a.bucketDir(bucket)
 					bucketRelativePath := strings.TrimPrefix(dir, bucketFullPath)
@@ -719,8 +967,13 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 					// Use metadata from the already-fetched .versions directory entry
 					if latestVersionEntry, err := s3a.getLatestVersionEntryFromDirectoryEntry(bucket, fullObjectPath, entry); err == nil {
 						eachEntryFn(dir, latestVersionEntry)
-					} else if !errors.Is(err, ErrDeleteMarker) {
-						// Log unexpected errors (delete markers are expected)
+					} else if errors.Is(err, ErrDeleteMarker) {
+						// The current version is a delete marker, so a null object listed
+						// for the base path just before this directory is stale.
+						if cursor.retractEntry != nil {
+							cursor.retractEntry(dir, baseObjectName)
+						}
+					} else {
 						glog.V(2).Infof("Skipping versioned object %s due to error: %v", fullObjectPath, err)
 					}
 					continue
@@ -758,7 +1011,10 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 					// identical to a directory created via PutObject with a trailing "/", so
 					// tools like hadoop-aws can find it. Plain listings are left untouched, so
 					// empty directories left behind by deleted objects are not shown as keys.
-					if explicitDirProbe && !isKeyObject && !childEmitted && !cursor.isTruncated && entry.Attributes != nil {
+					// A directory that still holds version history no longer names anything,
+					// so it gets no marker either.
+					if explicitDirProbe && !isKeyObject && !childEmitted && !cursor.isTruncated && entry.Attributes != nil &&
+						!s3a.dirHoldsOnlyHiddenEntries(ctx, client, bucket, dir+"/"+entry.Name, cursor) {
 						entry.Attributes.Mime = s3_constants.FolderMimeType
 						eachEntryFn(dir, entry)
 					}
@@ -771,7 +1027,7 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 						return
 					}
 					// println("doListFilerEntries2 nextMarker", nextMarker)
-				} else {
+				} else if entry.IsDirectoryKeyObject() || !s3a.dirHoldsOnlyHiddenEntries(ctx, client, bucket, dir+"/"+entry.Name, cursor) {
 					eachEntryFn(dir, entry)
 				}
 			} else {
@@ -788,6 +1044,125 @@ func (s3a *S3ApiServer) doListFilerEntries(ctx context.Context, client filer_pb.
 		}
 		marker = lastEntryName
 		inclusiveStartFrom = false
+	}
+}
+
+// hiddenProbePageSize is the window one probe request asks the filer for, and
+// hiddenProbeBudget caps how many entries a single list request may look at while
+// deciding which directories still stand for a prefix.
+const (
+	hiddenProbePageSize = 64
+	hiddenProbeBudget   = 10000
+)
+
+// dirHoldsOnlyHiddenEntries reports whether dir holds entries but none that a
+// current-version listing returns. Deleting the last object under a prefix in a
+// versioned bucket leaves the version history and a delete marker behind, so the filer
+// directory survives with nothing listable in it. AWS derives CommonPrefixes from the
+// keys a listing returns, so that path is no longer a prefix and no longer a directory
+// to answer a probe for. An empty directory is left alone: mount and mkdir create them
+// and empty-folder cleanup owns their lifetime.
+//
+// The scan stops at the first key it finds, so a populated prefix costs one ListEntries
+// answered by its first entry. A subtree that is entirely delete-marked costs a walk of
+// that subtree, bounded by the request's probe budget; once the budget is spent the
+// prefix is reported, as it was before this check existed.
+func (s3a *S3ApiServer) dirHoldsOnlyHiddenEntries(ctx context.Context, client filer_pb.SeaweedFilerClient, bucket, dir string, cursor *ListingCursor) bool {
+	if !cursor.hideDeletedPrefixes {
+		return false
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sawEntry := false
+	startFrom := ""
+	// A plain file is a null object that its .versions sibling, streaming later,
+	// may prove delete-marked; it stays pending until then. A pending file whose
+	// sibling window closes without one is a live key.
+	var pendingFiles []string
+	for {
+		request := &filer_pb.ListEntriesRequest{
+			Directory:         dir,
+			StartFromFileName: startFrom,
+			Limit:             hiddenProbePageSize,
+		}
+		stream, listErr := client.ListEntries(ctx, request)
+		if listErr != nil {
+			if !errors.Is(listErr, filer_pb.ErrNotFound) {
+				glog.V(1).Infof("dirHoldsOnlyHiddenEntries %s: %v", dir, listErr)
+			}
+			return false
+		}
+
+		var entriesReceived uint32
+		for {
+			resp, recvErr := stream.Recv()
+			if recvErr != nil {
+				if recvErr != io.EOF {
+					glog.V(1).Infof("dirHoldsOnlyHiddenEntries %s: %v", dir, recvErr)
+					return false
+				}
+				break
+			}
+			entry := resp.Entry
+			if entry == nil {
+				continue
+			}
+			entriesReceived++
+			startFrom = entry.Name
+			sawEntry = true
+
+			cursor.probedEntries++
+			if cursor.probedEntries > hiddenProbeBudget {
+				return false
+			}
+
+			for _, pendingFile := range pendingFiles {
+				if entry.Name > pendingFile+s3_constants.VersionsFolder {
+					return false
+				}
+			}
+			if !entry.IsDirectory {
+				pendingFiles = append(pendingFiles, entry.Name)
+				continue
+			}
+			if entry.Name == s3_constants.MultipartUploadsFolder {
+				continue
+			}
+			if strings.HasSuffix(entry.Name, s3_constants.VersionsFolder) {
+				// Each write that changes an object's current version stamps the answer
+				// onto its .versions directory entry, which the listing above already
+				// carries, so a delete-marked object costs nothing to recognize. A
+				// missing stamp leaves the current version unknown - the pointer is
+				// written on the key's owner filer and may not have reached the filer
+				// serving this list - and an unknown object keeps its prefix rather than
+				// turning one listing into a version rescan per object.
+				if isDeleteMarker, stamped := entry.Extended[s3_constants.ExtLatestVersionIsDeleteMarker]; stamped && string(isDeleteMarker) == "true" {
+					// The marker also hides the null object the key left at the base path.
+					base := strings.TrimSuffix(entry.Name, s3_constants.VersionsFolder)
+					kept := pendingFiles[:0]
+					for _, pendingFile := range pendingFiles {
+						if pendingFile != base {
+							kept = append(kept, pendingFile)
+						}
+					}
+					pendingFiles = kept
+					continue
+				}
+				return false
+			}
+			if entry.IsDirectoryKeyObject() {
+				return false
+			}
+			if !s3a.dirHoldsOnlyHiddenEntries(ctx, client, bucket, dir+"/"+entry.Name, cursor) {
+				return false
+			}
+		}
+
+		if entriesReceived < request.Limit {
+			return sawEntry && len(pendingFiles) == 0
+		}
 	}
 }
 

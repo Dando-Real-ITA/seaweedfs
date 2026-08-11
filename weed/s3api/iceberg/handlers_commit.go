@@ -66,6 +66,30 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Manifest repair runs once, as soon as the table location is known; on
+	// commit retries the updates already reference the repaired files. Repair
+	// is best effort end to end: the originals parsed already, so a repair
+	// that fails to re-parse is discarded rather than failing the commit.
+	manifestsRepaired := false
+	repairManifests := func(location string) {
+		if manifestsRepaired {
+			return
+		}
+		manifestsRepaired = true
+		repaired, changed := s.repairAddSnapshotManifests(r.Context(), location, raw.Updates)
+		if !changed {
+			return
+		}
+		repairedUpdates, repairedStatistics, err := parseCommitUpdates(repaired)
+		if err != nil {
+			glog.Warningf("Iceberg: repaired updates failed to parse, keeping originals: %v", err)
+			return
+		}
+		raw.Updates = repaired
+		req.Updates = repairedUpdates
+		statisticsUpdates = repairedStatistics
+	}
+
 	maxCommitAttempts := 3
 	generatedLegacyUUID := uuid.New()
 	stageCreateEnabled := isStageCreateEnabled()
@@ -160,12 +184,15 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 				}
 
 				if baseMetadata == nil {
-					baseMetadata = newTableMetadata(tableUUID, location, nil, nil, nil, nil)
-					if baseMetadata == nil {
+					var buildErr error
+					if baseMetadata, buildErr = newTableMetadata(tableUUID, location, nil, nil, nil, nil); buildErr != nil {
+						glog.Errorf("Iceberg: CommitTable placeholder metadata for %s: %v", tableName, buildErr)
 						writeError(w, http.StatusInternalServerError, "InternalServerError", "Failed to build current metadata")
 						return
 					}
 				}
+
+				repairManifests(location)
 
 				result, reqErr := s.finalizeCreateOnCommit(r.Context(), createOnCommitInput{
 					bucketARN:         bucketARN,
@@ -216,11 +243,12 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			currentMetadata = newTableMetadata(tableUUID, location, nil, nil, nil, nil)
-		}
-		if currentMetadata == nil {
-			writeError(w, http.StatusInternalServerError, "InternalServerError", "Failed to build current metadata")
-			return
+			currentMetadata, err = newTableMetadata(tableUUID, location, nil, nil, nil, nil)
+			if err != nil {
+				glog.Errorf("Iceberg: CommitTable placeholder metadata for %s: %v", tableName, err)
+				writeError(w, http.StatusInternalServerError, "InternalServerError", "Failed to build current metadata")
+				return
+			}
 		}
 
 		for _, requirement := range req.Requirements {
@@ -229,6 +257,8 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		repairManifests(location)
 
 		builder, err := table.MetadataBuilderFromBase(currentMetadata, getResp.MetadataLocation)
 		if err != nil {
@@ -264,6 +294,7 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "BadRequestException", "Failed to apply statistics updates: "+err.Error())
 			return
 		}
+		metadataBytes = refreshDefaultNameMapping(metadataBytes, newMetadata)
 		// Same spec-compliance fixup we apply on create-table; ensures
 		// v{N}.metadata.json files written during commit are also readable by
 		// strict Iceberg clients reading directly from S3, and that the

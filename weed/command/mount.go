@@ -12,6 +12,7 @@ type MountOptions struct {
 	dirAutoCreate        *bool
 	collection           *string
 	collectionQuota      *int
+	logicalDiskUsage     *bool
 	replication          *string
 	diskType             *string
 	ttlSec               *int
@@ -19,6 +20,7 @@ type MountOptions struct {
 	concurrentWriters    *int
 	concurrentReaders    *int
 	cacheMetaTtlSec      *int
+	cacheDirMaxEntries   *int
 	cacheDirForRead      *string
 	cacheDirForWrite     *string
 	cacheSizeMBForRead   *int64
@@ -38,6 +40,8 @@ type MountOptions struct {
 	debugFuse            *bool
 	localSocket          *string
 	disableXAttr         *bool
+	windowsUid           *int
+	windowsGid           *int
 	extraOptions         []string
 	fuseCommandPid       int
 
@@ -53,11 +57,11 @@ type MountOptions struct {
 	rdmaTimeoutMs     *int
 
 	// Peer chunk sharing options (design-weed-mount-peer-chunk-sharing.md).
-	peerEnabled      *bool
-	peerListen       *string
-	peerAdvertise    *string
-	peerDataCenter   *string
-	peerRack         *string
+	peerEnabled    *bool
+	peerListen     *string
+	peerAdvertise  *string
+	peerDataCenter *string
+	peerRack       *string
 
 	dirIdleEvictSec *int
 
@@ -99,6 +103,7 @@ func init() {
 	mountOptions.dirAutoCreate = cmdMount.Flag.Bool("dirAutoCreate", false, "auto create the directory to mount to")
 	mountOptions.collection = cmdMount.Flag.String("collection", "", "collection to create the files")
 	mountOptions.collectionQuota = cmdMount.Flag.Int("collectionQuotaMB", 0, "quota for the collection")
+	mountOptions.logicalDiskUsage = cmdMount.Flag.Bool("df.logical", false, "report data sizes to df and the quota, instead of the space they occupy with replicas and ec parity")
 	mountOptions.replication = cmdMount.Flag.String("replication", "", "replication(e.g. 000, 001) to create to files. If empty, let filer decide.")
 	mountOptions.diskType = cmdMount.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	mountOptions.ttlSec = cmdMount.Flag.Int("ttl", 0, "file ttl in seconds")
@@ -110,6 +115,7 @@ func init() {
 	mountOptions.cacheDirForWrite = cmdMount.Flag.String("cacheDirWrite", "", "buffer writes mostly for large files")
 	mountOptions.writeBufferSizeMB = cmdMount.Flag.Int64("writeBufferSizeMB", 0, "global cap on the per-mount write buffer (memory + swap) in MB, 0 means unlimited. Bounds /tmp growth when volume uploads stall")
 	mountOptions.cacheMetaTtlSec = cmdMount.Flag.Int("cacheMetaTtlSec", 60, "metadata cache validity seconds")
+	mountOptions.cacheDirMaxEntries = cmdMount.Flag.Int("cacheDirMaxEntries", 10000, "a directory with more children than this is not cached locally but read directly from the filer; 0 caches everything")
 	mountOptions.dataCenter = cmdMount.Flag.String("dataCenter", "", "prefer to write to the data center")
 	mountOptions.allowOthers = cmdMount.Flag.Bool("allowOthers", true, "allows other users to access the file system")
 	mountOptions.defaultPermissions = cmdMount.Flag.Bool("defaultPermissions", true, "enforce permissions by the operating system")
@@ -125,6 +131,8 @@ func init() {
 	mountOptions.debugFuse = cmdMount.Flag.Bool("debug.fuse", false, "log raw FUSE protocol requests and responses")
 	mountOptions.localSocket = cmdMount.Flag.String("localSocket", "", "default to /tmp/seaweedfs-mount-<mount_dir_hash>.sock")
 	mountOptions.disableXAttr = cmdMount.Flag.Bool("disableXAttr", false, "disable xattr")
+	mountOptions.windowsUid = cmdMount.Flag.Int("windows.uid", 0, "windows only: uid recorded on entries this mount creates, which other clients read")
+	mountOptions.windowsGid = cmdMount.Flag.Int("windows.gid", 0, "windows only: gid recorded on entries this mount creates, which other clients read")
 	mountOptions.hasAutofs = cmdMount.Flag.Bool("autofs", false, "ignore autofs mounted on the same mountpoint (useful when systemd.automount and autofs is used)")
 	mountOptions.fuseCommandPid = 0
 

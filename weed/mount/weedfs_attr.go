@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"context"
 	"os"
 	"syscall"
 	"time"
@@ -74,6 +75,18 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
 	if status != fuse.OK || entry == nil {
 		return status
+	}
+	if size, ok := input.GetSize(); ok && fh != nil && fh.dirtyPages.HasWrites() && size < filer.FileSize(entry) {
+		// The truncation below trims chunks; dirty pages it cannot see. Left
+		// alone, pages beyond the new size come back with the next flush and
+		// grow the file again, so turn them into chunks first. Runs before
+		// the entry locks below: the flush takes its own.
+		ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
+		flushStatus := wfs.doFlush(ctx, fh, input.Uid, input.Gid, false)
+		cancelFunc()
+		if flushStatus != fuse.OK {
+			return flushStatus
+		}
 	}
 	if fh != nil {
 		fh.entryLock.Lock()
@@ -317,7 +330,7 @@ func (wfs *WFS) touchDirMtimeCtimeBest(dirPath util.FullPath) {
 // touchDirMtimeCtime updates a directory's mtime and ctime on the filer.
 // POSIX requires this when entries are created or removed in the directory.
 func (wfs *WFS) touchDirMtimeCtime(dirPath util.FullPath) {
-	dirEntry, code := wfs.maybeLoadEntry(dirPath)
+	dirEntry, _, code := wfs.maybeLoadEntry(dirPath)
 	if code != fuse.OK || dirEntry == nil || dirEntry.Attributes == nil {
 		return
 	}
@@ -387,6 +400,20 @@ func (wfs *WFS) setAtime(inode uint64, t time.Time) {
 }
 
 // applyInMemoryAtime overlays the in-memory atime onto a fuse.Attr if present.
+// forgetInMemoryTimes drops the overlays for an inode. Both maps are keyed by
+// inode and inodes are derived from the path, so a delete and recreate can
+// hand the same number to a different file — which would then inherit the
+// previous one's access or modification time.
+func (wfs *WFS) forgetInMemoryTimes(inode uint64) {
+	wfs.atimeMu.Lock()
+	delete(wfs.atimeMap, inode)
+	wfs.atimeMu.Unlock()
+
+	wfs.dirMtimeMu.Lock()
+	delete(wfs.dirMtimeMap, inode)
+	wfs.dirMtimeMu.Unlock()
+}
+
 func (wfs *WFS) applyInMemoryAtime(out *fuse.Attr, inode uint64) {
 	wfs.atimeMu.Lock()
 	if t, ok := wfs.atimeMap[inode]; ok {
