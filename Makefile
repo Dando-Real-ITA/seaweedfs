@@ -3,33 +3,23 @@
 BINARY = weed
 ADMIN_DIR = weed/admin
 
-GO_FLAGS = #-v
-SOURCE_DIR = ./weed/
+SOURCE_DIR = .
 debug ?= 0
 
-appname := weed
+all: install
 
 install: admin-generate
 	cd weed; go install
 
-COMMIT ?= $(shell git rev-parse --short HEAD)
-PRIVATE_VERSION ?= $(shell git describe --tags --abbrev=0)
-LDFLAGS ?= -X github.com/seaweedfs/seaweedfs/weed/util.COMMIT=${COMMIT} -X github.com/seaweedfs/seaweedfs/weed/util.PRIVATE_VERSION=${PRIVATE_VERSION}
 weed-commands:
 	cd weed && $(MAKE) weed-db weed-sql
 
 warp_install:
 	go install github.com/minio/warp@v0.7.6
 
-build = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -ldflags "-s -w -extldflags -static $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
-tar = cd build && tar -cvzf $(1)_$(2).tar.gz $(appname)$(3) && rm $(appname)$(3)
-zip = cd build && zip $(1)_$(2).zip $(appname)$(3) && rm $(appname)$(3)
 full_install: admin-generate
 	cd weed; go install -tags "elastic gocdk sqlite ydb tarantool tikv rclone"
 
-build_large = CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) go build -tags 5BytesOffset -ldflags "-s -w -extldflags -static $(LDFLAGS)" -o build/$(appname)$(3) $(SOURCE_DIR)
-tar_large = cd build && tar -cvzf $(1)_$(2)_large_disk.tar.gz $(appname)$(3) && rm $(appname)$(3)
-zip_large = cd build && zip $(1)_$(2)_large_disk.zip $(appname)$(3) && rm $(appname)$(3)
 server: install
 	weed -v 0 server -s3 -filer -filer.maxMB=64 -volume.max=0 -master.volumeSizeLimitMB=100 -volume.preStopSeconds=1 -s3.port=8000 -s3.allowDeleteBucketNotEmpty=true -s3.config=./docker/compose/s3.json -metricsPort=9324
 
@@ -43,7 +33,9 @@ benchmark: install warp_install
 	pkill warp
 	pkill weed
 
-.PHONY : clean deps build linux release windows_build darwin_build linux_build bsd_build clean
+# curl -o profile "http://127.0.0.1:6060/debug/pprof/profile?debug=1"
+benchmark_with_pprof: debug = 1
+benchmark_with_pprof: benchmark
 
 test: admin-generate
 	cd weed; go test -tags "elastic gocdk sqlite ydb tarantool tikv rclone" -v ./...
