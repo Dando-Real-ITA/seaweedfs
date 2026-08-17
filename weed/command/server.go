@@ -95,7 +95,7 @@ func init() {
 	masterOptions.portGrpc = cmdServer.Flag.Int("master.port.grpc", 0, "master server grpc listen port")
 	masterOptions.metaFolder = cmdServer.Flag.String("master.dir", "", "data directory to store meta data, default to same as -dir specified")
 	masterOptions.peers = cmdServer.Flag.String("master.peers", "", "all master nodes in comma separated ip:masterPort list")
-	masterOptions.volumeSizeLimitMB = cmdServer.Flag.Uint("master.volumeSizeLimitMB", 30*1000, "Master stops directing writes to oversized volumes.")
+	masterOptions.volumeSizeLimitMB = cmdServer.Flag.Uint("master.volumeSizeLimitMB", util.DefaultVolumeSizeLimitMB, "Master stops directing writes to oversized volumes.")
 	masterOptions.volumePreallocate = cmdServer.Flag.Bool("master.volumePreallocate", false, "Preallocate disk space for volumes.")
 	masterOptions.maxParallelVacuumPerServer = cmdServer.Flag.Int("master.maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel on one volume server")
 	masterOptions.defaultReplication = cmdServer.Flag.String("master.defaultReplication", "", "Default replication type if not specified.")
@@ -164,6 +164,8 @@ func init() {
 	s3Options.portHttps = cmdServer.Flag.Int("s3.port.https", 0, "s3 server https listen port")
 	s3Options.portGrpc = cmdServer.Flag.Int("s3.port.grpc", 0, "s3 server grpc listen port")
 	s3Options.portIceberg = cmdServer.Flag.Int("s3.port.iceberg", 8181, "Iceberg REST Catalog server listen port (0 to disable)")
+	s3Options.icebergCredentialRole = cmdServer.Flag.String("s3.iceberg.credentialRole", "", "IAM role ARN the Iceberg catalog assumes to vend table-scoped credentials (empty disables vending)")
+	s3Options.icebergCredentialDuration = cmdServer.Flag.Int("s3.iceberg.credentialDurationSeconds", 3600, "lifetime of credentials vended by the Iceberg catalog")
 	s3Options.domainName = cmdServer.Flag.String("s3.domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
 	s3Options.allowedOrigins = cmdServer.Flag.String("s3.allowedOrigins", "*", "comma separated list of allowed origins")
 	s3Options.tlsPrivateKey = cmdServer.Flag.String("s3.key.file", "", "path to the TLS private key file")
@@ -340,8 +342,8 @@ func runServer(cmd *Command, args []string) bool {
 	*volumeDataFolders = util.ResolveCommaSeparatedPaths(*volumeDataFolders)
 	folders := strings.Split(*volumeDataFolders, ",")
 
-	if *masterOptions.volumeSizeLimitMB > util.VolumeSizeLimitGB*1000 {
-		glog.Fatalf("masterVolumeSizeLimitMB should be less than 30000")
+	if *masterOptions.volumeSizeLimitMB > util.MaxVolumeSizeLimitMB {
+		glog.Fatalf("master.volumeSizeLimitMB should not exceed %d", util.MaxVolumeSizeLimitMB)
 	}
 
 	if *masterOptions.metaFolder == "" {

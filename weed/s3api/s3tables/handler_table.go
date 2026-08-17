@@ -1,6 +1,7 @@
 package s3tables
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -292,6 +293,14 @@ func metadataVersionFromLocation(metadataLocation string) int {
 	// v{N} form
 	if v, err := strconv.Atoi(strings.TrimPrefix(name, "v")); err == nil && v > 0 {
 		return v
+	}
+	// v{N}-{unique} form, written when a commit finds v{N} already staged
+	if trimmed := strings.TrimPrefix(name, "v"); trimmed != name {
+		if idx := strings.IndexByte(trimmed, '-'); idx != -1 {
+			if v, err := strconv.Atoi(trimmed[:idx]); err == nil && v > 0 {
+				return v
+			}
+		}
 	}
 	// {NNNNN}-{uuid} form: the leading integer before the first '-'
 	if idx := strings.IndexByte(name, '-'); idx != -1 {
@@ -1200,7 +1209,8 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 				return err
 			}
 			return h.removeExtendedAttributes(r.Context(), client, tablePath,
-				ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags, ExtendedKeyEntryType)
+				ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags, ExtendedKeyEntryType,
+				ExtendedKeyMaintenance, ExtendedKeyMaintenanceStatus)
 		}
 		// Colocated table: the name path holds the data.
 		return h.deleteDirectory(r.Context(), client, tablePath)
@@ -1215,11 +1225,72 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 	return nil
 }
 
+// renamedTableAttributes are the catalog attributes a rename carries to the new
+// name and clears from the old one.
+var renamedTableAttributes = []string{
+	ExtendedKeyMetadata,
+	ExtendedKeyMetadataVersion,
+	ExtendedKeyPolicy,
+	ExtendedKeyTags,
+	ExtendedKeyMaintenance,
+	ExtendedKeyMaintenanceStatus,
+	ExtendedKeyEntryType,
+}
+
+// catalogEntryKind describes the entry a rename operates on, so tables and
+// views share one implementation of the catalog-only move.
+type catalogEntryKind struct {
+	entryType    string
+	noun         string
+	renameOp     string
+	createOp     string
+	notFoundCode string
+	existsCode   string
+	// resourceARN builds the ARN a policy scoped to this entry would name, so a
+	// view is authorized against its view ARN and not a table ARN.
+	resourceARN func(h *S3TablesHandler, ownerAccountID, bucketName, id string) string
+}
+
+var (
+	tableEntryKind = catalogEntryKind{
+		entryType:    EntryTypeTable,
+		noun:         "table",
+		renameOp:     "RenameTable",
+		createOp:     "CreateTable",
+		notFoundCode: ErrCodeNoSuchTable,
+		existsCode:   ErrCodeTableAlreadyExists,
+		resourceARN: func(h *S3TablesHandler, ownerAccountID, bucketName, id string) string {
+			return h.generateTableARN(ownerAccountID, bucketName, id)
+		},
+	}
+	viewEntryKind = catalogEntryKind{
+		entryType:    EntryTypeView,
+		noun:         "view",
+		renameOp:     "RenameView",
+		createOp:     "CreateView",
+		notFoundCode: ErrCodeNoSuchView,
+		existsCode:   ErrCodeViewAlreadyExists,
+		resourceARN: func(h *S3TablesHandler, ownerAccountID, bucketName, id string) string {
+			return h.generateViewARN(ownerAccountID, bucketName, id)
+		},
+	}
+)
+
 // handleRenameTable moves a table's catalog entry to a new namespace/name within
 // the same bucket. It is catalog-only: the metadata.json and data files stay put,
 // the destination keeps the source's MetadataLocation, and the source name is
 // soft-deleted in place (its catalog xattrs are dropped, its data is left intact).
 func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+	return h.renameCatalogEntry(w, r, filerClient, tableEntryKind)
+}
+
+// handleRenameView is handleRenameTable for views, which live in the same
+// namespace directory under the same name rules.
+func (h *S3TablesHandler) handleRenameView(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
+	return h.renameCatalogEntry(w, r, filerClient, viewEntryKind)
+}
+
+func (h *S3TablesHandler) renameCatalogEntry(w http.ResponseWriter, r *http.Request, filerClient FilerClient, kind catalogEntryKind) error {
 	var req RenameTableRequest
 	if err := h.readRequestBody(r, &req); err != nil {
 		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
@@ -1263,11 +1334,18 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 
 	var metadata tableMetadataInternal
 	var metadataVersionXattr []byte
+	var maintenanceXattr []byte
+	var maintenanceStatusXattr []byte
+	// The values the rename copies. The source is only cleared while it still
+	// holds exactly these, so a write that lands mid-rename is not deleted here
+	// after having missed the copy to the destination.
+	var copiedFromSource map[string][]byte
 	var tablePolicy string
 	var bucketPolicy string
 	var bucketTags map[string]string
 	var tableTags map[string]string
 	var bucketMetadata tableBucketMetadata
+	var srcExtended map[string][]byte
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		data, err := h.getExtendedAttribute(r.Context(), client, srcPath, ExtendedKeyMetadata)
 		if err != nil {
@@ -1294,6 +1372,35 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 			return err
 		}
 
+		srcEntry, err := h.lookupEntry(r.Context(), client, srcPath)
+		if err != nil {
+			return err
+		}
+		srcExtended = srcEntry.Extended
+		copiedFromSource = make(map[string][]byte, len(renamedTableAttributes))
+		for _, key := range renamedTableAttributes {
+			copiedFromSource[key] = srcEntry.Extended[key]
+		}
+
+		// The maintenance configuration and its last-run status belong to the
+		// table, so they move with it; leaving them behind re-enables
+		// maintenance under the new name and leaks the old settings onto
+		// whatever is created at the old one.
+		for _, attr := range []struct {
+			key  string
+			dest *[]byte
+		}{
+			{ExtendedKeyMaintenance, &maintenanceXattr},
+			{ExtendedKeyMaintenanceStatus, &maintenanceStatusXattr},
+		} {
+			data, err := h.getExtendedAttribute(r.Context(), client, srcPath, attr.key)
+			if err == nil {
+				*attr.dest = data
+			} else if !errors.Is(err, ErrAttributeNotFound) {
+				return fmt.Errorf("failed to fetch %s: %w", attr.key, err)
+			}
+		}
+
 		bucketPath := GetTableBucketPath(bucketName)
 		data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
 		if err == nil {
@@ -1318,19 +1425,26 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 	})
 
 	if err != nil {
-		if errors.Is(err, filer_pb.ErrNotFound) {
-			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", srcName))
+		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrAttributeNotFound) {
+			h.writeError(w, http.StatusNotFound, kind.notFoundCode, fmt.Sprintf("%s %s not found", kind.noun, srcName))
 		} else {
-			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check table: %v", err))
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check %s: %v", kind.noun, err))
 		}
 		return err
 	}
 
-	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, srcNamespace+"/"+srcName)
+	// Tables and views share the namespace directory, so a rename must not pick
+	// up the other kind under the same name.
+	if entryType(srcExtended) != kind.entryType {
+		h.writeError(w, http.StatusNotFound, kind.notFoundCode, fmt.Sprintf("%s %s not found", kind.noun, srcName))
+		return fmt.Errorf("%s %s not found", kind.noun, srcName)
+	}
+
+	tableARN := kind.resourceARN(h, metadata.OwnerAccountID, bucketName, srcNamespace+"/"+srcName)
 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
 	principal := h.getAccountID(r)
 	identityActions := getIdentityActions(r)
-	tableAllowed := CheckPermissionWithContext("RenameTable", principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+	tableAllowed := CheckPermissionWithContext(kind.renameOp, principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
 		TableBucketName: bucketName,
 		Namespace:       srcNamespace,
 		TableName:       srcName,
@@ -1339,7 +1453,7 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 		IdentityActions: identityActions,
 		DefaultAllow:    h.defaultAllowFor(r),
 	})
-	bucketAllowed := CheckPermissionWithContext("RenameTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+	bucketAllowed := CheckPermissionWithContext(kind.renameOp, principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 		TableBucketName: bucketName,
 		Namespace:       srcNamespace,
 		TableName:       srcName,
@@ -1349,8 +1463,8 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 		DefaultAllow:    h.defaultAllowFor(r),
 	})
 	if !tableAllowed && !bucketAllowed {
-		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to rename table")
-		return NewAuthError("RenameTable", principal, "not authorized to rename table")
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to rename "+kind.noun)
+		return NewAuthError(kind.renameOp, principal, "not authorized to rename "+kind.noun)
 	}
 
 	// Require the destination namespace to exist and the destination table to be free.
@@ -1381,7 +1495,7 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 
 	if err != nil {
 		if errors.Is(err, ErrTableAlreadyExists) {
-			h.writeError(w, http.StatusConflict, ErrCodeTableAlreadyExists, fmt.Sprintf("table %s already exists", destName))
+			h.writeError(w, http.StatusConflict, kind.existsCode, fmt.Sprintf("%s %s already exists", kind.noun, destName))
 		} else if errors.Is(err, filer_pb.ErrNotFound) {
 			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", destNamespace))
 		} else {
@@ -1393,7 +1507,7 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 	// Renaming places the table into the destination namespace, so the principal
 	// must also be allowed to create a table there (the source check alone lets a
 	// caller move tables into namespaces they don't control).
-	destNamespaceAllowed := CheckPermissionWithContext("CreateTable", principal, destNamespaceMetadata.OwnerAccountID, destNamespacePolicy, bucketARN, &PolicyContext{
+	destNamespaceAllowed := CheckPermissionWithContext(kind.createOp, principal, destNamespaceMetadata.OwnerAccountID, destNamespacePolicy, bucketARN, &PolicyContext{
 		TableBucketName: bucketName,
 		Namespace:       destNamespace,
 		TableName:       destName,
@@ -1401,7 +1515,7 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 		IdentityActions: identityActions,
 		DefaultAllow:    h.defaultAllowFor(r),
 	})
-	destBucketAllowed := CheckPermissionWithContext("CreateTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+	destBucketAllowed := CheckPermissionWithContext(kind.createOp, principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 		TableBucketName: bucketName,
 		Namespace:       destNamespace,
 		TableName:       destName,
@@ -1410,8 +1524,8 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 		DefaultAllow:    h.defaultAllowFor(r),
 	})
 	if !destNamespaceAllowed && !destBucketAllowed {
-		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table in the destination namespace")
-		return NewAuthError("RenameTable", principal, "not authorized to create table in the destination namespace")
+		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create "+kind.noun+" in the destination namespace")
+		return NewAuthError(kind.renameOp, principal, "not authorized to create "+kind.noun+" in the destination namespace")
 	}
 
 	metadata.Name = destName
@@ -1420,7 +1534,7 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 
 	metadataBytes, err := json.Marshal(&metadata)
 	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to marshal table metadata")
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to marshal "+kind.noun+" metadata")
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
@@ -1431,6 +1545,9 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 			return err
 		}
 		if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyMetadata, metadataBytes); err != nil {
+			return err
+		}
+		if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyEntryType, []byte(kind.entryType)); err != nil {
 			return err
 		}
 		if len(metadataVersionXattr) > 0 {
@@ -1452,20 +1569,34 @@ func (h *S3TablesHandler) handleRenameTable(w http.ResponseWriter, r *http.Reque
 				return err
 			}
 		}
+		if len(maintenanceXattr) > 0 {
+			if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyMaintenance, maintenanceXattr); err != nil {
+				return err
+			}
+		}
+		if len(maintenanceStatusXattr) > 0 {
+			if err := h.setExtendedAttribute(r.Context(), client, destPath, ExtendedKeyMaintenanceStatus, maintenanceStatusXattr); err != nil {
+				return err
+			}
+		}
 		// Soft-delete the source catalog identity in place: drop its catalog xattrs
 		// so the name stops resolving while the metadata/ and data/ children stay put
 		// (manifests embed absolute paths, so the data must not move).
-		return h.removeExtendedAttributes(r.Context(), client, srcPath,
-			ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags)
+		return h.removeExtendedAttributesIf(r.Context(), client, srcPath, copiedFromSource,
+			renamedTableAttributes...)
 	})
 
 	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to rename table")
+		if errors.Is(err, ErrConcurrentUpdate) {
+			h.writeError(w, http.StatusConflict, ErrCodeConflict, kind.noun+" changed during rename, retry the request")
+			return err
+		}
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to rename "+kind.noun)
 		return err
 	}
 
 	h.writeJSON(w, http.StatusOK, &RenameTableResponse{
-		TableARN:         h.generateTableARN(metadata.OwnerAccountID, bucketName, destNamespace+"/"+destName),
+		TableARN:         kind.resourceARN(h, metadata.OwnerAccountID, bucketName, destNamespace+"/"+destName),
 		MetadataLocation: metadata.MetadataLocation,
 	})
 	return nil
@@ -1506,6 +1637,8 @@ func (h *S3TablesHandler) handleUpdateTable(w http.ResponseWriter, r *http.Reque
 
 	// Load existing metadata and policies for authorization
 	var metadata tableMetadataInternal
+	var storedMetadata []byte
+	var storedPolicy []byte
 	var tablePolicy string
 	var bucketPolicy string
 	var bucketTags map[string]string
@@ -1521,11 +1654,13 @@ func (h *S3TablesHandler) handleUpdateTable(w http.ResponseWriter, r *http.Reque
 		if err := json.Unmarshal(data, &metadata); err != nil {
 			return fmt.Errorf("failed to unmarshal table metadata: %w", err)
 		}
+		storedMetadata = data
 
 		// 2. Get Table Policy & Tags
 		policyData, err := h.getExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyPolicy)
 		if err == nil {
 			tablePolicy = string(policyData)
+			storedPolicy = policyData
 		} else if !errors.Is(err, ErrAttributeNotFound) {
 			return fmt.Errorf("failed to fetch table policy: %w", err)
 		}
@@ -1637,14 +1772,33 @@ func (h *S3TablesHandler) handleUpdateTable(w http.ResponseWriter, r *http.Reque
 		return err
 	}
 
+	// Conditional on the metadata this request read and authorized against:
+	// two commits that both passed the version-token check would otherwise each
+	// write their own metadata and the later one would drop the earlier
+	// snapshot. mutateEntryExtended retries on a changed entry, so the check
+	// lives in the mutation, where it sees the value that is current now.
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		if err := h.setExtendedAttribute(r.Context(), client, tablePath, ExtendedKeyMetadata, metadataBytes); err != nil {
-			return err
-		}
-		return nil
+		return h.mutateEntryExtended(r.Context(), client, tablePath, func(extended map[string][]byte) error {
+			if !bytes.Equal(extended[ExtendedKeyMetadata], storedMetadata) {
+				return fmt.Errorf("%w: %s", ErrConcurrentUpdate, ExtendedKeyMetadata)
+			}
+			// The policy this request was authorized against must still be the
+			// one in force: an administrator restricting it mid-commit should
+			// send the caller back through authorization, not have its decision
+			// applied afterwards.
+			if !bytes.Equal(extended[ExtendedKeyPolicy], storedPolicy) {
+				return fmt.Errorf("%w: %s", ErrConcurrentUpdate, ExtendedKeyPolicy)
+			}
+			extended[ExtendedKeyMetadata] = metadataBytes
+			return nil
+		})
 	})
 
 	if err != nil {
+		if errors.Is(err, ErrConcurrentUpdate) {
+			h.writeError(w, http.StatusConflict, ErrCodeConflict, "table was updated concurrently")
+			return ErrVersionTokenMismatch
+		}
 		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update metadata")
 		return err
 	}

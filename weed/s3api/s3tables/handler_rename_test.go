@@ -1,6 +1,7 @@
 package s3tables
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -26,6 +27,9 @@ type memFilerServer struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	entries map[string]map[string]*filer_pb.Entry // dir -> name -> entry
 	client  filer_pb.SeaweedFilerClient
+	// beforeUpdate runs once, at the start of the next UpdateEntry, so a test
+	// can land a competing write in a handler's read-to-write window.
+	beforeUpdate func()
 }
 
 func newMemFilerServer() *memFilerServer {
@@ -81,6 +85,21 @@ func (f *memFilerServer) CreateEntry(_ context.Context, req *filer_pb.CreateEntr
 }
 
 func (f *memFilerServer) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
+	if hook := f.beforeUpdate; hook != nil {
+		f.beforeUpdate = nil
+		hook()
+	}
+	// The real filer validates ExpectedExtended under the per-path lock; without
+	// it here a lost update would look like a success.
+	for key, expected := range req.ExpectedExtended {
+		var actual []byte
+		if existing := f.getEntry(req.Directory, req.Entry.Name); existing != nil {
+			actual = existing.Extended[key]
+		}
+		if !bytes.Equal(actual, expected) {
+			return nil, status.Errorf(codes.FailedPrecondition, "extended attribute %q changed", key)
+		}
+	}
 	if _, ok := f.entries[req.Directory]; !ok {
 		f.entries[req.Directory] = make(map[string]*filer_pb.Entry)
 	}
@@ -351,4 +370,67 @@ func TestRenameTableInvalidName(t *testing.T) {
 	var s3Err *S3TablesError
 	require.ErrorAs(t, err, &s3Err)
 	assert.Equal(t, ErrCodeInvalidRequest, s3Err.Type)
+}
+
+// A disabled maintenance configuration has to move with the table. Leaving it
+// behind re-enables maintenance under the new name, and leaks the old settings
+// onto whatever is created at the old one.
+func TestRenameTableCarriesMaintenanceConfiguration(t *testing.T) {
+	fs, m := startRenameManager(t)
+
+	src := fs.getEntry(GetNamespacePath(renameTestBucket, "ns"), "t")
+	require.NotNil(t, src)
+	config := []byte(`{"icebergSnapshotManagement":{"status":"disabled"}}`)
+	status := []byte(`{"icebergCompaction":{"status":"Successful"}}`)
+	src.Extended[ExtendedKeyMaintenance] = config
+	src.Extended[ExtendedKeyMaintenanceStatus] = status
+
+	require.NoError(t, runRename(t, m, fs, &RenameTableRequest{
+		TableBucketARN:  mustBucketARN(t),
+		SourceNamespace: []string{"ns"},
+		SourceName:      "t",
+		DestNamespace:   []string{"ns"},
+		DestName:        "t2",
+	}))
+
+	dest := fs.getEntry(GetNamespacePath(renameTestBucket, "ns"), "t2")
+	require.NotNil(t, dest)
+	assert.Equal(t, config, dest.Extended[ExtendedKeyMaintenance], "the disable must move with the table")
+	assert.Equal(t, status, dest.Extended[ExtendedKeyMaintenanceStatus])
+
+	// And must not linger on the old name, where a reused name would inherit it.
+	moved := fs.getEntry(GetNamespacePath(renameTestBucket, "ns"), "t")
+	require.NotNil(t, moved)
+	_, hasConfig := moved.Extended[ExtendedKeyMaintenance]
+	assert.False(t, hasConfig, "source maintenance configuration must be cleared")
+	_, hasStatus := moved.Extended[ExtendedKeyMaintenanceStatus]
+	assert.False(t, hasStatus, "source maintenance status must be cleared")
+}
+
+// A maintenance configuration written after the rename copied the source must
+// not be deleted by the source cleanup: it would vanish without ever reaching
+// the destination.
+func TestRenameTableRejectsConcurrentMaintenanceWrite(t *testing.T) {
+	fs, _ := startRenameManager(t)
+
+	src := fs.getEntry(GetNamespacePath(renameTestBucket, "ns"), "t")
+	require.NotNil(t, src)
+	copied := []byte(`{"icebergCompaction":{"status":"enabled"}}`)
+	src.Extended[ExtendedKeyMaintenance] = copied
+
+	// Stand in for the Put that lands between the copy and the cleanup.
+	landedLate := []byte(`{"icebergSnapshotManagement":{"status":"disabled"}}`)
+	expected := map[string][]byte{ExtendedKeyMaintenance: copied}
+
+	src.Extended[ExtendedKeyMaintenance] = landedLate
+
+	h := NewS3TablesHandler()
+	err := NewManagerClient(fs.client).WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return h.removeExtendedAttributesIf(context.Background(),
+			client, GetTablePath(renameTestBucket, "ns", "t"), expected, renamedTableAttributes...)
+	})
+
+	require.Error(t, err, "cleanup must refuse to delete a configuration written after the copy")
+	assert.ErrorIs(t, err, ErrConcurrentUpdate)
+	assert.Equal(t, landedLate, src.Extended[ExtendedKeyMaintenance], "the late write must survive")
 }

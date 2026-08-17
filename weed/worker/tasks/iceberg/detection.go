@@ -69,6 +69,11 @@ func (h *Handler) scanTablesForMaintenance(
 		if !wildcard.MatchesAnyWildcard(bucketMatchers, bucketName) {
 			continue
 		}
+		bucketMaintenance, err := parseMaintenanceConfiguration(bucketEntry.Extended, bucketName)
+		if err != nil {
+			glog.Warningf("iceberg maintenance: skipping bucket %s: %v", bucketName, err)
+			continue
+		}
 
 		// List namespaces within the bucket
 		bucketPath := path.Join(bucketsPath, bucketName)
@@ -127,7 +132,19 @@ func (h *Handler) scanTablesForMaintenance(
 					continue
 				}
 
-				needsWork, err := h.tableNeedsMaintenance(ctx, filerClient, bucketName, tablePath, state, config, ops)
+				tableMaintenance, err := parseMaintenanceConfiguration(tableEntry.Extended, path.Join(bucketName, tablePath))
+				if err != nil {
+					glog.Warningf("iceberg maintenance: skipping %s/%s/%s: %v", bucketName, nsName, tblName, err)
+					continue
+				}
+				maintenance := mergeMaintenanceConfiguration(bucketMaintenance, tableMaintenance)
+				tableOps := filterDisabledOperations(ops, maintenance)
+				if len(tableOps) == 0 {
+					continue
+				}
+				effective := resolveTableConfig(config, state.Metadata.Properties(), maintenance)
+
+				needsWork, err := h.tableNeedsMaintenance(ctx, filerClient, bucketName, tablePath, state, effective, tableOps)
 				if err != nil {
 					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: cannot evaluate maintenance need: %v", bucketName, nsName, tblName, err)
 					continue
@@ -154,8 +171,8 @@ func (h *Handler) scanTablesForMaintenance(
 
 func normalizeDetectionConfig(config Config) Config {
 	config = applyThresholdDefaults(config)
-	if config.SnapshotRetentionHours <= 0 {
-		config.SnapshotRetentionHours = defaultSnapshotRetentionHours
+	if config.SnapshotRetentionMs <= 0 {
+		config.SnapshotRetentionMs = hoursToMs(defaultSnapshotRetentionHours)
 	}
 	if config.MaxSnapshotsToKeep <= 0 {
 		config.MaxSnapshotsToKeep = defaultMaxSnapshotsToKeep
@@ -469,27 +486,12 @@ func compactionMinInputFiles(minInputFiles int64) (int, error) {
 
 // needsMaintenance checks whether snapshot expiration work is needed based on
 // metadata-only thresholds.
+// It asks execution what it would do rather than reimplementing the rules:
+// expiry always requires a snapshot to be past the retention window, so a
+// table over the snapshot quota whose snapshots are all young, or all pinned by
+// refs, would otherwise be proposed for a job that can only no-op.
 func needsMaintenance(meta table.Metadata, config Config) bool {
-	snapshots := meta.Snapshots()
-	if len(snapshots) == 0 {
-		return false
-	}
-
-	// Check snapshot count
-	if int64(len(snapshots)) > config.MaxSnapshotsToKeep {
-		return true
-	}
-
-	// Check oldest snapshot age
-	retentionMs := config.SnapshotRetentionHours * 3600 * 1000
-	nowMs := time.Now().UnixMilli()
-	for _, snap := range snapshots {
-		if nowMs-snap.TimestampMs > retentionMs {
-			return true
-		}
-	}
-
-	return false
+	return len(snapshotsToExpire(meta, config, time.Now().UnixMilli())) > 0
 }
 
 // buildMaintenanceProposal creates a JobProposal for a table needing maintenance.
