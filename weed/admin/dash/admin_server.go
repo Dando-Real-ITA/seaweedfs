@@ -2,9 +2,11 @@ package dash
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -34,6 +36,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/lifecycle_xml"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/scheduler"
@@ -259,33 +262,25 @@ func NewAdminServer(masters string, filerGroup string, templateFS http.FileSyste
 			maintenanceConfig = maintenance.DefaultMaintenanceConfig()
 		}
 
-		// Apply new defaults to handle schema changes (like enabling by default)
-		schema := maintenance.GetMaintenanceConfigSchema()
-		if err := schema.ApplyDefaultsToProtobuf(maintenanceConfig); err != nil {
-			glog.Warningf("Failed to apply schema defaults to loaded config: %v", err)
-		}
-
-		// Force enable maintenance system for new default behavior
-		// This handles the case where old configs had Enabled=false as default
-		if !maintenanceConfig.Enabled {
-			glog.V(1).Infof("Enabling maintenance system (new default behavior)")
-			maintenanceConfig.Enabled = true
-		}
-
-		glog.V(1).Infof("Maintenance system initialized with persistent configuration (enabled: %v)", maintenanceConfig.Enabled)
+		glog.V(1).Infof("Maintenance system initialized with persistent configuration (enabled: %v)", maintenanceConfig.GetEnabled())
 	} else {
 		maintenanceConfig = maintenance.DefaultMaintenanceConfig()
-		glog.V(1).Infof("No data directory configured, maintenance system will run in memory-only mode (enabled: %v)", maintenanceConfig.Enabled)
+		glog.V(1).Infof("No data directory configured, maintenance system will run in memory-only mode (enabled: %v)", maintenanceConfig.GetEnabled())
 	}
+
+	// Load saved task configurations from persistence. This has to run before the maintenance
+	// manager is created: creating it applies the maintenance policy to the registered
+	// detectors and schedulers, while this call replaces each task's whole config object, so
+	// running it afterwards would discard what the policy just applied. Both read the same
+	// persisted task config files, so the policy ends up as the last writer and stays
+	// authoritative for the task types it covers.
+	server.loadTaskConfigurationsFromPersistence()
 
 	// Always initialize maintenance manager
 	server.InitMaintenanceManager(maintenanceConfig)
 
-	// Load saved task configurations from persistence
-	server.loadTaskConfigurationsFromPersistence()
-
 	// Start maintenance manager if enabled
-	if maintenanceConfig.Enabled {
+	if maintenanceConfig.GetEnabled() {
 		go func() {
 			// Give master client a bit of time to connect before starting scans
 			time.Sleep(2 * time.Second)
@@ -293,6 +288,8 @@ func NewAdminServer(masters string, filerGroup string, templateFS http.FileSyste
 				glog.Errorf("Failed to start maintenance manager: %v", err)
 			}
 		}()
+	} else {
+		glog.V(0).Infof("Maintenance system is disabled by configuration, not starting the maintenance manager")
 	}
 
 	pluginOpts := adminplugin.Options{
@@ -432,7 +429,72 @@ func (s *AdminServer) publishMaintenanceMetrics(ctx context.Context) {
 	}
 }
 
+// workerFleetTotals aggregates connected workers and their task slots across
+// BOTH worker registries the admin server keeps: the legacy maintenance-worker
+// registry (workers that register over the worker gRPC stream) and the plugin
+// worker registry (workers started as `weed worker`). Reading only the legacy
+// one reported zero workers on clusters that run the admin and the workers as
+// separate components, where no legacy worker ever registers.
+//
+// A worker can appear in both registries: `weed mini` starts both runtimes from
+// one working directory, so they share the persisted worker ID. Merging by ID
+// keeps such a worker counted once, and its slots are taken from the legacy
+// registry, which is where they were accounted for before.
+func (s *AdminServer) workerFleetTotals() (workers, usedSlots, maxSlots int) {
+	var legacySlots map[string]maintenance.WorkerSlots
+	if s.maintenanceManager != nil {
+		legacySlots = s.maintenanceManager.GetWorkerSlots()
+	}
+	return mergeWorkerFleetTotals(legacySlots, s.GetPluginWorkers())
+}
+
+// mergeWorkerFleetTotals unions the legacy and plugin worker registries by
+// worker ID. Plugin workers report their slots in the heartbeat, so one that
+// has connected but not yet sent a heartbeat adds to the worker count with zero
+// slots until its first heartbeat lands.
+func mergeWorkerFleetTotals(legacySlots map[string]maintenance.WorkerSlots, pluginWorkers []*adminplugin.WorkerSession) (workers, usedSlots, maxSlots int) {
+	for _, slots := range legacySlots {
+		workers++
+		usedSlots += slots.Used
+		maxSlots += slots.Max
+	}
+
+	for _, session := range pluginWorkers {
+		if session == nil {
+			continue
+		}
+		if _, counted := legacySlots[session.WorkerID]; counted {
+			continue
+		}
+		workers++
+		if heartbeat := session.Heartbeat; heartbeat != nil {
+			used := int(heartbeat.DetectionSlotsUsed) + int(heartbeat.ExecutionSlotsUsed)
+			max := int(heartbeat.DetectionSlotsTotal) + int(heartbeat.ExecutionSlotsTotal)
+			// A worker's self-reported slots are untrusted input; a stale or
+			// misbehaving one should not be able to drive the aggregate gauge
+			// negative, matching the same defensiveness as registry.go's own
+			// slot arithmetic.
+			if used < 0 {
+				used = 0
+			}
+			if max < 0 {
+				max = 0
+			}
+			usedSlots += used
+			maxSlots += max
+		}
+	}
+	return
+}
+
 func (s *AdminServer) collectMaintenanceMetrics() {
+	// Published before the maintenanceManager guard below: plugin workers are
+	// tracked independently of the maintenance manager.
+	workers, usedSlots, maxSlots := s.workerFleetTotals()
+	stats_collect.AdminWorkersConnected.Set(float64(workers))
+	stats_collect.AdminWorkerSlots.WithLabelValues("used").Set(float64(usedSlots))
+	stats_collect.AdminWorkerSlots.WithLabelValues("max").Set(float64(maxSlots))
+
 	if s.maintenanceManager == nil {
 		return
 	}
@@ -456,11 +518,6 @@ func (s *AdminServer) collectMaintenanceMetrics() {
 	} else {
 		stats_collect.AdminMaintenanceNextScanTimestampSeconds.Set(0)
 	}
-
-	workers, usedSlots, maxSlots := s.maintenanceManager.GetWorkerSlotTotals()
-	stats_collect.AdminWorkersConnected.Set(float64(workers))
-	stats_collect.AdminWorkerSlots.WithLabelValues("used").Set(float64(usedSlots))
-	stats_collect.AdminWorkerSlots.WithLabelValues("max").Set(float64(maxSlots))
 }
 
 // loadTaskConfigurationsFromPersistence loads saved task configurations from protobuf files
@@ -823,6 +880,7 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 					Owner:                 owner,
 					LifecycleRuleCount:    lifecycleRuleCount,
 					LifecycleEnabledCount: lifecycleEnabledCount,
+					PolicyStatementCount:  extractPolicyStatementCountFromEntry(resp.Entry),
 				}
 				buckets = append(buckets, bucket)
 			}
@@ -928,6 +986,7 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 		details.Bucket.ObjectLockDuration = objectLockDuration
 		details.Bucket.Owner = owner
 		details.Bucket.LifecycleRuleCount, details.Bucket.LifecycleEnabledCount = extractLifecycleCountsFromEntry(bucketResp.Entry)
+		details.Bucket.PolicyStatementCount = extractPolicyStatementCountFromEntry(bucketResp.Entry)
 
 		return nil
 	})
@@ -1531,13 +1590,13 @@ func (as *AdminServer) GetConfigInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // StartWorkerGrpcServer starts the worker gRPC server
-func (s *AdminServer) StartWorkerGrpcServer(grpcPort int) error {
+func (s *AdminServer) StartWorkerGrpcServer(grpcPort int, listener net.Listener) error {
 	if s.workerGrpcServer != nil {
 		return fmt.Errorf("worker gRPC server is already running")
 	}
 
 	s.workerGrpcServer = NewWorkerGrpcServer(s)
-	return s.workerGrpcServer.StartWithTLS(grpcPort)
+	return s.workerGrpcServer.StartWithTLS(grpcPort, listener)
 }
 
 // StopWorkerGrpcServer stops the worker gRPC server
@@ -1779,7 +1838,16 @@ func (s *AdminServer) ListPluginSchedulerStates() ([]adminplugin.SchedulerJobTyp
 
 // InitMaintenanceManager initializes the maintenance manager
 func (s *AdminServer) InitMaintenanceManager(config *maintenance.MaintenanceConfig) {
-	s.maintenanceManager = maintenance.NewMaintenanceManager(s, config)
+	// Hand the real config store to the manager so that, if it has to build the maintenance policy
+	// itself, it reads the persisted task configs instead of compiled-in defaults. Only pass it when
+	// a data directory is actually configured: an unconfigured store has nothing to read, and a typed
+	// nil pointer would satisfy the loaders' type assertion and then panic on use.
+	var configPersistence interface{}
+	if s.configPersistence != nil && s.configPersistence.IsConfigured() {
+		configPersistence = s.configPersistence
+	}
+
+	s.maintenanceManager = maintenance.NewMaintenanceManager(s, config, configPersistence)
 
 	// Set up task persistence if config persistence is available
 	if s.configPersistence != nil {
@@ -1794,7 +1862,7 @@ func (s *AdminServer) InitMaintenanceManager(config *maintenance.MaintenanceConf
 		}
 	}
 
-	glog.V(1).Infof("Maintenance manager initialized (enabled: %v)", config.Enabled)
+	glog.V(1).Infof("Maintenance manager initialized (enabled: %v)", config.GetEnabled())
 }
 
 // GetMaintenanceManager returns the maintenance manager
@@ -2030,6 +2098,21 @@ func extractLifecycleCountsFromEntry(entry *filer_pb.Entry) (ruleCount, enabledC
 		}
 	}
 	return
+}
+
+// extractPolicyStatementCountFromEntry returns the number of statements in
+// the bucket's policy, or 0 if it has none or the stored JSON can't be
+// parsed. Forgiving on parse failure, same as extractLifecycleCountsFromEntry.
+func extractPolicyStatementCountFromEntry(entry *filer_pb.Entry) int {
+	policyJSON := entry.Extended[s3api.BUCKET_POLICY_METADATA_KEY]
+	if len(policyJSON) == 0 {
+		return 0
+	}
+	var doc policy_engine.PolicyDocument
+	if err := json.Unmarshal(policyJSON, &doc); err != nil {
+		return 0
+	}
+	return len(doc.Statement)
 }
 
 // GetConfigPersistence returns the config persistence manager

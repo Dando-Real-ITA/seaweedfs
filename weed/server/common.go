@@ -316,6 +316,9 @@ func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 	ranges, err := parseRange(rangeReq, totalSize)
 	if err != nil {
 		glog.Errorf("ProcessRangeRequest, rangeReq/totalSize: %s/%s headers: Read: %+v - Write: %+v err: %v", rangeReq, strconv.FormatInt(totalSize, 10), r.Header, w.Header(), err)
+		if err == errNoOverlap {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+		}
 		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
 		return fmt.Errorf("ProcessRangeRequest header: %w", err)
 	}
