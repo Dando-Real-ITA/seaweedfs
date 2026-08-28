@@ -24,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/security"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -423,9 +424,10 @@ func (s3a *S3ApiServer) checkDirectoryObject(bucket, object string) (*filer_pb.E
 	return dirEntry, true, nil
 }
 
-// resolveObjectEntry resolves the object entry for conditional checks,
-// handling versioned buckets by resolving the latest version.
-func (s3a *S3ApiServer) resolveObjectEntry(bucket, object string) (*filer_pb.Entry, error) {
+// resolveObjectEntry resolves the object entry for conditional checks: the version the
+// request names when the bucket is versioned, otherwise the latest version. Callers
+// with no version to target pass an empty versionId.
+func (s3a *S3ApiServer) resolveObjectEntry(bucket, object, versionId string) (*filer_pb.Entry, error) {
 	// Check if versioning is configured
 	versioningConfigured, err := s3a.isVersioningConfigured(bucket)
 	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
@@ -434,6 +436,9 @@ func (s3a *S3ApiServer) resolveObjectEntry(bucket, object string) (*filer_pb.Ent
 	}
 
 	if versioningConfigured {
+		if versionId != "" {
+			return s3a.getSpecificObjectVersion(bucket, object, versionId)
+		}
 		// For versioned buckets, we must use getLatestObjectVersion to correctly
 		// find the latest versioned object (in .versions/) or null version.
 		// Standard getEntry would fail to find objects moved to .versions/.
@@ -3333,7 +3338,7 @@ func (s3a *S3ApiServer) openRemoteStream(ctx context.Context, bucket, object str
 		return nil, err
 	}
 
-	client, err := remote_storage.GetRemoteStorage(storageConf)
+	client, err := weed_server.BuildGuardedRemoteStorageClient(ctx, storageConf, false)
 	if err != nil {
 		return nil, err
 	}
