@@ -222,7 +222,7 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	entry.Name = name // this flush may be just after a rename operation
 
 	if entry.Attributes != nil {
-		entry.Attributes.Mime = fh.contentType
+		entry.Attributes.Mime = selectMimeTypeOnFlush(name, fh.contentType, entry.Attributes.Mime)
 		if entry.Attributes.Uid == 0 {
 			entry.Attributes.Uid = uid
 		}

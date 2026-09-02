@@ -1,7 +1,6 @@
 package mount
 
 import (
-	"net/http"
 	"syscall"
 	"time"
 
@@ -91,8 +90,7 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 	written = uint32(len(data))
 
 	if offset == 0 {
-		// detect mime type
-		fh.contentType = http.DetectContentType(data)
+		fh.contentType = detectMountMimeType(entry.Name, data)
 	}
 
 	fh.dirtyMetadata = true
