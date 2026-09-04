@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"mime"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+
+	"github.com/gabriel-vasile/mimetype"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -540,11 +543,39 @@ func detectMimeType(f *os.File) string {
 		return ""
 	}
 	f.Seek(0, io.SeekStart)
-	mimeType := http.DetectContentType(head[:n])
-	if mimeType == "application/octet-stream" {
-		return ""
+	return detectMimeTypeFromHead(filepath.Base(f.Name()), head[:n])
+}
+
+func detectMimeTypeFromHead(filename string, data []byte) string {
+	libraryType := strings.TrimSpace(mimetype.Detect(data).String())
+	if !isWeakMimeType(libraryType) {
+		return libraryType
 	}
-	return mimeType
+
+	stdlibType := strings.TrimSpace(http.DetectContentType(data))
+	if !isWeakMimeType(stdlibType) {
+		return stdlibType
+	}
+
+	if extensionType := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); extensionType != "" {
+		return extensionType
+	}
+	if stdlibType != "" {
+		return stdlibType
+	}
+	return libraryType
+}
+
+func isWeakMimeType(value string) bool {
+	if value == "" {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err == nil {
+		value = mediaType
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "application/octet-stream" || value == "text/plain"
 }
 
 func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, offset int64, tsNs int64, _ uint64) (chunk *filer_pb.FileChunk, err error) {
