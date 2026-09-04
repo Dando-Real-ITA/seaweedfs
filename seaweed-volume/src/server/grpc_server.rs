@@ -297,18 +297,18 @@ impl VolumeGrpcService {
     }
 
     /// Shared helper matching Go's `makeVolumeReadonly(ctx, v, canDelete, persist)`.
-    /// 1. Check maintenance mode
-    /// 2. Notify master (readonly=true)
-    /// 3. Mark local volume readonly
-    /// 4. Notify master again (cover heartbeat race)
+    /// Not gated on maintenance mode: marking a volume readonly only restricts a
+    /// server that is already meant to be read-only, and it is the first step of
+    /// moving a volume off a server under evacuation (issue #11066).
+    /// 1. Notify master (readonly=true)
+    /// 2. Mark local volume readonly
+    /// 3. Notify master again (cover heartbeat race)
     async fn make_volume_readonly(
         &self,
         vid: VolumeId,
         can_delete: bool,
         persist: bool,
     ) -> Result<(), Status> {
-        self.state.check_maintenance()?;
-
         let info = {
             let store = self.state.store.read().unwrap();
             let (loc_idx, vol) = store
@@ -1020,12 +1020,14 @@ impl VolumeServer for VolumeGrpcService {
         ))
     }
 
+    /// Allowed in maintenance mode: it removes data from the server rather than
+    /// adding any, and evacuating a server in maintenance mode ends each move by
+    /// deleting the source copy (issue #11066).
     async fn volume_delete(
         &self,
         request: Request<volume_server_pb::VolumeDeleteRequest>,
     ) -> Result<Response<volume_server_pb::VolumeDeleteResponse>, Status> {
         self.check_grpc_admin_auth(&request)?;
-        self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
         let mut store = self.state.store.write().unwrap();
@@ -1039,7 +1041,15 @@ impl VolumeServer for VolumeGrpcService {
         }
         store
             .delete_volume(vid, req.only_empty, req.keep_remote_data)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                crate::storage::volume::VolumeError::NotFound => {
+                    Status::not_found(format!("not found volume id {}", vid))
+                }
+                crate::storage::volume::VolumeError::NotEmpty => {
+                    Status::failed_precondition("volume not empty")
+                }
+                other => Status::internal(other.to_string()),
+            })?;
         self.state.volume_state_notify.notify_one();
         Ok(Response::new(volume_server_pb::VolumeDeleteResponse {}))
     }
@@ -1051,7 +1061,7 @@ impl VolumeServer for VolumeGrpcService {
         self.check_grpc_admin_auth(&request)?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
-        // Go: volume lookup (L239-241) happens before maintenance check (L166 in makeVolumeReadonly)
+        // Go: VolumeMarkReadonly looks the volume up before calling makeVolumeReadonly
         {
             let store = self.state.store.read().unwrap();
             store
@@ -3006,12 +3016,13 @@ impl VolumeServer for VolumeGrpcService {
         ))
     }
 
+    /// Allowed in maintenance mode: like `volume_delete` it only removes data, and
+    /// evacuating EC shards off a server in maintenance mode ends here (issue #11066).
     async fn volume_ec_shards_delete(
         &self,
         request: Request<volume_server_pb::VolumeEcShardsDeleteRequest>,
     ) -> Result<Response<volume_server_pb::VolumeEcShardsDeleteResponse>, Status> {
         self.check_grpc_admin_auth(&request)?;
-        self.state.check_maintenance()?;
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
@@ -6422,5 +6433,39 @@ mod tests {
         assert!(resp.broken_shard_infos.iter().any(|s| s.shard_id == 0));
         assert!(resp.details.is_empty(), "{:?}", resp.details);
         assert_eq!(resp.total_files, 1);
+    }
+
+    #[tokio::test]
+    async fn volume_delete_reports_absent_volume_as_not_found() {
+        let (service, _tmp) = make_service_with_seed_masters(&[]);
+        let err = service
+            .volume_delete(Request::new(volume_server_pb::VolumeDeleteRequest {
+                volume_id: 4242,
+                only_empty: false,
+                keep_remote_data: false,
+            }))
+            .await
+            .expect_err("deleting an absent volume must fail");
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        assert!(err.message().contains("not found"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn volume_delete_only_empty_refuses_a_volume_with_data() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        let err = service
+            .volume_delete(Request::new(volume_server_pb::VolumeDeleteRequest {
+                volume_id: 1,
+                only_empty: true,
+                keep_remote_data: false,
+            }))
+            .await
+            .expect_err("only_empty must refuse a volume holding a needle");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+        assert!(err.message().contains("volume not empty"), "{err:?}");
+        assert!(
+            service.state.store.read().unwrap().find_volume(VolumeId(1)).is_some(),
+            "refused delete must leave the volume mounted"
+        );
     }
 }
