@@ -73,6 +73,7 @@ const (
 	ErrInvalidMaxDeleteObjects
 	ErrInvalidPartNumberMarker
 	ErrInvalidPart
+	ErrInvalidPartNumber
 	ErrInvalidPartOrder
 	ErrInvalidRange
 	ErrInternalError
@@ -169,6 +170,7 @@ const (
 
 	ErrInvalidRenameSource
 	ErrRenameDestinationSameAsSource
+	ErrIdempotentParameterMismatch
 )
 
 // Error message constants for checksum validation
@@ -349,6 +351,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidPartNumber: {
+		Code:           "InvalidPartNumber",
+		Description:    "The requested partnumber is not satisfiable.",
+		HTTPStatusCode: http.StatusRequestedRangeNotSatisfiable,
+	},
 	ErrInvalidPartOrder: {
 		Code:           "InvalidPartOrder",
 		Description:    "The list of parts was not in ascending order. The parts list must be specified in order by part number.",
@@ -373,6 +380,13 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrRenameDestinationSameAsSource: {
 		Code:           "InvalidRequest",
 		Description:    "This rename request is illegal because it is trying to rename an object to itself.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrIdempotentParameterMismatch: {
+		Code:        "IdempotentParameterMismatch",
+		Description: "The request uses the same client token as a previous, but non-identical request.",
+		// 400 Bad Request, matching the AWS S3 RenameObject API documentation
+		// for IdempotencyParameterMismatch.
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidTag: {

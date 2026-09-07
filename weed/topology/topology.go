@@ -567,12 +567,15 @@ func (t *Topology) RegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
 
 func (t *Topology) UnRegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
 	glog.Infof("removing volume info: %+v from %v", v, dn.id)
-	if v.ReplicaPlacement.GetCopyCount() > 1 {
-		stats.MasterReplicaPlacementMismatch.WithLabelValues(v.Collection, v.Id.String()).Set(0)
-	}
 	diskType := types.ToDiskType(v.DiskType)
 	volumeLayout := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
 	volumeLayout.UnRegisterVolume(&v, dn)
+	// Drop the series only after the last placement is gone. Deleting while
+	// another data node still holds v would hide under-replication until the
+	// next CollectDeadNodeAndFullVolumes cycle recreates the label.
+	if v.ReplicaPlacement.GetCopyCount() > 1 && len(t.Lookup(v.Collection, v.Id)) == 0 {
+		stats.MasterReplicaPlacementMismatch.DeleteLabelValues(v.Collection, v.Id.String())
+	}
 	if volumeLayout.isEmpty() {
 		t.DeleteLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
 	}

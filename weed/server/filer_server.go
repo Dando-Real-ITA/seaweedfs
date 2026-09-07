@@ -88,6 +88,9 @@ type FilerOption struct {
 	TusSessionExpiry          time.Duration
 	S3ConfigFile              string // optional path to static S3 identity config file
 	CredentialManager         *credential.CredentialManager
+	// AllowUntrustedRemoteEndpoints lets a read of a remote-only entry dial a
+	// mounted endpoint that resolves to a loopback / private / metadata host.
+	AllowUntrustedRemoteEndpoints bool
 }
 
 type FilerServer struct {
@@ -180,9 +183,11 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	domains := strings.Split(allowedOrigins, ",")
 	option.AllowedOrigins = domains
 
+	// -exposeDirectoryData and filer.expose_directory_metadata both default to
+	// on, and either one turning it off has to hold: this is what keeps the
+	// directory listing off a filer whose reads are otherwise unauthenticated.
 	v.SetDefault("filer.expose_directory_metadata.enabled", true)
-	returnDirMetadata := v.GetBool("filer.expose_directory_metadata.enabled")
-	option.ExposeDirectoryData = returnDirMetadata
+	option.ExposeDirectoryData = option.ExposeDirectoryData && v.GetBool("filer.expose_directory_metadata.enabled")
 
 	fs = &FilerServer{
 		option:                option,
