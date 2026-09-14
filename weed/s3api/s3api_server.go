@@ -426,6 +426,8 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		}
 	}
 
+	s3ApiServer.applyTrustedProxies(util.GetViper())
+
 	// Initialize embedded IAM API if enabled
 	if option.EnableIam {
 		s3ApiServer.embeddedIam = NewEmbeddedIamApi(s3ApiServer.credentialManager, iam, option.IamReadOnly)
@@ -460,6 +462,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 			v.GetString("jwt.filer_signing.read.key"),
 			v.GetInt("jwt.filer_signing.read.expires_after_seconds"),
 		)
+		s3ApiServer.applyTrustedProxies(v)
 		util_http.ReloadJwtSigningReadConfig()
 	})
 	s3ApiServer.bucketRegistry = NewBucketRegistry(s3ApiServer)
@@ -504,6 +507,22 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	s3ApiServer.versionsReconcilerStop = s3ApiServer.startVersioningReconciler()
 
 	return s3ApiServer, nil
+}
+
+// applyTrustedProxies reads [s3.trusted_proxies] from the security config and
+// propagates the allowlist to the bucket policy engine, the IAM policy
+// engine, and the IAM integration so aws:SourceIp honors forwarded headers
+// only from configured trusted proxies.
+func (s3a *S3ApiServer) applyTrustedProxies(v util.Configuration) {
+	whiteList := util.StringSplit(v.GetString("s3.trusted_proxies.white_list"), ",")
+	tp := policy_engine.NewTrustedProxies(whiteList)
+	if s3a.policyEngine != nil {
+		s3a.policyEngine.engine.SetTrustedProxies(tp)
+	}
+	s3a.iam.SetTrustedProxies(tp)
+	if s3a.iamIntegration != nil {
+		s3a.iamIntegration.SetTrustedProxies(tp)
+	}
 }
 
 func (s3a *S3ApiServer) Shutdown() {
@@ -993,6 +1012,13 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 
 		//DeleteBucketOwnershipControls
 		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.DeleteBucketOwnershipControls, ACTION_ADMIN), "DELETE")).Queries("ownershipControls", "")
+
+		// SeaweedFS extension: bucket quota subresource
+		// PUT /{bucket}?seaweedfs-quota — set bucket quota (s3:PutBucketQuota)
+		// GET /{bucket}?seaweedfs-quota — get bucket quota (s3:GetBucketQuota)
+		// Authenticated via SigV4, authorized via dedicated IAM permissions.
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketQuotaHandler, ACTION_PUT_BUCKET_QUOTA)), "PUT")).Queries("seaweedfs-quota", "")
+		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketQuotaHandler, ACTION_GET_BUCKET_QUOTA)), "GET")).Queries("seaweedfs-quota", "")
 
 		// raw buckets
 

@@ -171,7 +171,11 @@ func retryFetchWithFreshLocations(ctx context.Context, invalidator CacheInvalida
 
 func PrepareStreamContentWithThrottler(ctx context.Context, masterClient wdclient.HasLookupFileIdFunction, jwtFunc VolumeServerJwtFunction, chunks []*filer_pb.FileChunk, offset int64, size int64, downloadMaxBytesPs int64) (DoStreamContent, error) {
 	glog.V(4).InfofCtx(ctx, "prepare to stream content for chunks: %d", len(chunks))
-	chunkViews := ViewFromChunks(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, size)
+	visibles, err := NonOverlappingVisibleIntervals(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, offset+size)
+	if err != nil {
+		return nil, err
+	}
+	chunkViews := ViewFromVisibleIntervals(visibles, offset, size)
 
 	fileId2Url := make(map[string][]string)
 
@@ -285,7 +289,11 @@ func PrepareStreamContentWithPrefetch(ctx context.Context, masterClient wdclient
 	}
 
 	glog.V(4).InfofCtx(ctx, "prepare to stream content with prefetch=%d for chunks: %d", prefetchAhead, len(chunks))
-	chunkViews := ViewFromChunks(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, size)
+	visibles, err := NonOverlappingVisibleIntervals(ctx, masterClient.GetLookupFileIdFunction(), chunks, offset, offset+size)
+	if err != nil {
+		return nil, err
+	}
+	chunkViews := ViewFromVisibleIntervals(visibles, offset, size)
 
 	fileId2Url := make(map[string][]string)
 
@@ -369,6 +377,7 @@ type ChunkStreamReader struct {
 	bufferLock   sync.Mutex
 	chunk        string
 	lookupFileId wdclient.LookupFileIdFunctionType
+	sourceErr    error
 }
 
 var _ = io.ReadSeeker(&ChunkStreamReader{})
@@ -507,7 +516,7 @@ func (c *ChunkStreamReader) fetchChunkToBuffer(chunkView *ChunkView) error {
 	urlStrings, err := c.lookupFileId(context.Background(), chunkView.FileId)
 	if err != nil {
 		glog.V(1).Infof("operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
-		return err
+		return c.rememberSourceError(err)
 	}
 	var buffer bytes.Buffer
 	// pre-size to the known chunk size; avoids bytes.Buffer's doubling regrowth
@@ -529,7 +538,7 @@ func (c *ChunkStreamReader) fetchChunkToBuffer(chunkView *ChunkView) error {
 		}
 	}
 	if err != nil {
-		return err
+		return c.rememberSourceError(err)
 	}
 	c.buffer = buffer.Bytes()
 	c.bufferOffset = chunkView.ViewOffset
@@ -537,6 +546,28 @@ func (c *ChunkStreamReader) fetchChunkToBuffer(chunkView *ChunkView) error {
 
 	// glog.V(0).Infof("fetched %s [%d,%d)", chunkView.FileId, chunkView.ViewOffset, chunkView.ViewOffset+int64(chunkView.ViewSize))
 
+	return nil
+}
+
+func (c *ChunkStreamReader) rememberSourceError(err error) error {
+	if c.sourceErr == nil {
+		c.sourceErr = err
+	}
+	return err
+}
+
+// SourceError returns the first lookup or chunk read failure, or nil.
+func (c *ChunkStreamReader) SourceError() error {
+	c.bufferLock.Lock()
+	defer c.bufferLock.Unlock()
+	return c.sourceErr
+}
+
+// ReaderSourceError returns the SourceError of a reader from NewFileReader, or nil.
+func ReaderSourceError(r io.Reader) error {
+	if csr, ok := r.(*ChunkStreamReader); ok {
+		return csr.SourceError()
+	}
 	return nil
 }
 

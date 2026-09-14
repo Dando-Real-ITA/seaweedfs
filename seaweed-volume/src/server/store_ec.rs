@@ -134,8 +134,13 @@ pub async fn read_ec_shard_needle_distributed(
             Ok(fresh) => {
                 // A complete reply merges into the cache; an incomplete one
                 // (< data_shards) is left unwritten — keep the prior cache.
-                match write_back_shard_locations(state, vid, fresh, snapshot.data_shards as usize)
-                {
+                match write_back_shard_locations(
+                    state,
+                    vid,
+                    fresh,
+                    snapshot.data_shards as usize,
+                    snapshot.encode_ts_ns,
+                ) {
                     Some(merged) => shard_locations = merged,
                     // An incomplete reply leaves the cache unwritten and its refresh
                     // time unadvanced, so the mark this refresh consumed goes back.
@@ -168,36 +173,37 @@ pub async fn read_ec_shard_needle_distributed(
     let parity_shards = snapshot.parity_shards as usize;
     let encode_ts_ns = snapshot.encode_ts_ns;
     let intervals = std::mem::take(&mut snapshot.intervals);
-    let fetched: Vec<io::Result<(Vec<u8>, bool)>> = stream::iter(intervals.into_iter().map(|res| {
-        let shard_locations = &shard_locations;
-        async move {
-            match res {
-                IntervalResult::Local(buf) => Ok((buf, false)),
-                IntervalResult::NeedRemote {
-                    shard_id,
-                    shard_offset,
-                    size,
-                } => {
-                    fetch_one_interval(
-                        state,
-                        vid,
-                        needle_id,
+    let fetched: Vec<io::Result<(Vec<u8>, bool)>> =
+        stream::iter(intervals.into_iter().map(|res| {
+            let shard_locations = &shard_locations;
+            async move {
+                match res {
+                    IntervalResult::Local(buf) => Ok((buf, false)),
+                    IntervalResult::NeedRemote {
                         shard_id,
                         shard_offset,
                         size,
-                        shard_locations,
-                        data_shards,
-                        parity_shards,
-                        encode_ts_ns,
-                    )
-                    .await
+                    } => {
+                        fetch_one_interval(
+                            state,
+                            vid,
+                            needle_id,
+                            shard_id,
+                            shard_offset,
+                            size,
+                            shard_locations,
+                            data_shards,
+                            parity_shards,
+                            encode_ts_ns,
+                        )
+                        .await
+                    }
                 }
             }
-        }
-    }))
-    .buffered(INTERVAL_READ_CONCURRENCY)
-    .collect()
-    .await;
+        }))
+        .buffered(INTERVAL_READ_CONCURRENCY)
+        .collect()
+        .await;
 
     let mut assembled: Vec<Vec<u8>> = Vec::with_capacity(fetched.len());
     for res in fetched {
@@ -230,8 +236,10 @@ pub async fn read_ec_shard_needle_distributed(
         ));
     }
 
-    let mut n = Needle::default();
-    n.id = needle_id;
+    let mut n = Needle {
+        id: needle_id,
+        ..Needle::default()
+    };
     n.read_bytes(
         &bytes,
         snapshot.offset.to_actual_offset(),
@@ -256,16 +264,16 @@ pub async fn read_ec_shard_needle_distributed(
 pub async fn scrub_ec_volume_distributed(
     state: &Arc<VolumeServerState>,
     vid: VolumeId,
+    expected_encode_ts_ns: i64,
     force_deleted_needles_check: bool,
     recover_unreadable: bool,
-) -> (i64, Vec<crate::pb::volume_server_pb::EcShardInfo>, Vec<String>) {
+) -> (
+    i64,
+    Vec<crate::pb::volume_server_pb::EcShardInfo>,
+    Vec<String>,
+) {
     // Phase A — under the Store read lock, snapshot the index scrub and grab the
     // paths/scalars + shard-location staleness; release the lock before any await.
-    //
-    // The index walk itself runs AFTER the guard: scrub_index() reads the whole
-    // .ecx, and doing that under store.read() parks the periodic heartbeat's
-    // store.write(), which a write-preferring RwLock then makes every later
-    // reader queue behind. See EcChecksumScrubPlan.
     let (
         ecx_path,
         collection,
@@ -278,7 +286,10 @@ pub async fn scrub_ec_volume_distributed(
         total_shards,
     ) = {
         let store = state.store.read().unwrap();
-        let ecv = match store.find_ec_volume(vid) {
+        // Resolve the runtime matching the anchor's encode generation, not the
+        // first-match find_ec_volume — otherwise the needle walk can scan an
+        // older run while the parity half scans the newest.
+        let ecv = match find_ec_volume_for_scrub(&store, vid, expected_encode_ts_ns) {
             Some(v) => v,
             None => {
                 return (
@@ -300,7 +311,7 @@ pub async fn scrub_ec_volume_distributed(
         // one scrub — the same race the vanished-volume policy exists to hide.
         // The descriptor outlives the name, the same way the checksum plan's
         // shard handles do.
-        let ecx_walk = fs::File::open(&ecv.ecx_file_name());
+        let ecx_walk = fs::File::open(ecv.ecx_file_name());
         // Encode-run identity of the volume this scrub started against. The
         // per-needle `scrub_snapshot_under_lock` re-resolves the volume by id
         // under a fresh guard, so a teardown-and-remount of the same vid between
@@ -350,7 +361,7 @@ pub async fn scrub_ec_volume_distributed(
                         "EC volume {} index scrub task panicked: {}",
                         vid.0, e
                     )],
-                )
+                );
             }
             // Cancellation: the runtime is shutting down, so this response is
             // unlikely to reach anyone. Return clean rather than inventing a
@@ -374,7 +385,9 @@ pub async fn scrub_ec_volume_distributed(
     ) {
         match cached_lookup_ec_shard_locations(state, vid).await {
             Ok(fresh) => {
-                if write_back_shard_locations(state, vid, fresh, data_shards).is_none() {
+                if write_back_shard_locations(state, vid, fresh, data_shards, expected_encode_ts_ns)
+                    .is_none()
+                {
                     mark_shard_locations_stale(state, vid);
                     return (
                         0,
@@ -401,18 +414,17 @@ pub async fn scrub_ec_volume_distributed(
     // walk, so per-needle snapshots no longer clone it.
     let locations: HashMap<ShardId, Vec<String>> = {
         let store = state.store.read().unwrap();
-        let ecv = match store.find_ec_volume(vid) {
+        let ecv = match find_ec_volume_for_scrub(&store, vid, expected_encode_ts_ns) {
             Some(v) => v,
             None => {
                 return (
                     0,
                     Vec::new(),
                     vec![format!("EC volume id {} not found", vid.0)],
-                )
+                );
             }
         };
-        let map = ecv.shard_locations.read().unwrap().clone();
-        map
+        ecv.shard_locations.read().unwrap().clone()
     };
 
     // Walk the .ecx (private fd captured under the lock, no lock held) for the
@@ -424,54 +436,57 @@ pub async fn scrub_ec_volume_distributed(
     // `walk_index_file` reads the full .ecx synchronously, so run it in the
     // blocking pool rather than on this async worker — same reason as
     // `index_plan.run()` above.
-    let (count, needles, walk_errs) =
-        match tokio::task::spawn_blocking(move || -> (i64, Vec<(NeedleId, Offset, Size)>, Vec<String>) {
+    let (count, needles, walk_errs) = match tokio::task::spawn_blocking(
+        move || -> (i64, Vec<(NeedleId, Offset, Size)>, Vec<String>) {
             let mut count: i64 = 0;
             let mut needles: Vec<(NeedleId, Offset, Size)> = Vec::new();
             let mut walk_errs: Vec<String> = Vec::new();
             match ecx_walk {
                 Ok(mut f) => {
-                    if let Err(e) = crate::storage::idx::walk_index_file(&mut f, 0, |id, offset, size| {
-                        count += 1;
-                        // Skip ALL deleted entries: -1 tombstones (runtime delete folded
-                        // into .ecx) and -originalSize entries (a needle deleted on the
-                        // regular volume before EC encode). get_actual_size uses the raw
-                        // signed size, so a negative would yield empty intervals
-                        // (false-positive) or an under-16-byte buffer (parse panic).
-                        if !size.is_deleted() {
-                            needles.push((id, offset, size));
-                        }
-                        Ok(())
-                    }) {
+                    if let Err(e) =
+                        crate::storage::idx::walk_index_file(&mut f, 0, |id, offset, size| {
+                            count += 1;
+                            // Skip ALL deleted entries: -1 tombstones (runtime delete folded
+                            // into .ecx) and -originalSize entries (a needle deleted on the
+                            // regular volume before EC encode). get_actual_size uses the raw
+                            // signed size, so a negative would yield empty intervals
+                            // (false-positive) or an under-16-byte buffer (parse panic).
+                            if !size.is_deleted() {
+                                needles.push((id, offset, size));
+                            }
+                            Ok(())
+                        })
+                    {
                         walk_errs.push(format!("walk ECX file {}: {}", ecx_path, e));
                     }
                 }
                 Err(e) => walk_errs.push(format!("open ECX file {}: {}", ecx_path, e)),
             }
             (count, needles, walk_errs)
-        }).await {
-            Ok(v) => v,
-            Err(e) => {
-                // A panic is evidence about the volume and counts as broken; a
-                // cancellation is not — see the index_plan join above for the
-                // same reasoning.
-                if e.is_panic() {
-                    return (
-                        0,
-                        Vec::new(),
-                        vec![format!(
-                            "EC volume {} ecx walk task panicked: {}",
-                            vid.0, e
-                        )],
-                    )
-                }
-                return (0, Vec::new(), Vec::new());
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // A panic is evidence about the volume and counts as broken; a
+            // cancellation is not — see the index_plan join above for the
+            // same reasoning.
+            if e.is_panic() {
+                return (
+                    0,
+                    Vec::new(),
+                    vec![format!("EC volume {} ecx walk task panicked: {}", vid.0, e)],
+                );
             }
-        };
+            return (0, Vec::new(), Vec::new());
+        }
+    };
     errs.extend(walk_errs);
 
     // reads for EC chunks can hit the same shard repeatedly, so dedupe broken shards
-    let mut broken_shards: HashMap<ShardId, crate::pb::volume_server_pb::EcShardInfo> = HashMap::new();
+    let mut broken_shards: HashMap<ShardId, crate::pb::volume_server_pb::EcShardInfo> =
+        HashMap::new();
 
     for (id, offset, size) in needles {
         // Per-needle snapshot under the lock from the RAW .ecx (offset, size) so
@@ -606,7 +621,11 @@ pub async fn scrub_ec_volume_distributed(
     // Mirror Go CmpEcShardInfo: sort by (volume_id, shard_id).
     let mut broken: Vec<crate::pb::volume_server_pb::EcShardInfo> =
         broken_shards.into_values().collect();
-    broken.sort_by(|a, b| a.volume_id.cmp(&b.volume_id).then(a.shard_id.cmp(&b.shard_id)));
+    broken.sort_by(|a, b| {
+        a.volume_id
+            .cmp(&b.volume_id)
+            .then(a.shard_id.cmp(&b.shard_id))
+    });
 
     (count, broken, errs)
 }
@@ -647,7 +666,7 @@ fn scrub_snapshot_under_lock(
     expected_encode_ts: i64,
 ) -> io::Result<ScrubSnapshot> {
     let store = state.store.read().unwrap();
-    let ecv = match store.find_ec_volume(vid) {
+    let ecv = match find_ec_volume_for_scrub(&store, vid, expected_encode_ts) {
         Some(v) => v,
         // Volume unmounted mid-scan: a distinct NotFound so the caller aborts
         // with an error rather than silently skipping (which would false-CLEAN).
@@ -794,9 +813,9 @@ fn needs_refresh(
     let ttl = if stale || shard_count < data_shards {
         Duration::from_secs(11)
     } else if shard_count == total_shards {
-        Duration::from_secs(37 * 60)
+        Duration::from_mins(37)
     } else {
-        Duration::from_secs(7 * 60)
+        Duration::from_mins(7)
     };
     age >= ttl
 }
@@ -850,22 +869,19 @@ async fn cached_lookup_ec_shard_locations(
         }
     };
     if master.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "no master configured for ec shard lookup",
-        ));
+        return Err(io::Error::other("no master configured for ec shard lookup"));
     }
 
-    let grpc_addr = parse_grpc_address(&master)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let grpc_addr =
+        parse_grpc_address(&master).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let endpoint = build_grpc_endpoint(&grpc_addr, state.outgoing_grpc_tls.as_ref())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let channel = endpoint
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .connect()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("master connect: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("master connect: {}", e)))?;
 
     let mut client = SeaweedClient::with_interceptor(channel, outgoing_request_id_interceptor)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
@@ -874,7 +890,7 @@ async fn cached_lookup_ec_shard_locations(
     let resp = client
         .lookup_ec_volume(Request::new(LookupEcVolumeRequest { volume_id: vid.0 }))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lookup_ec_volume: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("lookup_ec_volume: {}", e)))?;
     let resp = resp.into_inner();
 
     let mut out = HashMap::new();
@@ -905,13 +921,32 @@ fn write_back_shard_locations(
     vid: VolumeId,
     locations: HashMap<ShardId, Vec<String>>,
     data_shards: usize,
+    expected_encode_ts_ns: i64,
 ) -> Option<HashMap<ShardId, Vec<String>>> {
     if locations.len() < data_shards {
         return None;
     }
     let store = state.store.read().unwrap();
-    let ecv = store.find_ec_volume(vid)?;
+    let ecv = find_ec_volume_for_scrub(&store, vid, expected_encode_ts_ns)?;
     Some(ecv.merge_shard_locations(locations))
+}
+
+/// Resolve the runtime matching the scrub's anchor encode generation, not the
+/// first-match `find_ec_volume`. When `expected_encode_ts_ns` is 0 (legacy or
+/// pre-feature), falls back to first-match so existing behavior is preserved.
+fn find_ec_volume_for_scrub(
+    store: &crate::storage::store::Store,
+    vid: VolumeId,
+    expected_encode_ts_ns: i64,
+) -> Option<&crate::storage::erasure_coding::EcVolume> {
+    if expected_encode_ts_ns != 0 {
+        store
+            .find_all_ec_volumes(vid)
+            .into_iter()
+            .find(|v| v.encode_ts_ns == expected_encode_ts_ns)
+    } else {
+        store.find_ec_volume(vid)
+    }
 }
 
 /// Build a SeaweedFS-style `host:httpPort.grpcPort` address from a
@@ -922,16 +957,17 @@ fn format_location_as_server_address(loc: &master_pb::Location) -> String {
         .url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    if loc.grpc_port > 0 {
-        if let Some((host, http_port)) = raw.rsplit_once(':') {
-            return format!("{}:{}.{}", host, http_port, loc.grpc_port);
-        }
+    if loc.grpc_port > 0
+        && let Some((host, http_port)) = raw.rsplit_once(':')
+    {
+        return format!("{}:{}.{}", host, http_port, loc.grpc_port);
     }
     raw.to_string()
 }
 
 /// Try direct peer read; on failure, reconstruct via Reed-Solomon
 /// from the other shards. Mirrors `readOneEcShardInterval`'s tail.
+#[expect(clippy::too_many_arguments)]
 async fn fetch_one_interval(
     state: &Arc<VolumeServerState>,
     vid: VolumeId,
@@ -945,35 +981,35 @@ async fn fetch_one_interval(
     expected_encode_ts_ns: i64,
 ) -> io::Result<(Vec<u8>, bool)> {
     // Direct peer read against the cached locations for this shard.
-    if let Some(sources) = shard_locations.get(&shard_id) {
-        if !sources.is_empty() {
-            match read_remote_ec_shard_interval(
-                state,
-                sources,
-                vid,
-                needle_id,
-                shard_id,
-                shard_offset,
-                size,
-                expected_encode_ts_ns,
-            )
-            .await
-            {
-                // A deleted needle short-circuits: don't reconstruct (every shard
-                // would report deleted), let the caller return "deleted".
-                Ok((buf, is_deleted)) => return Ok((buf, is_deleted)),
-                Err(e) => {
-                    tracing::debug!(
-                        "direct read ec shard {}.{} from {:?} failed: {} — will reconstruct",
-                        vid.0,
-                        shard_id,
-                        sources,
-                        e
-                    );
-                    // Reconstruction below skips this very shard, so nothing else
-                    // invalidates the location that just failed.
-                    mark_shard_locations_stale(state, vid);
-                }
+    if let Some(sources) = shard_locations.get(&shard_id)
+        && !sources.is_empty()
+    {
+        match read_remote_ec_shard_interval(
+            state,
+            sources,
+            vid,
+            needle_id,
+            shard_id,
+            shard_offset,
+            size,
+            expected_encode_ts_ns,
+        )
+        .await
+        {
+            // A deleted needle short-circuits: don't reconstruct (every shard
+            // would report deleted), let the caller return "deleted".
+            Ok((buf, is_deleted)) => return Ok((buf, is_deleted)),
+            Err(e) => {
+                tracing::debug!(
+                    "direct read ec shard {}.{} from {:?} failed: {} — will reconstruct",
+                    vid.0,
+                    shard_id,
+                    sources,
+                    e
+                );
+                // Reconstruction below skips this very shard, so nothing else
+                // invalidates the location that just failed.
+                mark_shard_locations_stale(state, vid);
             }
         }
     }
@@ -995,6 +1031,7 @@ async fn fetch_one_interval(
     .await
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn read_remote_ec_shard_interval(
     state: &Arc<VolumeServerState>,
     sources: &[String],
@@ -1031,6 +1068,7 @@ async fn read_remote_ec_shard_interval(
     }))
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn do_read_remote_ec_shard_interval(
     state: &Arc<VolumeServerState>,
     source: &str,
@@ -1044,18 +1082,13 @@ async fn do_read_remote_ec_shard_interval(
     let grpc_addr =
         parse_grpc_address(source).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let endpoint = build_grpc_endpoint(&grpc_addr, state.outgoing_grpc_tls.as_ref())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let channel = endpoint
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .connect()
         .await
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("connect to {}: {}", source, e),
-            )
-        })?;
+        .map_err(|e| io::Error::other(format!("connect to {}: {}", source, e)))?;
 
     // TODO(grpc-jwt): clusters with `jwt.signing.key` configured will
     // reject peer-to-peer VolumeEcShardRead calls until the Rust
@@ -1081,10 +1114,10 @@ async fn do_read_remote_ec_shard_interval(
         .volume_ec_shard_read(Request::new(req))
         .await
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("volume_ec_shard_read {}.{} from {}: {}", vid.0, shard_id, source, e),
-            )
+            io::Error::other(format!(
+                "volume_ec_shard_read {}.{} from {}: {}",
+                vid.0, shard_id, source, e
+            ))
         })?;
     let mut stream = resp.into_inner();
 
@@ -1093,19 +1126,16 @@ async fn do_read_remote_ec_shard_interval(
     while let Some(msg) = stream
         .message()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
+        .map_err(|e| io::Error::other(format!("recv: {}", e)))?
     {
         // Validate the served shard's identity client-side, so the guard holds even
         // against a pre-upgrade server that ignored the request field (returns 0).
         // A mismatch fails the read; the caller recovers from parity.
         if expected_encode_ts_ns != 0 && msg.encode_ts_ns != expected_encode_ts_ns {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "ec shard {}.{} from {} belongs to a different encode run (want {} got {})",
-                    vid.0, shard_id, source, expected_encode_ts_ns, msg.encode_ts_ns
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "ec shard {}.{} from {} belongs to a different encode run (want {} got {})",
+                vid.0, shard_id, source, expected_encode_ts_ns, msg.encode_ts_ns
+            )));
         }
         if msg.is_deleted {
             is_deleted = true;
@@ -1141,6 +1171,7 @@ async fn do_read_remote_ec_shard_interval(
     Ok((out, false))
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn recover_one_remote_ec_shard_interval(
     state: &Arc<VolumeServerState>,
     vid: VolumeId,
@@ -1154,12 +1185,8 @@ async fn recover_one_remote_ec_shard_interval(
     expected_encode_ts_ns: i64,
 ) -> io::Result<(Vec<u8>, bool)> {
     let total_shards = data_shards + parity_shards;
-    let rs = ReedSolomon::new(data_shards, parity_shards).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("reed-solomon init: {:?}", e),
-        )
-    })?;
+    let rs = ReedSolomon::new(data_shards, parity_shards)
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     // Charge the buffers this recovery is about to hold against the budget, so a
     // burst of them queues here rather than on the heap. An interval whose
@@ -1169,13 +1196,10 @@ async fn recover_one_remote_ec_shard_interval(
         .acquire_many((size * data_shards).min(EC_RECOVER_BUDGET) as u32)
         .await
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "ec recover budget for shard {}.{}: {}",
-                    vid.0, shard_id_to_recover, e
-                ),
-            )
+            io::Error::other(format!(
+                "ec recover budget for shard {}.{}: {}",
+                vid.0, shard_id_to_recover, e
+            ))
         })?;
 
     let mut bufs: Vec<Option<Vec<u8>>> = vec![None; total_shards];
@@ -1188,7 +1212,7 @@ async fn recover_one_remote_ec_shard_interval(
     let mut available = 0usize;
     {
         let store = state.store.read().unwrap();
-        for sid in 0..total_shards {
+        for (sid, slot) in bufs.iter_mut().enumerate() {
             if available >= data_shards {
                 break;
             }
@@ -1201,13 +1225,21 @@ async fn recover_one_remote_ec_shard_interval(
             // lenient only when the caller carries no identity (pre-upgrade).
             // Mirrors Go's `readLocalEcShardInterval`.
             let owner = match store.find_ec_volume_with_shard(vid, sid as u32) {
-                Some(ecv) if expected_encode_ts_ns == 0 || ecv.encode_ts_ns == expected_encode_ts_ns => ecv,
+                Some(ecv)
+                    if expected_encode_ts_ns == 0 || ecv.encode_ts_ns == expected_encode_ts_ns =>
+                {
+                    ecv
+                }
                 _ => continue,
             };
             if let Some(Some(shard)) = owner.shards.get(sid) {
                 let mut buf = vec![0u8; size];
-                if shard.read_at(&mut buf, shard_offset as u64).map(|n| n == size).unwrap_or(false) {
-                    bufs[sid] = Some(buf);
+                if shard
+                    .read_at(&mut buf, shard_offset as u64)
+                    .map(|n| n == size)
+                    .unwrap_or(false)
+                {
+                    *slot = Some(buf);
                     available += 1;
                 }
             }
@@ -1291,34 +1323,25 @@ async fn recover_one_remote_ec_shard_interval(
         if any_deleted {
             return Ok((Vec::new(), true));
         }
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "cannot recover ec shard {}.{}: only {} shards available, need at least {}",
-                vid.0, shard_id_to_recover, available, data_shards
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "cannot recover ec shard {}.{}: only {} shards available, need at least {}",
+            vid.0, shard_id_to_recover, available, data_shards
+        )));
     }
 
     rs.reconstruct(&mut bufs).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "reed-solomon reconstruct ec shard {}.{}: {:?}",
-                vid.0, shard_id_to_recover, e
-            ),
-        )
+        io::Error::other(format!(
+            "reed-solomon reconstruct ec shard {}.{}: {:?}",
+            vid.0, shard_id_to_recover, e
+        ))
     })?;
 
     match bufs.into_iter().nth(shard_id_to_recover as usize).flatten() {
         Some(buf) => Ok((buf, any_deleted)),
-        None => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "reconstructed buffer for shard {}.{} missing after RS reconstruct",
-                vid.0, shard_id_to_recover
-            ),
-        )),
+        None => Err(io::Error::other(format!(
+            "reconstructed buffer for shard {}.{} missing after RS reconstruct",
+            vid.0, shard_id_to_recover
+        ))),
     }
 }
 
@@ -1460,12 +1483,12 @@ async fn fetch_ec_index_from_one_peer(
     let grpc_addr =
         parse_grpc_address(peer).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let channel = build_grpc_endpoint(&grpc_addr, state.outgoing_grpc_tls.as_ref())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .map_err(|e| io::Error::other(e.to_string()))?
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .connect()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("connect {}: {}", peer, e)))?;
+        .map_err(|e| io::Error::other(format!("connect {}: {}", peer, e)))?;
     let mut client = VolumeServerClient::with_interceptor(channel, outgoing_request_id_interceptor)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
@@ -1486,18 +1509,19 @@ async fn fetch_ec_index_from_one_peer(
     let stream = client
         .copy_file(copy_req(".ecx", false))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("copy .ecx: {}", e)))?
+        .map_err(|e| io::Error::other(format!("copy .ecx: {}", e)))?
         .into_inner();
     drain_copy_stream(stream, ecx_path, false).await?;
 
-    let meta = fs::metadata(ecx_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("stat copied .ecx: {}", e)))?;
+    let meta =
+        fs::metadata(ecx_path).map_err(|e| io::Error::other(format!("stat copied .ecx: {}", e)))?;
     if meta.is_dir() || meta.len() == 0 {
         let _ = fs::remove_file(ecx_path);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("peer {} served an unusable .ecx (size {})", peer, meta.len()),
-        ));
+        return Err(io::Error::other(format!(
+            "peer {} served an unusable .ecx (size {})",
+            peer,
+            meta.len()
+        )));
     }
 
     // .ecj is the source peer's deletion journal (appended); .vif carries EC
@@ -1534,18 +1558,21 @@ async fn drain_copy_stream(
 ) -> io::Result<()> {
     use std::io::Write;
     let mut file = if append {
-        fs::OpenOptions::new().create(true).append(true).open(dest_path)
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dest_path)
     } else {
         fs::File::create(dest_path)
     }
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("create {}: {}", dest_path, e)))?;
+    .map_err(|e| io::Error::other(format!("create {}: {}", dest_path, e)))?;
     while let Some(chunk) = stream
         .message()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv {}: {}", dest_path, e)))?
+        .map_err(|e| io::Error::other(format!("recv {}: {}", dest_path, e)))?
     {
         file.write_all(&chunk.file_content)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("write {}: {}", dest_path, e)))?;
+            .map_err(|e| io::Error::other(format!("write {}: {}", dest_path, e)))?;
     }
     Ok(())
 }

@@ -50,7 +50,7 @@ pub fn write_ec_files(
     let dat_size = dat_file.metadata()?.len() as i64;
 
     let rs = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("reed-solomon init: {:?}", e)))?;
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     // Create shard files
     let total_shards = data_shards + parity_shards;
@@ -162,7 +162,7 @@ pub fn rebuild_ec_files(
     }
 
     let rs = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("reed-solomon init: {:?}", e)))?;
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     let total_shards = data_shards + parity_shards;
     let mut shards: Vec<EcVolumeShard> = (0..total_shards as u8)
@@ -175,7 +175,7 @@ pub fn rebuild_ec_files(
     let mut shard_size = 0;
     for (i, shard) in shards.iter_mut().enumerate() {
         if !missing_shard_ids.contains(&(i as u32)) {
-            if let Ok(_) = shard.open() {
+            if shard.open().is_ok() {
                 let size = shard.file_size();
                 if size > shard_size {
                     shard_size = size;
@@ -185,7 +185,7 @@ pub fn rebuild_ec_files(
                 let mut found = false;
                 for &other_dir in additional_dirs {
                     let mut alt = EcVolumeShard::new(other_dir, collection, volume_id, i as u8);
-                    if let Ok(_) = alt.open() {
+                    if alt.open().is_ok() {
                         let size = alt.file_size();
                         if size > shard_size {
                             shard_size = size;
@@ -251,12 +251,8 @@ pub fn rebuild_ec_files(
         }
 
         // Reconstruct missing shards
-        rs.reconstruct(&mut buffers).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("reed-solomon reconstruct: {:?}", e),
-            )
-        })?;
+        rs.reconstruct(&mut buffers)
+            .map_err(|e| io::Error::other(format!("reed-solomon reconstruct: {:?}", e)))?;
 
         // Write recovered data into the missing shards
         for i in missing_shard_ids {
@@ -284,40 +280,63 @@ pub fn rebuild_ec_files(
 /// FULL walk only reads live data-shard intervals, so on its own it can't catch
 /// bitrot in a parity shard or an unwalked region. Move to mode 4 (CHECKSUM) and
 /// drop it from mode 2 once the `.ecsum` subsystem lands.
+///
+/// `dirs` is indexed BY SHARD ID: each entry is the directory holding that
+/// shard, or `None` when no disk mounts it. A reconciled volume's shards can be
+/// split across disks, so a single directory cannot address them all.
 pub fn verify_ec_shards(
-    dir: &str,
+    dirs: &[Option<String>],
     collection: &str,
     volume_id: VolumeId,
     data_shards: usize,
     parity_shards: usize,
 ) -> io::Result<(Vec<u32>, Vec<String>)> {
     let rs = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("reed-solomon init: {:?}", e)))?;
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     let total_shards = data_shards + parity_shards;
-    let mut shards: Vec<EcVolumeShard> = (0..total_shards as u8)
-        .map(|i| EcVolumeShard::new(dir, collection, volume_id, i))
+    let mut shards: Vec<Option<EcVolumeShard>> = (0..total_shards)
+        .map(|i| {
+            dirs.get(i)
+                .and_then(|d| d.as_ref())
+                .map(|d| EcVolumeShard::new(d, collection, volume_id, i as u8))
+        })
         .collect();
 
     let mut shard_size = 0;
     let mut broken_shards = std::collections::HashSet::new();
     let mut details = Vec::new();
 
-    for (i, shard) in shards.iter_mut().enumerate() {
-        if let Ok(_) = shard.open() {
-            let size = shard.file_size();
-            if size > shard_size {
-                shard_size = size;
+    for (i, slot) in shards.iter_mut().enumerate() {
+        match slot.as_mut() {
+            // Not a match guard: a binding is immutable until the guard ends,
+            // and `open()` needs `&mut self`.
+            Some(shard) => {
+                if shard.open().is_ok() {
+                    let size = shard.file_size();
+                    if size > shard_size {
+                        shard_size = size;
+                    }
+                } else {
+                    broken_shards.insert(i as u32);
+                    details.push(format!("failed to open or missing shard {}", i));
+                }
             }
-        } else {
-            broken_shards.insert(i as u32);
-            details.push(format!("failed to open or missing shard {}", i));
+            None => {
+                broken_shards.insert(i as u32);
+                details.push(format!("shard {} is not mounted on any disk", i));
+            }
         }
     }
 
     if shard_size == 0 || broken_shards.len() >= parity_shards {
-        // Can't do much if we don't know the size or have too many missing
-        return Ok((broken_shards.into_iter().collect(), details));
+        // Can't do much if we don't know the size or have too many missing.
+        // Sort like the normal path below: a `HashSet` iteration order would
+        // make this return shard ids in an arbitrary order, and enough `None`
+        // entries in `dirs` now reach this branch for a caller to notice.
+        let mut broken_vec: Vec<u32> = broken_shards.into_iter().collect();
+        broken_vec.sort_unstable();
+        return Ok((broken_vec, details));
     }
 
     let block_size = ERASURE_CODING_SMALL_BLOCK_SIZE;
@@ -331,7 +350,17 @@ pub fn verify_ec_shards(
         let mut read_failed = false;
         for i in 0..total_shards {
             if !broken_shards.contains(&(i as u32)) {
-                if let Err(e) = shards[i].read_at(&mut buffers[i], offset) {
+                // The `None` arm is defensive and unreachable: the open loop
+                // put every unmounted slot in `broken_shards`, which this
+                // branch already skipped. Kept because the `Option` forces
+                // some handling here, and an error is the only shape that
+                // cannot quietly feed an unread buffer into the parity
+                // comparison below. Nothing needs to cover it.
+                let read = match shards[i].as_mut() {
+                    Some(shard) => shard.read_at(&mut buffers[i], offset),
+                    None => Err(io::Error::new(io::ErrorKind::NotFound, "shard not mounted")),
+                };
+                if let Err(e) = read {
                     broken_shards.insert(i as u32);
                     details.push(format!("read error shard {}: {}", i, e));
                     read_failed = true;
@@ -345,27 +374,27 @@ pub fn verify_ec_shards(
         if !read_failed {
             // Need to convert Vec<Vec<u8>> to &[&[u8]] for rs.verify
             let slice_ptrs: Vec<&[u8]> = buffers.iter().map(|v| v.as_slice()).collect();
-            if let Ok(is_valid) = rs.verify(&slice_ptrs) {
-                if !is_valid {
-                    // Reed-Solomon verification failed. We cannot easily pinpoint which shard
-                    // is corrupted without recalculating parities or syndromes, so we just
-                    // log that this batch has corruption. Wait, we can test each parity shard!
-                    // Let's re-encode from the first `data_shards` and compare to the actual `parity_shards`.
+            if let Ok(is_valid) = rs.verify(&slice_ptrs)
+                && !is_valid
+            {
+                // Reed-Solomon verification failed. We cannot easily pinpoint which shard
+                // is corrupted without recalculating parities or syndromes, so we just
+                // log that this batch has corruption. Wait, we can test each parity shard!
+                // Let's re-encode from the first `data_shards` and compare to the actual `parity_shards`.
 
-                    let mut verify_buffers = buffers.clone();
-                    // Clear the parity parts
-                    for i in data_shards..total_shards {
-                        verify_buffers[i].fill(0);
-                    }
-                    if rs.encode(&mut verify_buffers).is_ok() {
-                        for i in 0..total_shards {
-                            if buffers[i] != verify_buffers[i] {
-                                broken_shards.insert(i as u32);
-                                details.push(format!(
-                                    "parity mismatch on shard {} at offset {}",
-                                    i, offset
-                                ));
-                            }
+                let mut verify_buffers = buffers.clone();
+                // Clear the parity parts
+                for buf in &mut verify_buffers[data_shards..total_shards] {
+                    buf.fill(0);
+                }
+                if rs.encode(&mut verify_buffers).is_ok() {
+                    for i in 0..total_shards {
+                        if buffers[i] != verify_buffers[i] {
+                            broken_shards.insert(i as u32);
+                            details.push(format!(
+                                "parity mismatch on shard {} at offset {}",
+                                i, offset
+                            ));
                         }
                     }
                 }
@@ -377,7 +406,7 @@ pub fn verify_ec_shards(
     }
 
     // Close all shards
-    for shard in &mut shards {
+    for shard in shards.iter_mut().flatten() {
         shard.close();
     }
 
@@ -457,7 +486,7 @@ pub fn rebuild_ecx_file(
         .collect();
 
     for (i, shard) in shards.iter_mut().enumerate() {
-        if let Err(_) = shard.open() {
+        if shard.open().is_err() {
             let mut found = false;
             for &other_dir in additional_dirs {
                 let mut alt = EcVolumeShard::new(other_dir, collection, volume_id, i as u8);
@@ -474,7 +503,7 @@ pub fn rebuild_ecx_file(
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("cannot open data shard for ecx rebuild"),
+                    "cannot open data shard for ecx rebuild".to_string(),
                 ));
             }
         }
@@ -482,7 +511,7 @@ pub fn rebuild_ecx_file(
 
     // Determine total logical data size from shard sizes
     let shard_size = shards.iter().map(|s| s.file_size()).max().unwrap_or(0);
-    let total_data_size = shard_size as i64 * data_shards as i64;
+    let total_data_size = shard_size * data_shards as i64;
     // The volume's shard block layout: the .vif-recorded uniform block size,
     // or the legacy two-tier sizes when 0. The row count comes from the shard
     // length; -1 disambiguates a legacy shard that is an exact large-block
@@ -505,7 +534,7 @@ pub fn rebuild_ecx_file(
     let locate_shard_size = if dat_file_size > 0 {
         dat_file_size / data_shards as i64
     } else {
-        (shard_size as i64 - 1).max(0)
+        (shard_size - 1).max(0)
     };
 
     // Read version from superblock (first byte of logical data)
@@ -607,7 +636,6 @@ pub fn rebuild_ecx_file(
 /// Read bytes from EC data shards at a logical offset in the .dat file,
 /// resolving the shard/offset through the volume's block layout via
 /// locate_data — the same mapping the read path uses.
-#[allow(clippy::too_many_arguments)]
 fn read_from_data_shards(
     shards: &[EcVolumeShard],
     buf: &mut [u8],
@@ -681,7 +709,7 @@ const ENCODE_BUFFER_SIZE: usize = 256 * 1024;
 /// 2. Process remaining data with small blocks
 ///
 /// `buffer_size` must divide both block sizes.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn encode_dat_file(
     dat_file: &File,
     dat_size: i64,
@@ -745,7 +773,7 @@ pub(crate) fn encode_dat_file(
 /// Encode one row of blocks, streaming it in ENCODE_BUFFER_SIZE sub-batches so
 /// arbitrarily large blocks never require block-sized allocations. Mirrors
 /// Go's encodeData.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn encode_data(
     dat_file: &File,
     row_offset: u64,
@@ -757,7 +785,7 @@ fn encode_data(
     data_shards: usize,
 ) -> io::Result<()> {
     let buffer_size = buffers[0].len();
-    if block_size % buffer_size != 0 {
+    if !block_size.is_multiple_of(buffer_size) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -784,7 +812,7 @@ fn encode_data(
 
 /// Encode one sub-batch: the same buffer-sized slice of every shard's block in
 /// this row. Mirrors Go's encodeDataOneBatch.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn encode_one_batch(
     dat_file: &File,
     offset: u64,
@@ -797,21 +825,15 @@ fn encode_one_batch(
 ) -> io::Result<()> {
     // Read data shards from the .dat file, zero-filling past EOF — the buffers
     // are reused across batches, so the tail must be cleared explicitly.
-    for i in 0..data_shards {
+    for (i, buf) in buffers[..data_shards].iter_mut().enumerate() {
         let read_offset = offset + (i * block_size) as u64;
-        let n = read_at_most(dat_file, &mut buffers[i], read_offset)?;
-        for b in buffers[i][n..].iter_mut() {
-            *b = 0;
-        }
+        let n = read_at_most(dat_file, buf, read_offset)?;
+        buf[n..].fill(0);
     }
 
     // Encode parity shards
-    rs.encode(&mut *buffers).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("reed-solomon encode: {:?}", e),
-        )
-    })?;
+    rs.encode(&mut *buffers)
+        .map_err(|e| io::Error::other(format!("reed-solomon encode: {:?}", e)))?;
 
     // Write all shard buffers to files and feed the same bytes to each
     // shard's bitrot checksum builder, keeping covered_size == on-disk length.
@@ -1455,6 +1477,113 @@ mod tests {
         assert!(
             result.is_err(),
             "should fail when idx_dir doesn't contain .idx"
+        );
+    }
+
+    /// Write a real 10+4 encoded volume into `dir`.
+    ///
+    /// Unlike `make_volume_with_needles` and `encode_sample_volume` this seeds
+    /// a caller-chosen directory, which is what a split-disk test needs: the
+    /// shards have to be scattered out of the directory they were encoded into.
+    fn seed_encoded_volume(dir: &str, vid: VolumeId) {
+        let mut v = Volume::new(
+            dir,
+            dir,
+            "",
+            vid,
+            NeedleMapKind::InMemory,
+            None,
+            None,
+            0,
+            Version::current(),
+        )
+        .unwrap();
+        for i in 1..=8 {
+            let data = format!("test data for needle {} with a bit more length", i);
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: data.as_bytes().to_vec(),
+                data_size: data.len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        v.sync_to_disk().unwrap();
+        v.close();
+        write_ec_files(dir, dir, "", vid, 10, 4).unwrap();
+    }
+
+    /// Shards split across two directories must all be found. Passing one dir
+    /// per shard is what lets a reconciled volume's parity be checked at all.
+    #[test]
+    fn test_verify_ec_shards_reads_shards_from_multiple_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let d0 = tmp.path().join("d0");
+        let d1 = tmp.path().join("d1");
+        for d in [&src, &d0, &d1] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let src_s = src.to_str().unwrap();
+        seed_encoded_volume(src_s, VolumeId(1));
+
+        // Move shards 0..=6 to d0 and 7..=13 to d1.
+        let mut dirs: Vec<Option<String>> = Vec::new();
+        for id in 0..14u8 {
+            let target = if id < 7 { &d0 } else { &d1 };
+            std::fs::rename(
+                format!("{}/1.ec{:02}", src_s, id),
+                format!("{}/1.ec{:02}", target.to_str().unwrap(), id),
+            )
+            .unwrap();
+            dirs.push(Some(target.to_str().unwrap().to_string()));
+        }
+
+        let (broken, details) = verify_ec_shards(&dirs, "", VolumeId(1), 10, 4).unwrap();
+        assert!(
+            broken.is_empty(),
+            "split-dir shards reported broken: {:?}",
+            details
+        );
+    }
+
+    /// A shard no disk holds is a missing shard, not a panic and not a silent
+    /// pass: it is REPORTED, by id, with a message that distinguishes "no disk
+    /// holds this shard" from "the disk holds it but it won't open".
+    ///
+    /// Read the scope literally. This does NOT show that the mounted shards
+    /// verify clean. `dirs[5] = None` puts shard 5 in `broken_shards` before
+    /// the block loop starts, so every iteration takes the
+    /// `else { read_failed = true; }` arm and the Reed-Solomon comparison never
+    /// runs at all. `broken == vec![5]` therefore holds because the other 13
+    /// were never verified, not because they verified clean -- a parity check
+    /// over intact shards is what
+    /// `test_verify_ec_shards_reads_shards_from_multiple_dirs` and the
+    /// end-to-end split-disk FULL scrub establish.
+    #[test]
+    fn test_verify_ec_shards_treats_a_none_dir_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        seed_encoded_volume(dir, VolumeId(1));
+
+        let mut dirs: Vec<Option<String>> = (0..14).map(|_| Some(dir.to_string())).collect();
+        dirs[5] = None;
+
+        let (broken, details) = verify_ec_shards(&dirs, "", VolumeId(1), 10, 4).unwrap();
+        assert_eq!(
+            broken,
+            vec![5],
+            "an unmounted shard must be reported, and only it: {:?}",
+            details
+        );
+        // "no disk holds this shard" and "the disk holds it but it won't open"
+        // are different operator problems, which is why they carry different
+        // messages. Asserting only the id would let one masquerade as the other.
+        assert!(
+            details.iter().any(|d| d.contains("not mounted")),
+            "an unmounted shard must be distinguished from an unopenable one, got {:?}",
+            details
         );
     }
 }
