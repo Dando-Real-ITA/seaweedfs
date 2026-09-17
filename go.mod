@@ -99,7 +99,7 @@ require (
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
-	google.golang.org/api v0.296.0
+	google.golang.org/api v0.297.0
 	google.golang.org/genproto v0.0.0-20260715232425-e75dac1f907d // indirect
 	google.golang.org/grpc v1.85.0-dev
 	google.golang.org/protobuf v1.36.12
@@ -146,7 +146,7 @@ require (
 	github.com/rabbitmq/amqp091-go v1.14.0
 	github.com/rclone/rclone v1.75.1
 	github.com/rdleal/intervalst v1.5.0
-	github.com/redis/go-redis/v9 v9.21.0
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/schollz/progressbar/v3 v3.19.1
 	github.com/seaweedfs/go-fuse/v2 v2.9.4
 	github.com/shirou/gopsutil/v4 v4.26.7

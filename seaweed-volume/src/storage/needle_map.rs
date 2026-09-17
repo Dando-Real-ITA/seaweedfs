@@ -607,6 +607,14 @@ impl RedbNeedleMap {
         }
     }
 
+    /// Test-only read of META `idx_size` through the live handle. See
+    /// [`test_support::live_meta_idx_size`] for why durability tests use
+    /// this instead of copying the open `.rdb`.
+    #[cfg(test)]
+    pub(crate) fn live_meta_idx_size(&self) -> Option<u64> {
+        self.read_idx_size_meta().unwrap()
+    }
+
     /// Load from an .idx file, reusing an existing .rdb if it is consistent.
     ///
     /// Strategy:
@@ -801,23 +809,26 @@ impl RedbNeedleMap {
                 }
                 #[cfg(feature = "redb-experimental-cursor")]
                 {
-                    let mut cursor = table
-                        .upper_bound_mut(Bound::<u64>::Unbounded)
-                        .map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("redb upper_bound_mut: {}", e),
-                            )
-                        })?;
+                    let mut cursor =
+                        table
+                            .upper_bound_mut(Bound::<u64>::Unbounded)
+                            .map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("redb upper_bound_mut: {}", e),
+                                )
+                            })?;
                     for (key, nv) in &entries {
                         let key_u64: u64 = (*key).into();
                         let packed = pack_needle_value(nv);
-                        cursor.insert_before(key_u64, packed.as_slice()).map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("redb insert_before: {}", e),
-                            )
-                        })?;
+                        cursor
+                            .insert_before(key_u64, packed.as_slice())
+                            .map_err(|e| {
+                                io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("redb insert_before: {}", e),
+                                )
+                            })?;
                     }
                     cursor.close().map_err(|e| {
                         io::Error::new(io::ErrorKind::Other, format!("redb cursor close: {}", e))
@@ -1114,18 +1125,12 @@ impl RedbNeedleMap {
         let read_file = std::fs::OpenOptions::new()
             .read(true)
             .open(&idx_path)
-            .map_err(|e| {
-                io::Error::other(format!("reopen: open .idx {}: {}", idx_path, e))
-            })?;
+            .map_err(|e| io::Error::other(format!("reopen: open .idx {}: {}", idx_path, e)))?;
         let actual_idx_size = read_file.metadata()?.len();
         let mut reader = io::BufReader::new(read_file);
 
-        let reopened = Self::load_from_idx(
-            &self.rdb_path,
-            &mut reader,
-            self.version,
-            self.cache_bytes,
-        )?;
+        let reopened =
+            Self::load_from_idx(&self.rdb_path, &mut reader, self.version, self.cache_bytes)?;
 
         // Preserve the append writer and the paths/version/cache; adopt the
         // repaired database, metrics, and idx_file_offset from the reload.
@@ -1479,22 +1484,30 @@ impl NeedleMap {
 pub(crate) mod test_support {
     use super::*;
 
-    /// The `.idx` size recorded in the durable state of the `.rdb` at
-    /// `rdb_path`, read from a copy taken while the map may still be open:
-    /// exactly what a crash would leave behind. `None` when nothing durable
-    /// has been recorded yet.
-    pub(crate) fn durable_idx_size(rdb_path: &Path) -> Option<u64> {
-        let copy = rdb_path.with_extension("crash-copy.rdb");
-        std::fs::copy(rdb_path, &copy).unwrap();
-        let db = Database::open(&copy).unwrap();
-        let txn = db.begin_read().unwrap();
-        let meta = txn.open_table(META_TABLE).ok()?;
-        let size = meta.get(META_IDX_SIZE).unwrap().map(|g| g.value());
-        drop(meta);
-        drop(txn);
-        drop(db);
-        let _ = std::fs::remove_file(&copy);
-        size
+    /// The `.idx` size in the map's META table, read through the live
+    /// handle.
+    ///
+    /// The load path records the `.idx` size with `Durability::None`, and
+    /// every `put`/`delete` also commits non-durably, so before the first
+    /// checkpoint this is the load-time value (`Some(0)` for a fresh map) —
+    /// NOT the crash-durable `None` a copy of the open `.rdb` would show.
+    /// A live read is the only portable observation: redb 4.2.0 takes an
+    /// exclusive whole-file lock, which is advisory on Unix but mandatory
+    /// on Windows, so copying the open `.rdb` fails there with OS error 33.
+    ///
+    /// It still pins the property under test: the only *durable* META
+    /// writer is `checkpoint`, so any value other than the load-time one
+    /// proves a checkpoint recorded progress — and the post-checkpoint
+    /// value equals the durable one, because checkpoints commit with
+    /// `Durability::Immediate`. What is lost vs the old copy: strict crash
+    /// fidelity — a hard crash pre-checkpoint would leave META absent
+    /// rather than `Some(0)` (loader-equivalent outcomes: full rebuild vs
+    /// replay-from-0, both correct). A clean close+reopen cannot recover
+    /// that distinction either: dropping the `Database` flushes pending
+    /// non-durable commits, so a reopened handle reads `Some(0)` just like
+    /// the live one.
+    pub(crate) fn live_meta_idx_size(nm: &RedbNeedleMap) -> Option<u64> {
+        nm.live_meta_idx_size()
     }
 }
 
@@ -2136,8 +2149,14 @@ mod tests {
         // server opens one redb database per volume, so the process-wide
         // ceiling is roughly (volumes x budget).
         assert_eq!(NeedleMapKind::Redb.redb_cache_bytes(), 4 * 1024 * 1024);
-        assert_eq!(NeedleMapKind::RedbMedium.redb_cache_bytes(), 8 * 1024 * 1024);
-        assert_eq!(NeedleMapKind::RedbLarge.redb_cache_bytes(), 16 * 1024 * 1024);
+        assert_eq!(
+            NeedleMapKind::RedbMedium.redb_cache_bytes(),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            NeedleMapKind::RedbLarge.redb_cache_bytes(),
+            16 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -2166,7 +2185,7 @@ mod tests {
 
     #[test]
     fn test_redb_checkpoint_is_explicit_and_due_every_interval() {
-        use test_support::durable_idx_size;
+        use test_support::live_meta_idx_size;
 
         // Every non-durable redb commit leaves bookkeeping behind until a
         // durable one clears it, so a writable map asks for a checkpoint on
@@ -2176,8 +2195,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut nm, db_path, _idx_path) = open_writable_redb(dir.path());
         for i in 1..EXPECTED_INTERVAL {
-            nm.put(NeedleId(i), Offset::from_actual_offset((i * 8) as i64), Size(1))
-                .unwrap();
+            nm.put(
+                NeedleId(i),
+                Offset::from_actual_offset((i * 8) as i64),
+                Size(1),
+            )
+            .unwrap();
             assert!(!nm.checkpoint_due(), "due after only {i} writes");
         }
         nm.put(
@@ -2187,20 +2210,29 @@ mod tests {
         )
         .unwrap();
         assert!(nm.checkpoint_due());
-        assert_eq!(durable_idx_size(&db_path), None, "put() must not commit durably");
+        // No checkpoint taken yet: META still holds the load-time .idx size.
+        // put() only commits non-durably, so the live value is unchanged.
+        assert_eq!(
+            live_meta_idx_size(&nm),
+            Some(0),
+            "put() must not record checkpoint progress"
+        );
 
         nm.checkpoint(true).unwrap();
         assert!(!nm.checkpoint_due());
         assert_eq!(
-            durable_idx_size(&db_path),
+            live_meta_idx_size(&nm),
             Some(EXPECTED_INTERVAL * NEEDLE_MAP_ENTRY_SIZE as u64),
             "checkpoint records how much of the .idx the table reflects"
         );
 
-        // Snapshot the .rdb while the map is still open: what a crash leaves.
+        // Everything is durable after the checkpoint, so the map is closed
+        // first and the snapshot sees the same bytes on every platform.
+        // (Copying while open fails on Windows, where redb's file lock is
+        // mandatory: what a crash leaves.)
+        drop(nm);
         let crash_copy = dir.path().join("crash.rdb");
         std::fs::copy(&db_path, &crash_copy).unwrap();
-        drop(nm);
         let db = Database::open(&crash_copy).unwrap();
         let txn = db.begin_read().unwrap();
         let table = txn.open_table(NEEDLE_TABLE).unwrap();
@@ -2215,8 +2247,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut nm, db_path, idx_path) = open_writable_redb(dir.path());
         for i in 1..=5u64 {
-            nm.put(NeedleId(i), Offset::from_actual_offset((i * 8) as i64), Size(1))
-                .unwrap();
+            nm.put(
+                NeedleId(i),
+                Offset::from_actual_offset((i * 8) as i64),
+                Size(1),
+            )
+            .unwrap();
         }
         nm.close();
         drop(nm);
@@ -2240,8 +2276,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut nm, db_path, idx_path) = open_writable_redb(dir.path());
         for i in 1..=5u64 {
-            nm.put(NeedleId(i), Offset::from_actual_offset((i * 8) as i64), Size(1))
-                .unwrap();
+            nm.put(
+                NeedleId(i),
+                Offset::from_actual_offset((i * 8) as i64),
+                Size(1),
+            )
+            .unwrap();
         }
         // Drop without close(): redb makes the table durable on drop, but the
         // recorded .idx size stays at its load-time value (0), so the reload

@@ -5,14 +5,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use super::grpc_client::{build_grpc_endpoint, GRPC_MAX_MESSAGE_SIZE};
+use super::grpc_client::{GRPC_MAX_MESSAGE_SIZE, build_grpc_endpoint};
 use super::volume_server::VolumeServerState;
 use crate::pb::master_pb;
 use crate::pb::master_pb::seaweed_client::SeaweedClient;
@@ -119,7 +119,9 @@ pub async fn run_heartbeat_with_state(
 
                     if err_msg.contains(DUPLICATE_UUID_RETRY_MESSAGE) {
                         if duplicate_retry_count >= MAX_DUPLICATE_UUID_RETRIES {
-                            error!("Shut down Volume Server due to persistent duplicate volume directories after 3 retries");
+                            error!(
+                                "Shut down Volume Server due to persistent duplicate volume directories after 3 retries"
+                            );
                             error!(
                                 "Please check if another volume server is using the same directory"
                             );
@@ -981,7 +983,11 @@ fn build_heartbeat_with_ec_status(
                         > DISK_CHECK_INTERVAL_NS
                     {
                         if !Path::new(&vol.file_name(".dat")).exists() {
-                            warn!("Volume {}: data file {} missing (held open as deleted FD) - not reporting to master", vol.id.0, vol.file_name(".dat"));
+                            warn!(
+                                "Volume {}: data file {} missing (held open as deleted FD) - not reporting to master",
+                                vol.id.0,
+                                vol.file_name(".dat")
+                            );
                             continue;
                         }
                         vol.last_disk_check_ns.store(now_ns, Ordering::Relaxed);
@@ -1247,9 +1253,10 @@ mod tests {
     use crate::remote_storage::s3_tier::S3TierRegistry;
     use crate::security::{Guard, SigningKey};
     use crate::storage::needle_map::NeedleMapKind;
-    use crate::storage::types::{DiskType, Version, VolumeId};
-    use std::sync::atomic::Ordering;
+    use crate::storage::types::{DiskType, VolumeId};
+    use crate::storage::volume::VolumeSpec;
     use std::sync::RwLock;
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_config() -> HeartbeatConfig {
@@ -1360,12 +1367,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(7),
-                "pics",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "pics",
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -1410,12 +1416,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(7),
-                "pics",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "pics",
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -1476,12 +1481,11 @@ mod tests {
             store
                 .add_volume(
                     VolumeId(id),
-                    "pics",
-                    None,
-                    None,
-                    0,
                     DiskType::HardDrive,
-                    Version::current(),
+                    &VolumeSpec {
+                        collection: "pics",
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         }
@@ -1530,12 +1534,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(3),
-                "pics",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "pics",
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -1591,12 +1594,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(3),
-                "pics",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "pics",
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -1634,12 +1636,11 @@ mod tests {
             store
                 .add_volume(
                     vid,
-                    "pics",
-                    None,
-                    None,
-                    0,
                     DiskType::HardDrive,
-                    Version::current(),
+                    &VolumeSpec {
+                        collection: "pics",
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
         }
@@ -1673,12 +1674,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(17),
-                "heartbeat_metrics_case",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "heartbeat_metrics_case",
+                    ..Default::default()
+                },
             )
             .unwrap();
         store.locations[0]
@@ -1776,12 +1776,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(21),
-                collection,
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection,
+                    ..Default::default()
+                },
             )
             .unwrap();
         {
@@ -1949,12 +1948,13 @@ mod tests {
         store
             .add_volume(
                 VolumeId(41),
-                "expired_volume_case",
-                None,
-                Some(crate::storage::needle::ttl::TTL::read("20m").unwrap()),
-                1024,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "expired_volume_case",
+                    ttl: Some(crate::storage::needle::ttl::TTL::read("20m").unwrap()),
+                    preallocate: 1024,
+                    ..Default::default()
+                },
             )
             .unwrap();
         let dat_path = {
@@ -2005,12 +2005,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(51),
-                "io_error_case",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "io_error_case",
+                    ..Default::default()
+                },
             )
             .unwrap();
         let (_, volume) = store.find_volume_mut(VolumeId(51)).unwrap();
@@ -2046,12 +2045,11 @@ mod tests {
         store
             .add_volume(
                 VolumeId(71),
-                "remote_volume_case",
-                None,
-                None,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection: "remote_volume_case",
+                    ..Default::default()
+                },
             )
             .unwrap();
         let (_, volume) = store.find_volume_mut(VolumeId(71)).unwrap();

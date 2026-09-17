@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pb::master_pb;
 use crate::storage::erasure_coding::ec_locate;
 use crate::storage::erasure_coding::ec_shard::*;
-use crate::storage::needle::needle::{get_actual_size, Needle, NeedleError};
+use crate::storage::needle::needle::{Needle, NeedleError, get_actual_size};
 use crate::storage::types::*;
 use crate::storage::volume_open::open_volume_file;
 
@@ -705,6 +705,17 @@ impl EcVolume {
                 use std::os::unix::fs::FileExt;
                 ecj_file.read_exact_at(&mut buf, off as u64)?;
             }
+            #[cfg(windows)]
+            {
+                // Positional read so concurrent readers of the shared .ecj
+                // handle can't interleave seek/read. Mirrors the
+                // read_exact_at helper at the bottom of this file.
+                read_exact_at(ecj_file, &mut buf, off as u64)?;
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                compile_error!("Platform not supported: only unix and windows are supported");
+            }
             set.insert(NeedleId::from_bytes(&buf));
             off += NEEDLE_ID_SIZE as i64;
         }
@@ -830,11 +841,23 @@ impl EcVolume {
     }
 
     /// Remove and close a shard.
-    pub fn remove_shard(&mut self, shard_id: ShardId) {
-        if let Some(ref mut shard) = self.shards[shard_id as usize] {
+    pub fn remove_shard(&mut self, shard_id: ShardId) -> io::Result<()> {
+        let idx = shard_id as usize;
+        if idx >= self.shards.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid shard id {} (max {})",
+                    shard_id,
+                    self.shards.len().saturating_sub(1)
+                ),
+            ));
+        }
+        if let Some(ref mut shard) = self.shards[idx] {
             shard.close();
         }
-        self.shards[shard_id as usize] = None;
+        self.shards[idx] = None;
+        Ok(())
     }
 
     /// Get a ShardBits bitmap of locally available shards.
@@ -856,7 +879,7 @@ impl EcVolume {
     /// Reports whether `shard_id` is currently registered to this
     /// EcVolume (used by the cross-disk reconcile to skip already-
     /// loaded shards).
-    pub fn has_shard(&self, shard_id: u8) -> bool {
+    pub fn has_shard(&self, shard_id: ShardId) -> bool {
         self.shards
             .get(shard_id as usize)
             .map(|s| s.is_some())
@@ -1276,6 +1299,17 @@ impl EcVolume {
                 use std::os::unix::fs::FileExt;
                 ecx_file.read_exact_at(&mut entry_buf, file_offset)?;
             }
+            #[cfg(windows)]
+            {
+                // Positional read so concurrent readers of the shared .ecx
+                // handle can't interleave seek/read. Mirrors the
+                // read_exact_at helper at the bottom of this file.
+                read_exact_at(ecx_file, &mut entry_buf, file_offset)?;
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                compile_error!("Platform not supported: only unix and windows are supported");
+            }
             let (_key, _offset, size) = idx_entry_from_bytes(&entry_buf);
             // Match Go's Size.Raw(): tombstone (-1) returns 0, other negatives return abs
             if !size.is_tombstone() {
@@ -1379,6 +1413,17 @@ impl EcVolume {
                 use std::os::unix::fs::FileExt;
                 ecx_file.read_exact_at(&mut entry_buf, file_offset)?;
             }
+            #[cfg(windows)]
+            {
+                // Positional read so concurrent readers of the shared .ecx
+                // handle can't interleave seek/read. Mirrors the
+                // read_exact_at helper at the bottom of this file.
+                read_exact_at(ecx_file, &mut entry_buf, file_offset)?;
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                compile_error!("Platform not supported: only unix and windows are supported");
+            }
             let (key, _offset, _old_size) = idx_entry_from_bytes(&entry_buf);
             if key == needle_id {
                 let size_offset = file_offset + NEEDLE_ID_SIZE as u64 + OFFSET_SIZE as u64;
@@ -1388,6 +1433,31 @@ impl EcVolume {
                 {
                     use std::os::unix::fs::FileExt;
                     ecx_file.write_all_at(&size_buf, size_offset)?;
+                }
+                #[cfg(windows)]
+                {
+                    // Positional write so concurrent readers of the shared
+                    // .ecx handle can't observe a moved cursor. Mirrors the
+                    // read_exact_at helper at the bottom of this file, with
+                    // seek_write in place of seek_read.
+                    use std::os::windows::fs::FileExt;
+                    let mut written = 0;
+                    let mut at = size_offset;
+                    while written < size_buf.len() {
+                        let n = ecx_file.seek_write(&size_buf[written..], at)?;
+                        if n == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "seek_write wrote nothing",
+                            ));
+                        }
+                        written += n;
+                        at += n as u64;
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    compile_error!("Platform not supported: only unix and windows are supported");
                 }
                 return Ok(true);
             } else if key < needle_id {
@@ -1557,6 +1627,18 @@ impl EcVolume {
                 use std::os::unix::fs::FileExt;
                 ecx_file.read_exact_at(&mut entry_buf, file_offset)?;
             }
+            #[cfg(windows)]
+            {
+                // Positional read so concurrent find_needle_from_ecx_raw calls
+                // on the shared .ecx handle don't interleave seek/read and
+                // corrupt each other's binary search. Mirrors the
+                // read_exact_at helper at the bottom of this file.
+                read_exact_at(ecx_file, &mut entry_buf, file_offset)?;
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                compile_error!("Platform not supported: only unix and windows are supported");
+            }
             let (key, offset, size) = idx_entry_from_bytes(&entry_buf);
             if key == needle_id {
                 return Ok(Some((offset, size)));
@@ -1579,38 +1661,62 @@ impl EcVolume {
     ) -> io::Result<()> {
         // cookie == 0 indicates SkipCookieCheck was requested
         if cookie.0 != 0 {
-            // Try to read the needle's cookie from the EC shards to validate
-            // Look up the needle in ecx index to find its offset, then read header from shard
-            if let Ok(Some((offset, size))) = self.find_needle_from_ecx(needle_id)
-                && !size.is_deleted()
-                && !offset.is_zero()
-            {
-                let actual_offset = offset.to_actual_offset() as u64;
-                // Determine which shard contains this offset and read the cookie
-                let shard_size = self
-                    .shards
-                    .iter()
-                    .filter_map(|s| s.as_ref())
-                    .map(|s| s.file_size())
-                    .next()
-                    .unwrap_or(0) as u64;
-                if let Some(shard_id) = actual_offset.checked_div(shard_size) {
-                    let shard_id = shard_id as usize;
-                    let shard_offset = actual_offset % shard_size;
-                    if let Some(Some(shard)) = self.shards.get(shard_id) {
-                        let mut header_buf = [0u8; 4]; // cookie is first 4 bytes of needle
-                        if shard.read_at(&mut header_buf, shard_offset).is_ok() {
-                            let needle_cookie =
-                                crate::storage::types::Cookie(u32::from_be_bytes(header_buf));
-                            if needle_cookie != cookie {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("unexpected cookie {:x}", cookie.0),
-                                ));
-                            }
-                        }
+            let (offset, size) = match self.find_needle_from_ecx(needle_id)? {
+                Some((o, s)) => (o, s),
+                None => return self.journal_delete(needle_id),
+            };
+            if size.is_deleted() || offset.is_zero() {
+                return self.journal_delete(needle_id);
+            }
+            let actual_offset = offset.to_actual_offset();
+            let intervals = self.locate_ec_shard_needle_interval(actual_offset, size);
+            if intervals.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cannot verify cookie for needle {}", needle_id.0),
+                ));
+            }
+            let (shard_id, shard_offset) = self.interval_to_shard_id_and_offset(&intervals[0]);
+            let shard = self
+                .shards
+                .get(shard_id as usize)
+                .and_then(|s| s.as_ref())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("cannot verify cookie: shard {} not local", shard_id),
+                    )
+                })?;
+            // Retry short reads, but fail closed on EOF.
+            let mut header_buf = [0u8; 4];
+            let mut filled = 0usize;
+            while filled < header_buf.len() {
+                match shard.read_at(
+                    &mut header_buf[filled..],
+                    shard_offset as u64 + filled as u64,
+                ) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("cannot verify cookie: {}", e),
+                        ));
                     }
                 }
+            }
+            if filled != header_buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot verify cookie: incomplete header",
+                ));
+            }
+            let needle_cookie = crate::storage::types::Cookie(u32::from_be_bytes(header_buf));
+            if needle_cookie != cookie {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected cookie {:x}", cookie.0),
+                ));
             }
         }
         self.journal_delete(needle_id)
@@ -1721,20 +1827,19 @@ mod tests {
     #[test]
     fn test_destroy_removes_bitrot_sidecar() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
         let mut v = Volume::new(
             dir,
             dir,
-            "ec1c",
             VolumeId(2074),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec {
+                collection: "ec1c",
+                ..Default::default()
+            },
         )
         .unwrap();
         for i in 1..=3 {
@@ -1797,20 +1902,16 @@ mod tests {
     fn test_mount_loads_bitrot_sidecar() {
         use crate::storage::erasure_coding::ec_bitrot::BitrotStatus;
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=5 {
@@ -1855,20 +1956,16 @@ mod tests {
     #[test]
     fn test_scrub_plans_are_self_contained_and_match_direct_call() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=8 {
@@ -1948,20 +2045,16 @@ mod tests {
     #[test]
     fn test_local_scrub_plan_reports_negative_size_ecx_row() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=8 {
@@ -2040,20 +2133,16 @@ mod tests {
     #[test]
     fn test_scrub_plans_survive_files_removed_after_snapshot() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=8 {
@@ -2139,20 +2228,16 @@ mod tests {
     #[test]
     fn test_checksum_scrub_clean_and_detects_corruption() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=8 {
@@ -2282,6 +2367,147 @@ mod tests {
         vol.journal_delete(NeedleId(999)).unwrap();
         let (fc, dc) = vol.file_and_delete_count();
         assert_eq!((fc, dc), (2, 2));
+    }
+
+    #[test]
+    fn test_journal_delete_wrong_cookie() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let needle = NeedleId(7);
+        let entries = vec![(needle, Offset::from_actual_offset(8), Size(100))];
+        write_ecx_file(dir, "", VolumeId(1), &entries);
+
+        let vif = crate::storage::volume::VifVolumeInfo {
+            dat_file_size: 14000,
+            ..Default::default()
+        };
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(1));
+        std::fs::write(
+            format!("{}.vif", base),
+            serde_json::to_string_pretty(&vif).unwrap(),
+        )
+        .unwrap();
+
+        let mut shard9 = EcVolumeShard::new(dir, "", VolumeId(1), 9);
+        shard9.create().unwrap();
+        shard9.write_all(&[0xAAu8; 2048]).unwrap();
+        shard9.close();
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(1)).unwrap();
+        vol.add_shard(EcVolumeShard::new(dir, "", VolumeId(1), 9))
+            .unwrap();
+
+        let (off, size) = vol
+            .find_needle_from_ecx(needle)
+            .unwrap()
+            .expect("fixture needle must be indexed");
+        let intervals = vol.locate_ec_shard_needle_interval(off.to_actual_offset(), size);
+        assert!(
+            !intervals.is_empty(),
+            "fixture must locate to a shard for the test to be meaningful"
+        );
+        let (located, _) = vol.interval_to_shard_id_and_offset(&intervals[0]);
+        assert_ne!(
+            located, 9,
+            "fixture must locate away from mounted shard 9, got {}",
+            located
+        );
+
+        let res = vol.journal_delete_with_cookie(needle, Cookie(0xDEAD_BEEF));
+        let err = res.expect_err("wrong cookie must Err, not bypass to journal");
+        assert!(
+            err.to_string().contains("cannot verify cookie"),
+            "fail-closed error must say why, got: {}",
+            err
+        );
+        let deleted = vol.read_deleted_needles().unwrap();
+        assert!(
+            !deleted.contains(&needle),
+            "failed delete must not append to .ecj, got {:?}",
+            deleted
+        );
+
+        vol.journal_delete_with_cookie(needle, Cookie(0)).unwrap();
+        let deleted = vol.read_deleted_needles().unwrap();
+        assert!(
+            deleted.contains(&needle),
+            "cookie-0 delete must still journal, got {:?}",
+            deleted
+        );
+    }
+
+    #[test]
+    fn test_journal_delete_incomplete_header() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let needle = NeedleId(7);
+        let entries = vec![(needle, Offset::from_actual_offset(8), Size(100))];
+        write_ecx_file(dir, "", VolumeId(1), &entries);
+
+        let vif = crate::storage::volume::VifVolumeInfo {
+            dat_file_size: 14000,
+            ..Default::default()
+        };
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(1));
+        std::fs::write(
+            format!("{}.vif", base),
+            serde_json::to_string_pretty(&vif).unwrap(),
+        )
+        .unwrap();
+
+        let probe = EcVolume::new(dir, dir, "", VolumeId(1)).unwrap();
+        let (off, size) = probe
+            .find_needle_from_ecx(needle)
+            .unwrap()
+            .expect("fixture needle must be indexed");
+        let intervals = probe.locate_ec_shard_needle_interval(off.to_actual_offset(), size);
+        assert!(
+            !intervals.is_empty(),
+            "fixture must locate to a shard for the test to be meaningful"
+        );
+        let (located, located_offset) = probe.interval_to_shard_id_and_offset(&intervals[0]);
+        drop(probe);
+
+        let mut shard = EcVolumeShard::new(dir, "", VolumeId(1), located);
+        shard.create().unwrap();
+        shard.write_all(&[0x00u8; 2]).unwrap();
+        shard.close();
+
+        let mut vol = EcVolume::new(dir, dir, "", VolumeId(1)).unwrap();
+        vol.add_shard(EcVolumeShard::new(dir, "", VolumeId(1), located))
+            .unwrap();
+
+        let shard_ref = vol.shards[located as usize]
+            .as_ref()
+            .expect("located shard must be mounted");
+        assert!(
+            (shard_ref.file_size()) < located_offset + 4,
+            "fixture must truncate the header read (file {} bytes, offset {})",
+            shard_ref.file_size(),
+            located_offset
+        );
+
+        let res = vol.journal_delete_with_cookie(needle, Cookie(0x1234));
+        let err = res.expect_err("short header read must Err, not forge-match");
+        assert!(
+            err.to_string().contains("incomplete header"),
+            "short read must report incomplete header, got: {}",
+            err
+        );
+        let deleted = vol.read_deleted_needles().unwrap();
+        assert!(
+            !deleted.contains(&needle),
+            "failed delete must not append to .ecj, got {:?}",
+            deleted
+        );
+
+        vol.journal_delete_with_cookie(needle, Cookie(0)).unwrap();
+        let deleted = vol.read_deleted_needles().unwrap();
+        assert!(
+            deleted.contains(&needle),
+            "cookie-0 delete must still journal, got {:?}",
+            deleted
+        );
     }
 
     #[test]
@@ -2589,18 +2815,14 @@ mod tests {
     /// split-disk mount without needing N directories.
     fn split_runtimes(dir: &str, vid: VolumeId, subsets: &[&[u8]]) -> Vec<EcVolume> {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
 
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             vid,
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=8 {
@@ -3307,7 +3529,7 @@ mod tests {
 mod uniform_layout_tests {
     use super::*;
     use crate::storage::needle_map::NeedleMapKind;
-    use crate::storage::volume::{VifEcShardConfig, VifVolumeInfo, Volume};
+    use crate::storage::volume::{VifEcShardConfig, VifVolumeInfo, Volume, VolumeSpec};
     use tempfile::TempDir;
 
     // Write ~26MB of needles so the uniform block size (3MB) diverges from the
@@ -3324,13 +3546,9 @@ mod uniform_layout_tests {
             let mut v = Volume::new(
                 dir,
                 dir,
-                "",
                 vid,
                 NeedleMapKind::InMemory,
-                None,
-                None,
-                0,
-                Version::current(),
+                &VolumeSpec::default(),
             )
             .unwrap();
             let mut expected: Vec<(NeedleId, Vec<u8>)> = Vec::new();
@@ -3357,7 +3575,7 @@ mod uniform_layout_tests {
                 // Legacy fixture: two-tier encode plus a .vif without a block
                 // size, the state every pre-upgrade EC volume is in.
                 use crate::storage::erasure_coding::ec_bitrot::{
-                    ShardChecksumBuilder, DEFAULT_BITROT_BLOCK_SIZE,
+                    DEFAULT_BITROT_BLOCK_SIZE, ShardChecksumBuilder,
                 };
                 use reed_solomon_erasure::galois_8::ReedSolomon;
                 let base = crate::storage::volume::volume_file_name(dir, "", vid);
@@ -3383,11 +3601,13 @@ mod uniform_layout_tests {
                     &rs,
                     &mut shards,
                     &mut builders,
-                    10,
-                    4,
-                    256 * 1024,
-                    ERASURE_CODING_LARGE_BLOCK_SIZE,
-                    ERASURE_CODING_SMALL_BLOCK_SIZE,
+                    crate::storage::erasure_coding::ec_encoder::EcEncodeLayout {
+                        data_shards: 10,
+                        parity_shards: 4,
+                        buffer_size: 256 * 1024,
+                        large_block_size: ERASURE_CODING_LARGE_BLOCK_SIZE,
+                        small_block_size: ERASURE_CODING_SMALL_BLOCK_SIZE,
+                    },
                 )
                 .unwrap();
                 for shard in &mut shards {
