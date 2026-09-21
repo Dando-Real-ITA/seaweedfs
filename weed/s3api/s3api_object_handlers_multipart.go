@@ -445,6 +445,21 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// Parts inherit the checksum algorithm declared at CreateMultipartUpload
+	// when the request doesn't specify one; a conflicting one is rejected.
+	if headerName := string(uploadEntry.Extended[s3_constants.ExtChecksumAlgorithm]); headerName != "" {
+		if algo, reqHeaderName, code := detectRequestedChecksumAlgorithm(r); code == s3err.ErrNone {
+			if algo == ChecksumAlgorithmNone {
+				if name := checksumAlgorithmNameFromHeaderName(headerName); name != "" {
+					r.Header.Set(s3_constants.AmzChecksumAlgorithm, name)
+				}
+			} else if reqHeaderName != headerName {
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+				return
+			}
+		}
+	}
+
 	filePath := s3a.genPartUploadPath(bucket, uploadID, partID)
 
 	if partID == 1 && r.Header.Get("Content-Type") == "" {
@@ -635,6 +650,7 @@ type CompleteMultipartUpload struct {
 type CompletedPart struct {
 	ETag       string
 	PartNumber int
+	ChecksumResult
 }
 
 // handleSSES3MultipartHeaders handles SSE-S3 multipart upload header setup to reduce nesting complexity

@@ -112,9 +112,6 @@ fn build_test_state(
         pre_stop_seconds: 0,
         volume_state_notify: tokio::sync::Notify::new(),
         write_queue: std::sync::OnceLock::new(),
-        s3_tier_registry: std::sync::RwLock::new(
-            seaweed_volume::remote_storage::s3_tier::S3TierRegistry::new(),
-        ),
         read_mode: seaweed_volume::config::ReadMode::Local,
         allow_untrusted_remote_endpoints: false,
         master_url,
@@ -1042,4 +1039,219 @@ async fn chunk_manifest_expands_chunk_stored_on_ec_volume() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await, chunk_data);
+}
+
+// ============================================================================
+// HTTP DELETE on an EC volume whose shards are not all mounted locally
+//
+// The delete handler used to validate the cookie with the local-only
+// `EcVolume::read_ec_shard_needle`, which errors "ec shard N not available
+// locally" for any interval held by a peer. Every such error was mapped to 500
+// and no `.ecj` tombstone was written, so on a standard 10+4 spread across 14
+// servers no HTTP delete of an EC needle could ever succeed.
+//
+// A single node can exercise that path without peers: mount 13 of the 14
+// shards, leaving out the one holding the needle's interval. The distributed
+// reader seeds its Reed-Solomon buffers from locally mounted siblings (Phase 0
+// in `store_ec.rs`), so with >= 10 survivors it reconstructs without any peer
+// fan-out — while the local-only read still fails outright.
+// ============================================================================
+
+#[tokio::test]
+async fn delete_on_ec_volume_succeeds_when_the_needles_shard_is_not_mounted() {
+    use seaweed_volume::storage::erasure_coding::ec_encoder::write_ec_files;
+    use seaweed_volume::storage::erasure_coding::ec_shard::ShardId;
+    use seaweed_volume::storage::needle::needle::{FileId, Needle};
+    use seaweed_volume::storage::types::{Cookie, NeedleId};
+    use seaweed_volume::storage::volume::{Volume, VolumeSpec};
+
+    let (state, tmp) = test_state();
+    let dir = tmp.path().to_str().unwrap();
+
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let nid = NeedleId(0x5c);
+    let cookie = Cookie(0x0badc0de);
+
+    // Build regular volume 4, then EC-encode it. The volume is standalone and
+    // never registered in the store, so afterwards it exists only as shards.
+    {
+        let mut v = Volume::new(
+            dir,
+            dir,
+            VolumeId(4),
+            NeedleMapKind::InMemory,
+            &VolumeSpec::default(),
+        )
+        .unwrap();
+        let mut n = Needle {
+            id: nid,
+            cookie,
+            data: data.clone(),
+            data_size: data.len() as u32,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+        v.close();
+    }
+    write_ec_files(dir, dir, "", VolumeId(4), 10, 4).unwrap();
+
+    // Mount shards 1..=13 only. A needle at .dat offset 0 lives in shard 0's
+    // first small block, so the interval this delete needs is deliberately the
+    // one shard that is absent.
+    {
+        let mut store = state.store.write().unwrap();
+        let shard_ids: Vec<ShardId> = (1..14).collect();
+        store.mount_ec_shards(VolumeId(4), "", &shard_ids).unwrap();
+    }
+
+    let fid = FileId::new(VolumeId(4), nid, cookie).to_string();
+    let app = build_admin_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/{}", fid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "DELETE of an EC needle must reconstruct through the distributed \
+         reader instead of failing 500 on a non-local shard"
+    );
+
+    // The tombstone must actually have landed: a later GET is a 404.
+    let app = build_admin_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/{}", fid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the delete must have been journalled, not just answered 202"
+    );
+}
+
+// ============================================================================
+// Hostile response-header override params must not panic the handler
+//
+// The `response-*` query params are attacker-controlled and were inserted with
+// `parse().unwrap()`. `%0A` decodes to a newline, `HeaderValue::from_str`
+// rejects it, and the unwrap panicked the connection task — unauthenticated.
+// The override must simply be skipped.
+// ============================================================================
+
+#[tokio::test]
+async fn hostile_response_header_overrides_are_skipped_not_panicked() {
+    let (state, _tmp) = test_state();
+    let uri = "/1,01637037d6";
+
+    let app = build_admin_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::from(b"payload".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // One request per override param, each carrying a raw newline.
+    for param in [
+        "response-cache-control",
+        "response-content-encoding",
+        "response-expires",
+        "response-content-language",
+        "response-content-disposition",
+        "response-content-type",
+    ] {
+        let app = build_admin_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{}?{}=%0Aevil", uri, param))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{} with a newline must be ignored, not panic",
+            param
+        );
+        assert_eq!(body_bytes(response).await, b"payload".to_vec());
+    }
+}
+
+// ============================================================================
+// Non-ASCII in the fid and in ?ttl= must be rejected, not panic
+//
+// `parse_needle_id_cookie` split the hex by BYTE offset and `TTL::read` took
+// the unit as the last BYTE, so a multi-byte character split inside itself.
+// Both are reachable unauthenticated from the request line / query string.
+// ============================================================================
+
+#[tokio::test]
+async fn non_ascii_fid_and_ttl_are_rejected_not_panicked() {
+    let (state, _tmp) = test_state();
+
+    // A fid whose hex part is multi-byte UTF-8.
+    let app = build_admin_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/1,%C3%A9%C3%A9%C3%A9%C3%A9a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_client_error() || response.status().is_server_error(),
+        "non-ASCII fid must produce an error status, got {}",
+        response.status()
+    );
+
+    // A TTL whose unit character is multi-byte. The upload path does
+    // `TTL::read(..).ok()`, so *any* unparseable TTL is simply dropped and the
+    // write succeeds — the point here is that a non-ASCII one now takes that
+    // same road instead of panicking. Assert it matches an ASCII-invalid TTL
+    // rather than inventing a stricter contract than the handler has.
+    let mut statuses = Vec::new();
+    // Distinct needle ids: reusing one id with a different cookie is a
+    // cookie-mismatch overwrite, which would mask what this test measures.
+    for (fid, ttl) in [("/1,03637037d7", "5%C3%A9"), ("/1,04637037d8", "5z")] {
+        let app = build_admin_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("{}?ttl={}", fid, ttl))
+                    .body(Body::from(b"x".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        statuses.push(response.status());
+    }
+    assert_eq!(
+        statuses[0], statuses[1],
+        "a non-ASCII ttl must behave like any other invalid ttl, not panic"
+    );
 }

@@ -15,7 +15,8 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use super::grpc_client::{GRPC_MAX_MESSAGE_SIZE, build_grpc_endpoint};
+use super::absolute_display_path;
+use super::grpc_client::{GrpcDialOptions, connect_channel, volume_server_client};
 use super::volume_server::{VolumeServerState, normalize_outgoing_http_url, to_http_address};
 use crate::config::ReadMode;
 use crate::metrics;
@@ -540,19 +541,16 @@ async fn batch_delete_file_ids(
     }
 
     for (grpc_addr, batch) in server_to_file_ids {
-        let endpoint = build_grpc_endpoint(&grpc_addr, state.outgoing_grpc_tls.as_ref())
-            .map_err(|e| format!("batch delete {}: {}", grpc_addr, e))?;
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| format!("batch delete {}: {}", grpc_addr, e))?;
-        let mut client =
-            volume_server_pb::volume_server_client::VolumeServerClient::with_interceptor(
-                channel,
-                super::request_id::outgoing_request_id_interceptor,
-            )
-            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+        // BatchDelete is unary, but `stream()` is still right: this fan-out has
+        // no per-request deadline today, and `unary()` would add a 10 s one.
+        let channel = connect_channel(
+            &grpc_addr,
+            state.outgoing_grpc_tls.as_ref(),
+            GrpcDialOptions::stream(),
+        )
+        .await
+        .map_err(|e| format!("batch delete {}: {}", grpc_addr, e))?;
+        let mut client = volume_server_client(channel);
 
         let response = client
             .batch_delete(volume_server_pb::BatchDeleteRequest {
@@ -1353,9 +1351,7 @@ async fn get_or_head_handler_inner(
 
     // H6: Determine Content-Type: filter application/octet-stream, use mime_guess
     // For chunk manifests, skip extension-based MIME override — use stored MIME as-is (Go parity)
-    let content_type = if let Some(ref ct) = query.response_content_type {
-        Some(ct.clone())
-    } else if n.is_chunk_manifest() {
+    let content_type = if n.is_chunk_manifest() {
         // Chunk manifests: use stored MIME but filter application/octet-stream (Go L334)
         if !n.mime.is_empty() {
             let mt = String::from_utf8_lossy(&n.mime).to_string();
@@ -1404,27 +1400,50 @@ async fn get_or_head_handler_inner(
             }
         }
     };
-    if let Some(ref ct) = content_type {
-        response_headers.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+    // Every value below can come straight from the query string, so none of
+    // them may be unwrapped: `?response-cache-control=%0Aevil` decodes to a
+    // value with a newline, `HeaderValue::from_str` rejects it, and the unwrap
+    // would panic the connection task. An invalid `response-content-type`
+    // falls back to the needle MIME rather than dropping Content-Type.
+    if let Some(hval) = query
+        .response_content_type
+        .as_ref()
+        .and_then(|ct| ct.parse::<header::HeaderValue>().ok())
+    {
+        response_headers.insert(header::CONTENT_TYPE, hval);
+    } else if let Some(ref ct) = content_type
+        && let Ok(hval) = ct.parse()
+    {
+        response_headers.insert(header::CONTENT_TYPE, hval);
     }
 
     // Cache-Control override from query param
-    if let Some(ref cc) = query.response_cache_control {
-        response_headers.insert(header::CACHE_CONTROL, cc.parse().unwrap());
+    if let Some(ref cc) = query.response_cache_control
+        && let Ok(hval) = cc.parse()
+    {
+        response_headers.insert(header::CACHE_CONTROL, hval);
     }
 
     // S3 response passthrough headers
-    if let Some(ref ce) = query.response_content_encoding {
-        response_headers.insert(header::CONTENT_ENCODING, ce.parse().unwrap());
+    if let Some(ref ce) = query.response_content_encoding
+        && let Ok(hval) = ce.parse()
+    {
+        response_headers.insert(header::CONTENT_ENCODING, hval);
     }
-    if let Some(ref exp) = query.response_expires {
-        response_headers.insert(header::EXPIRES, exp.parse().unwrap());
+    if let Some(ref exp) = query.response_expires
+        && let Ok(hval) = exp.parse()
+    {
+        response_headers.insert(header::EXPIRES, hval);
     }
-    if let Some(ref cl) = query.response_content_language {
-        response_headers.insert("Content-Language", cl.parse().unwrap());
+    if let Some(ref cl) = query.response_content_language
+        && let Ok(hval) = cl.parse()
+    {
+        response_headers.insert("Content-Language", hval);
     }
-    if let Some(ref cd) = query.response_content_disposition {
-        response_headers.insert(header::CONTENT_DISPOSITION, cd.parse().unwrap());
+    if let Some(ref cd) = query.response_content_disposition
+        && let Ok(hval) = cd.parse()
+    {
+        response_headers.insert(header::CONTENT_DISPOSITION, hval);
     }
 
     // Last-Modified
@@ -2789,15 +2808,23 @@ pub async fn delete_handler(
     {
         let has_ec = state.store.read().unwrap().has_ec_volume(vid);
         if has_ec {
-            // Step 1: Read the EC needle to get its size and validate cookie
-            let ec_read_result = {
-                let store = state.store.read().unwrap();
-                store
-                    .find_ec_volume(vid)
-                    .map(|ecv| ecv.read_ec_shard_needle(needle_id))
-            };
+            // Step 1: Read the EC needle to get its size and validate cookie.
+            //
+            // This must go through the *distributed* reader, as the GET path
+            // does. The local-only `EcVolume::read_ec_shard_needle` errors
+            // "ec shard N not available locally" for any interval that lives on
+            // a peer, so on a standard 10+4 spread every HTTP DELETE of an EC
+            // needle failed 500 and never appended to `.ecj`. The distributed
+            // reader does a local-first pass in its snapshot phase, so the
+            // all-shards-local case costs the same as before.
+            //
+            // No store guard is held across this call: the reader takes and
+            // releases its own, and `RwLockReadGuard` is `!Send`.
+            let ec_read_result =
+                crate::server::store_ec::read_ec_shard_needle_distributed(&state, vid, needle_id)
+                    .await;
             match ec_read_result {
-                Some(Ok(Some(ec_needle))) => {
+                Ok(Some(ec_needle)) => {
                     // Step 2: Validate cookie (Go: cookie != 0 && cookie != n.Cookie)
                     if cookie.0 != 0 && ec_needle.cookie != cookie {
                         return json_error_with_query(
@@ -2807,26 +2834,50 @@ pub async fn delete_handler(
                         );
                     }
                     let count = ec_needle.data_size as i64;
-                    // Step 3: Journal the delete
-                    let mut store = state.store.write().unwrap();
-                    if let Some(ecv) = store.find_ec_volume_mut(vid)
-                        && let Err(e) = ecv.journal_delete(needle_id)
+                    // Step 3: Journal the delete on a holder of the needle's
+                    // primary data shard — Go's DeleteEcShardNeedle forwards a
+                    // VolumeEcBlobDelete there rather than journaling locally,
+                    // so exactly one node carries the tombstone and
+                    // delete_count stays consistent across replicas.
+                    match crate::server::store_ec::delete_ec_shard_needle_distributed(
+                        &state, vid, needle_id,
+                    )
+                    .await
                     {
-                        return json_error_with_query(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Deletion Failed: {}", e),
-                            Some(&del_query),
-                        );
+                        Ok(()) => {
+                            let result = DeleteResult { size: count };
+                            return json_response_with_params(
+                                StatusCode::ACCEPTED,
+                                &result,
+                                Some(&del_params),
+                            );
+                        }
+                        // Unmounted between the read and the append, or the
+                        // needle went away in the same window: nothing was
+                        // journalled, so answering 202 would lose the delete
+                        // while reporting success.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            let result = DeleteResult { size: 0 };
+                            return json_response_with_params(
+                                StatusCode::NOT_FOUND,
+                                &result,
+                                Some(&del_params),
+                            );
+                        }
+                        Err(e) => {
+                            return json_error_with_query(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Deletion Failed: {}", e),
+                                Some(&del_query),
+                            );
+                        }
                     }
-                    let result = DeleteResult { size: count };
-                    return json_response_with_params(
-                        StatusCode::ACCEPTED,
-                        &result,
-                        Some(&del_params),
-                    );
                 }
-                Some(Ok(None)) => {
-                    // Needle not found in EC volume
+                Ok(None) => {
+                    // Needle not in the EC index, or the volume disappeared
+                    // between the `has_ec` check and the snapshot — the
+                    // distributed reader reports both as `Ok(None)`, and both
+                    // mean the same thing to a deleter.
                     let result = DeleteResult { size: 0 };
                     return json_response_with_params(
                         StatusCode::NOT_FOUND,
@@ -2834,20 +2885,23 @@ pub async fn delete_handler(
                         Some(&del_params),
                     );
                 }
-                Some(Err(e)) => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // A shard or interval the read needed is gone rather than
+                    // merely remote. The GET path answers 404 here; answering
+                    // 500 (as this handler did for every error) told callers to
+                    // retry a delete that can never succeed.
+                    let result = DeleteResult { size: 0 };
+                    return json_response_with_params(
+                        StatusCode::NOT_FOUND,
+                        &result,
+                        Some(&del_params),
+                    );
+                }
+                Err(e) => {
                     return json_error_with_query(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Deletion Failed: {}", e),
                         Some(&del_query),
-                    );
-                }
-                None => {
-                    // EC volume disappeared between has_ec check and find
-                    let result = DeleteResult { size: 0 };
-                    return json_response_with_params(
-                        StatusCode::NOT_FOUND,
-                        &result,
-                        Some(&del_params),
                     );
                 }
             }
@@ -3620,16 +3674,6 @@ async fn read_remote_chunk_needle(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-fn absolute_display_path(path: &str) -> String {
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        return path.to_string();
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(p).to_string_lossy().to_string())
-        .unwrap_or_else(|_| path.to_string())
-}
 
 fn build_disk_statuses(store: &crate::storage::store::Store) -> Vec<serde_json::Value> {
     let mut disk_statuses = Vec::new();

@@ -35,6 +35,7 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 	if readSize.IsDeleted() {
 		if readOption != nil && readOption.ReadDeleted && readSize != TombstoneFileSize {
 			glog.V(3).Infof("reading deleted %s", n.String())
+			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ReadDeletedNeedle).Inc()
 			readSize = -readSize
 		} else {
 			return -1, ErrorDeleted
@@ -234,6 +235,11 @@ func min(x, y int) int {
 
 // read fills in Needle content by looking up n.Id from NeedleMapper
 func (v *Volume) ReadNeedleBlob(offset int64, size Size) ([]byte, error) {
+	// A deletion marker is not a record length; reject it before taking the lock.
+	if size.IsDeleted() {
+		return nil, fmt.Errorf("invalid needle size %d", size)
+	}
+
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
 
@@ -293,7 +299,13 @@ func ScanVolumeFileFrom(version needle.Version, datBackend backend.BackendStorag
 			glog.V(0).Infof("visit needle error: %v", err)
 			return fmt.Errorf("visit needle error: %w", err)
 		}
-		offset += NeedleHeaderSize + rest
+		// A corrupt header can carry a size so negative that the record length
+		// is zero or less; the scan cannot advance past it.
+		recordSize := NeedleHeaderSize + rest
+		if recordSize <= 0 {
+			return fmt.Errorf("%s: needle header at offset %d has size %d, record length %d: %w", datBackend.Name(), offset, n.Size, recordSize, needle.ErrorCorrupted)
+		}
+		offset += recordSize
 		glog.V(4).Infof("==> new entry offset %d", offset)
 		if n, nh, rest, err = needle.ReadNeedleHeader(datBackend, version, offset); err != nil {
 			if err == io.EOF {

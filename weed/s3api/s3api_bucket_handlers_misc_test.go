@@ -162,6 +162,11 @@ func TestGetBucketOwnershipControlsDefaultsToBucketOwnerEnforced(t *testing.T) {
 	})
 	req := newBucketRequest(http.MethodGet, "b", "ownershipControls=", "")
 	req.Header.Set(s3_constants.AmzAccountId, AccountAdmin.Id)
+	req = req.WithContext(s3_constants.SetIdentityInContext(req.Context(), &Identity{
+		Name:    "admin",
+		Account: &AccountAdmin,
+		Actions: []Action{s3_constants.ACTION_ADMIN},
+	}))
 	rec := httptest.NewRecorder()
 
 	s3a.GetBucketOwnershipControls(rec, req)
@@ -219,6 +224,24 @@ func TestGetBucketLogging(t *testing.T) {
 	}
 	if !strings.Contains(got, `xmlns="http://s3.amazonaws.com/doc/2006-03-01/"`) {
 		t.Fatalf("missing xmlns: %s", got)
+	}
+}
+
+func TestGetBucketLocationInvalidBucketName(t *testing.T) {
+	// AWS answers 400 InvalidBucketName for a malformed bucket name rather than
+	// the 404 NoSuchBucket an unknown-but-valid name gets.
+	s3a := &S3ApiServer{}
+	req := httptest.NewRequest(http.MethodGet, "/invalid%20bucket%20name?location=", nil)
+	req = mux.SetURLVars(req, map[string]string{"bucket": "invalid bucket name"})
+	rec := httptest.NewRecorder()
+
+	s3a.GetBucketLocationHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "InvalidBucketName") {
+		t.Fatalf("body = %s, want InvalidBucketName", rec.Body.String())
 	}
 }
 

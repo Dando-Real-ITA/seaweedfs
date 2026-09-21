@@ -18,6 +18,7 @@ use std::sync::{Mutex, RwLock};
 
 use super::file_pool::pooled_index_files;
 use crate::storage::idx;
+use crate::storage::io::read_exact_at;
 use crate::storage::needle_map::{CompactNeedleMap, NeedleMapMetric, NeedleValue};
 use crate::storage::types::*;
 
@@ -316,9 +317,11 @@ impl SortedFileNeedleMap {
         Ok(())
     }
 
-    pub fn ascending_visit<F>(&self, mut f: F) -> Result<(), String>
+    /// Visit all live entries in ascending order by needle ID.
+    pub fn ascending_visit<F, E>(&self, mut f: F) -> Result<(), E>
     where
-        F: FnMut(NeedleId, &NeedleValue) -> Result<(), String>,
+        F: FnMut(NeedleId, &NeedleValue) -> Result<(), E>,
+        E: From<String>,
     {
         let mut visit_error = None;
         self.visit_live_entries(|id, nv| {
@@ -328,7 +331,7 @@ impl SortedFileNeedleMap {
             }
             Ok(())
         })
-        .map_err(|e| visit_error.take().unwrap_or_else(|| e.to_string()))
+        .map_err(|e| visit_error.take().unwrap_or_else(|| E::from(e.to_string())))
     }
 
     pub fn iter_entries(&self) -> io::Result<Vec<(NeedleId, NeedleValue)>> {
@@ -518,32 +521,6 @@ fn search_sorted_index(
         }
     }
     Ok(None)
-}
-
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        let mut filled = 0;
-        let mut at = offset;
-        while filled < buf.len() {
-            let n = file.seek_read(&mut buf[filled..], at)?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF in seek_read",
-                ));
-            }
-            filled += n;
-            at += n as u64;
-        }
-        Ok(())
-    }
 }
 
 fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
@@ -1060,7 +1037,7 @@ mod tests {
         let mut visited = Vec::new();
         m.ascending_visit(|id, _| {
             visited.push(id);
-            Ok(())
+            Ok::<(), String>(())
         })
         .unwrap();
         assert_eq!(visited, vec![NeedleId(2)]);

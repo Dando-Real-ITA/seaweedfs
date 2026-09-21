@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -21,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -29,6 +31,8 @@ import (
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util/constants"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Object lock validation errors
@@ -963,7 +967,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			if finalize != nil && len(finalize.mutations) > 0 {
 				lockKey, finalizeMutations = finalize.lockKey, finalize.mutations
 			}
-			resp, err := s3a.routedPut(owner, s3a.objectRouteKey(bucket, object), lockKey, filePath, entry, cond, finalizeMutations)
+			resp, err := s3a.routedPut(owner, s3a.objectRouteKey(bucket, object), lockKey, filePath, entry, cond, "", finalizeMutations)
 			switch {
 			case err != nil:
 				glog.Warningf("putToFiler: routed PUT to %s failed for %s, falling back to lock: %v", owner, filePath, err)
@@ -992,17 +996,29 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 		// If the entry was never created, the uploaded chunks are orphaned and must be deleted.
 		if !entryCreated {
-			orphaned := chunkResult.FileChunks
-			if manifestChunks, _ := filer.SeparateManifestChunks(entry.GetChunks()); len(manifestChunks) > 0 {
-				orphaned = append(manifestChunks, orphaned...)
+			// A failed create does not prove the entry is absent: a lost response
+			// can hide a commit (issue #11366) and the filer can fail after
+			// inserting the entry (issue #11387), so the entry's presence — not
+			// the error class — decides the chunks' fate.
+			landed, absent := s3a.confirmCreateLanded(filePath, bucket, object, entry, chunkResult.FileChunks, finalize)
+			if landed {
+				createCode = s3err.ErrNone
 			}
-			if len(orphaned) > 0 {
-				glog.Warningf("putToFiler: finalization failed, attempting to cleanup %d orphaned chunks", len(orphaned))
-				s3a.deleteOrphanedChunks(orphaned)
+			if createCode != s3err.ErrNone && absent {
+				orphaned := chunkResult.FileChunks
+				if manifestChunks, _ := filer.SeparateManifestChunks(entry.GetChunks()); len(manifestChunks) > 0 {
+					orphaned = append(manifestChunks, orphaned...)
+				}
+				if len(orphaned) > 0 {
+					glog.Warningf("putToFiler: finalization failed, attempting to cleanup %d orphaned chunks", len(orphaned))
+					s3a.deleteOrphanedChunks(orphaned)
+				}
 			}
 		}
 
-		return "", createCode, SSEResponseMetadata{}
+		if createCode != s3err.ErrNone {
+			return "", createCode, SSEResponseMetadata{}
+		}
 	}
 	glog.V(3).Infof("putToFiler: CreateEntry SUCCESS for %s", filePath)
 
@@ -1027,6 +1043,123 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	}
 
 	return etag, s3err.ErrNone, responseMetadata
+}
+
+// createLookupTimeout bounds the entry lookups confirmCreateLanded runs under
+// the object write lock, so a hung filer cannot stall the write path.
+const createLookupTimeout = 10 * time.Second
+
+// confirmCreateLanded resolves a create whose outcome is uncertain: a stored
+// entry resolving to the uploaded chunks confirms the write landed — the
+// finalization the error skipped then runs under the object write lock, and
+// landed reports success — while absent requires every filer the create could
+// have committed on to lack the entry, the only outcome where the uploaded
+// chunks are orphaned.
+func (s3a *S3ApiServer) confirmCreateLanded(filePath, bucket, object string, entry *filer_pb.Entry, uploaded []*filer_pb.FileChunk, finalize *putFinalize) (landed, absent bool) {
+	dir, name := path.Dir(filePath), path.Base(filePath)
+	owner := s3a.routableWriteOwner(bucket, object)
+	lookupCtx, cancel := context.WithTimeout(context.Background(), createLookupTimeout)
+	defer cancel()
+	// Verify, finalize, and roll back inside one critical section: a concurrent
+	// write to the same key must not slip in between them.
+	s3a.withObjectWriteLock(bucket, object, nil, func() s3err.ErrorCode {
+		var existing *filer_pb.Entry
+		uncertain, queried := false, false
+		for _, target := range s3a.createTargetFilers(owner, bucket, object) {
+			e, lookupErr := s3a.lookupEntryOnFiler(lookupCtx, target, dir, name)
+			queried = true
+			if e != nil {
+				existing = e
+				break
+			}
+			if lookupErr != nil && !errors.Is(lookupErr, filer_pb.ErrNotFound) {
+				uncertain = true
+			}
+		}
+		if existing == nil {
+			absent = queried && !uncertain
+			return s3err.ErrNone
+		}
+		if len(uploaded) == 0 {
+			return s3err.ErrNone
+		}
+		resolved, _, resolveErr := filer.ResolveChunkManifest(lookupCtx, s3a.createLookupFileIdFunction(), existing.GetChunks(), 0, math.MaxInt64, s3a.filerClient)
+		if resolveErr != nil || !sameFileChunks(resolved, uploaded) {
+			return s3err.ErrNone
+		}
+		glog.Warningf("putToFiler: create entry for %s failed but the entry exists, treating the write as successful", filePath)
+		if finalize == nil || finalize.afterCreate == nil {
+			landed = true
+			return s3err.ErrNone
+		}
+		if code := finalize.afterCreate(entry); code != s3err.ErrNone {
+			// Same undo the create path applies when post-create finalization fails.
+			if rbErr := s3a.rmObject(context.Background(), dir, name, true, false); rbErr != nil {
+				glog.Errorf("putToFiler: failed to rollback recovered entry for %s: %v", filePath, rbErr)
+			}
+			return s3err.ErrNone
+		}
+		landed = true
+		return s3err.ErrNone
+	})
+	return landed, absent
+}
+
+// createTargetFilers lists the filers a failed create could have committed on:
+// the routed owner and the prior one mid-rebalance first, then the failover
+// set the lock path dials. Deduped, empty addresses skipped.
+func (s3a *S3ApiServer) createTargetFilers(owner pb.ServerAddress, bucket, object string) []pb.ServerAddress {
+	var filers []pb.ServerAddress
+	seen := map[pb.ServerAddress]bool{}
+	add := func(f pb.ServerAddress) {
+		if f != "" && !seen[f] {
+			seen[f] = true
+			filers = append(filers, f)
+		}
+	}
+	add(owner)
+	add(s3a.priorWriteOwner(bucket, object))
+	if s3a.filerClient != nil {
+		add(s3a.filerClient.GetCurrentFiler())
+		for _, f := range s3a.filerClient.GetAllFilers() {
+			add(f)
+		}
+	}
+	for _, f := range s3a.option.Filers {
+		add(f)
+	}
+	return filers
+}
+
+// sameFileChunks reports whether two chunk lists reference the same needles,
+// regardless of order. File id strings are normalized through the parsed Fid so
+// a non-canonical representation cannot masquerade as a different chunk.
+func sameFileChunks(a, b []*filer_pb.FileChunk) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(c *filer_pb.FileChunk) string {
+		fid := c.GetFid()
+		if fid == nil {
+			fid, _ = filer_pb.ToFileIdObject(c.GetFileIdString())
+		}
+		if fid == nil {
+			return c.GetFileIdString()
+		}
+		return fmt.Sprintf("%d,%x,%x", fid.VolumeId, fid.FileKey, fid.Cookie)
+	}
+	counts := make(map[string]int, len(a))
+	for _, c := range a {
+		counts[key(c)]++
+	}
+	for _, c := range b {
+		k := key(c)
+		if counts[k] == 0 {
+			return false
+		}
+		counts[k]--
+	}
+	return true
 }
 
 // checksumAlgorithmMapping maps algorithm name strings to their enum and header name.
@@ -1090,6 +1223,22 @@ func (c *ChecksumResult) SetChecksum(headerName, value string) {
 	case s3_constants.AmzChecksumSHA256:
 		c.ChecksumSHA256 = value
 	}
+}
+
+func (c *ChecksumResult) GetChecksum(headerName string) string {
+	switch headerName {
+	case s3_constants.AmzChecksumCRC32:
+		return c.ChecksumCRC32
+	case s3_constants.AmzChecksumCRC32C:
+		return c.ChecksumCRC32C
+	case s3_constants.AmzChecksumCRC64NVME:
+		return c.ChecksumCRC64NVME
+	case s3_constants.AmzChecksumSHA1:
+		return c.ChecksumSHA1
+	case s3_constants.AmzChecksumSHA256:
+		return c.ChecksumSHA256
+	}
+	return ""
 }
 
 // lookupHeaderOrQuery returns the value of an x-amz-* parameter, checking the
@@ -1293,13 +1442,23 @@ func filerErrorToS3Error(err error) s3err.ErrorCode {
 		return s3err.ErrAccessDenied
 	}
 
+	// A transport failure leaves the outcome ambiguous — the write may have
+	// been applied anyway — so it must stay retryable, not a permanent 4xx.
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded, codes.Unavailable:
+		return s3err.ErrServiceUnavailable
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return s3err.ErrServiceUnavailable
+	}
+
 	// Non-filer errors that don't go through CreateEntryResponse — string matching required
 	errString := err.Error()
 	switch {
 	case errString == constants.ErrMsgBadDigest:
 		return s3err.ErrBadDigest
 	case strings.Contains(errString, "context canceled") || strings.Contains(errString, "code = Canceled"):
-		return s3err.ErrInvalidRequest
+		return s3err.ErrServiceUnavailable
 	default:
 		return s3err.ErrInternalError
 	}

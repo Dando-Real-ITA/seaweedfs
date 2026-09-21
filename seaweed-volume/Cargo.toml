@@ -27,8 +27,15 @@ redb-experimental-cursor = ["redb/experimental_cursor"]
 # Protobuf message literals keep `..Default::default()` on purpose: it is
 # what lets a proto gain a field without touching every constructor.
 needless_update = "allow"
+# Every `unsafe` block states its precondition, right above the block.
+undocumented_unsafe_blocks = "warn"
 
 [dependencies]
+# Helpers the Rust plugin workers (seaweed-worker) need as well. A path
+# dependency because the two trees are separate cargo workspaces with no
+# common root manifest.
+seaweed-common = { path = "../seaweed-common" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

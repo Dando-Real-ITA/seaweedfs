@@ -12,10 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use super::grpc_client::{GRPC_MAX_MESSAGE_SIZE, build_grpc_endpoint};
+use super::grpc_client::{GrpcDialOptions, connect_channel, master_client};
 use super::volume_server::VolumeServerState;
 use crate::pb::master_pb;
-use crate::pb::master_pb::seaweed_client::SeaweedClient;
 use crate::pb::volume_server_pb;
 use crate::remote_storage::s3_tier::{S3TierBackend, S3TierConfig};
 use crate::storage::store::Store;
@@ -24,7 +23,6 @@ use crate::storage::volume_report::VolumeReportKey;
 use crate::storage::volume_report_hash::report_hash;
 
 const DUPLICATE_UUID_RETRY_MESSAGE: &str = "duplicate UUIDs detected, retrying connection";
-const VOLUME_IO_ERROR_TOLERANCE: i32 = 3;
 const MAX_DUPLICATE_UUID_RETRIES: u32 = 3;
 
 /// Configuration for the heartbeat client.
@@ -222,7 +220,7 @@ async fn check_with_master(config: &HeartbeatConfig, state: &Arc<VolumeServerSta
                     if changed {
                         state.metrics_notify.notify_waiters();
                     }
-                    apply_storage_backends(state, &resp.storage_backends);
+                    apply_storage_backends(&resp.storage_backends);
                     info!(
                         "Got master configuration from {}: metrics_address={}, metrics_interval={}s",
                         master_addr, resp.metrics_address, resp.metrics_interval_seconds
@@ -246,17 +244,8 @@ pub async fn try_get_master_configuration(
     grpc_addr: &str,
     tls: Option<&super::grpc_client::OutgoingGrpcTlsConfig>,
 ) -> Result<master_pb::GetMasterConfigurationResponse, Box<dyn std::error::Error>> {
-    let channel = build_grpc_endpoint(grpc_addr, tls)?
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .connect()
-        .await?;
-    let mut client = SeaweedClient::with_interceptor(
-        channel,
-        super::request_id::outgoing_request_id_interceptor,
-    )
-    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+    let channel = connect_channel(grpc_addr, tls, GrpcDialOptions::unary()).await?;
+    let mut client = master_client(channel);
     let resp = client
         .get_master_configuration(master_pb::GetMasterConfigurationRequest {})
         .await?;
@@ -391,18 +380,14 @@ async fn do_heartbeat(
     pulse: Duration,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let channel = build_grpc_endpoint(grpc_addr, state.outgoing_grpc_tls.as_ref())?
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .connect()
-        .await?;
-
-    let mut client = SeaweedClient::with_interceptor(
-        channel,
-        super::request_id::outgoing_request_id_interceptor,
+    let channel = connect_channel(
+        grpc_addr,
+        state.outgoing_grpc_tls.as_ref(),
+        GrpcDialOptions::long(),
     )
-    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+    .await?;
+
+    let mut client = master_client(channel);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<master_pb::Heartbeat>(32);
 
@@ -674,16 +659,15 @@ fn apply_metrics_push_settings(
     true
 }
 
-fn apply_storage_backends(
-    state: &VolumeServerState,
-    storage_backends: &[master_pb::StorageBackend],
-) {
+/// Registers the master's S3 storage backends in the process-wide tier
+/// registry, the single place both the tier-move handlers and `Volume` itself
+/// resolve a backend from.
+fn apply_storage_backends(storage_backends: &[master_pb::StorageBackend]) {
     if storage_backends.is_empty() {
         return;
     }
 
-    let mut registry = state.s3_tier_registry.write().unwrap();
-    let mut global_registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
+    let mut registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
         .write()
         .unwrap();
     for backend in storage_backends {
@@ -714,7 +698,6 @@ fn apply_storage_backends(
             backend.id.as_str()
         };
         register_s3_backend(&mut registry, backend, backend_id, &config);
-        register_s3_backend(&mut global_registry, backend, backend_id, &config);
     }
 }
 
@@ -954,8 +937,8 @@ fn build_heartbeat_with_ec_status(
             let volume_size = vol.dat_file_size().unwrap_or(0);
             let mut should_delete_volume = false;
 
-            let (_, io_count, io_quarantined) = vol.get_io_error_state();
-            if io_quarantined || io_count >= VOLUME_IO_ERROR_TOLERANCE {
+            if vol.should_quarantine() {
+                let (_, io_count, io_quarantined) = vol.get_io_error_state();
                 if !io_quarantined {
                     vol.mark_io_quarantined();
                     warn!(
@@ -973,7 +956,7 @@ fn build_heartbeat_with_ec_status(
                 // whose .dat legitimately lives in cloud storage. Only a present .dat is
                 // cached for 30s; a missing one is re-checked every heartbeat so the volume
                 // stays suppressed until the file returns. See issues/10004
-                if vol.file_count() > 0 && !vol.has_remote_file {
+                if vol.file_count() > 0 && !vol.has_remote_file() {
                     const DISK_CHECK_INTERVAL_NS: i64 = 30 * 1_000_000_000;
                     let now_ns = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1250,7 +1233,6 @@ mod tests {
         READ_ONLY_LABEL_NO_WRITE_CAN_DELETE, READ_ONLY_LABEL_NO_WRITE_OR_DELETE,
         READ_ONLY_VOLUME_GAUGE,
     };
-    use crate::remote_storage::s3_tier::S3TierRegistry;
     use crate::security::{Guard, SigningKey};
     use crate::storage::needle_map::NeedleMapKind;
     use crate::storage::types::{DiskType, VolumeId};
@@ -1302,7 +1284,6 @@ mod tests {
             pre_stop_seconds: 0,
             volume_state_notify: tokio::sync::Notify::new(),
             write_queue: std::sync::OnceLock::new(),
-            s3_tier_registry: std::sync::RwLock::new(S3TierRegistry::new()),
             read_mode: ReadMode::Local,
             allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
@@ -1688,8 +1669,9 @@ mod tests {
         {
             let (_, volume) = store.find_volume_mut(VolumeId(17)).unwrap();
             volume.set_read_only().unwrap();
-            volume.volume_info.files.push(Default::default());
-            volume.refresh_remote_write_mode().unwrap();
+            volume
+                .update_remote_files(|files| files.push(Default::default()))
+                .unwrap();
         }
 
         let heartbeat = build_heartbeat(&test_config(), &mut store);
@@ -2054,15 +2036,15 @@ mod tests {
             .unwrap();
         let (_, volume) = store.find_volume_mut(VolumeId(71)).unwrap();
         volume
-            .volume_info
-            .files
-            .push(crate::storage::volume::PbRemoteFile {
-                backend_type: "s3".to_string(),
-                backend_id: "archive".to_string(),
-                key: "volumes/71.dat".to_string(),
-                ..Default::default()
-            });
-        volume.refresh_remote_write_mode().unwrap();
+            .update_remote_files(|files| {
+                files.push(crate::storage::volume::PbRemoteFile {
+                    backend_type: "s3".to_string(),
+                    backend_id: "archive".to_string(),
+                    key: "volumes/71.dat".to_string(),
+                    ..Default::default()
+                })
+            })
+            .unwrap();
 
         let heartbeat = build_heartbeat(&test_config(), &mut store);
 
@@ -2071,65 +2053,56 @@ mod tests {
         assert_eq!(heartbeat.volumes[0].remote_storage_key, "volumes/71.dat");
     }
 
+    // Not hermetic, and cannot be made so cheaply: `register_s3_backend` skips
+    // a name that is already registered, so had another test put `s3` or
+    // `s3.default` in the process-wide registry first, this would pass without
+    // proving that this call registered anything. Removing them afterwards is
+    // no better — unlike the tier tests' unique ids, the bare `s3` alias is the
+    // production one. Nothing else in the tree registers those two names.
     #[test]
     fn test_apply_storage_backends_registers_s3_default_aliases() {
-        let state = test_state_with_store(Store::new(NeedleMapKind::InMemory));
         // Do not call clear() on the global registry — other tests may be
         // running concurrently.  Just register our entries and verify them.
 
-        apply_storage_backends(
-            &state,
-            &[master_pb::StorageBackend {
-                r#type: "s3".to_string(),
-                id: "default".to_string(),
-                properties: std::collections::HashMap::from([
-                    ("aws_access_key_id".to_string(), "access".to_string()),
-                    ("aws_secret_access_key".to_string(), "secret".to_string()),
-                    ("bucket".to_string(), "bucket-a".to_string()),
-                    ("region".to_string(), "us-west-2".to_string()),
-                    ("endpoint".to_string(), "http://127.0.0.1:8333".to_string()),
-                    ("storage_class".to_string(), "STANDARD".to_string()),
-                    ("force_path_style".to_string(), "false".to_string()),
-                ]),
-            }],
-        );
+        apply_storage_backends(&[master_pb::StorageBackend {
+            r#type: "s3".to_string(),
+            id: "default".to_string(),
+            properties: std::collections::HashMap::from([
+                ("aws_access_key_id".to_string(), "access".to_string()),
+                ("aws_secret_access_key".to_string(), "secret".to_string()),
+                ("bucket".to_string(), "bucket-a".to_string()),
+                ("region".to_string(), "us-west-2".to_string()),
+                ("endpoint".to_string(), "http://127.0.0.1:8333".to_string()),
+                ("storage_class".to_string(), "STANDARD".to_string()),
+                ("force_path_style".to_string(), "false".to_string()),
+            ]),
+        }]);
 
-        let registry = state.s3_tier_registry.read().unwrap();
-        assert!(registry.get("s3.default").is_some());
-        assert!(registry.get("s3").is_some());
-        let global_registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
+        let registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
             .read()
             .unwrap();
-        assert!(global_registry.get("s3.default").is_some());
-        assert!(global_registry.get("s3").is_some());
+        assert!(registry.get("s3.default").is_some());
+        assert!(registry.get("s3").is_some());
     }
 
     #[test]
     fn test_apply_storage_backends_ignores_unsupported_types() {
-        let state = test_state_with_store(Store::new(NeedleMapKind::InMemory));
         // Do not call clear() on the global registry — other tests may be
         // running concurrently.
 
-        apply_storage_backends(
-            &state,
-            &[master_pb::StorageBackend {
-                r#type: "rclone".to_string(),
-                id: "default".to_string(),
-                properties: std::collections::HashMap::new(),
-            }],
-        );
+        apply_storage_backends(&[master_pb::StorageBackend {
+            r#type: "rclone".to_string(),
+            id: "default".to_string(),
+            properties: std::collections::HashMap::new(),
+        }]);
 
-        // The per-state registry is freshly created and should have no entries
-        // since "rclone" is unsupported.
-        let registry = state.s3_tier_registry.read().unwrap();
-        assert!(registry.names().is_empty());
         // Only check that the unsupported type was not added to the global
         // registry.  Other tests may have their own entries present.
-        let global_registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
+        let registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
             .read()
             .unwrap();
-        assert!(global_registry.get("rclone.default").is_none());
-        assert!(global_registry.get("rclone").is_none());
+        assert!(registry.get("rclone.default").is_none());
+        assert!(registry.get("rclone").is_none());
     }
 
     #[test]
