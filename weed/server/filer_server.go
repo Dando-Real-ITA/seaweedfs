@@ -92,6 +92,9 @@ type FilerOption struct {
 	// AllowUntrustedRemoteEndpoints lets a read of a remote-only entry dial a
 	// mounted endpoint that resolves to a loopback / private / metadata host.
 	AllowUntrustedRemoteEndpoints bool
+	// RemoteCacheEvictThreshold is the disk usage fraction at which the filer
+	// evicts remote-mounted cached chunks; 0 disables eviction.
+	RemoteCacheEvictThreshold float64
 }
 
 type FilerServer struct {
@@ -121,6 +124,15 @@ type FilerServer struct {
 	// deduplicates concurrent remote object caching operations
 	remoteCacheGroup singleflight.Group
 
+	// serializes remote-cache eviction passes; lastVacuum rate-limits the
+	// compaction trigger that reclaims evicted chunks.
+	remoteCacheEvictMu       sync.Mutex
+	remoteCacheLastVacuum    atomic.Pointer[time.Time]
+	remoteCacheEvictCtx      context.Context
+	remoteCacheEvictCancel   context.CancelFunc
+	remoteCachePendingVidsMu sync.Mutex
+	remoteCachePendingVids   map[uint32]int
+
 	recentCopyRequestsMu sync.Mutex
 	recentCopyRequests   map[string]recentCopyRequest
 
@@ -135,6 +147,11 @@ type FilerServer struct {
 	// a concurrent PATCH or DELETE is refused instead of recording duplicate
 	// chunks behind the first request's back.
 	tusActiveUploads sync.Map
+
+	// ringPeerIPs caches resolved ring member addresses per ring version so
+	// verifying a forwarded request's peer does not pay a DNS lookup per hop.
+	ringPeerIPs      atomic.Pointer[ringPeerIPs]
+	ringResolveGroup singleflight.Group
 
 	// entryLockTable serializes mutations to the same entry path on this filer.
 	// CreateEntry takes it today; UpdateEntry and DeleteEntry are intended to take
@@ -204,6 +221,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.startPosixLockSweeper()
 	fs.mountPeerRegistry = filer.NewMountPeerRegistry()
 	go fs.runMountPeerRegistrySweeper()
+	fs.remoteCacheEvictCtx, fs.remoteCacheEvictCancel = context.WithCancel(context.Background())
 
 	option.Masters.RefreshBySrvIfAvailable()
 	if len(option.Masters.GetInstances()) == 0 {
@@ -234,6 +252,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.filer.RemoteStorage.SetConfValidator(func(ctx context.Context, conf *remote_pb.RemoteConf) error {
 		return ValidateRemoteConfForLoad(ctx, conf, option.AllowUntrustedRemoteEndpoints)
 	})
+	go fs.runRemoteCacheEviction()
 	// we do not support IP whitelist right now https://github.com/seaweedfs/seaweedfs/issues/7094
 	if v.GetString("guard.white_list") != "" {
 		glog.Warningf("filer: guard.white_list is configured but the IP whitelist feature is currently disabled. See https://github.com/seaweedfs/seaweedfs/issues/7094")
@@ -311,6 +330,8 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 
 	fs.filer.LoadRemoteStorageConfAndMapping()
 
+	fs.filer.RebuildRemoteDeletionTombstones(context.Background())
+
 	grace.OnReload(fs.Reload)
 
 	fs.SetupDlmReplication()
@@ -355,6 +376,9 @@ func (fs *FilerServer) Shutdown() {
 	glog.V(0).Infof("Shutting down filer")
 	if fs.posixLockSweeperStop != nil {
 		close(fs.posixLockSweeperStop)
+	}
+	if fs.remoteCacheEvictCancel != nil {
+		fs.remoteCacheEvictCancel()
 	}
 	fs.filer.Shutdown()
 }

@@ -45,12 +45,14 @@ const (
 )
 
 type MasterOption struct {
-	Master                     pb.ServerAddress
-	MetaFolder                 string
-	VolumeSizeLimitMB          uint32
-	FileSizeLimitMB            int
-	VolumePreallocate          bool
-	MaxParallelVacuumPerServer int
+	Master                        pb.ServerAddress
+	MetaFolder                    string
+	VolumeSizeLimitMB             uint32
+	FileSizeLimitMB               int
+	VolumePreallocate             bool
+	MaxParallelVacuumPerServer    int
+	VacuumIntervalSeconds         int
+	VacuumDeleteEmptyAfterSeconds int
 	// PulseSeconds            int
 	DefaultReplicaPlacement string
 	GarbageThreshold        float64
@@ -117,6 +119,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	v.SetDefault("master.volume_growth.copy_3", topology.VolumeGrowStrategy.Copy3Count)
 	v.SetDefault("master.volume_growth.copy_other", topology.VolumeGrowStrategy.CopyOtherCount)
 	v.SetDefault("master.volume_growth.threshold", topology.VolumeGrowStrategy.Threshold)
+	v.SetDefault("master.volume_growth.reservation_timeout", "5m")
 	v.SetDefault("master.volume_growth.disable", false)
 	option.VolumeGrowthDisabled = v.GetBool("master.volume_growth.disable")
 
@@ -125,6 +128,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	topology.VolumeGrowStrategy.Copy3Count = v.GetUint32("master.volume_growth.copy_3")
 	topology.VolumeGrowStrategy.CopyOtherCount = v.GetUint32("master.volume_growth.copy_other")
 	topology.VolumeGrowStrategy.Threshold = v.GetFloat64("master.volume_growth.threshold")
+	topology.VolumeGrowStrategy.ReservationTimeout = parseReservationTimeout(v)
 	whiteList := util.StringSplit(v.GetString("guard.white_list"), ",")
 
 	var preallocateSize int64
@@ -202,6 +206,8 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.option.MaxParallelVacuumPerServer,
 		topology.VolumeGrowStrategy.Threshold,
 		ms.preallocateSize,
+		time.Duration(ms.option.VacuumIntervalSeconds)*time.Second,
+		time.Duration(ms.option.VacuumDeleteEmptyAfterSeconds)*time.Second,
 	)
 
 	ms.ProcessGrowRequest()
@@ -658,4 +664,17 @@ func (ms *MasterServer) Reload() {
 		v.GetString("jwt.signing.read.key"),
 		v.GetInt("jwt.signing.read.expires_after_seconds"),
 	)
+}
+
+func parseReservationTimeout(v *util.ViperProxy) time.Duration {
+	if str := strings.TrimSpace(v.GetString("master.volume_growth.reservation_timeout")); str != "" {
+		if d, err := time.ParseDuration(str); err == nil && d > 0 {
+			return d
+		}
+	}
+	// A bare number in the config means seconds; GetDuration would read it as nanoseconds.
+	if sec := v.GetInt("master.volume_growth.reservation_timeout"); sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	return topology.DefaultReservationTimeout
 }

@@ -34,20 +34,12 @@ import (
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-// A bucket creation lists collections, and a bucket deletion deletes one.
-// Neither RPC carried a deadline, so a transient failure anywhere down the chain
-// -- gateway to filer, filer to master, master to volume server -- held the S3
-// request open until the client gave up on it. Both budgets are taken outside
-// the filer failover walk, so they cover the whole walk rather than granting
-// each filer a fresh one.
-//
-// The delete is the shorter of the two: the filer has already spent its own
-// budget on this collection, under the bucket entry's delete inside s3a.rm, and
-// this call is the follow-up for when that did not happen.
-const (
-	collectionListTimeout   = 15 * time.Second
-	collectionDeleteTimeout = 10 * time.Second
-)
+// A bucket creation lists collections. The RPC carried no deadline, so a
+// transient failure anywhere down the chain -- gateway to filer, filer to
+// master, master to volume server -- held the S3 request open until the client
+// gave up on it. The budget is taken outside the filer failover walk, so it
+// covers the whole walk rather than granting each filer a fresh one.
+const collectionListTimeout = 15 * time.Second
 
 func (s3a *S3ApiServer) ListBucketsHandler(w http.ResponseWriter, r *http.Request) {
 
@@ -479,11 +471,8 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Delete bucket directory first, then collection. This order ensures that if
-	// collection deletion fails, the bucket directory is already gone, preventing
-	// the "collection exists but bucket directory missing" inconsistency that blocks
-	// bucket recreation. An orphaned collection is harmless and will be cleaned up
-	// or reused when the bucket is recreated.
+	// The filer resolves and drops the bucket's collection inside the delete;
+	// it keeps a shared one rather than risk another bucket's volumes.
 	err := s3a.rm(r.Context(), s3a.option.BucketsPath, bucket, false, true)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
@@ -493,36 +482,6 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 	if owner := bucketConfig.IdentityId; owner != "" {
 		if err := s3a.removeBucketFromOwnerIndex(owner, bucket); err != nil {
 			glog.Warningf("DeleteBucketHandler: owner index remove %s/%s: %v", owner, bucket, err)
-		}
-	}
-
-	// Bounded on a background context: the bucket directory is already gone, so
-	// this follow-up must survive a client disconnect, but it must not outlive the
-	// client by an unbounded amount either.
-	deleteCtx, cancelDelete := context.WithTimeout(context.Background(), collectionDeleteTimeout)
-	err = s3a.withFilerClient(deleteCtx, false, func(client filer_pb.SeaweedFilerClient) error {
-		deleteCollectionRequest := &filer_pb.DeleteCollectionRequest{
-			Collection: s3a.getCollectionName(bucket),
-		}
-
-		glog.V(1).Infof("delete collection: %v", deleteCollectionRequest)
-		if _, err := client.DeleteCollection(deleteCtx, deleteCollectionRequest); err != nil {
-			return fmt.Errorf("delete collection %s: %v", bucket, err)
-		}
-
-		return nil
-	})
-	timedOut := deleteCtx.Err() != nil
-	cancelDelete()
-
-	if err != nil {
-		// Log but don't fail — the bucket directory is already removed, so the bucket
-		// is effectively deleted. The orphaned collection will be cleaned up or reused.
-		if timedOut {
-			// Our own budget, not a refusal: the master carries on deleting once asked.
-			glog.Warningf("DeleteBucketHandler: stopped waiting for the collection delete for bucket %s: %v", bucket, err)
-		} else {
-			glog.Errorf("DeleteBucketHandler: failed to delete collection for bucket %s: %v", bucket, err)
 		}
 	}
 
@@ -544,31 +503,56 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 	s3err.WriteEmptyResponse(w, r, http.StatusNoContent)
 }
 
-// bucketHasUserObjects checks whether a bucket contains any non-special entries.
-// Special entries (.uploads, *.versions) are internal to S3 and don't count as user objects.
+// bucketHasUserObjects checks whether a bucket contains any user objects.
+// Empty directories left behind by deleted objects and internal folders
+// (.uploads, *.versions) do not count as user objects.
 func (s3a *S3ApiServer) bucketHasUserObjects(bucket string) (bool, error) {
-	bucketPath := s3a.option.BucketsPath + "/" + bucket
-	startFrom := ""
-	// Start with a small batch — most non-empty buckets have a real object early.
-	// If we only find special entries, switch to larger batches to page through quickly.
-	limit := uint32(10)
-	for {
-		entries, isLast, err := s3a.list(bucketPath, "", startFrom, false, limit)
-		if err != nil {
-			return false, err
-		}
-		for _, entry := range entries {
-			if entry.Name != s3_constants.MultipartUploadsFolder &&
-				!strings.HasSuffix(entry.Name, s3_constants.VersionsFolder) {
-				return true, nil
+	return s3a.dirHasUserObjects(s3a.option.BucketsPath + "/" + bucket)
+}
+
+func (s3a *S3ApiServer) dirHasUserObjects(root string) (bool, error) {
+	dirs := []string{root}
+	for len(dirs) > 0 {
+		dir := dirs[len(dirs)-1]
+		dirs = dirs[:len(dirs)-1]
+		startFrom := ""
+		// Start with a small batch — most non-empty buckets have a real object
+		// early; switch to larger batches to page through quickly.
+		limit := uint32(10)
+		for {
+			entries, isLast, err := s3a.list(dir, "", startFrom, false, limit)
+			if err != nil {
+				if isFilerNotFound(err) {
+					break // the directory was deleted between listing and walking it
+				}
+				return false, err
 			}
-			startFrom = entry.Name
+			for _, entry := range entries {
+				startFrom = entry.Name
+				if entry.Name == "" || entry.Name == "." || entry.Name == ".." || strings.Contains(entry.Name, "/") {
+					continue
+				}
+				if !entry.IsDirectory {
+					return true, nil
+				}
+				// An explicit directory object counts even under a reserved name.
+				if entry.IsDirectoryKeyObject() {
+					return true, nil
+				}
+				// Internal folders are skipped by object listing at every level,
+				// so a directory with a reserved name never counts.
+				if isReservedDirectoryName(entry.Name) {
+					continue
+				}
+				dirs = append(dirs, dir+"/"+entry.Name)
+			}
+			if isLast || len(entries) == 0 {
+				break
+			}
+			limit = 1000
 		}
-		if isLast {
-			return false, nil
-		}
-		limit = 1000
 	}
+	return false, nil
 }
 
 // hasObjectsWithActiveLocks checks if any objects in the bucket have active retention or legal hold
@@ -909,18 +893,24 @@ func (s3a *S3ApiServer) AuthWithPublicRead(handler http.HandlerFunc, action Acti
 
 		glog.V(4).Infof("AuthWithPublicRead: bucket=%s, object=%s, authType=%v, isAnonymous=%v", bucket, object, authType, isAnonymous)
 
-		// For anonymous requests, check if bucket allows public read via ACLs or bucket policies
+		// For anonymous requests, check if bucket allows public read via bucket policies or ACLs
 		if isAnonymous {
-			// First check ACL-based public access
+			// Loading the bucket config on a cache miss also refreshes the
+			// compiled policy, so a remotely deleted policy cannot leave a
+			// stale verdict in the engine.
 			isPublic := s3a.isBucketPublicRead(bucket)
 			glog.V(4).Infof("AuthWithPublicRead: bucket=%s, isPublicACL=%v", bucket, isPublic)
-			if isPublic {
+
+			// Object requests are re-evaluated inside Get/HeadObjectHandler
+			// once the entry is fetched, where tag conditions like
+			// s3:ExistingObjectTag/<key> can resolve correctly. Only
+			// bucket-level requests (List, HeadBucket) rely on this check alone.
+			if isPublic && object != "" {
 				glog.V(3).Infof("AuthWithPublicRead: allowing anonymous access to public-read bucket %s (ACL)", bucket)
 				handler(w, r)
 				return
 			}
 
-			// Check bucket policy for anonymous access using the policy engine
 			principal := "*" // Anonymous principal
 			// Evaluate bucket policy (objectEntry nil - not yet fetched)
 			allowed, evaluated, err := s3a.policyEngine.EvaluatePolicy(bucket, object, string(action), principal, r, nil, nil)
@@ -944,7 +934,13 @@ func (s3a *S3ApiServer) AuthWithPublicRead(handler http.HandlerFunc, action Acti
 					return
 				}
 			}
-			// No matching policy statement - fall through to check ACLs and then IAM auth
+
+			// No matching policy statement - fall back to the ACL grant
+			if isPublic {
+				glog.V(3).Infof("AuthWithPublicRead: allowing anonymous access to public-read bucket %s (ACL)", bucket)
+				handler(w, r)
+				return
+			}
 			glog.V(3).Infof("AuthWithPublicRead: no bucket policy match for %s, checking ACLs", bucket)
 		}
 
