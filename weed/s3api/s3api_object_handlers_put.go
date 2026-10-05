@@ -147,6 +147,13 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
+		var aclCode s3err.ErrorCode
+		r, aclCode = s3a.preparePutObjectACL(r, bucket)
+		if aclCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, aclCode)
+			return
+		}
+
 		objectLockEnabled, lockErr := s3a.isObjectLockEnabled(bucket)
 		if lockErr != nil && !errors.Is(lockErr, filer_pb.ErrNotFound) {
 			glog.Errorf("PutObjectHandler: failed to check object lock for bucket %s: %v", bucket, lockErr)
@@ -230,6 +237,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 					// Set object owner for directory objects (same as regular objects)
 					s3a.setObjectOwnerFromRequest(r, bucket, entry)
+					applyPutObjectACL(r, entry)
 
 					if lockErr := s3a.extractObjectLockMetadataFromRequest(r, entry); lockErr != nil {
 						glog.Errorf("PutObjectHandler: failed to extract object lock metadata for %s/%s: %v", bucket, object, lockErr)
@@ -266,6 +274,13 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 				return
 			}
+		}
+
+		var aclCode s3err.ErrorCode
+		r, aclCode = s3a.preparePutObjectACL(r, bucket)
+		if aclCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, aclCode)
+			return
 		}
 
 		versioningEnabled := (versioningState == s3_constants.VersioningEnabled)
@@ -580,8 +595,8 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			if err != nil {
 				return fmt.Errorf("assign volume: %w", err)
 			}
-			if resp.Error != "" {
-				return fmt.Errorf("assign volume: %v", resp.Error)
+			if err := filer_pb.AssignVolumeResponseError(resp); err != nil {
+				return fmt.Errorf("assign volume: %w", err)
 			}
 			assignResult = resp
 			return nil
@@ -796,6 +811,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// Set object owner according to bucket ownership settings.
 	s3a.setObjectOwnerFromRequest(r, bucket, entry)
+	applyPutObjectACL(r, entry)
 
 	// Set version ID if present. It is later used as a filer path segment, so a
 	// value carrying "/", "\\" or ".." must never be stored.
@@ -833,8 +849,12 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				entry.Extended[k] = []byte(v[0])
 			} else {
 				switch k {
-				case "Cache-Control", "Expires", "Content-Disposition", "Content-Encoding", "Content-Language":
+				case "Cache-Control", "Expires", "Content-Disposition", "Content-Language":
 					entry.Extended[k] = []byte(v[0])
+				case "Content-Encoding":
+					if ce := storedContentEncoding(v); ce != "" {
+						entry.Extended[k] = []byte(ce)
+					}
 				}
 			}
 			if k == "Response-Content-Disposition" {
@@ -1351,9 +1371,14 @@ func detectRequestedChecksumAlgorithmQ(r *http.Request, query url.Values) (Check
 const defaultFileMode = uint32(0660)
 
 // resolveFileMode determines the file permission mode for an S3 upload.
-// Priority: per-object X-Amz-Acl header > server default > defaultFileMode.
+// Priority: validated PUT ACL > X-Amz-Acl header > server default > defaultFileMode.
 func (s3a *S3ApiServer) resolveFileMode(r *http.Request) uint32 {
-	if cannedAcl := r.Header.Get(s3_constants.AmzCannedAcl); cannedAcl != "" {
+	cannedAcl := r.Header.Get(s3_constants.AmzCannedAcl)
+	if metadata, ok := r.Context().Value(putObjectACLContextKey{}).(putObjectACLMetadata); ok {
+		// Signed query ACLs must resolve identically to signed ACL headers.
+		cannedAcl = metadata.canned
+	}
+	if cannedAcl != "" {
 		switch cannedAcl {
 		case s3_constants.CannedAclPublicRead, s3_constants.CannedAclAuthenticatedRead,
 			s3_constants.CannedAclBucketOwnerRead:
@@ -1487,8 +1512,13 @@ func filerErrorToS3Error(err error) s3err.ErrorCode {
 // added later that does — a request budget, an auth deadline, shutdown draining —
 // would have to cancel with its own cause and be excluded here, otherwise a body
 // truncated at that instant gets attributed to the peer.
+//
+// A read-only destination (the filer refused the volume assign, e.g. bucket over
+// quota) is AccessDenied, as in filerErrorToS3Error and mapCopyErrorToS3Error.
 func mapChunkedUploadErrorToS3Error(reqCtx context.Context, err error) s3err.ErrorCode {
 	switch {
+	case errors.Is(err, weed_server.ErrReadOnly):
+		return s3err.ErrAccessDenied
 	case strings.Contains(err.Error(), s3err.ErrMsgPayloadChecksumMismatch):
 		return s3err.ErrInvalidDigest
 	case errors.Is(err, operation.ErrTruncatedBody):

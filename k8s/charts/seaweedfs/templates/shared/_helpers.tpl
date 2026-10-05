@@ -76,6 +76,43 @@ Inject extra environment vars in the format key:value, if populated
 {{- end }}
 {{- end -}}
 
+{{/*
+Writable temporary directory for containers using a read-only root filesystem.
+Input: list of the root context, the component container security context, the
+rendered extraVolumeMounts and extraVolumes, and whether the pod has secondary
+chart-managed containers that mount seaweedfs-tmp. A user-supplied /tmp mount
+only covers the main container, so the volume is still emitted for secondaries;
+a user-supplied seaweedfs-tmp volume is reused rather than duplicated.
+*/}}
+{{- define "seaweedfs.tmpDirCovered" -}}
+{{- regexMatch `(?m)^\s*-?\s*mountPath:\s*['"]?/tmp/?['"]?\s*(#.*)?$` (index . 2) -}}
+{{- end -}}
+
+{{- define "seaweedfs.tmpDirVolume" -}}
+{{- $root := index . 0 -}}
+{{- $securityContext := index . 1 -}}
+{{- if and $securityContext.enabled $securityContext.readOnlyRootFilesystem
+  (or (index . 4) (ne (include "seaweedfs.tmpDirCovered" .) "true"))
+  (not (regexMatch `(?m)^\s*-?\s*name:\s*['"]?seaweedfs-tmp['"]?\s*(#.*)?$` (index . 3))) }}
+- name: seaweedfs-tmp
+  {{- with $root.Values.global.seaweedfs.tmpDir.sizeLimit }}
+  emptyDir:
+    sizeLimit: {{ . | quote }}
+  {{- else }}
+  emptyDir: {}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "seaweedfs.tmpDirVolumeMount" -}}
+{{- $securityContext := index . 1 -}}
+{{- if and $securityContext.enabled $securityContext.readOnlyRootFilesystem
+  (ne (include "seaweedfs.tmpDirCovered" .) "true") }}
+- name: seaweedfs-tmp
+  mountPath: /tmp
+{{- end }}
+{{- end -}}
+
 {{/* Whether the mysql filer store is selected; a flag the chart cannot read counts as selected. */}}
 {{- define "seaweedfs.filer.mysqlEnabled" -}}
 {{- $merged := dict -}}
@@ -467,8 +504,9 @@ true
 {{-             $pvcName := printf "%s-%s-%s-%d" $dir.name $seaweedfsName $volumeName $e }}
 {{-             $currentPVC := (lookup "v1" "PersistentVolumeClaim" $.Release.Namespace $pvcName) }}
 {{-             if $currentPVC }}
-{{-               $oldSize := include "seaweedfs.resource-quantity" $currentPVC.spec.resources.requests.storage }}
-{{-               $newSize := include "seaweedfs.resource-quantity" $desiredSize }}
+{{- /* include returns a string such as "6.442450944e+10"; convert back to a number, or gt compares lexically */}}
+{{-               $oldSize := include "seaweedfs.resource-quantity" $currentPVC.spec.resources.requests.storage | float64 }}
+{{-               $newSize := include "seaweedfs.resource-quantity" $desiredSize | float64 }}
 {{-               if gt $newSize $oldSize }}
 {{-                 $commands = append $commands (printf "kubectl patch pvc %s-%s-%s-%d -p '{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"%s\"}}}}'" $dir.name $seaweedfsName $volumeName $e $desiredSize) }}
 {{-               end }}

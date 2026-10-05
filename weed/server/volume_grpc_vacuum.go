@@ -22,9 +22,10 @@ func (vs *VolumeServer) VacuumVolumeCheck(ctx context.Context, req *volume_serve
 
 	resp := &volume_server_pb.VacuumVolumeCheckResponse{}
 
-	garbageRatio, err := vs.store.CheckCompactVolume(needle.VolumeId(req.VolumeId))
+	garbageRatio, diskSpaceLow, err := vs.store.CheckCompactVolume(needle.VolumeId(req.VolumeId))
 
 	resp.GarbageRatio = garbageRatio
+	resp.DiskSpaceLow = diskSpaceLow
 
 	if err != nil {
 		glog.V(3).Infof("check volume %d: %v", req.VolumeId, err)
@@ -54,6 +55,9 @@ func (vs *VolumeServer) VacuumVolumeCompact(req *volume_server_pb.VacuumVolumeCo
 	fs, fsErr := procfs.NewDefaultFS()
 	var sendErr error
 	err := vs.store.CompactVolume(needle.VolumeId(req.VolumeId), req.Preallocate, vs.compactionBytePerSecond, func(processed int64) bool {
+		if stream.Context().Err() != nil {
+			return false
+		}
 		if processed > nextReportTarget {
 			resp.ProcessedBytes = processed
 			if fsErr == nil && numCPU > 0 {

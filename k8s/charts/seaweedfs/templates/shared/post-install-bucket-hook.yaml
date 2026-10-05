@@ -16,6 +16,12 @@
 {{- $clusterUpper := upper $clusterAlias }}
 {{- $clusterMasterKey := printf "WEED_CLUSTER_%s_MASTER" $clusterUpper }}
 {{- $clusterFilerKey := printf "WEED_CLUSTER_%s_FILER" $clusterUpper }}
+{{- $podSecurityContext := .Values.filer.podSecurityContext }}
+{{- $containerSecurityContext := .Values.filer.containerSecurityContext }}
+{{- if .Values.allInOne.enabled }}
+  {{- $podSecurityContext = .Values.allInOne.podSecurityContext }}
+  {{- $containerSecurityContext = .Values.allInOne.containerSecurityContext }}
+{{- end }}
 
 {{- /* Check allInOne mode first */}}
 {{- if .Values.allInOne.enabled }}
@@ -71,8 +77,8 @@ spec:
         app.kubernetes.io/component: bucket-hook
     spec:
       restartPolicy: Never
-      {{- if .Values.filer.podSecurityContext.enabled }}
-      securityContext: {{- omit .Values.filer.podSecurityContext "enabled" | toYaml | nindent 8 }}
+      {{- if $podSecurityContext.enabled }}
+      securityContext: {{- omit $podSecurityContext "enabled" | toYaml | nindent 8 }}
       {{- end }}
       {{- include "seaweedfs.imagePullSecrets" $ | nindent 6 }}
       containers:
@@ -202,8 +208,9 @@ spec:
                 /usr/bin/weed shell
           {{- end }}  
           {{- end }}
-        {{- if or $enableAuth (include "seaweedfs.securityConfigEnabled" .) }}
+        {{- if or (and $containerSecurityContext.enabled $containerSecurityContext.readOnlyRootFilesystem) $enableAuth (include "seaweedfs.securityConfigEnabled" .) }}
         volumeMounts:
+          {{- include "seaweedfs.tmpDirVolumeMount" (list . $containerSecurityContext "" "") | nindent 10 }}
           {{- if $enableAuth }}
           - name: config-users
             mountPath: /etc/sw
@@ -214,6 +221,14 @@ spec:
             readOnly: true
             mountPath: /etc/seaweedfs/security.toml
             subPath: security.toml
+          {{- end }}
+          {{- if .Values.global.seaweedfs.enableSecurity }}
+          - name: ca-cert
+            readOnly: true
+            mountPath: /usr/local/share/ca-certificates/ca/
+          - name: client-cert
+            readOnly: true
+            mountPath: /usr/local/share/ca-certificates/client/
           {{- end }}
         {{- end }}
         ports:
@@ -229,11 +244,12 @@ spec:
         resources:
           {{- toYaml . | nindent 10 }}
         {{- end }}
-        {{- if .Values.filer.containerSecurityContext.enabled }}
-        securityContext: {{- omit .Values.filer.containerSecurityContext "enabled" | toYaml | nindent 12 }}
+        {{- if $containerSecurityContext.enabled }}
+        securityContext: {{- omit $containerSecurityContext "enabled" | toYaml | nindent 12 }}
         {{- end }}
-    {{- if or $enableAuth (include "seaweedfs.securityConfigEnabled" .) }}
+    {{- if or (and $containerSecurityContext.enabled $containerSecurityContext.readOnlyRootFilesystem) $enableAuth (include "seaweedfs.securityConfigEnabled" .) }}
       volumes:
+        {{- include "seaweedfs.tmpDirVolume" (list . $containerSecurityContext "" "" false) | nindent 8 }}
         {{- if $enableAuth }}
         - name: config-users
           secret:
@@ -248,6 +264,14 @@ spec:
         - name: security-config
           configMap:
             name: {{ include "seaweedfs.fullname" . }}-security-config
+        {{- end }}
+        {{- if .Values.global.seaweedfs.enableSecurity }}
+        - name: ca-cert
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-ca-cert
+        - name: client-cert
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-client-cert
         {{- end }}
     {{- end }}
 {{- end }}

@@ -22,20 +22,46 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 )
 
+// vacuumPhaseTimeout bounds one synchronous vacuum RPC, scaled with the
+// volume size limit, so a stalled volume server cannot hold the vacuum
+// guard forever.
+var vacuumPhaseTimeout = time.Minute
+
+func (t *Topology) vacuumRPCTimeout() time.Duration {
+	return vacuumPhaseTimeout * time.Duration(t.volumeSizeLimit/1024/1024/1000+1)
+}
+
 func (t *Topology) batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vid needle.VolumeId,
-	locationlist *VolumeLocationList, garbageThreshold float64) (*VolumeLocationList, bool) {
+	locationlist *VolumeLocationList, garbageThreshold float64, skipReadOnly bool) (*VolumeLocationList, bool) {
 	ch := make(chan int, locationlist.Length())
 	errCount := int32(0)
+	ctx, cancel := context.WithTimeout(context.Background(), t.vacuumRPCTimeout())
+	defer cancel()
 	for index, dn := range locationlist.list {
-		go func(index int, url pb.ServerAddress, vid needle.VolumeId) {
+		go func(index int, dn *DataNode, url pb.ServerAddress, vid needle.VolumeId) {
 			err := operation.WithVolumeServerClient(false, url, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				resp, err := volumeServerClient.VacuumVolumeCheck(context.Background(), &volume_server_pb.VacuumVolumeCheckRequest{
+				resp, err := volumeServerClient.VacuumVolumeCheck(ctx, &volume_server_pb.VacuumVolumeCheckRequest{
 					VolumeId: uint32(vid),
 				})
 				if err != nil {
 					atomic.AddInt32(&errCount, 1)
 					ch <- -1
 					return err
+				}
+				// A sweep skips a read-only copy unless low disk space is its
+				// only read-only cause — that is the copy compaction exists for.
+				if skipReadOnly {
+					v, lookErr := dn.GetVolumesById(vid)
+					if lookErr != nil {
+						atomic.AddInt32(&errCount, 1)
+						ch <- -1
+						return lookErr
+					}
+					if v.ReadOnly && !resp.DiskSpaceLow {
+						glog.V(0).Infof("skip vacuuming read-only volume %d on %s", vid, url)
+						ch <- -1
+						return nil
+					}
 				}
 				if resp.GarbageRatio >= garbageThreshold {
 					ch <- index
@@ -47,12 +73,9 @@ func (t *Topology) batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vid ne
 			if err != nil {
 				glog.V(0).Infof("Checking vacuuming %d on %s: %v", vid, url, err)
 			}
-		}(index, dn.ServerAddress(), vid)
+		}(index, dn, dn.ServerAddress(), vid)
 	}
 	vacuumLocationList := NewVolumeLocationList()
-
-	waitTimeout := time.NewTimer(time.Minute * time.Duration(t.volumeSizeLimit/1024/1024/1000+1))
-	defer waitTimeout.Stop()
 
 	for range locationlist.list {
 		select {
@@ -60,7 +83,7 @@ func (t *Topology) batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vid ne
 			if index != -1 {
 				vacuumLocationList.list = append(vacuumLocationList.list, locationlist.list[index])
 			}
-		case <-waitTimeout.C:
+		case <-ctx.Done():
 			return vacuumLocationList, false
 		}
 	}
@@ -72,11 +95,13 @@ func (t *Topology) batchVacuumVolumeCompact(grpcDialOption grpc.DialOption, vl *
 	vl.DrainAndRemoveFromWritable(vid)
 
 	ch := make(chan bool, locationlist.Length())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*t.vacuumRPCTimeout())
+	defer cancel()
 	for index, dn := range locationlist.list {
 		go func(index int, url pb.ServerAddress, vid needle.VolumeId) {
 			glog.V(0).Infoln(index, "Start vacuuming", vid, "on", url)
 			err := operation.WithVolumeServerClient(true, url, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				stream, err := volumeServerClient.VacuumVolumeCompact(context.Background(), &volume_server_pb.VacuumVolumeCompactRequest{
+				stream, err := volumeServerClient.VacuumVolumeCompact(ctx, &volume_server_pb.VacuumVolumeCompactRequest{
 					VolumeId:    uint32(vid),
 					Preallocate: preallocate,
 				})
@@ -109,14 +134,11 @@ func (t *Topology) batchVacuumVolumeCompact(grpcDialOption grpc.DialOption, vl *
 	}
 	isVacuumSuccess := true
 
-	waitTimeout := time.NewTimer(3 * time.Minute * time.Duration(t.volumeSizeLimit/1024/1024/1000+1))
-	defer waitTimeout.Stop()
-
 	for range locationlist.list {
 		select {
 		case canCommit := <-ch:
 			isVacuumSuccess = isVacuumSuccess && canCommit
-		case <-waitTimeout.C:
+		case <-ctx.Done():
 			return false
 		}
 	}
@@ -130,7 +152,9 @@ func (t *Topology) batchVacuumVolumeCommit(grpcDialOption grpc.DialOption, vl *V
 	for _, dn := range vacuumLocationList.list {
 		glog.V(0).Infoln("Start Committing vacuum", vid, "on", dn.Url())
 		err := operation.WithVolumeServerClient(false, dn.ServerAddress(), grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-			resp, err := volumeServerClient.VacuumVolumeCommit(context.Background(), &volume_server_pb.VacuumVolumeCommitRequest{
+			ctx, cancel := context.WithTimeout(context.Background(), t.vacuumRPCTimeout())
+			defer cancel()
+			resp, err := volumeServerClient.VacuumVolumeCommit(ctx, &volume_server_pb.VacuumVolumeCommitRequest{
 				VolumeId: uint32(vid),
 			})
 			if resp != nil {
@@ -163,7 +187,9 @@ func (t *Topology) batchVacuumVolumeCommit(grpcDialOption grpc.DialOption, vl *V
 			}
 			if !isFound {
 				err := operation.WithVolumeServerClient(false, dn.ServerAddress(), grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-					resp, err := volumeServerClient.VolumeStatus(context.Background(), &volume_server_pb.VolumeStatusRequest{
+					ctx, cancel := context.WithTimeout(context.Background(), t.vacuumRPCTimeout())
+					defer cancel()
+					resp, err := volumeServerClient.VolumeStatus(ctx, &volume_server_pb.VolumeStatusRequest{
 						VolumeId: uint32(vid),
 					})
 					if resp != nil {
@@ -203,7 +229,9 @@ func (t *Topology) batchVacuumVolumeCleanup(grpcDialOption grpc.DialOption, vl *
 	for _, dn := range locationlist.list {
 		glog.V(0).Infoln("Start cleaning up", vid, "on", dn.Url())
 		err := operation.WithVolumeServerClient(false, dn.ServerAddress(), grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-			_, err := volumeServerClient.VacuumVolumeCleanup(context.Background(), &volume_server_pb.VacuumVolumeCleanupRequest{
+			ctx, cancel := context.WithTimeout(context.Background(), t.vacuumRPCTimeout())
+			defer cancel()
+			_, err := volumeServerClient.VacuumVolumeCleanup(ctx, &volume_server_pb.VacuumVolumeCleanupRequest{
 				VolumeId: uint32(vid),
 			})
 			return err
@@ -356,18 +384,16 @@ func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeL
 }
 
 // skipReadOnly is set by the background scan and all-volumes sweep, where a
-// read-only flag usually means an unhealthy disk. An explicit volumeId clears
-// it so a benignly read-only (full/oversized) volume can be reclaimed.
+// read-only flag usually means an unhealthy disk. Even then a copy that is
+// read-only because its disk is low on space stays eligible — compaction is
+// how the space comes back. An explicit volumeId clears the rule entirely.
 func (t *Topology) vacuumOneVolumeId(grpcDialOption grpc.DialOption, volumeLayout *VolumeLayout, c *Collection, garbageThreshold float64, locationList *VolumeLocationList, vid needle.VolumeId, preallocate int64, skipReadOnly bool) {
 	volumeLayout.accessLock.RLock()
 	isReadOnly := volumeLayout.vid2location[vid].AnyReadOnly()
 	isEnoughCopies := volumeLayout.enoughCopies(vid)
 	volumeLayout.accessLock.RUnlock()
 
-	if isReadOnly {
-		if skipReadOnly {
-			return
-		}
+	if isReadOnly && !skipReadOnly {
 		glog.V(0).Infof("vacuuming read-only volume %d on explicit request", vid)
 	}
 	if !isEnoughCopies {
@@ -377,7 +403,7 @@ func (t *Topology) vacuumOneVolumeId(grpcDialOption grpc.DialOption, volumeLayou
 
 	glog.V(1).Infof("check vacuum on collection:%s volume:%d", c.Name, vid)
 	if vacuumLocationList, needVacuum := t.batchVacuumVolumeCheck(
-		grpcDialOption, vid, locationList, garbageThreshold); needVacuum {
+		grpcDialOption, vid, locationList, garbageThreshold, skipReadOnly); needVacuum {
 		if t.batchVacuumVolumeCompact(grpcDialOption, volumeLayout, vid, vacuumLocationList, preallocate) {
 			t.batchVacuumVolumeCommit(grpcDialOption, volumeLayout, vid, vacuumLocationList, locationList)
 		} else {

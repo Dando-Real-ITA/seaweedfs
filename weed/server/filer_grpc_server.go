@@ -717,6 +717,9 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 
 	entry, err := fs.filer.FindEntry(ctx, lockPath)
 	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			return &filer_pb.UpdateEntryResponse{}, status.Errorf(codes.NotFound, "not found %s: %v", fullpath, err)
+		}
 		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("not found %s: %v", fullpath, err)
 	}
 	if err := validateUpdateEntryPreconditions(entry, req.ExpectedExtended); err != nil {
@@ -909,7 +912,13 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 	so, err := fs.resolveAssignStorageOption(ctx, req)
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "AssignVolume: %v", err)
-		return &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume: %v", err)}, nil
+		resp = &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume: %v", err)}
+		if errors.Is(err, ErrReadOnly) {
+			// Still a successful RPC: clients treat gRPC errors as transport
+			// failures and retry or fail over, but read-only is a verdict.
+			resp.ErrorCode = filer_pb.FilerError_READ_ONLY
+		}
+		return resp, nil
 	}
 
 	assignRequest, altRequest := so.ToAssignRequests(int(req.Count))

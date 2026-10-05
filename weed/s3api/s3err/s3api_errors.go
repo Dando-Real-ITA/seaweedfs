@@ -171,6 +171,9 @@ const (
 	ErrInvalidRenameSource
 	ErrRenameDestinationSameAsSource
 	ErrIdempotentParameterMismatch
+	ErrAccessControlListNotSupported
+	// The request's snapshot changed during a conditional write; clients can retry.
+	ErrConditionalRequestConflict
 )
 
 // Error message constants for checksum validation
@@ -565,6 +568,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "Invalid Request",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrAccessControlListNotSupported: {
+		Code:           "AccessControlListNotSupported",
+		Description:    "The bucket does not allow ACLs",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInvalidRange: {
 		Code:           "InvalidRange",
 		Description:    "The requested range is not satisfiable",
@@ -584,6 +592,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Code:           "PreconditionFailed",
 		Description:    "At least one of the pre-conditions you specified did not hold",
 		HTTPStatusCode: http.StatusPreconditionFailed,
+	},
+	ErrConditionalRequestConflict: {
+		Code:           "ConditionalRequestConflict",
+		Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
+		HTTPStatusCode: http.StatusConflict,
 	},
 	ErrNotModified: {
 		Code:           "NotModified",

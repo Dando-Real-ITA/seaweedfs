@@ -72,6 +72,15 @@ func (c *testFilerClient) ListEntries(ctx context.Context, in *filer_pb.ListEntr
 	return &testListEntriesStream{entries: entries}, nil
 }
 
+func (c *testFilerClient) LookupDirectoryEntry(ctx context.Context, in *filer_pb.LookupDirectoryEntryRequest, opts ...grpc.CallOption) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	for _, e := range c.entriesByDir[in.Directory] {
+		if e.Name == in.Name {
+			return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
+		}
+	}
+	return nil, filer_pb.ErrNotFound
+}
+
 type markerEchoFilerClient struct {
 	filer_pb.SeaweedFilerClient
 	entriesByDir    map[string][]*filer_pb.Entry
@@ -119,7 +128,7 @@ func TestListObjectsHandler(t *testing.T) {
 	// https://docs.aws.amazon.com/AmazonS3/latest/API/v2-RESTBucketGET.html
 
 	expected := `<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult><Name>test_container</Name><Prefix></Prefix><Marker></Marker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>1.zip</Key><ETag>&#34;4397da7a7649e8085de9916c240e8166&#34;</ETag><Size>1234567</Size><Owner><ID>65a011niqo39cdf8ec533ec3d1ccaafsa932</ID></Owner><StorageClass>STANDARD</StorageClass><LastModified>2011-04-09T12:34:49Z</LastModified></Contents><EncodingType></EncodingType></ListBucketResult>`
+<ListBucketResult><Name>test_container</Name><Prefix></Prefix><Marker></Marker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>1.zip</Key><ETag>&#34;4397da7a7649e8085de9916c240e8166&#34;</ETag><Size>1234567</Size><Owner><ID>65a011niqo39cdf8ec533ec3d1ccaafsa932</ID></Owner><StorageClass>STANDARD</StorageClass><LastModified>2011-04-09T12:34:49.000Z</LastModified></Contents><EncodingType></EncodingType></ListBucketResult>`
 
 	response := ListBucketResult{
 		Name:        "test_container",
