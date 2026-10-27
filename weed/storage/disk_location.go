@@ -38,6 +38,10 @@ type DiskLocation struct {
 	OriginalMaxVolumeCount int32
 	MinFreeSpace           util.MinFreeSpace
 	AvailableSpace         atomic.Uint64
+	// Headroom promised to in-flight copies that statfs cannot see yet.
+	// Probes keep it out of AvailableSpace so they cannot re-spend it; a
+	// copy that lands ends its charge, one that fails removes only its own.
+	ReservedSpace atomic.Uint64
 	// Physical filesystem capacity from the latest CheckDiskSpace probe, reported
 	// to the master so balancing can see real disk fullness, not just slot counts.
 	diskTotalBytes atomic.Uint64
@@ -58,7 +62,11 @@ type DiskLocation struct {
 
 	isDiskSpaceLow    atomic.Bool
 	isDiskUnavailable atomic.Bool
-	closeCh           chan struct{}
+	// readOnlyMount: dir or idxDir is on a read-only filesystem. Volumes load
+	// read-only and the location offers no free slots. Fixed at startup.
+	readOnlyMount bool
+	syncBatch     SyncBatchOption
+	closeCh       chan struct{}
 }
 
 func GenerateDirUuid(dir string) (dirUuidString string, err error) {
@@ -100,9 +108,27 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 			glog.Fatalf("cannot create idx dir %s: %v", idxDir, err)
 		}
 	}
+	readOnlyMount := util.IsReadOnlyMount(dir) || util.IsReadOnlyMount(idxDir)
+	if readOnlyMount {
+		glog.V(0).Infof("%s is on a read-only filesystem: its volumes load read-only, no new volumes", dir)
+	}
 	dirUuid, err := GenerateDirUuid(dir)
 	if err != nil {
-		glog.Fatalf("cannot generate uuid of dir %s: %v", dir, err)
+		if !readOnlyMount {
+			glog.Fatalf("cannot generate uuid of dir %s: %v", dir, err)
+		}
+		// The uuid file cannot be written on a read-only mount; derive a
+		// stable one from the directory plus its device and host so restarts
+		// report the same id and independent disks at the same path differ.
+		diskKey := dir
+		if fi, statErr := os.Stat(dir); statErr == nil {
+			diskKey = fmt.Sprintf("%s@%x", dir, util.FileDeviceId(fi))
+		}
+		if host, hostErr := os.Hostname(); hostErr == nil {
+			diskKey = host + "|" + diskKey
+		}
+		dirUuid = uuid.NewSHA1(uuid.NameSpaceOID, []byte(diskKey)).String()
+		glog.V(0).Infof("%s has no stored uuid and is read-only; using derived uuid %s", dir, dirUuid)
 	}
 	// Defensive copy of tags to prevent external mutation
 	var copiedTags []string
@@ -119,6 +145,8 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 		MaxVolumeCount:         maxVolumeCount,
 		OriginalMaxVolumeCount: maxVolumeCount,
 		MinFreeSpace:           minFreeSpace,
+		readOnlyMount:          readOnlyMount,
+		syncBatch:              DefaultSyncBatchOption,
 	}
 	location.volumes = make(map[needle.VolumeId]*Volume)
 	location.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
@@ -704,6 +732,8 @@ func (l *DiskLocation) UnUsedSpace(volumeSizeLimit uint64) (unUsedSpace uint64) 
 			continue
 		}
 		datSize, idxSize, _ := vol.FileStat()
+		// A preallocated volume already holds its space on disk.
+		datSize = max(datSize, vol.datAllocatedSize())
 		unUsedSpaceVolume := int64(volumeSizeLimit) - int64(datSize+idxSize)
 		glog.V(4).Infof("Volume stats for %d: volumeSizeLimit=%d, datSize=%d idxSize=%d unused=%d", vol.Id, volumeSizeLimit, datSize, idxSize, unUsedSpaceVolume)
 		if unUsedSpaceVolume >= 0 {
@@ -734,7 +764,11 @@ func (l *DiskLocation) CheckDiskSpace(config stats.DiskIOProbeConfig) {
 		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "used").Set(float64(s.Used))
 		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "free").Set(float64(s.Free))
 		stats.VolumeServerResourceGauge.WithLabelValues(l.Directory, "avail").Set(float64(available))
-		l.AvailableSpace.Store(available)
+		if pending := l.ReservedSpace.Load(); pending < available {
+			l.AvailableSpace.Store(available - pending)
+		} else {
+			l.AvailableSpace.Store(0)
+		}
 		l.diskTotalBytes.Store(s.All)
 		l.diskFreeBytes.Store(s.Free)
 		isLow, desc := l.MinFreeSpace.IsLow(s.Free, s.PercentFree)

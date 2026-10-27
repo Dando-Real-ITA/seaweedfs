@@ -672,18 +672,22 @@ func (x *RemoteEntry) GetRemoteContentEncoding() string {
 }
 
 type Entry struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	Name               string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	IsDirectory        bool                   `protobuf:"varint,2,opt,name=is_directory,json=isDirectory,proto3" json:"is_directory,omitempty"`
-	Chunks             []*FileChunk           `protobuf:"bytes,3,rep,name=chunks,proto3" json:"chunks,omitempty"`
-	Attributes         *FuseAttributes        `protobuf:"bytes,4,opt,name=attributes,proto3" json:"attributes,omitempty"`
-	Extended           map[string][]byte      `protobuf:"bytes,5,rep,name=extended,proto3" json:"extended,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	HardLinkId         []byte                 `protobuf:"bytes,7,opt,name=hard_link_id,json=hardLinkId,proto3" json:"hard_link_id,omitempty"`
-	HardLinkCounter    int32                  `protobuf:"varint,8,opt,name=hard_link_counter,json=hardLinkCounter,proto3" json:"hard_link_counter,omitempty"` // only exists in hard link meta data
-	Content            []byte                 `protobuf:"bytes,9,opt,name=content,proto3" json:"content,omitempty"`                                           // if not empty, the file content
-	RemoteEntry        *RemoteEntry           `protobuf:"bytes,10,opt,name=remote_entry,json=remoteEntry,proto3" json:"remote_entry,omitempty"`
-	Quota              int64                  `protobuf:"varint,11,opt,name=quota,proto3" json:"quota,omitempty"` // for bucket only. Positive/Negative means enabled/disabled.
-	WormEnforcedAtTsNs int64                  `protobuf:"varint,12,opt,name=worm_enforced_at_ts_ns,json=wormEnforcedAtTsNs,proto3" json:"worm_enforced_at_ts_ns,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Name        string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	IsDirectory bool                   `protobuf:"varint,2,opt,name=is_directory,json=isDirectory,proto3" json:"is_directory,omitempty"`
+	Chunks      []*FileChunk           `protobuf:"bytes,3,rep,name=chunks,proto3" json:"chunks,omitempty"`
+	Attributes  *FuseAttributes        `protobuf:"bytes,4,opt,name=attributes,proto3" json:"attributes,omitempty"`
+	Extended    map[string][]byte      `protobuf:"bytes,5,rep,name=extended,proto3" json:"extended,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// filer-local commit timestamp of the version stored here: the meta log
+	// event's ts_ns for the mutation that produced this entry, or 0 for
+	// entries written before the field existed
+	CommitTsNs         int64        `protobuf:"varint,6,opt,name=commit_ts_ns,json=commitTsNs,proto3" json:"commit_ts_ns,omitempty"`
+	HardLinkId         []byte       `protobuf:"bytes,7,opt,name=hard_link_id,json=hardLinkId,proto3" json:"hard_link_id,omitempty"`
+	HardLinkCounter    int32        `protobuf:"varint,8,opt,name=hard_link_counter,json=hardLinkCounter,proto3" json:"hard_link_counter,omitempty"` // only exists in hard link meta data
+	Content            []byte       `protobuf:"bytes,9,opt,name=content,proto3" json:"content,omitempty"`                                           // if not empty, the file content
+	RemoteEntry        *RemoteEntry `protobuf:"bytes,10,opt,name=remote_entry,json=remoteEntry,proto3" json:"remote_entry,omitempty"`
+	Quota              int64        `protobuf:"varint,11,opt,name=quota,proto3" json:"quota,omitempty"` // for bucket only. Positive/Negative means enabled/disabled.
+	WormEnforcedAtTsNs int64        `protobuf:"varint,12,opt,name=worm_enforced_at_ts_ns,json=wormEnforcedAtTsNs,proto3" json:"worm_enforced_at_ts_ns,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -751,6 +755,13 @@ func (x *Entry) GetExtended() map[string][]byte {
 		return x.Extended
 	}
 	return nil
+}
+
+func (x *Entry) GetCommitTsNs() int64 {
+	if x != nil {
+		return x.CommitTsNs
+	}
+	return 0
 }
 
 func (x *Entry) GetHardLinkId() []byte {
@@ -1549,6 +1560,7 @@ type ObjectMutation struct {
 	Content           []byte                 `protobuf:"bytes,11,opt,name=content,proto3" json:"content,omitempty"`                                                                                                     // PATCH_EXTENDED: new Entry.content when set_content
 	TouchMtime        bool                   `protobuf:"varint,12,opt,name=touch_mtime,json=touchMtime,proto3" json:"touch_mtime,omitempty"`                                                                            // PATCH_EXTENDED: set the entry's Mtime to now (e.g. a metadata-replace copy)
 	RemoveEmptyParent bool                   `protobuf:"varint,13,opt,name=remove_empty_parent,json=removeEmptyParent,proto3" json:"remove_empty_parent,omitempty"`                                                     // DELETE: also remove the parent directory when the delete leaves it empty (best-effort)
+	KeepRemoteObject  bool                   `protobuf:"varint,14,opt,name=keep_remote_object,json=keepRemoteObject,proto3" json:"keep_remote_object,omitempty"`                                                        // DELETE: leave the object on the mounted remote storage
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1670,6 +1682,13 @@ func (x *ObjectMutation) GetTouchMtime() bool {
 func (x *ObjectMutation) GetRemoveEmptyParent() bool {
 	if x != nil {
 		return x.RemoveEmptyParent
+	}
+	return false
+}
+
+func (x *ObjectMutation) GetKeepRemoteObject() bool {
+	if x != nil {
+		return x.KeepRemoteObject
 	}
 	return false
 }
@@ -1803,9 +1822,11 @@ type ObjectTransactionRequest struct {
 	Mutations          []*ObjectMutation      `protobuf:"bytes,3,rep,name=mutations,proto3" json:"mutations,omitempty"`
 	IsFromOtherCluster bool                   `protobuf:"varint,4,opt,name=is_from_other_cluster,json=isFromOtherCluster,proto3" json:"is_from_other_cluster,omitempty"`
 	Signatures         []int32                `protobuf:"varint,5,rep,packed,name=signatures,proto3" json:"signatures,omitempty"`
-	ConditionKey       string                 `protobuf:"bytes,6,opt,name=condition_key,json=conditionKey,proto3" json:"condition_key,omitempty"` // if set, evaluate the condition against this entry instead of lock_key (still locking lock_key)
-	RouteKey           string                 `protobuf:"bytes,7,opt,name=route_key,json=routeKey,proto3" json:"route_key,omitempty"`             // ring key identifying the owner filer; a non-owner forwards the whole transaction to it
-	IsMoved            bool                   `protobuf:"varint,8,opt,name=is_moved,json=isMoved,proto3" json:"is_moved,omitempty"`               // set on a forwarded transaction so the receiver applies it locally instead of forwarding again
+	ConditionKey       string                 `protobuf:"bytes,6,opt,name=condition_key,json=conditionKey,proto3" json:"condition_key,omitempty"`             // if set, evaluate the condition against this entry instead of lock_key (still locking lock_key)
+	RouteKey           string                 `protobuf:"bytes,7,opt,name=route_key,json=routeKey,proto3" json:"route_key,omitempty"`                         // ring key identifying the owner filer; a non-owner forwards the whole transaction to it
+	IsMoved            bool                   `protobuf:"varint,8,opt,name=is_moved,json=isMoved,proto3" json:"is_moved,omitempty"`                           // set on a forwarded transaction so the receiver applies it locally instead of forwarding again
+	RequestId          string                 `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                      // idempotency token: the owner records the outcome and replays it on a retried request instead of re-applying
+	ConditionAltKey    string                 `protobuf:"bytes,10,opt,name=condition_alt_key,json=conditionAltKey,proto3" json:"condition_alt_key,omitempty"` // if the condition's entry is absent, evaluate it against this entry instead (e.g. null slot, else latest version)
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -1894,6 +1915,20 @@ func (x *ObjectTransactionRequest) GetIsMoved() bool {
 		return x.IsMoved
 	}
 	return false
+}
+
+func (x *ObjectTransactionRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *ObjectTransactionRequest) GetConditionAltKey() string {
+	if x != nil {
+		return x.ConditionAltKey
+	}
+	return ""
 }
 
 type ObjectTransactionResponse struct {
@@ -2745,7 +2780,9 @@ type DeleteEntryRequest struct {
 	IgnoreRecursiveError bool    `protobuf:"varint,6,opt,name=ignore_recursive_error,json=ignoreRecursiveError,proto3" json:"ignore_recursive_error,omitempty"`
 	IsFromOtherCluster   bool    `protobuf:"varint,7,opt,name=is_from_other_cluster,json=isFromOtherCluster,proto3" json:"is_from_other_cluster,omitempty"`
 	Signatures           []int32 `protobuf:"varint,8,rep,packed,name=signatures,proto3" json:"signatures,omitempty"`
-	IfNotModifiedAfter   int64   `protobuf:"varint,9,opt,name=if_not_modified_after,json=ifNotModifiedAfter,proto3" json:"if_not_modified_after,omitempty"`
+	IfNotModifiedAfter   int64   `protobuf:"varint,9,opt,name=if_not_modified_after,json=ifNotModifiedAfter,proto3" json:"if_not_modified_after,omitempty"` // unix time in seconds
+	KeepRemoteObject     bool    `protobuf:"varint,10,opt,name=keep_remote_object,json=keepRemoteObject,proto3" json:"keep_remote_object,omitempty"`
+	IfNotModifiedAfterNs int64   `protobuf:"varint,11,opt,name=if_not_modified_after_ns,json=ifNotModifiedAfterNs,proto3" json:"if_not_modified_after_ns,omitempty"` // unix time in nanoseconds; overrides if_not_modified_after when set
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -2836,6 +2873,20 @@ func (x *DeleteEntryRequest) GetIfNotModifiedAfter() int64 {
 	return 0
 }
 
+func (x *DeleteEntryRequest) GetKeepRemoteObject() bool {
+	if x != nil {
+		return x.KeepRemoteObject
+	}
+	return false
+}
+
+func (x *DeleteEntryRequest) GetIfNotModifiedAfterNs() int64 {
+	if x != nil {
+		return x.IfNotModifiedAfterNs
+	}
+	return 0
+}
+
 type DeleteEntryResponse struct {
 	state         protoimpl.MessageState     `protogen:"open.v1"`
 	Error         string                     `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
@@ -2889,14 +2940,18 @@ func (x *DeleteEntryResponse) GetMetadataEvent() *SubscribeMetadataResponse {
 }
 
 type AtomicRenameEntryRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	OldDirectory  string                 `protobuf:"bytes,1,opt,name=old_directory,json=oldDirectory,proto3" json:"old_directory,omitempty"`
-	OldName       string                 `protobuf:"bytes,2,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
-	NewDirectory  string                 `protobuf:"bytes,3,opt,name=new_directory,json=newDirectory,proto3" json:"new_directory,omitempty"`
-	NewName       string                 `protobuf:"bytes,4,opt,name=new_name,json=newName,proto3" json:"new_name,omitempty"`
-	Signatures    []int32                `protobuf:"varint,5,rep,packed,name=signatures,proto3" json:"signatures,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	OldDirectory string                 `protobuf:"bytes,1,opt,name=old_directory,json=oldDirectory,proto3" json:"old_directory,omitempty"`
+	OldName      string                 `protobuf:"bytes,2,opt,name=old_name,json=oldName,proto3" json:"old_name,omitempty"`
+	NewDirectory string                 `protobuf:"bytes,3,opt,name=new_directory,json=newDirectory,proto3" json:"new_directory,omitempty"`
+	NewName      string                 `protobuf:"bytes,4,opt,name=new_name,json=newName,proto3" json:"new_name,omitempty"`
+	Signatures   []int32                `protobuf:"varint,5,rep,packed,name=signatures,proto3" json:"signatures,omitempty"`
+	// When true, the rename fails with ErrEntryAlreadyExists if the target
+	// already exists. Lets a caller that authorized the rename without delete
+	// access on an absent target stay safe if one is created concurrently.
+	FailIfTargetExists bool `protobuf:"varint,6,opt,name=fail_if_target_exists,json=failIfTargetExists,proto3" json:"fail_if_target_exists,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *AtomicRenameEntryRequest) Reset() {
@@ -2962,6 +3017,13 @@ func (x *AtomicRenameEntryRequest) GetSignatures() []int32 {
 		return x.Signatures
 	}
 	return nil
+}
+
+func (x *AtomicRenameEntryRequest) GetFailIfTargetExists() bool {
+	if x != nil {
+		return x.FailIfTargetExists
+	}
+	return false
 }
 
 type AtomicRenameEntryResponse struct {
@@ -4378,9 +4440,10 @@ type SubscribeMetadataResponse struct {
 	Directory         string                       `protobuf:"bytes,1,opt,name=directory,proto3" json:"directory,omitempty"`
 	EventNotification *EventNotification           `protobuf:"bytes,2,opt,name=event_notification,json=eventNotification,proto3" json:"event_notification,omitempty"`
 	TsNs              int64                        `protobuf:"varint,3,opt,name=ts_ns,json=tsNs,proto3" json:"ts_ns,omitempty"`
-	Events            []*SubscribeMetadataResponse `protobuf:"bytes,4,rep,name=events,proto3" json:"events,omitempty"`                                 // batch of additional events (backlog catch-up)
-	LogFileRefs       []*LogFileChunkRef           `protobuf:"bytes,5,rep,name=log_file_refs,json=logFileRefs,proto3" json:"log_file_refs,omitempty"`  // log file chunk refs for client direct-read
-	FlushedTsNs       int64                        `protobuf:"varint,6,opt,name=flushed_ts_ns,json=flushedTsNs,proto3" json:"flushed_ts_ns,omitempty"` // local log-buffer flush watermark: everything at or below it is on disk
+	Events            []*SubscribeMetadataResponse `protobuf:"bytes,4,rep,name=events,proto3" json:"events,omitempty"`                                    // batch of additional events (backlog catch-up)
+	LogFileRefs       []*LogFileChunkRef           `protobuf:"bytes,5,rep,name=log_file_refs,json=logFileRefs,proto3" json:"log_file_refs,omitempty"`     // log file chunk refs for client direct-read
+	FlushedTsNs       int64                        `protobuf:"varint,6,opt,name=flushed_ts_ns,json=flushedTsNs,proto3" json:"flushed_ts_ns,omitempty"`    // local log-buffer flush watermark: everything at or below it is on disk
+	MutationTsNs      int64                        `protobuf:"varint,7,opt,name=mutation_ts_ns,json=mutationTsNs,proto3" json:"mutation_ts_ns,omitempty"` // metadata mutation commit stamp; ts_ns carries the delivery stream position instead
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -4453,6 +4516,13 @@ func (x *SubscribeMetadataResponse) GetLogFileRefs() []*LogFileChunkRef {
 func (x *SubscribeMetadataResponse) GetFlushedTsNs() int64 {
 	if x != nil {
 		return x.FlushedTsNs
+	}
+	return 0
+}
+
+func (x *SubscribeMetadataResponse) GetMutationTsNs() int64 {
+	if x != nil {
+		return x.MutationTsNs
 	}
 	return 0
 }
@@ -4761,9 +4831,13 @@ func (x *TraverseBfsMetadataRequest) GetExcludedPrefixes() []string {
 }
 
 type TraverseBfsMetadataResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Directory     string                 `protobuf:"bytes,1,opt,name=directory,proto3" json:"directory,omitempty"`
-	Entry         *Entry                 `protobuf:"bytes,2,opt,name=entry,proto3" json:"entry,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Directory string                 `protobuf:"bytes,1,opt,name=directory,proto3" json:"directory,omitempty"`
+	Entry     *Entry                 `protobuf:"bytes,2,opt,name=entry,proto3" json:"entry,omitempty"`
+	// The sender's per-path commit timestamp (see meta_path_ts.go): the newest
+	// event time this filer committed for the path, 0 when unrecorded so
+	// subscribers fall back to the entry's mtime.
+	EntryTsNs     int64 `protobuf:"varint,3,opt,name=entry_ts_ns,json=entryTsNs,proto3" json:"entry_ts_ns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4810,6 +4884,13 @@ func (x *TraverseBfsMetadataResponse) GetEntry() *Entry {
 		return x.Entry
 	}
 	return nil
+}
+
+func (x *TraverseBfsMetadataResponse) GetEntryTsNs() int64 {
+	if x != nil {
+		return x.EntryTsNs
+	}
+	return 0
 }
 
 type LogEntry struct {
@@ -7048,20 +7129,21 @@ func (x *LocateBrokerResponse_Resource) GetResourceCount() int32 {
 }
 
 type FilerConf_PathConf struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	LocationPrefix       string                 `protobuf:"bytes,1,opt,name=location_prefix,json=locationPrefix,proto3" json:"location_prefix,omitempty"`
-	Collection           string                 `protobuf:"bytes,2,opt,name=collection,proto3" json:"collection,omitempty"`
-	Replication          string                 `protobuf:"bytes,3,opt,name=replication,proto3" json:"replication,omitempty"`
-	Ttl                  string                 `protobuf:"bytes,4,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	DiskType             string                 `protobuf:"bytes,5,opt,name=disk_type,json=diskType,proto3" json:"disk_type,omitempty"`
-	Fsync                bool                   `protobuf:"varint,6,opt,name=fsync,proto3" json:"fsync,omitempty"`
-	VolumeGrowthCount    uint32                 `protobuf:"varint,7,opt,name=volume_growth_count,json=volumeGrowthCount,proto3" json:"volume_growth_count,omitempty"`
-	ReadOnly             bool                   `protobuf:"varint,8,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
-	DataCenter           string                 `protobuf:"bytes,9,opt,name=data_center,json=dataCenter,proto3" json:"data_center,omitempty"`
-	Rack                 string                 `protobuf:"bytes,10,opt,name=rack,proto3" json:"rack,omitempty"`
-	DataNode             string                 `protobuf:"bytes,11,opt,name=data_node,json=dataNode,proto3" json:"data_node,omitempty"`
-	MaxFileNameLength    uint32                 `protobuf:"varint,12,opt,name=max_file_name_length,json=maxFileNameLength,proto3" json:"max_file_name_length,omitempty"`
-	DisableChunkDeletion bool                   `protobuf:"varint,13,opt,name=disable_chunk_deletion,json=disableChunkDeletion,proto3" json:"disable_chunk_deletion,omitempty"`
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	LocationPrefix string                 `protobuf:"bytes,1,opt,name=location_prefix,json=locationPrefix,proto3" json:"location_prefix,omitempty"`
+	Collection     string                 `protobuf:"bytes,2,opt,name=collection,proto3" json:"collection,omitempty"`
+	Replication    string                 `protobuf:"bytes,3,opt,name=replication,proto3" json:"replication,omitempty"`
+	Ttl            string                 `protobuf:"bytes,4,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	DiskType       string                 `protobuf:"bytes,5,opt,name=disk_type,json=diskType,proto3" json:"disk_type,omitempty"`
+	// unset inherits from the enclosing path rule, set overrides it
+	Fsync                *bool  `protobuf:"varint,6,opt,name=fsync,proto3,oneof" json:"fsync,omitempty"`
+	VolumeGrowthCount    uint32 `protobuf:"varint,7,opt,name=volume_growth_count,json=volumeGrowthCount,proto3" json:"volume_growth_count,omitempty"`
+	ReadOnly             bool   `protobuf:"varint,8,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
+	DataCenter           string `protobuf:"bytes,9,opt,name=data_center,json=dataCenter,proto3" json:"data_center,omitempty"`
+	Rack                 string `protobuf:"bytes,10,opt,name=rack,proto3" json:"rack,omitempty"`
+	DataNode             string `protobuf:"bytes,11,opt,name=data_node,json=dataNode,proto3" json:"data_node,omitempty"`
+	MaxFileNameLength    uint32 `protobuf:"varint,12,opt,name=max_file_name_length,json=maxFileNameLength,proto3" json:"max_file_name_length,omitempty"`
+	DisableChunkDeletion bool   `protobuf:"varint,13,opt,name=disable_chunk_deletion,json=disableChunkDeletion,proto3" json:"disable_chunk_deletion,omitempty"`
 	// unset inherits from the enclosing path rule, set overrides it
 	Worm                     *bool  `protobuf:"varint,14,opt,name=worm,proto3,oneof" json:"worm,omitempty"`
 	WormGracePeriodSeconds   uint64 `protobuf:"varint,15,opt,name=worm_grace_period_seconds,json=wormGracePeriodSeconds,proto3" json:"worm_grace_period_seconds,omitempty"`
@@ -7136,8 +7218,8 @@ func (x *FilerConf_PathConf) GetDiskType() string {
 }
 
 func (x *FilerConf_PathConf) GetFsync() bool {
-	if x != nil {
-		return x.Fsync
+	if x != nil && x.Fsync != nil {
+		return *x.Fsync
 	}
 	return false
 }
@@ -7245,7 +7327,7 @@ const file_filer_proto_rawDesc = "" +
 	"\vremote_size\x18\x05 \x01(\x03R\n" +
 	"remoteSize\x12;\n" +
 	"\x17remote_content_encoding\x18\x06 \x01(\tH\x00R\x15remoteContentEncoding\x88\x01\x01B\x1a\n" +
-	"\x18_remote_content_encoding\"\x89\x04\n" +
+	"\x18_remote_content_encoding\"\xab\x04\n" +
 	"\x05Entry\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
 	"\fis_directory\x18\x02 \x01(\bR\visDirectory\x12+\n" +
@@ -7254,6 +7336,8 @@ const file_filer_proto_rawDesc = "" +
 	"attributes\x18\x04 \x01(\v2\x18.filer_pb.FuseAttributesR\n" +
 	"attributes\x129\n" +
 	"\bextended\x18\x05 \x03(\v2\x1d.filer_pb.Entry.ExtendedEntryR\bextended\x12 \n" +
+	"\fcommit_ts_ns\x18\x06 \x01(\x03R\n" +
+	"commitTsNs\x12 \n" +
 	"\fhard_link_id\x18\a \x01(\fR\n" +
 	"hardLinkId\x12*\n" +
 	"\x11hard_link_counter\x18\b \x01(\x05R\x0fhardLinkCounter\x12\x18\n" +
@@ -7362,7 +7446,7 @@ const file_filer_proto_rawDesc = "" +
 	"\x18IF_EXTENDED_TIME_ELAPSED\x10\b\x12\x13\n" +
 	"\x0fIF_CHUNKS_EQUAL\x10\t\x12\x12\n" +
 	"\x0eIF_ENTRY_EQUAL\x10\n" +
-	"\"\xa2\x05\n" +
+	"\"\xd0\x05\n" +
 	"\x0eObjectMutation\x121\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1d.filer_pb.ObjectMutation.TypeR\x04type\x12\x1c\n" +
 	"\tdirectory\x18\x02 \x01(\tR\tdirectory\x12\x12\n" +
@@ -7379,7 +7463,8 @@ const file_filer_proto_rawDesc = "" +
 	"\acontent\x18\v \x01(\fR\acontent\x12\x1f\n" +
 	"\vtouch_mtime\x18\f \x01(\bR\n" +
 	"touchMtime\x12.\n" +
-	"\x13remove_empty_parent\x18\r \x01(\bR\x11removeEmptyParent\x1a>\n" +
+	"\x13remove_empty_parent\x18\r \x01(\bR\x11removeEmptyParent\x12,\n" +
+	"\x12keep_remote_object\x18\x0e \x01(\bR\x10keepRemoteObject\x1a>\n" +
 	"\x10SetExtendedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"E\n" +
@@ -7405,7 +7490,7 @@ const file_filer_proto_rawDesc = "" +
 	"\fexclude_name\x18\t \x01(\tR\vexcludeName\x1a?\n" +
 	"\x11CopyExtendedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd5\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa0\x03\n" +
 	"\x18ObjectTransactionRequest\x12\x19\n" +
 	"\block_key\x18\x01 \x01(\tR\alockKey\x126\n" +
 	"\tcondition\x18\x02 \x01(\v2\x18.filer_pb.WriteConditionR\tcondition\x126\n" +
@@ -7416,7 +7501,11 @@ const file_filer_proto_rawDesc = "" +
 	"signatures\x12#\n" +
 	"\rcondition_key\x18\x06 \x01(\tR\fconditionKey\x12\x1b\n" +
 	"\troute_key\x18\a \x01(\tR\brouteKey\x12\x19\n" +
-	"\bis_moved\x18\b \x01(\bR\aisMoved\"f\n" +
+	"\bis_moved\x18\b \x01(\bR\aisMoved\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\t \x01(\tR\trequestId\x12*\n" +
+	"\x11condition_alt_key\x18\n" +
+	" \x01(\tR\x0fconditionAltKey\"f\n" +
 	"\x19ObjectTransactionResponse\x12\x14\n" +
 	"\x05error\x18\x01 \x01(\tR\x05error\x123\n" +
 	"\n" +
@@ -7480,7 +7569,7 @@ const file_filer_proto_rawDesc = "" +
 	"\n" +
 	"entry_name\x18\x02 \x01(\tR\tentryName\x12+\n" +
 	"\x06chunks\x18\x03 \x03(\v2\x13.filer_pb.FileChunkR\x06chunks\"\x17\n" +
-	"\x15AppendToEntryResponse\"\xcb\x02\n" +
+	"\x15AppendToEntryResponse\"\xb1\x03\n" +
 	"\x12DeleteEntryRequest\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12$\n" +
@@ -7491,10 +7580,13 @@ const file_filer_proto_rawDesc = "" +
 	"\n" +
 	"signatures\x18\b \x03(\x05R\n" +
 	"signatures\x121\n" +
-	"\x15if_not_modified_after\x18\t \x01(\x03R\x12ifNotModifiedAfter\"w\n" +
+	"\x15if_not_modified_after\x18\t \x01(\x03R\x12ifNotModifiedAfter\x12,\n" +
+	"\x12keep_remote_object\x18\n" +
+	" \x01(\bR\x10keepRemoteObject\x126\n" +
+	"\x18if_not_modified_after_ns\x18\v \x01(\x03R\x14ifNotModifiedAfterNs\"w\n" +
 	"\x13DeleteEntryResponse\x12\x14\n" +
 	"\x05error\x18\x01 \x01(\tR\x05error\x12J\n" +
-	"\x0emetadata_event\x18\x02 \x01(\v2#.filer_pb.SubscribeMetadataResponseR\rmetadataEvent\"\xba\x01\n" +
+	"\x0emetadata_event\x18\x02 \x01(\v2#.filer_pb.SubscribeMetadataResponseR\rmetadataEvent\"\xed\x01\n" +
 	"\x18AtomicRenameEntryRequest\x12#\n" +
 	"\rold_directory\x18\x01 \x01(\tR\foldDirectory\x12\x19\n" +
 	"\bold_name\x18\x02 \x01(\tR\aoldName\x12#\n" +
@@ -7502,7 +7594,8 @@ const file_filer_proto_rawDesc = "" +
 	"\bnew_name\x18\x04 \x01(\tR\anewName\x12\x1e\n" +
 	"\n" +
 	"signatures\x18\x05 \x03(\x05R\n" +
-	"signatures\"\x1b\n" +
+	"signatures\x121\n" +
+	"\x15fail_if_target_exists\x18\x06 \x01(\bR\x12failIfTargetExists\"\x1b\n" +
 	"\x19AtomicRenameEntryResponse\"\xba\x01\n" +
 	"\x18StreamRenameEntryRequest\x12#\n" +
 	"\rold_directory\x18\x01 \x01(\tR\foldDirectory\x12\x19\n" +
@@ -7638,14 +7731,15 @@ const file_filer_proto_rawDesc = "" +
 	" \x03(\tR\vdirectories\x128\n" +
 	"\x18client_supports_batching\x18\v \x01(\bR\x16clientSupportsBatching\x12E\n" +
 	"\x1fclient_supports_metadata_chunks\x18\f \x01(\bR\x1cclientSupportsMetadataChunks\x12C\n" +
-	"\x1eclient_supports_idle_heartbeat\x18\r \x01(\bR\x1bclientSupportsIdleHeartbeat\"\xba\x02\n" +
+	"\x1eclient_supports_idle_heartbeat\x18\r \x01(\bR\x1bclientSupportsIdleHeartbeat\"\xe0\x02\n" +
 	"\x19SubscribeMetadataResponse\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12J\n" +
 	"\x12event_notification\x18\x02 \x01(\v2\x1b.filer_pb.EventNotificationR\x11eventNotification\x12\x13\n" +
 	"\x05ts_ns\x18\x03 \x01(\x03R\x04tsNs\x12;\n" +
 	"\x06events\x18\x04 \x03(\v2#.filer_pb.SubscribeMetadataResponseR\x06events\x12=\n" +
 	"\rlog_file_refs\x18\x05 \x03(\v2\x19.filer_pb.LogFileChunkRefR\vlogFileRefs\x12\"\n" +
-	"\rflushed_ts_ns\x18\x06 \x01(\x03R\vflushedTsNs\"C\n" +
+	"\rflushed_ts_ns\x18\x06 \x01(\x03R\vflushedTsNs\x12$\n" +
+	"\x0emutation_ts_ns\x18\a \x01(\x03R\fmutationTsNs\"C\n" +
 	"\x1eListMetadataSubscribersRequest\x12!\n" +
 	"\fclient_types\x18\x01 \x03(\tR\vclientTypes\"a\n" +
 	"\x1fListMetadataSubscribersResponse\x12>\n" +
@@ -7669,10 +7763,11 @@ const file_filer_proto_rawDesc = "" +
 	"\bfiler_id\x18\x03 \x01(\tR\afilerId\"g\n" +
 	"\x1aTraverseBfsMetadataRequest\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12+\n" +
-	"\x11excluded_prefixes\x18\x02 \x03(\tR\x10excludedPrefixes\"b\n" +
+	"\x11excluded_prefixes\x18\x02 \x03(\tR\x10excludedPrefixes\"\x82\x01\n" +
 	"\x1bTraverseBfsMetadataResponse\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12%\n" +
-	"\x05entry\x18\x02 \x01(\v2\x0f.filer_pb.EntryR\x05entry\"\x8b\x01\n" +
+	"\x05entry\x18\x02 \x01(\v2\x0f.filer_pb.EntryR\x05entry\x12\x1e\n" +
+	"\ventry_ts_ns\x18\x03 \x01(\x03R\tentryTsNs\"\x8b\x01\n" +
 	"\bLogEntry\x12\x13\n" +
 	"\x05ts_ns\x18\x01 \x01(\x03R\x04tsNs\x12,\n" +
 	"\x12partition_key_hash\x18\x02 \x01(\x05R\x10partitionKeyHash\x12\x12\n" +
@@ -7701,10 +7796,10 @@ const file_filer_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"%\n" +
 	"\rKvPutResponse\x12\x14\n" +
-	"\x05error\x18\x01 \x01(\tR\x05error\"\xc0\x05\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error\"\xcf\x05\n" +
 	"\tFilerConf\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x05R\aversion\x12:\n" +
-	"\tlocations\x18\x02 \x03(\v2\x1c.filer_pb.FilerConf.PathConfR\tlocations\x1a\xdc\x04\n" +
+	"\tlocations\x18\x02 \x03(\v2\x1c.filer_pb.FilerConf.PathConfR\tlocations\x1a\xeb\x04\n" +
 	"\bPathConf\x12'\n" +
 	"\x0flocation_prefix\x18\x01 \x01(\tR\x0elocationPrefix\x12\x1e\n" +
 	"\n" +
@@ -7712,8 +7807,8 @@ const file_filer_proto_rawDesc = "" +
 	"collection\x12 \n" +
 	"\vreplication\x18\x03 \x01(\tR\vreplication\x12\x10\n" +
 	"\x03ttl\x18\x04 \x01(\tR\x03ttl\x12\x1b\n" +
-	"\tdisk_type\x18\x05 \x01(\tR\bdiskType\x12\x14\n" +
-	"\x05fsync\x18\x06 \x01(\bR\x05fsync\x12.\n" +
+	"\tdisk_type\x18\x05 \x01(\tR\bdiskType\x12\x19\n" +
+	"\x05fsync\x18\x06 \x01(\bH\x00R\x05fsync\x88\x01\x01\x12.\n" +
 	"\x13volume_growth_count\x18\a \x01(\rR\x11volumeGrowthCount\x12\x1b\n" +
 	"\tread_only\x18\b \x01(\bR\breadOnly\x12\x1f\n" +
 	"\vdata_center\x18\t \x01(\tR\n" +
@@ -7723,9 +7818,10 @@ const file_filer_proto_rawDesc = "" +
 	"\tdata_node\x18\v \x01(\tR\bdataNode\x12/\n" +
 	"\x14max_file_name_length\x18\f \x01(\rR\x11maxFileNameLength\x124\n" +
 	"\x16disable_chunk_deletion\x18\r \x01(\bR\x14disableChunkDeletion\x12\x17\n" +
-	"\x04worm\x18\x0e \x01(\bH\x00R\x04worm\x88\x01\x01\x129\n" +
+	"\x04worm\x18\x0e \x01(\bH\x01R\x04worm\x88\x01\x01\x129\n" +
 	"\x19worm_grace_period_seconds\x18\x0f \x01(\x04R\x16wormGracePeriodSeconds\x12=\n" +
-	"\x1bworm_retention_time_seconds\x18\x10 \x01(\x04R\x18wormRetentionTimeSecondsB\a\n" +
+	"\x1bworm_retention_time_seconds\x18\x10 \x01(\x04R\x18wormRetentionTimeSecondsB\b\n" +
+	"\x06_fsyncB\a\n" +
 	"\x05_worm\"\xba\x01\n" +
 	"&CacheRemoteObjectToLocalClusterRequest\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12\x12\n" +

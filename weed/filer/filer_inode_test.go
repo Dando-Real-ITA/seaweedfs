@@ -103,15 +103,26 @@ func TestEnsureEntryInodeHardLinkFitsSignedLong(t *testing.T) {
 	}
 }
 
-func newTestFilerWithStubStore() (*Filer, *stubFilerStore) {
+func newTestFilerWithStubStore(t *testing.T) (*Filer, *stubFilerStore) {
+	t.Helper()
 	store := newStubFilerStore()
 	f := NewFiler(pb.ServerDiscovery{}, nil, "", "", "", "", "", 255, nil)
 	f.Store = NewFilerStoreWrapper(store)
+	// A live LogBuffer keeps its flush loops and their multi-buffer pool
+	// reachable; without this the package's filers pin gigabytes on 32-bit.
+	// There is no master to flush to, so cancel the flush context first:
+	// otherwise the queued window retries forever and the buffer never exits.
+	t.Cleanup(func() {
+		close(f.deletionQuit)
+		f.flushCancel()
+		f.LocalMetaLogBuffer.ShutdownLogBuffer()
+		f.LocalMetaLogBuffer.WaitForShutdown()
+	})
 	return f, store
 }
 
 func TestCreateEntryAssignsInodeWhenMissing(t *testing.T) {
-	f, store := newTestFilerWithStubStore()
+	f, store := newTestFilerWithStubStore(t)
 
 	entry := &Entry{
 		FullPath: util.FullPath("/dir/file.txt"),
@@ -131,7 +142,7 @@ func TestCreateEntryAssignsInodeWhenMissing(t *testing.T) {
 }
 
 func TestCreateEntryAssignsInodesToAutoCreatedParents(t *testing.T) {
-	f, store := newTestFilerWithStubStore()
+	f, store := newTestFilerWithStubStore(t)
 
 	entry := &Entry{
 		FullPath: util.FullPath("/a/b/c.txt"),
@@ -152,7 +163,7 @@ func TestCreateEntryAssignsInodesToAutoCreatedParents(t *testing.T) {
 }
 
 func TestCreateEntryOExclPreservesExistingEntry(t *testing.T) {
-	f, store := newTestFilerWithStubStore()
+	f, store := newTestFilerWithStubStore(t)
 
 	original := &Entry{
 		FullPath: util.FullPath("/buckets/my-bucket"),
@@ -177,7 +188,7 @@ func TestCreateEntryOExclPreservesExistingEntry(t *testing.T) {
 }
 
 func TestCreateEntryOExclFailsOnLookupError(t *testing.T) {
-	f, store := newTestFilerWithStubStore()
+	f, store := newTestFilerWithStubStore(t)
 
 	original := &Entry{
 		FullPath: util.FullPath("/buckets/my-bucket"),
@@ -203,7 +214,7 @@ func TestCreateEntryOExclFailsOnLookupError(t *testing.T) {
 }
 
 func TestUpdateEntryPreservesExistingInode(t *testing.T) {
-	f, store := newTestFilerWithStubStore()
+	f, store := newTestFilerWithStubStore(t)
 
 	original := &Entry{
 		FullPath: util.FullPath("/doc.txt"),
@@ -240,7 +251,7 @@ func TestUpdateEntryPreservesExistingInode(t *testing.T) {
 }
 
 func TestUpdateEntryBackfillsMissingLegacyInode(t *testing.T) {
-	f, store := newTestFilerWithStubStore()
+	f, store := newTestFilerWithStubStore(t)
 
 	original := &Entry{
 		FullPath: util.FullPath("/legacy.txt"),
@@ -264,4 +275,29 @@ func TestUpdateEntryBackfillsMissingLegacyInode(t *testing.T) {
 	require.NotNil(t, stored)
 	assert.NotZero(t, stored.Attr.Inode)
 	assert.NotEqual(t, uint64(1), stored.Attr.Inode)
+}
+
+// A transient store error must fail the write instead of being mistaken for a
+// missing entry: on upsert stores proceeding would replace the entry without
+// loading the old chunks, orphaning them from cleanup.
+func TestCreateEntryFailsWhenLookupErrors(t *testing.T) {
+	f, store := newTestFilerWithStubStore(t)
+	path := util.FullPath("/dir/file.txt")
+	require.NoError(t, store.InsertEntry(context.Background(), &Entry{
+		FullPath: path,
+		Content:  []byte("existing"),
+	}))
+	store.findErr = errors.New("transient store failure")
+
+	entry := &Entry{
+		FullPath: path,
+		Attr:     Attr{Mode: 0o644},
+		Content:  []byte("overwrite"),
+	}
+	require.Error(t, f.CreateEntry(context.Background(), entry, nil, false, false, nil, false, f.MaxFilenameLength))
+
+	store.findErr = nil
+	stored, findErr := store.FindEntry(context.Background(), path)
+	require.NoError(t, findErr)
+	assert.Equal(t, "existing", string(stored.Content))
 }

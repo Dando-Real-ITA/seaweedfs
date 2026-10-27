@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/syndtr/goleveldb/leveldb/storage"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -35,6 +37,12 @@ type LevelDB3Store struct {
 	dbs      map[string]*leveldb.DB
 	dbsLock  sync.RWMutex
 	ReadOnly bool
+	emptyDB  *leveldb.DB
+
+	blockCacheSizeMB      int
+	writeBufferSizeMB     int
+	blockSizeKB           int
+	compactionTableSizeMB int
 }
 
 func (store *LevelDB3Store) GetName() string {
@@ -43,14 +51,69 @@ func (store *LevelDB3Store) GetName() string {
 
 func (store *LevelDB3Store) Initialize(configuration weed_util.Configuration, prefix string) (err error) {
 	dir := configuration.GetString(prefix + "dir")
+	store.blockCacheSizeMB = configuration.GetInt(prefix + "block_cache_size_mb")
+	store.writeBufferSizeMB = configuration.GetInt(prefix + "write_buffer_size_mb")
+	store.blockSizeKB = configuration.GetInt(prefix + "block_size_kb")
+	store.compactionTableSizeMB = configuration.GetInt(prefix + "compaction_table_size_mb")
+	if err := store.validateSizeOptions(); err != nil {
+		return err
+	}
 	return store.initialize(dir)
+}
+
+// validateSizeOptions rejects sizes too large to convert to bytes without
+// overflowing int on this platform.
+func (store *LevelDB3Store) validateSizeOptions() error {
+	for name, kv := range map[string][2]int{
+		"block_cache_size_mb":      {store.blockCacheSizeMB, 1 << 20},
+		"write_buffer_size_mb":     {store.writeBufferSizeMB, 1 << 20},
+		"block_size_kb":            {store.blockSizeKB, 1 << 10},
+		"compaction_table_size_mb": {store.compactionTableSizeMB, 1 << 20},
+	} {
+		if kv[0] > math.MaxInt/kv[1] {
+			return fmt.Errorf("leveldb3 option %s=%d overflows int", name, kv[0])
+		}
+	}
+	return nil
+}
+
+func (store *LevelDB3Store) buildOptions(name string) *opt.Options {
+	opts := &opt.Options{
+		BlockCacheCapacity: 32 * 1024 * 1024, // default value is 8MiB
+		WriteBuffer:        16 * 1024 * 1024, // default value is 4MiB
+		Filter:             filter.NewBloomFilter(8),
+		ReadOnly:           store.ReadOnly,
+	}
+	if name != DEFAULT {
+		opts.BlockCacheCapacity = 16 * 1024 * 1024 // default value is 8MiB
+		opts.WriteBuffer = 8 * 1024 * 1024         // default value is 4MiB
+	}
+	if store.blockCacheSizeMB > 0 {
+		opts.BlockCacheCapacity = store.blockCacheSizeMB * 1024 * 1024
+	}
+	if store.writeBufferSizeMB > 0 {
+		opts.WriteBuffer = store.writeBufferSizeMB * 1024 * 1024
+	}
+	if store.blockSizeKB > 0 {
+		opts.BlockSize = store.blockSizeKB * 1024
+	}
+	if store.compactionTableSizeMB > 0 {
+		opts.CompactionTableSize = store.compactionTableSizeMB * 1024 * 1024
+	}
+	return opts
 }
 
 func (store *LevelDB3Store) initialize(dir string) (err error) {
 	glog.Infof("filer store leveldb3 dir: %s", dir)
 	os.MkdirAll(dir, 0755)
-	if err := weed_util.TestFolderWritable(dir); err != nil {
-		return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
+	if weed_util.IsReadOnlyMount(dir) {
+		glog.V(0).Infof("filer store %s is on a read-only filesystem, opening it read-only", dir)
+		store.ReadOnly = true
+	}
+	if !store.ReadOnly {
+		if err := weed_util.TestFolderWritable(dir); err != nil {
+			return fmt.Errorf("Check Level Folder %s Writable: %s", dir, err)
+		}
 	}
 	store.dir = dir
 
@@ -65,21 +128,7 @@ func (store *LevelDB3Store) initialize(dir string) (err error) {
 }
 
 func (store *LevelDB3Store) loadDB(name string) (*leveldb.DB, error) {
-	bloom := filter.NewBloomFilter(8) // false positive rate 0.02
-	opts := &opt.Options{
-		BlockCacheCapacity: 32 * 1024 * 1024, // default value is 8MiB
-		WriteBuffer:        16 * 1024 * 1024, // default value is 4MiB
-		Filter:             bloom,
-		ReadOnly:           store.ReadOnly,
-	}
-	if name != DEFAULT {
-		opts = &opt.Options{
-			BlockCacheCapacity: 16 * 1024 * 1024, // default value is 8MiB
-			WriteBuffer:        8 * 1024 * 1024,  // default value is 4MiB
-			Filter:             bloom,
-			ReadOnly:           store.ReadOnly,
-		}
-	}
+	opts := store.buildOptions(name)
 
 	dbFolder := fmt.Sprintf("%s/%s", store.dir, name)
 	os.MkdirAll(dbFolder, 0755)
@@ -132,9 +181,30 @@ func (store *LevelDB3Store) findDB(fullpath weed_util.FullPath, isForChildren bo
 
 	store.dbsLock.RUnlock()
 
+	// A bucket with no db directory has no entries. Opening it read-only
+	// cannot create the directory, so serve its reads from an empty
+	// in-memory db; the store's write methods refuse mutations.
+	if store.ReadOnly && !weed_util.FolderExists(fmt.Sprintf("%s/%s", store.dir, bucket)) {
+		db, err := store.emptyBucketDB()
+		return db, bucket, shortPath, err
+	}
+
 	db, err := store.createDB(bucket)
 
 	return db, bucket, shortPath, err
+}
+
+func (store *LevelDB3Store) emptyBucketDB() (*leveldb.DB, error) {
+	store.dbsLock.Lock()
+	defer store.dbsLock.Unlock()
+	if store.emptyDB == nil {
+		db, err := leveldb.Open(storage.NewMemStorage(), nil)
+		if err != nil {
+			return nil, err
+		}
+		store.emptyDB = db
+	}
+	return store.emptyDB, nil
 }
 
 func (store *LevelDB3Store) createDB(bucket string) (*leveldb.DB, error) {
@@ -180,8 +250,20 @@ func (store *LevelDB3Store) RollbackTransaction(ctx context.Context) error {
 	return nil
 }
 
+var syncWriteOptions = &opt.WriteOptions{Sync: true}
+
+func writeOptions(ctx context.Context) *opt.WriteOptions {
+	if filer.SyncWrite(ctx) {
+		return syncWriteOptions
+	}
+	return nil
+}
+
 func (store *LevelDB3Store) InsertEntry(ctx context.Context, entry *filer.Entry) (err error) {
 
+	if store.ReadOnly {
+		return fmt.Errorf("filer store leveldb3 is read-only")
+	}
 	db, _, shortPath, err := store.findDB(entry.FullPath, false)
 	if err != nil {
 		return fmt.Errorf("findDB %s : %v", entry.FullPath, err)
@@ -199,7 +281,7 @@ func (store *LevelDB3Store) InsertEntry(ctx context.Context, entry *filer.Entry)
 		value = weed_util.MaybeGzipData(value)
 	}
 
-	err = db.Put(key, value, nil)
+	err = db.Put(key, value, writeOptions(ctx))
 
 	if err != nil {
 		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
@@ -249,6 +331,9 @@ func (store *LevelDB3Store) FindEntry(ctx context.Context, fullpath weed_util.Fu
 
 func (store *LevelDB3Store) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 
+	if store.ReadOnly {
+		return fmt.Errorf("filer store leveldb3 is read-only")
+	}
 	db, _, shortPath, err := store.findDB(fullpath, false)
 	if err != nil {
 		return fmt.Errorf("findDB %s : %v", fullpath, err)
@@ -257,7 +342,7 @@ func (store *LevelDB3Store) DeleteEntry(ctx context.Context, fullpath weed_util.
 	dir, name := shortPath.DirAndName()
 	key := genKey(dir, name)
 
-	err = db.Delete(key, nil)
+	err = db.Delete(key, writeOptions(ctx))
 	if err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
@@ -267,6 +352,9 @@ func (store *LevelDB3Store) DeleteEntry(ctx context.Context, fullpath weed_util.
 
 func (store *LevelDB3Store) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 
+	if store.ReadOnly {
+		return fmt.Errorf("filer store leveldb3 is read-only")
+	}
 	db, bucket, shortPath, err := store.findDB(fullpath, true)
 	if err != nil {
 		return fmt.Errorf("findDB %s : %v", fullpath, err)
@@ -298,7 +386,7 @@ func (store *LevelDB3Store) DeleteFolderChildren(ctx context.Context, fullpath w
 	}
 	iter.Release()
 
-	err = db.Write(batch, nil)
+	err = db.Write(batch, writeOptions(ctx))
 
 	if err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
@@ -320,7 +408,7 @@ func (store *LevelDB3Store) ListDirectoryPrefixedEntries(ctx context.Context, di
 
 	directoryPrefix := genDirectoryKeyPrefix(shortPath, prefix)
 	lastFileStart := directoryPrefix
-	if startFileName != "" {
+	if startFileName > prefix {
 		lastFileStart = genDirectoryKeyPrefix(shortPath, startFileName)
 	}
 
@@ -399,5 +487,8 @@ func hashToBytes(dir string) []byte {
 func (store *LevelDB3Store) Shutdown() {
 	for _, db := range store.dbs {
 		db.Close()
+	}
+	if store.emptyDB != nil {
+		store.emptyDB.Close()
 	}
 }

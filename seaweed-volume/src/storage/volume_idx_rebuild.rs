@@ -2,8 +2,8 @@
 //! `weed/storage/volume_idx_rebuild.go`.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufWriter, Seek, Write};
+use std::path::{Path, PathBuf};
 
 use crate::storage::idx;
 use crate::storage::needle::Needle;
@@ -101,6 +101,41 @@ impl Volume {
         }
         result
     }
+
+    /// Write the volume's .idx rows to a new temporary file and return it
+    /// rewound for reading, for a volume whose index directory cannot hold
+    /// the rebuilt index. Mirrors Go's `rebuildIdxToTempFile`; the caller
+    /// removes the file.
+    pub(crate) fn rebuild_idx_to_temp(&self) -> Result<(fs::File, PathBuf), VolumeError> {
+        let dat_path = self.file_name(".dat");
+        let tmp_path = std::env::temp_dir().join(format!("weed-idx-{}", uuid::Uuid::new_v4()));
+        let build = || -> Result<fs::File, VolumeError> {
+            let tmp_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            let mut scanner = VolumeFileScanner4RebuildIdx {
+                writer: BufWriter::new(&tmp_file),
+                dat_size: fs::metadata(&dat_path)?.len() as i64,
+                version: self.version(),
+                stopped: false,
+            };
+            scan_volume_file(&dat_path, &mut scanner)?;
+            scanner.writer.flush()?;
+            drop(scanner);
+            let mut tmp_file = tmp_file;
+            tmp_file.seek(io::SeekFrom::Start(0))?;
+            Ok(tmp_file)
+        };
+        match build() {
+            Ok(f) => Ok((f, tmp_path)),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -142,7 +177,7 @@ mod tests {
         let old_idx = old_idx_dir.to_str().unwrap();
         let new_idx = new_idx_dir.to_str().unwrap();
 
-        let mut v = Volume::new(
+        let v = Volume::new(
             data,
             old_idx,
             VolumeId(1),
@@ -196,7 +231,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let dir = root.path().to_str().unwrap();
 
-        let mut v = Volume::new(
+        let v = Volume::new(
             dir,
             dir,
             VolumeId(1),
@@ -242,7 +277,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let dir = root.path().to_str().unwrap();
 
-        let mut v = Volume::new(
+        let v = Volume::new(
             dir,
             dir,
             VolumeId(1),
@@ -291,7 +326,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let dir = root.path().to_str().unwrap();
 
-        let mut v = Volume::new(
+        let v = Volume::new(
             dir,
             dir,
             VolumeId(1),

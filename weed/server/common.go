@@ -109,7 +109,7 @@ func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj inter
 
 	if httpStatus >= 400 {
 		glog.V(0).Infof("response method:%s URL:%s with httpStatus:%d and JSON:%s",
-			r.Method, r.URL.String(), httpStatus, string(bytes))
+			r.Method, redactedURL(r), httpStatus, string(bytes))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -119,10 +119,21 @@ func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj inter
 	return
 }
 
+func redactedURL(r *http.Request) string {
+	if _, ok := r.URL.Query()["jwt"]; !ok {
+		return r.URL.String()
+	}
+	u := *r.URL
+	q := u.Query()
+	q.Set("jwt", "[redacted]")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // wrapper for writeJson - just logs errors
 func writeJsonQuiet(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) {
 	if err := writeJson(w, r, httpStatus, obj); err != nil {
-		glog.V(0).Infof("error writing JSON status %s %d: %v", r.URL, httpStatus, err)
+		glog.V(0).Infof("error writing JSON status %s %d: %v", redactedURL(r), httpStatus, err)
 		glog.V(1).Infof("JSON content: %+v", obj)
 	}
 }
@@ -302,8 +313,33 @@ func (t *responseBodyTracker) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// ifRangeMatches reports whether an If-Range validator still names the
+// representation described by header (RFC 9110 13.1.5): an entity tag by
+// strong comparison, or a date equal to Last-Modified.
+func ifRangeMatches(ifRange string, header http.Header) bool {
+	ifRange = strings.TrimSpace(ifRange)
+	if ifRange == "" {
+		return true
+	}
+	if strings.HasPrefix(ifRange, "\"") || strings.HasPrefix(ifRange, "W/") {
+		etag := header.Get("ETag")
+		return etag != "" && !strings.HasPrefix(etag, "W/") && ifRange == etag
+	}
+	date, err := http.ParseTime(ifRange)
+	if err != nil {
+		return false
+	}
+	lastModified, err := http.ParseTime(header.Get("Last-Modified"))
+	return err == nil && date.Equal(lastModified)
+}
+
 func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64, mimeType string, prepareWriteFn func(offset int64, size int64) (filer.DoStreamContent, error)) error {
 	rangeReq := r.Header.Get("Range")
+	// A Range whose If-Range no longer matches is ignored and the whole content
+	// is sent, so a resumed download restarts instead of mixing two versions.
+	if rangeReq != "" && !ifRangeMatches(r.Header.Get("If-Range"), w.Header()) {
+		rangeReq = ""
+	}
 	sink := &responseBodyTracker{ResponseWriter: w}
 	bufferedWriter := writePool.Get().(*bufio.Writer)
 	bufferedWriter.Reset(sink)

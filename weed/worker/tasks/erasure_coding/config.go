@@ -2,6 +2,7 @@ package erasure_coding
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/seaweedfs/seaweedfs/weed/admin/config"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -12,12 +13,17 @@ import (
 // Config extends BaseConfig with erasure coding specific settings
 type Config struct {
 	base.BaseConfig
-	QuietForSeconds  int      `json:"quiet_for_seconds"`
-	FullnessRatio    float64  `json:"fullness_ratio"`
-	CollectionFilter string   `json:"collection_filter"`
-	MinSizeMB        int      `json:"min_size_mb"`
-	PreferredTags    []string `json:"preferred_tags"`
-	ReplicaPlacement string   `json:"replica_placement"` // e.g. "020"; empty falls back to the master default replication
+	QuietForSeconds   int      `json:"quiet_for_seconds"`
+	FullnessRatio     float64  `json:"fullness_ratio"`
+	CollectionFilter  string   `json:"collection_filter"`
+	MinSizeMB         int      `json:"min_size_mb"`
+	PreferredTags     []string `json:"preferred_tags"`
+	ReplicaPlacement  string   `json:"replica_placement"`   // e.g. "020"; empty falls back to the master default replication
+	StrictPlacement   bool     `json:"strict_placement"`    // fail planning instead of relaxing placement constraints
+	FreeSlotsDeadband int      `json:"free_slots_deadband"` // Place volume-slot M; |ΔfreeSlots| ≤ M×dataShards is a tie, then liveShards; 0 = strict
+	// MaxShardTransfers is the global in-flight cap for EC shard copies.
+	// nil = no cap (one in-flight per dest disk); 0 = sequential; N>0 = cap.
+	MaxShardTransfers *int `json:"max_shard_transfers,omitempty"`
 }
 
 // NewDefaultConfig creates a new default erasure coding configuration
@@ -171,6 +177,34 @@ func GetConfigSpec() base.ConfigSpec {
 				InputType:    "text",
 				CSSClasses:   "form-control",
 			},
+			{
+				Name:         "strict_placement",
+				JSONName:     "strict_placement",
+				Type:         config.FieldTypeBool,
+				DefaultValue: false,
+				Required:     false,
+				DisplayName:  "Strict Placement",
+				Description:  "Refuse to encode a volume when the placement constraints can't be satisfied",
+				HelpText:     "When enabled, a volume is only encoded if every shard can be placed within the per-disk, anti-affinity, replica-placement and per-rack caps, so the configured resilience is preserved. When disabled (default), unsatisfiable constraints are relaxed and noted in the log",
+				InputType:    "checkbox",
+				CSSClasses:   "form-check-input",
+			},
+			{
+				Name:         "free_slots_deadband",
+				JSONName:     "free_slots_deadband",
+				Type:         config.FieldTypeInt,
+				DefaultValue: 0,
+				MinValue:     0,
+				MaxValue:     100000,
+				Required:     false,
+				DisplayName:  "Free Volume Deadband (M)",
+				Description:  "Treat |Δfree volume slots| ≤ M as a Place tie and rank by liveShards instead",
+				HelpText:     "0 (default) keeps strict freeSlots ranking. A positive M is volume slots; Place applies M × data shards (10+4 → ×10).",
+				Placeholder:  "0",
+				Unit:         config.UnitCount,
+				InputType:    "number",
+				CSSClasses:   "form-control",
+			},
 		},
 	}
 }
@@ -186,15 +220,57 @@ func (c *Config) ToTaskPolicy() *worker_pb.TaskPolicy {
 		CheckIntervalSeconds:  int32(c.ScanIntervalSeconds),
 		TaskConfig: &worker_pb.TaskPolicy_ErasureCodingConfig{
 			ErasureCodingConfig: &worker_pb.ErasureCodingTaskConfig{
-				FullnessRatio:    float64(c.FullnessRatio),
-				QuietForSeconds:  int32(c.QuietForSeconds),
-				MinVolumeSizeMb:  int32(c.MinSizeMB),
-				CollectionFilter: c.CollectionFilter,
-				PreferredTags:    preferredTagsCopy,
-				ReplicaPlacement: c.ReplicaPlacement,
+				FullnessRatio:     float64(c.FullnessRatio),
+				QuietForSeconds:   int32(c.QuietForSeconds),
+				MinVolumeSizeMb:   int32(c.MinSizeMB),
+				CollectionFilter:  c.CollectionFilter,
+				PreferredTags:     preferredTagsCopy,
+				ReplicaPlacement:  c.ReplicaPlacement,
+				StrictPlacement:   c.StrictPlacement,
+				FreeSlotsDeadband: int32(c.FreeSlotsDeadband),
+				MaxShardTransfers: optionalInt32(c.MaxShardTransfers),
 			},
 		},
 	}
+}
+
+// optionalInt32 keeps unset (nil) distinct from sequential (0) on the proto field.
+func optionalInt32(n *int) *int32 {
+	n = normalizedMaxShardTransfers(n)
+	if n == nil {
+		return nil
+	}
+	v := int32(*n)
+	return &v
+}
+
+// normalizedMaxShardTransfers clamps a set cap into the proto int32 range.
+// nil stays nil so an absent knob is not stored as sequential.
+func normalizedMaxShardTransfers(n *int) *int {
+	if n == nil {
+		return nil
+	}
+	v := *n
+	if v < 0 {
+		v = 0
+	}
+	if v > math.MaxInt32 {
+		v = math.MaxInt32
+	}
+	return &v
+}
+
+func optionalIntFromProto(n *int32) *int {
+	if n == nil {
+		return nil
+	}
+	v := int(*n)
+	return &v
+}
+
+// cloneMaxShardTransfers copies the cap so a task does not alias the live config.
+func cloneMaxShardTransfers(n *int) *int {
+	return normalizedMaxShardTransfers(n)
 }
 
 // FromTaskPolicy loads configuration from a TaskPolicy protobuf message
@@ -216,6 +292,10 @@ func (c *Config) FromTaskPolicy(policy *worker_pb.TaskPolicy) error {
 		c.CollectionFilter = ecConfig.CollectionFilter
 		c.PreferredTags = append([]string(nil), ecConfig.PreferredTags...)
 		c.ReplicaPlacement = ecConfig.ReplicaPlacement
+		c.StrictPlacement = ecConfig.StrictPlacement
+		c.FreeSlotsDeadband = int(ecConfig.FreeSlotsDeadband)
+		// Read the pointer, not GetMaxShardTransfers: the getter maps unset to 0.
+		c.MaxShardTransfers = normalizedMaxShardTransfers(optionalIntFromProto(ecConfig.MaxShardTransfers))
 	}
 
 	return nil

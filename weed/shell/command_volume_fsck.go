@@ -34,6 +34,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -55,11 +56,13 @@ type commandVolumeFsck struct {
 	writer                    io.Writer
 	bucketsPath               string
 	collection                *string
+	collectionMatcher         *wildcard.CollectionMatcher
+	knownVolumeIds            map[uint32]bool
 	volumeIds                 map[uint32]bool
-	scopedFilerPath           string
 	tempFolder                string
 	verbose                   *bool
 	forcePurging              *bool
+	purgeConcurrency          *int
 	skipEcVolumes             *bool
 	findMissingChunksInFiler  *bool
 	verifyNeedle              *bool
@@ -96,6 +99,12 @@ func (c *commandVolumeFsck) Help() string {
 		A newly uploaded chunk may appear as orphan if metadata commit is still pending.
 		The default 5h cutoff provides sufficient buffer for metadata commits.
 
+	Step 2 reads the filer from one consistent snapshot when its store supports
+	that (the SQL stores do), so a file renamed while the filer is being read is
+	still counted and its chunks are not mistaken for orphans. Other stores are
+	walked directory by directory; there, avoid running with -reallyDeleteFromVolume
+	while files are being renamed or moved.
+
 `
 }
 
@@ -109,11 +118,12 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	c.verbose = fsckCommand.Bool("v", false, "verbose mode")
 	c.skipEcVolumes = fsckCommand.Bool("skipEcVolumes", false, "skip erasure coded volumes")
 	c.findMissingChunksInFiler = fsckCommand.Bool("findMissingChunksInFiler", false, "see \"help volume.fsck\"")
-	c.collection = fsckCommand.String("collection", "", "the collection name")
-	volumeIds := fsckCommand.String("volumeId", "", "comma separated the volume id")
+	c.collection = fsckCommand.String("collection", "", "comma-separated collection names, wildcards, or regex patterns; empty or \"*\" matches all, \""+CollectionDefault+"\" the collection with no name")
+	volumeIds := fsckCommand.String("volumeId", "", "comma separated the volume id; the filer is still read from its root, since a file under any path may reference these volumes")
 	applyPurging := fsckCommand.Bool("reallyDeleteFromVolume", false, "<expert only!> after detection, delete missing data from volumes / delete missing file entries from filer. Currently this only works with default filerGroup.")
 	c.forcePurging = fsckCommand.Bool("forcePurging", false, "delete missing data from volumes in one replica used together with applyPurging")
 	purgeAbsent := fsckCommand.Bool("reallyDeleteFilerEntries", false, "<expert only!> delete missing file entries from filer if the corresponding volume is missing for any reason, please ensure all still existing/expected volumes are connected! used together with findMissingChunksInFiler")
+	c.purgeConcurrency = fsckCommand.Int("purgeConcurrency", 16, "parallel filer deletes for -reallyDeleteFilerEntries")
 	tempPath := fsckCommand.String("tempPath", path.Join(os.TempDir()), "path for temporary idx files")
 	cutoffTimeAgo := fsckCommand.Duration("cutoffTimeAgo", 5*time.Hour, "only include entries on volume servers before this cutoff time to check orphan chunks")
 	modifyTimeAgo := fsckCommand.Duration("modifyTimeAgo", 0, "only include entries after this modify time to check orphan chunks")
@@ -145,7 +155,11 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		}
 	}
 	c.env = commandEnv
-	c.writer = writer
+	c.writer = &lockedWriter{w: writer}
+
+	if c.collectionMatcher, err = wildcard.CompileCollectionMatcher(*c.collection); err != nil {
+		return fmt.Errorf("invalid collection pattern %q: %w", *c.collection, err)
+	}
 
 	c.bucketsPath, err = readFilerBucketsPath(commandEnv)
 	if err != nil {
@@ -170,6 +184,16 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		return fmt.Errorf("failed to collect all volume locations: %w", err)
 	}
 
+	// Every volume the master knows about, before any filtering: a filer
+	// entry pointing at a volume that was filtered out of this run is
+	// excluded, not missing — it must never be reported or purged.
+	c.knownVolumeIds = make(map[uint32]bool)
+	for _, vidMap := range dataNodeVolumeIdToVInfo {
+		for vid := range vidMap {
+			c.knownVolumeIds[vid] = true
+		}
+	}
+
 	// If the operator specified -volumeId, reject unknown ids up front instead
 	// of silently filtering them out and reporting "no orphan data". A silent
 	// success on a missing volume looks identical to a clean volume and hides
@@ -191,11 +215,6 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 			sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
 			return fmt.Errorf("volume(s) not found on master: %v", missing)
 		}
-	}
-
-	c.scopedFilerPath = c.resolveScopedFilerPath(dataNodeVolumeIdToVInfo)
-	if *c.verbose && c.scopedFilerPath != "/" {
-		fmt.Fprintf(c.writer, "scoping filer walk to %s\n", c.scopedFilerPath)
 	}
 
 	var collectCutoffFromAtNs int64 = 0
@@ -222,7 +241,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 						continue
 					}
 				}
-				if *c.collection != "" && vinfo.collection != *c.collection {
+				if !c.collectionMatcher.Matches(vinfo.collection) {
 					delete(volumeIdToVInfo, volumeId)
 					continue
 				}
@@ -246,19 +265,33 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	if *c.findMissingChunksInFiler {
 		// collect all filer file ids and paths
 
-		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, *purgeAbsent, collectModifyFromAtNs, collectCutoffFromAtNs); err != nil {
-			return fmt.Errorf("collectFilerFileIdAndPaths: %w", err)
+		var queuePurge func(purgeItem)
+		var finishPurge func()
+		if *applyPurging || *purgeAbsent {
+			queuePurge, finishPurge = startPurgeWorkers(*c.purgeConcurrency, c.httpDelete)
 		}
-		for dataNodeId, volumeIdToVInfo := range dataNodeVolumeIdToVInfo {
-			// for each volume, check filer file ids
-			if err = c.findFilerChunksMissingInVolumeServers(volumeIdToVInfo, dataNodeId, *applyPurging || *purgeAbsent); err != nil {
-				return fmt.Errorf("findFilerChunksMissingInVolumeServers: %w", err)
+		err = func() error {
+			if err := c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, *purgeAbsent, queuePurge, collectModifyFromAtNs, collectCutoffFromAtNs); err != nil {
+				return fmt.Errorf("collectFilerFileIdAndPaths: %w", err)
 			}
+			for dataNodeId, volumeIdToVInfo := range dataNodeVolumeIdToVInfo {
+				// for each volume, check filer file ids
+				if err := c.findFilerChunksMissingInVolumeServers(volumeIdToVInfo, dataNodeId, queuePurge); err != nil {
+					return fmt.Errorf("findFilerChunksMissingInVolumeServers: %w", err)
+				}
+			}
+			return nil
+		}()
+		if finishPurge != nil {
+			finishPurge()
+		}
+		if err != nil {
+			return err
 		}
 		c.purgeEmptyDirectories()
 	} else {
 		// collect all filer file ids
-		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, false, 0, 0); err != nil {
+		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, false, nil, 0, 0); err != nil {
 			return fmt.Errorf("failed to collect file ids from filer: %w", err)
 		}
 		// If any entry's manifest could not be resolved, our in-use fid set
@@ -281,9 +314,9 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	return nil
 }
 
-func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, purgeAbsent bool, collectModifyFromAtNs int64, cutoffFromAtNs int64) error {
+func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo, purgeAbsent bool, queuePurge func(purgeItem), collectModifyFromAtNs int64, cutoffFromAtNs int64) error {
 	if *c.verbose {
-		fmt.Fprintf(c.writer, "checking each file from filer path %s...\n", c.getCollectFilerFilePath())
+		fmt.Fprintf(c.writer, "checking each file from filer path /...\n")
 	}
 
 	files := make(map[uint32]*os.File)
@@ -305,7 +338,7 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 		}
 	}()
 
-	return doTraverseBfsAndSaving(c.env, c.writer, c.getCollectFilerFilePath(), false, false,
+	return doTraverseAndSaving(c.env, c.writer, "/", false, false,
 		func(ctx context.Context, entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
 			if *c.verbose && entry.Entry.IsDirectory {
 				fmt.Fprintf(c.writer, "checking directory %s\n", util.NewFullPath(entry.Dir, entry.Entry.Name))
@@ -343,10 +376,11 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 				}
 				select {
 				case outputChan <- &Item{
-					vid:     chunk.Fid.VolumeId,
-					fileKey: chunk.Fid.FileKey,
-					cookie:  chunk.Fid.Cookie,
-					path:    util.NewFullPath(entry.Dir, entry.Entry.Name),
+					vid:        chunk.Fid.VolumeId,
+					fileKey:    chunk.Fid.FileKey,
+					cookie:     chunk.Fid.Cookie,
+					path:       util.NewFullPath(entry.Dir, entry.Entry.Name),
+					hardLinkId: entry.Entry.GetHardLinkId(),
 				}:
 				case <-ctx.Done():
 					return ctx.Err()
@@ -368,6 +402,13 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 					if _, err := f.Write([]byte(i.path)); err != nil {
 						return err
 					}
+					util.Uint32toBytes(buffer[:4], uint32(len(i.hardLinkId)))
+					if _, err := f.Write(buffer[:4]); err != nil {
+						return err
+					}
+					if _, err := f.Write(i.hardLinkId); err != nil {
+						return err
+					}
 				} else if *c.findMissingChunksInFiler {
 					// check if the volume matches the filter
 					if len(c.volumeIds) > 0 {
@@ -375,10 +416,15 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 							continue
 						}
 					}
+					// A volume the master knows but this run filtered out is not a
+					// missing volume: its files are healthy and stay untouched.
+					if c.knownVolumeIds[i.vid] {
+						continue
+					}
 					fmt.Fprintf(c.writer, "%d,%x%08x %s volume not found\n", i.vid, i.fileKey, i.cookie, i.path)
 					if purgeAbsent {
 						fmt.Fprintf(c.writer, "deleting path %s after volume not found\n", i.path)
-						c.httpDelete(i.path)
+						queuePurge(purgeItem{path: i.path, hardLinkId: i.hardLinkId})
 					}
 				}
 			}
@@ -386,10 +432,10 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 		})
 }
 
-func (c *commandVolumeFsck) findFilerChunksMissingInVolumeServers(volumeIdToVInfo map[uint32]VInfo, dataNodeId string, applyPurging bool) error {
+func (c *commandVolumeFsck) findFilerChunksMissingInVolumeServers(volumeIdToVInfo map[uint32]VInfo, dataNodeId string, queuePurge func(purgeItem)) error {
 
 	for volumeId, vinfo := range volumeIdToVInfo {
-		checkErr := c.oneVolumeFileIdsCheckOneVolume(dataNodeId, volumeId, applyPurging)
+		checkErr := c.oneVolumeFileIdsCheckOneVolume(dataNodeId, volumeId, queuePurge)
 		if checkErr != nil {
 			return fmt.Errorf("failed to collect file ids from volume %d on %s: %v", volumeId, vinfo.server, checkErr)
 		}
@@ -593,13 +639,27 @@ func (c *commandVolumeFsck) collectOneVolumeFileIds(dataNodeId string, volumeId 
 }
 
 type Item struct {
-	vid     uint32
-	fileKey uint64
-	cookie  uint32
-	path    util.FullPath
+	vid        uint32
+	fileKey    uint64
+	cookie     uint32
+	path       util.FullPath
+	hardLinkId []byte
 }
 
-func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleId types.NeedleId, itemPath util.FullPath)) error {
+// lockedWriter serializes concurrent writers — the traversal, the consumer,
+// and the purge workers all log through c.writer at the same time.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (lw *lockedWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
+}
+
+func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleId types.NeedleId, itemPath util.FullPath, hardLinkId []byte)) error {
 	fp, err := os.Open(getFilerFileIdFile(c.tempFolder, volumeId))
 	if err != nil {
 		return err
@@ -634,13 +694,23 @@ func (c *commandVolumeFsck) readFilerFileIdFile(volumeId uint32, fn func(needleI
 			return fmt.Errorf("read fid path size mismatch for volume %d,%x%08x: got %d want %d", volumeId, item.fileKey, item.cookie, n, pathSize)
 		}
 		item.path = util.FullPath(pathBytes)
+		item.hardLinkId = nil
+		if _, err := io.ReadFull(br, buffer[:4]); err != nil {
+			return fmt.Errorf("read fid hard link id size for volume %d,%x%08x: %w", volumeId, item.fileKey, item.cookie, err)
+		}
+		if hardLinkIdSize := util.BytesToUint32(buffer[:4]); hardLinkIdSize > 0 {
+			item.hardLinkId = make([]byte, int(hardLinkIdSize))
+			if _, err := io.ReadFull(br, item.hardLinkId); err != nil {
+				return fmt.Errorf("read fid hard link id for volume %d,%x%08x: %w", volumeId, item.fileKey, item.cookie, err)
+			}
+		}
 		needleId := types.NeedleId(item.fileKey)
-		fn(needleId, item.path)
+		fn(needleId, item.path, item.hardLinkId)
 	}
 	return nil
 }
 
-func (c *commandVolumeFsck) oneVolumeFileIdsCheckOneVolume(dataNodeId string, volumeId uint32, applyPurging bool) (err error) {
+func (c *commandVolumeFsck) oneVolumeFileIdsCheckOneVolume(dataNodeId string, volumeId uint32, queuePurge func(purgeItem)) (err error) {
 	if *c.verbose {
 		fmt.Fprintf(c.writer, "find missing file chunks in dataNodeId %s volume %d ...\n", dataNodeId, volumeId)
 	}
@@ -651,17 +721,58 @@ func (c *commandVolumeFsck) oneVolumeFileIdsCheckOneVolume(dataNodeId string, vo
 	if err = db.LoadFromIdx(getVolumeFileIdFile(c.tempFolder, dataNodeId, volumeId)); err != nil {
 		return
 	}
-	if err = c.readFilerFileIdFile(volumeId, func(needleId types.NeedleId, itemPath util.FullPath) {
+	if err = c.readFilerFileIdFile(volumeId, func(needleId types.NeedleId, itemPath util.FullPath, hardLinkId []byte) {
 		if _, found := db.Get(needleId); !found {
 			fmt.Fprintf(c.writer, "%s\n", itemPath)
-			if applyPurging {
-				c.httpDelete(itemPath)
+			if queuePurge != nil {
+				queuePurge(purgeItem{path: itemPath, hardLinkId: hardLinkId})
 			}
 		}
 	}); err != nil {
 		return
 	}
 	return nil
+}
+
+type purgeItem struct {
+	path       util.FullPath
+	hardLinkId []byte
+}
+
+// startPurgeWorkers fans deletes across at least one worker and returns a
+// queue function plus a finish function that closes the channels and waits
+// for in-flight deletes. Paths that share a hard link id always land on the
+// same worker, so their shared hard-link counter updates stay serialized —
+// concurrent deletes of the same id could both read count N and write N-1,
+// leaving the shared record behind after every path is gone.
+func startPurgeWorkers(workers int, deleteFn func(util.FullPath)) (queue func(purgeItem), finish func()) {
+	if workers < 1 {
+		workers = 1
+	}
+	chans := make([]chan purgeItem, workers)
+	var wg sync.WaitGroup
+	for w := range chans {
+		chans[w] = make(chan purgeItem, 128)
+		wg.Add(1)
+		go func(ch <-chan purgeItem) {
+			defer wg.Done()
+			for it := range ch {
+				deleteFn(it.path)
+			}
+		}(chans[w])
+	}
+	return func(it purgeItem) {
+			key := []byte(it.path)
+			if len(it.hardLinkId) > 0 {
+				key = it.hardLinkId
+			}
+			chans[int(uint32(util.HashToInt32(key))%uint32(workers))] <- it
+		}, func() {
+			for _, ch := range chans {
+				close(ch)
+			}
+			wg.Wait()
+		}
 }
 
 func (c *commandVolumeFsck) httpDelete(path util.FullPath) {
@@ -673,7 +784,7 @@ func (c *commandVolumeFsck) httpDelete(path util.FullPath) {
 
 	req.URL = &url.URL{
 		Scheme: "http",
-		Host:   c.env.option.FilerAddress.ToHttpAddress(),
+		Host:   c.env.FilerAddress().ToHttpAddress(),
 		Path:   string(path),
 	}
 
@@ -746,7 +857,7 @@ func (c *commandVolumeFsck) purgeEmptyDirectories() {
 		if mtime <= 0 || mtime >= time.Now().Add(-directoryQuietPeriod).Unix() {
 			continue
 		}
-		if err := c.deleteEmptyDirectory(dir, mtime); err != nil {
+		if err := c.deleteEmptyDirectory(dir, entry.Attributes); err != nil {
 			if !errors.Is(err, filer.ErrNonEmptyFolder) {
 				fmt.Fprintf(c.writer, "delete empty directory %s: %v\n", dir, err)
 			}
@@ -756,16 +867,21 @@ func (c *commandVolumeFsck) purgeEmptyDirectories() {
 	}
 }
 
-// deleteEmptyDirectory deletes dir unless it changed since it was looked up at mtime,
-// so a directory promoted to an S3 object meanwhile survives. The delete is not
-// recursive, leaving the filer to reject a directory that is not empty.
-func (c *commandVolumeFsck) deleteEmptyDirectory(dir util.FullPath, mtime int64) error {
+// deleteEmptyDirectory deletes dir unless it changed since it was looked up,
+// so a directory promoted to an S3 object meanwhile survives. The delete is
+// not recursive, leaving the filer to reject a directory that is not empty.
+func (c *commandVolumeFsck) deleteEmptyDirectory(dir util.FullPath, attr *filer_pb.FuseAttributes) error {
 	parent, name := dir.DirAndName()
+	sec, ns, ok := deleteEntryCutoff(attr.GetMtime(), attr.GetMtimeNs())
+	if !ok {
+		return nil
+	}
 	return c.env.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.DeleteEntry(context.Background(), &filer_pb.DeleteEntryRequest{
-			Directory:          parent,
-			Name:               name,
-			IfNotModifiedAfter: mtime,
+			Directory:            parent,
+			Name:                 name,
+			IfNotModifiedAfter:   sec,
+			IfNotModifiedAfterNs: ns,
 		})
 		if err != nil {
 			return err
@@ -778,8 +894,7 @@ func (c *commandVolumeFsck) deleteEmptyDirectory(dir util.FullPath, mtime int64)
 }
 
 func (c *commandVolumeFsck) canPurgeDirectory(dir util.FullPath) bool {
-	root := c.getCollectFilerFilePath()
-	if string(dir) == root || !strings.HasPrefix(string(dir), strings.TrimSuffix(root, "/")+"/") {
+	if string(dir) == "/" {
 		return false
 	}
 	// deleting a bucket drops its whole collection
@@ -797,7 +912,7 @@ func (c *commandVolumeFsck) oneVolumeFileIdsSubtractFilerFileIds(dataNodeId stri
 		return
 	}
 
-	if err = c.readFilerFileIdFile(volumeId, func(filerNeedleId types.NeedleId, itemPath util.FullPath) {
+	if err = c.readFilerFileIdFile(volumeId, func(filerNeedleId types.NeedleId, itemPath util.FullPath, _ []byte) {
 		inUseCount++
 		if *c.verifyNeedle && !vinfo.isEcVolume {
 			if needleValue, ok := volumeFileIdDb.Get(filerNeedleId); ok && !needleValue.Size.IsDeleted() {
@@ -958,68 +1073,6 @@ func (c *commandVolumeFsck) purgeFileIdsForOneVolume(volumeId uint32, fileIds []
 	}
 
 	return
-}
-
-func (c *commandVolumeFsck) getCollectFilerFilePath() string {
-	return c.scopedFilerPath
-}
-
-func (c *commandVolumeFsck) resolveScopedFilerPath(dataNodeVolumeIdToVInfo map[string]map[uint32]VInfo) string {
-	if *c.collection != "" {
-		return fmt.Sprintf("%s/%s", c.bucketsPath, *c.collection)
-	}
-	if len(c.volumeIds) == 0 {
-		return "/"
-	}
-	collections := make(map[string]struct{})
-	for _, vidMap := range dataNodeVolumeIdToVInfo {
-		for vid, vinfo := range vidMap {
-			if _, ok := c.volumeIds[vid]; !ok {
-				continue
-			}
-			// empty collection: volume can be referenced from anywhere
-			if vinfo.collection == "" {
-				return "/"
-			}
-			collections[vinfo.collection] = struct{}{}
-			if len(collections) > 1 {
-				return "/"
-			}
-		}
-	}
-	if len(collections) != 1 {
-		return "/"
-	}
-	var collection string
-	for col := range collections {
-		collection = col
-	}
-	exists, err := c.bucketDirExists(collection)
-	if err != nil || !exists {
-		return "/"
-	}
-	return fmt.Sprintf("%s/%s", c.bucketsPath, collection)
-}
-
-func (c *commandVolumeFsck) bucketDirExists(name string) (bool, error) {
-	var found bool
-	err := c.env.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
-			Directory: c.bucketsPath,
-			Name:      name,
-		})
-		if err != nil {
-			if strings.Contains(err.Error(), filer_pb.ErrNotFound.Error()) {
-				return nil
-			}
-			return err
-		}
-		if resp.Entry != nil && resp.Entry.IsDirectory {
-			found = true
-		}
-		return nil
-	})
-	return found, err
 }
 
 func getVolumeFileIdFile(tempFolder string, dataNodeid string, vid uint32) string {

@@ -422,6 +422,9 @@ func (p *OIDCProvider) Initialize(config interface{}) error {
 
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
+		// A replaced provider drops its transport without a close; bound
+		// idle connections so they cannot linger with their goroutines.
+		IdleConnTimeout: 90 * time.Second,
 	}
 	p.httpClient = &http.Client{
 		Timeout:       30 * time.Second,
@@ -681,7 +684,8 @@ func (p *OIDCProvider) ValidateToken(ctx context.Context, token string) (*provid
 		return nil, fmt.Errorf("failed to get public key: %v", err)
 	}
 
-	// Parse and validate token with proper signature verification
+	// Parse and validate token with proper signature verification. exp is
+	// required: without it a leaked token could mint STS sessions forever.
 	claims := jwt.MapClaims{}
 	validatedToken, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
 		// Verify signing method
@@ -691,7 +695,7 @@ func (p *OIDCProvider) ValidateToken(ctx context.Context, token string) (*provid
 		default:
 			return nil, fmt.Errorf("unsupported signing method: %v", token.Header["alg"])
 		}
-	})
+	}, jwt.WithExpirationRequired())
 
 	if err != nil {
 		// Use JWT library's typed errors for robust error checking

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -29,13 +31,7 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 	// autoChunking can be set at the command-line level or as a query param. Query param overrides command-line
 	query := r.URL.Query()
 
-	parsedMaxMB, _ := strconv.ParseInt(query.Get("maxMB"), 10, 32)
-	maxMB := int32(parsedMaxMB)
-	if maxMB <= 0 && fs.option.MaxMB > 0 {
-		maxMB = int32(fs.option.MaxMB)
-	}
-
-	chunkSize := 1024 * 1024 * maxMB
+	chunkSize := fs.requestChunkSize(query)
 
 	var reply *FilerPostResult
 	var err error
@@ -58,7 +54,10 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 			writeJsonError(w, r, util.HttpStatusCancelled, err)
 		case strings.HasSuffix(errStr, "is a file") || strings.HasSuffix(errStr, "already exists"):
 			writeJsonError(w, r, http.StatusConflict, err)
-		case errStr == constants.ErrMsgBadDigest:
+		case errStr == constants.ErrMsgBadDigest,
+			errStr == constants.ErrMsgAppendSaveInsideChunked,
+			errStr == constants.ErrMsgAppendInlineMode,
+			errStr == constants.ErrMsgOffsetWriteInline:
 			writeJsonError(w, r, http.StatusBadRequest, err)
 		default:
 			writeJsonError(w, r, http.StatusInternalServerError, err)
@@ -99,8 +98,17 @@ func (fs *FilerServer) doPostAutoChunk(ctx context.Context, w http.ResponseWrite
 	if so.SaveInside {
 		buf := bufPool.Get().(*bytes.Buffer)
 		buf.Reset()
-		buf.ReadFrom(part1)
-		filerResult, replyerr, _ = fs.saveMetaData(ctx, r, fileName, contentType, so, chunkSize, nil, nil, 0, buf.Bytes())
+		if _, err := buf.ReadFrom(part1); err != nil {
+			bufPool.Put(buf)
+			return nil, nil, fmt.Errorf("read input: %w", err)
+		}
+		md5bytes = util.Md5(buf.Bytes())
+		headerMd5 := r.Header.Get("Content-Md5")
+		if headerMd5 != "" && !(util.Base64Encode(md5bytes) == headerMd5 || fmt.Sprintf("%x", md5bytes) == headerMd5) {
+			bufPool.Put(buf)
+			return nil, nil, errors.New(constants.ErrMsgBadDigest)
+		}
+		filerResult, replyerr, _ = fs.saveMetaData(ctx, r, fileName, contentType, so, chunkSize, md5bytes, nil, int64(buf.Len()), buf.Bytes())
 		bufPool.Put(buf)
 		return
 	}
@@ -164,6 +172,22 @@ func isAppend(r *http.Request) bool {
 
 func skipCheckParentDirEntry(r *http.Request) bool {
 	return r.URL.Query().Get("skipCheckParentDir") == "true"
+}
+
+// requestChunkSize resolves the auto-chunking size from the maxMB query param
+// or the server default, clamped so the int32 chunk size cannot overflow into
+// a non-positive value that would drop the upload's contents.
+func (fs *FilerServer) requestChunkSize(query url.Values) int32 {
+	parsedMaxMB, _ := strconv.ParseInt(query.Get("maxMB"), 10, 32)
+	maxMB := parsedMaxMB
+	if maxMB <= 0 {
+		maxMB = int64(fs.option.MaxMB)
+	}
+	const maxChunkSizeMB = math.MaxInt32 / (1024 * 1024) // 2047
+	if maxMB > maxChunkSizeMB {
+		maxMB = maxChunkSizeMB
+	}
+	return int32(maxMB) * 1024 * 1024
 }
 
 func (fs *FilerServer) checkPermissions(ctx context.Context, r *http.Request, fileName string) error {
@@ -293,7 +317,11 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	if entry != nil {
 		inlineCandidate := len(entry.Content) > 0 ||
 			(isAppend && entry.FileSize == 0 && entry.Remote == nil && len(entry.HardLinkId) == 0 && len(entry.GetChunks()) == 0)
-		if isAppend && !so.SaveInside && content != nil && !inlineCandidate {
+		if isAppend && content != nil && !inlineCandidate {
+			if so.SaveInside {
+				replyerr = errors.New(constants.ErrMsgAppendSaveInsideChunked)
+				return
+			}
 			replyerr = fmt.Errorf("inline file changed while preparing append; retry the request")
 			return
 		}
@@ -301,11 +329,11 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		if inlineCandidate {
 			if isOffsetWrite {
 				// TODO: support inline offset writes separately from append semantics.
-				replyerr = fmt.Errorf("offset write to inline small file is not supported yet")
+				replyerr = errors.New(constants.ErrMsgOffsetWriteInline)
 				return
 			}
 			if !isAppend || so.SaveInside || entry.Remote != nil || len(entry.HardLinkId) != 0 || len(entry.GetChunks()) != 0 {
-				replyerr = fmt.Errorf("append to inline content with this storage mode is not supported")
+				replyerr = errors.New(constants.ErrMsgAppendInlineMode)
 				return
 			}
 			if entry.FileSize > uint64(len(entry.Content)) {
@@ -468,6 +496,9 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	}
 	for k, v := range r.Header {
 		if len(v) > 0 && len(v[0]) > 0 {
+			if k == filer.ExtRemoteRenameSourceKey {
+				continue // set by the filer only: it picks the remote key reads serve
+			}
 			if strings.HasPrefix(k, needle.PairNamePrefix) || k == "Cache-Control" || k == "Expires" || k == "Content-Disposition" {
 				entry.Extended[k] = []byte(v[0])
 			}

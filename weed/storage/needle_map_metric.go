@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync/atomic"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -151,34 +152,42 @@ func (mm *mapMetric) MaxNeedleEnd() int64 {
 func needleMapMetricFromIndexFile(r *os.File, mm *mapMetric, version needle.Version) error {
 	var bf *boom.BloomFilter
 	buf := make([]byte, NeedleIdSize)
+	var liveKeyCount uint32
+	var liveKeyBytes uint64
 	err := reverseWalkIndexFile(r, func(entryCount int64) {
 		bf = boom.NewBloomFilter(uint(entryCount), 0.001)
+		// The default FNV-1 kernel leaves the last byte of a big-endian
+		// NeedleId as the final XOR, so keys in the same 256-block get
+		// correlated probe positions and false positives arrive in bursts
+		// of hundreds. xxhash diffuses the input fully and keeps the
+		// observed rate near the 0.001 target.
+		bf.SetHash(xxhash.New())
 	}, func(key NeedleId, offset Offset, size Size) error {
 
 		mm.MaybeSetMaxFileKey(key)
 		mm.MaybeSetMaxNeedleEnd(offset, size, version)
 		NeedleIdToBytes(buf, key)
-		if size.IsValid() {
-			mm.FileByteCounter += uint64(size)
+		seen := bf.TestAndAdd(buf)
+		if offset.IsZero() || size.IsDeleted() {
+			return nil
 		}
-
 		mm.FileCounter++
-		if !bf.TestAndAdd(buf) {
-			// if !size.IsValid(), then this file is deleted already
-			if !size.IsValid() {
-				mm.DeletionCounter++
-			}
-		} else {
-			// deleted file
-			mm.DeletionCounter++
-			if size.IsValid() {
-				// previously already deleted file
-				mm.DeletionByteCounter += uint64(size)
-			}
+		mm.FileByteCounter += uint64(size)
+		if !seen {
+			liveKeyCount++
+			liveKeyBytes += uint64(size)
 		}
 		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// Runtime counters tally each live-key removal: an overwrite deletes the
+	// superseded row and a tombstone deletes the live row. Replaying forward,
+	// that is (file rows) - (keys whose latest row is live).
+	mm.DeletionCounter = mm.FileCounter - liveKeyCount
+	mm.DeletionByteCounter = mm.FileByteCounter - liveKeyBytes
+	return nil
 }
 
 func newNeedleMapMetricFromIndexFile(r *os.File, version needle.Version) (mm *mapMetric, err error) {

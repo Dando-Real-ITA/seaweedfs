@@ -1,20 +1,25 @@
 package shell
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -22,25 +27,20 @@ import (
 
 func TestVolumeFsckCanPurgeDirectory(t *testing.T) {
 	testCases := []struct {
-		scopedFilerPath string
-		dir             util.FullPath
-		expected        bool
+		dir      util.FullPath
+		expected bool
 	}{
-		{"/", "/orphan/dir/deep", true},
-		{"/", "/orphan", true},
-		{"/", "/", false},
-		{"/", "/buckets", false},
-		{"/", "/buckets/bucket1", false},
-		{"/", "/buckets/bucket1/dir", true},
-		{"/buckets/bucket1", "/buckets/bucket1", false},
-		{"/buckets/bucket1", "/buckets/bucket1/dir", true},
-		{"/buckets/bucket1", "/buckets/bucket11/dir", false},
-		{"/buckets/bucket1", "/orphan/dir", false},
+		{"/orphan/dir/deep", true},
+		{"/orphan", true},
+		{"/", false},
+		{"/buckets", false},
+		{"/buckets/bucket1", false},
+		{"/buckets/bucket1/dir", true},
 	}
 	for _, tc := range testCases {
-		c := &commandVolumeFsck{bucketsPath: "/buckets", scopedFilerPath: tc.scopedFilerPath}
+		c := &commandVolumeFsck{bucketsPath: "/buckets"}
 		if actual := c.canPurgeDirectory(tc.dir); actual != tc.expected {
-			t.Errorf("scope %s: canPurgeDirectory(%s) = %v, expected %v", tc.scopedFilerPath, tc.dir, actual, tc.expected)
+			t.Errorf("canPurgeDirectory(%s) = %v, expected %v", tc.dir, actual, tc.expected)
 		}
 	}
 }
@@ -96,13 +96,50 @@ func (s *stubFilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_p
 	return &filer_pb.LookupDirectoryEntryResponse{Entry: entry}, nil
 }
 
+func (s *stubFilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream filer_pb.SeaweedFiler_ListEntriesServer) error {
+	var names []string
+	children := make(map[string]*filer_pb.Entry)
+	for path, entry := range s.entries {
+		parent, name := util.FullPath(path).DirAndName()
+		if parent != req.Directory || name == "" {
+			continue
+		}
+		if name < req.StartFromFileName || (name == req.StartFromFileName && !req.InclusiveStartFrom) {
+			continue
+		}
+		names = append(names, name)
+		children[name] = entry
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		stored := children[name]
+		entry := &filer_pb.Entry{
+			Name:        name,
+			IsDirectory: stored.IsDirectory,
+			Chunks:      stored.Chunks,
+			Attributes:  stored.Attributes,
+			HardLinkId:  stored.HardLinkId,
+		}
+		if err := stream.Send(&filer_pb.ListEntriesResponse{Entry: entry}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *stubFilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
 	fullPath := string(util.NewFullPath(req.Directory, req.Name))
 	entry, found := s.entries[fullPath]
 	if !found {
 		return &filer_pb.DeleteEntryResponse{Error: filer_pb.ErrNotFound.Error()}, nil
 	}
-	if req.IfNotModifiedAfter > 0 && entry.Attributes.GetMtime() > req.IfNotModifiedAfter {
+	entryNewer := false
+	if req.IfNotModifiedAfterNs > 0 {
+		entryNewer = entry.Attributes.GetMtime()*1e9+int64(entry.Attributes.GetMtimeNs()) > req.IfNotModifiedAfterNs
+	} else if req.IfNotModifiedAfter > 0 {
+		entryNewer = entry.Attributes.GetMtime() > req.IfNotModifiedAfter
+	}
+	if entryNewer {
 		return &filer_pb.DeleteEntryResponse{}, nil
 	}
 	for path := range s.entries {
@@ -153,10 +190,9 @@ func TestVolumeFsckPurgeEmptyDirectories(t *testing.T) {
 
 	verbose := false
 	c := &commandVolumeFsck{
-		verbose:         &verbose,
-		writer:          io.Discard,
-		bucketsPath:     "/buckets",
-		scopedFilerPath: "/",
+		verbose:     &verbose,
+		writer:      io.Discard,
+		bucketsPath: "/buckets",
 		purgedDirs: map[util.FullPath]struct{}{
 			"/orphan/dir/deep":        {},
 			"/orphan/dir/wide":        {},
@@ -186,12 +222,11 @@ func TestVolumeFsckPurgeEmptyDirectoriesKeepsFreshDirectory(t *testing.T) {
 
 	verbose := false
 	c := &commandVolumeFsck{
-		verbose:         &verbose,
-		writer:          io.Discard,
-		bucketsPath:     "/buckets",
-		scopedFilerPath: "/",
-		purgedDirs:      map[util.FullPath]struct{}{"/fresh/dir": {}},
-		env:             startStubFiler(t, stub),
+		verbose:     &verbose,
+		writer:      io.Discard,
+		bucketsPath: "/buckets",
+		purgedDirs:  map[util.FullPath]struct{}{"/fresh/dir": {}},
+		env:         startStubFiler(t, stub),
 	}
 
 	c.purgeEmptyDirectories()
@@ -204,25 +239,274 @@ func TestVolumeFsckPurgeEmptyDirectoriesKeepsFreshDirectory(t *testing.T) {
 func TestVolumeFsckPurgeEmptyDirectoriesKeepsChangedDirectory(t *testing.T) {
 	stub := &stubFilerServer{
 		entries: map[string]*filer_pb.Entry{
-			"/race":     {IsDirectory: true, Attributes: &filer_pb.FuseAttributes{Mtime: 100}},
-			"/race/dir": {IsDirectory: true, Attributes: &filer_pb.FuseAttributes{Mtime: 100}},
+			"/race":     {IsDirectory: true, Attributes: &filer_pb.FuseAttributes{Mtime: time.Now().Add(-time.Hour).Unix()}},
+			"/race/dir": {IsDirectory: true, Attributes: &filer_pb.FuseAttributes{Mtime: time.Now().Add(-time.Hour).Unix()}},
 		},
 		writtenAfterLookup: map[string]bool{"/race/dir": true},
 	}
 
 	verbose := false
 	c := &commandVolumeFsck{
-		verbose:         &verbose,
-		writer:          io.Discard,
-		bucketsPath:     "/buckets",
-		scopedFilerPath: "/",
-		purgedDirs:      map[util.FullPath]struct{}{"/race/dir": {}},
-		env:             startStubFiler(t, stub),
+		verbose:     &verbose,
+		writer:      io.Discard,
+		bucketsPath: "/buckets",
+		purgedDirs:  map[util.FullPath]struct{}{"/race/dir": {}},
+		env:         startStubFiler(t, stub),
 	}
 
 	c.purgeEmptyDirectories()
 
 	if len(stub.deleted) > 0 {
 		t.Errorf("deleted %v, expected a directory written to after the lookup to be kept", stub.deleted)
+	}
+}
+
+// The purge pool may run at most `workers` deletes at once, and at least one
+// even when the flag is set to zero.
+func TestVolumeFsckPurgeWorkerLimit(t *testing.T) {
+	gate := make(chan struct{})
+	var inFlight, maxSeen, processed atomic.Int32
+	queue, finish := startPurgeWorkers(3, func(util.FullPath) {
+		n := inFlight.Add(1)
+		for {
+			m := maxSeen.Load()
+			if n <= m || maxSeen.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		<-gate
+		inFlight.Add(-1)
+		processed.Add(1)
+	})
+
+	for i := 0; i < 10; i++ {
+		queue(purgeItem{path: util.FullPath(fmt.Sprintf("/p/%d", i))})
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for inFlight.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := inFlight.Load(); got != 3 {
+		t.Fatalf("in-flight deletes %d, want the 3-worker limit", got)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got := maxSeen.Load(); got > 3 {
+		t.Fatalf("saw %d concurrent deletes, want at most 3", got)
+	}
+	close(gate)
+	finish()
+	if got := processed.Load(); got != 10 {
+		t.Fatalf("processed %d deletes, want all 10 drained", got)
+	}
+}
+
+func TestVolumeFsckPurgeWorkersAtLeastOne(t *testing.T) {
+	var processed atomic.Int32
+	queue, finish := startPurgeWorkers(0, func(util.FullPath) { processed.Add(1) })
+	for i := 0; i < 5; i++ {
+		queue(purgeItem{path: util.FullPath(fmt.Sprintf("/p/%d", i))})
+	}
+	finish()
+	if got := processed.Load(); got != 5 {
+		t.Fatalf("processed %d deletes, want 5", got)
+	}
+}
+
+// Deletes of paths sharing a hard link id must never overlap: the filer
+// decrements a shared counter non-atomically, so concurrent deletes of the
+// same id would both read N and write back N-1.
+func TestVolumeFsckPurgeHardLinksSerialized(t *testing.T) {
+	var inFlight, maxSeen, processed atomic.Int32
+	gate := make(chan struct{})
+	queue, finish := startPurgeWorkers(8, func(util.FullPath) {
+		n := inFlight.Add(1)
+		for {
+			m := maxSeen.Load()
+			if n <= m || maxSeen.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		<-gate
+		inFlight.Add(-1)
+		processed.Add(1)
+	})
+	for i := 0; i < 8; i++ {
+		queue(purgeItem{path: util.FullPath(fmt.Sprintf("/hl/%d", i)), hardLinkId: []byte{9, 9, 9}})
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := maxSeen.Load(); got > 1 {
+		t.Fatalf("saw %d concurrent deletes on one hard link id, want 1", got)
+	}
+	close(gate)
+	finish()
+	if got := processed.Load(); got != 8 {
+		t.Fatalf("processed %d deletes, want 8", got)
+	}
+}
+
+// A file outside the selected volumes' bucket can still reference their
+// chunks — a filer can bind a collection to any path — so the filer walk must
+// reach them or their live chunks would be reported as orphans.
+func TestVolumeFsckCollectFilerFileIdsReachesOutsideBucket(t *testing.T) {
+	tempDir := t.TempDir()
+	chunk := func(fileKey uint64) *filer_pb.FileChunk {
+		return &filer_pb.FileChunk{Size: 1, Fid: &filer_pb.FileId{VolumeId: 7, FileKey: fileKey, Cookie: 1}}
+	}
+	directory := &filer_pb.Entry{IsDirectory: true}
+	stub := &stubFilerServer{entries: map[string]*filer_pb.Entry{
+		"/":                    directory,
+		"/buckets":             directory,
+		"/buckets/col1":        directory,
+		"/buckets/col1/object": {Chunks: []*filer_pb.FileChunk{chunk(11)}},
+		"/topics":              directory,
+		"/topics/system-log":   {Chunks: []*filer_pb.FileChunk{chunk(22)}},
+	}}
+
+	verbose, findMissing, verify, force := false, false, false, false
+	c := &commandVolumeFsck{
+		tempFolder:               tempDir,
+		verbose:                  &verbose,
+		findMissingChunksInFiler: &findMissing,
+		verifyNeedle:             &verify,
+		forcePurging:             &force,
+		writer:                   io.Discard,
+		bucketsPath:              "/buckets",
+		env:                      startStubFiler(t, stub),
+	}
+
+	vinfo := map[string]map[uint32]VInfo{"dn1": {7: {collection: "col1"}}}
+	if err := c.collectFilerFileIdAndPaths(vinfo, false, func(purgeItem) {}, 0, 0); err != nil {
+		t.Fatalf("collect filer file ids: %v", err)
+	}
+
+	db := needle_map.NewMemDb()
+	for _, needleId := range []types.NeedleId{11, 22, 33} {
+		if err := db.Set(needleId, types.ToOffset(16), types.Size(1)); err != nil {
+			t.Fatalf("seed volume idx: %v", err)
+		}
+	}
+	if err := db.SaveToIdx(getVolumeFileIdFile(tempDir, "dn1", 7)); err != nil {
+		t.Fatalf("write volume idx: %v", err)
+	}
+	db.Close()
+
+	inUseCount, orphanFileIds, _, err := c.oneVolumeFileIdsSubtractFilerFileIds("dn1", 7, &VInfo{collection: "col1"}, 0, 0)
+	if err != nil {
+		t.Fatalf("subtract filer file ids: %v", err)
+	}
+	if inUseCount != 2 {
+		t.Fatalf("in-use count %d, want 2 (the in-bucket and out-of-bucket references)", inUseCount)
+	}
+	if len(orphanFileIds) != 1 {
+		t.Fatalf("orphans %v, want only the unreferenced needle", orphanFileIds)
+	}
+	if want := types.NeedleId(33).FileId(7); orphanFileIds[0] != want {
+		t.Fatalf("orphan %s, want the unreferenced needle %s", orphanFileIds[0], want)
+	}
+}
+
+// Orphans found by the per-volume check go through the same purge queue as
+// the missing-volume path, and the fid file keeps each entry's hard link id
+// so same-id deletes still land on one worker.
+func TestVolumeFsckCheckOneVolumeQueuesOrphansWithHardLinkId(t *testing.T) {
+	tempDir := t.TempDir()
+	var verbose bool
+	var buf bytes.Buffer
+	c := &commandVolumeFsck{tempFolder: tempDir, verbose: &verbose, writer: &buf}
+
+	volumeId := uint32(7)
+	db := needle_map.NewMemDb()
+	if err := db.Set(types.NeedleId(11), types.ToOffset(16), types.Size(1)); err != nil {
+		t.Fatalf("seed volume idx: %v", err)
+	}
+	if err := db.SaveToIdx(getVolumeFileIdFile(tempDir, "dn1", volumeId)); err != nil {
+		t.Fatalf("write volume idx: %v", err)
+	}
+	db.Close()
+
+	f, err := os.Create(getFilerFileIdFile(tempDir, volumeId))
+	if err != nil {
+		t.Fatalf("create fid file: %v", err)
+	}
+	writeFid := func(fileKey uint64, cookie uint32, p string, hardLinkId []byte) {
+		buffer := make([]byte, readbufferSize)
+		util.Uint64toBytes(buffer, fileKey)
+		util.Uint32toBytes(buffer[8:], cookie)
+		util.Uint32toBytes(buffer[12:], uint32(len(p)))
+		if _, err := f.Write(buffer); err != nil {
+			t.Fatalf("write fid header: %v", err)
+		}
+		if _, err := f.Write([]byte(p)); err != nil {
+			t.Fatalf("write fid path: %v", err)
+		}
+		util.Uint32toBytes(buffer[:4], uint32(len(hardLinkId)))
+		if _, err := f.Write(buffer[:4]); err != nil {
+			t.Fatalf("write fid hard link id size: %v", err)
+		}
+		if _, err := f.Write(hardLinkId); err != nil {
+			t.Fatalf("write fid hard link id: %v", err)
+		}
+	}
+	writeFid(11, 1, "/keep/a", nil)
+	writeFid(22, 2, "/orphan/b", []byte{1, 2, 3})
+	writeFid(33, 3, "/orphan/c", nil)
+	if err := f.Close(); err != nil {
+		t.Fatalf("close fid file: %v", err)
+	}
+
+	var queued []purgeItem
+	if err := c.oneVolumeFileIdsCheckOneVolume("dn1", volumeId, func(it purgeItem) {
+		queued = append(queued, it)
+	}); err != nil {
+		t.Fatalf("check volume: %v", err)
+	}
+	if len(queued) != 2 {
+		t.Fatalf("queued %d purges, want 2 (the two orphans): %v", len(queued), queued)
+	}
+	if queued[0].path != "/orphan/b" || queued[1].path != "/orphan/c" {
+		t.Fatalf("queued paths %v, want /orphan/b then /orphan/c", queued)
+	}
+	if !bytes.Equal(queued[0].hardLinkId, []byte{1, 2, 3}) {
+		t.Fatalf("queued hardLinkId %v, want [1 2 3]", queued[0].hardLinkId)
+	}
+	if queued[1].hardLinkId != nil {
+		t.Fatalf("queued hardLinkId %v, want nil", queued[1].hardLinkId)
+	}
+}
+
+// A .fid file cut short inside the hard link id field is corrupt input, not a
+// record without a link id: the reader must fail instead of emitting the entry
+// with a nil id.
+func TestReadFilerFileIdFileRejectsTruncatedHardLinkId(t *testing.T) {
+	tempDir := t.TempDir()
+	var verbose bool
+	c := &commandVolumeFsck{tempFolder: tempDir, verbose: &verbose, writer: io.Discard}
+
+	f, err := os.Create(getFilerFileIdFile(tempDir, 7))
+	if err != nil {
+		t.Fatalf("create fid file: %v", err)
+	}
+	buffer := make([]byte, readbufferSize)
+	util.Uint64toBytes(buffer, 11)
+	util.Uint32toBytes(buffer[8:], 1)
+	util.Uint32toBytes(buffer[12:], uint32(len("/orphan/b")))
+	if _, err := f.Write(buffer); err != nil {
+		t.Fatalf("write fid header: %v", err)
+	}
+	if _, err := f.Write([]byte("/orphan/b")); err != nil {
+		t.Fatalf("write fid path: %v", err)
+	}
+	if _, err := f.Write([]byte{0, 0}); err != nil {
+		t.Fatalf("write partial hard link id size: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close fid file: %v", err)
+	}
+
+	err = c.readFilerFileIdFile(7, func(types.NeedleId, util.FullPath, []byte) {
+		t.Fatal("callback fired for a truncated record")
+	})
+	if err == nil {
+		t.Fatal("expected an error for a truncated hard link id size")
 	}
 }

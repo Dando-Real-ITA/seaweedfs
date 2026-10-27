@@ -29,6 +29,8 @@ func (f *Filer) NotifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 
 func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32) *filer_pb.SubscribeMetadataResponse {
 	if metadataEventsSuppressed(ctx) {
+		// The entry's stamp stays in flight for the covering event the
+		// caller emits itself (the rename handler does).
 		return nil
 	}
 
@@ -44,6 +46,10 @@ func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 	// println("fullpath:", fullpath)
 
 	if strings.HasPrefix(fullpath, SystemLogDir) {
+		// No event covers this write: release its stamp.
+		if newEntry != nil {
+			f.metaLogInflight.release(newEntry.CommitTsNs)
+		}
 		return nil
 	}
 	foundSelf := false
@@ -56,7 +62,7 @@ func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 		signatures = append(signatures, f.Signature)
 	}
 
-	event := f.newMetadataEvent(oldEntry, newEntry, deleteChunks, isFromOtherCluster, signatures)
+	event := f.newMetadataEvent(oldEntry, newEntry, deleteChunks, isFromOtherCluster, signatures, f.stampOf(newEntry))
 	// Clear the stamp after the buffer append below - deliberately also on
 	// append failure (see the metaLogInflight comment).
 	defer f.metaLogInflight.done(event.TsNs)
@@ -130,6 +136,28 @@ func (t *metaLogInflight) done(tsNs int64) {
 	}
 }
 
+// inFlight reports whether tsNs is a pre-commit stamp still awaiting its
+// buffer append — how an event adopts the stamp an entry carries.
+func (t *metaLogInflight) inFlight(tsNs int64) bool {
+	t.Lock()
+	defer t.Unlock()
+	return t.stamped[tsNs] > 0
+}
+
+// release drops a stamp whose event will never be appended.
+func (t *metaLogInflight) release(tsNs int64) {
+	if tsNs == 0 {
+		return
+	}
+	t.Lock()
+	defer t.Unlock()
+	if t.stamped[tsNs] <= 1 {
+		delete(t.stamped, tsNs)
+	} else {
+		t.stamped[tsNs]--
+	}
+}
+
 // minTsNs returns the oldest in-flight stamp, or 0 when nothing is in flight.
 func (t *metaLogInflight) minTsNs() int64 {
 	t.Lock()
@@ -193,7 +221,41 @@ func (f *Filer) DoneMetaLogInflightForTest(tsNs int64) {
 	f.metaLogInflight.done(tsNs)
 }
 
-func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32) *filer_pb.SubscribeMetadataResponse {
+// stampEntryCommitTsNs assigns the mutation's event timestamp to the entry
+// pre-write so the emitted event and stored version carry the same commit
+// time. The stamp stays in flight until the event appends; a write no event
+// covers must release it via releaseEntryCommitTsNs.
+func (f *Filer) stampEntryCommitTsNs(entry *Entry) int64 {
+	tsNs := f.metaLogInflight.stamp()
+	entry.CommitTsNs = tsNs
+	return tsNs
+}
+
+// releaseEntryCommitTsNs drops a stamp no event will adopt.
+func (f *Filer) releaseEntryCommitTsNs(tsNs int64) {
+	f.metaLogInflight.release(tsNs)
+}
+
+// StampEntryCommitTsNs/ReleaseEntryCommitTsNs expose the lifecycle to the
+// filer server's mutation paths.
+func (f *Filer) StampEntryCommitTsNs(entry *Entry) int64 {
+	return f.stampEntryCommitTsNs(entry)
+}
+
+func (f *Filer) ReleaseEntryCommitTsNs(tsNs int64) {
+	f.metaLogInflight.release(tsNs)
+}
+
+// stampOf returns the event's timestamp: the entry's in-flight stamp, or a
+// fresh one for events with no newly stamped entry (deletes).
+func (f *Filer) stampOf(newEntry *Entry) int64 {
+	if newEntry != nil && f.metaLogInflight.inFlight(newEntry.CommitTsNs) {
+		return newEntry.CommitTsNs
+	}
+	return f.metaLogInflight.stamp()
+}
+
+func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32, tsNs int64) *filer_pb.SubscribeMetadataResponse {
 	if oldEntry == nil && newEntry == nil {
 		return nil
 	}
@@ -220,20 +282,26 @@ func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFrom
 			Signatures:         signatures,
 		},
 		// In flight until appended to the local log buffer (see metaLogInflight).
-		TsNs: f.metaLogInflight.stamp(),
+		TsNs:         tsNs,
+		MutationTsNs: tsNs,
 	}
 }
 
 func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetadataResponse) {
 	data, err := proto.Marshal(event)
 	if err != nil {
-		glog.Errorf("failed to marshal filer_pb.SubscribeMetadataResponse %+v: %v", event, err)
+		glog.Errorf("failed to marshal filer_pb.SubscribeMetadataResponse %s -> %s ts_ns=%d: %v", filer_pb.MetadataEventSourceFullPath(event), filer_pb.MetadataEventTargetFullPath(event), event.TsNs, err)
 		return
 	}
 
-	if err := f.LocalMetaLogBuffer.AddDataToBuffer([]byte(event.Directory), data, event.TsNs); err != nil {
+	tsNs, err := f.LocalMetaLogBuffer.AddDataToBufferAndGetTs([]byte(event.Directory), data, event.TsNs)
+	if err != nil {
 		glog.Errorf("failed to add data to log buffer for %s: %v", event.Directory, err)
+		return
 	}
+	// The in-memory copy now carries the position the stream assigns it, the
+	// same value subscribers will see delivered.
+	event.TsNs = tsNs
 
 }
 
@@ -246,6 +314,11 @@ func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetad
 // under any configuration that works at all; a cluster running below it says so
 // in the rejection and volumeFileSizeLimit picks the real limit up from there.
 const metadataLogUploadLimit = log_buffer.BufferSize
+
+// shutdownMetadataLogFlushBudget bounds how long metadata-log flushes may keep
+// retrying once the filer is shutting down; Shutdown cancels the shared flush
+// context when it expires.
+const shutdownMetadataLogFlushBudget = 15 * time.Second
 
 var fileSizeLimitPattern = regexp.MustCompile(`file over the limited (\d+) bytes`)
 
@@ -278,17 +351,30 @@ func (f *Filer) logFlushFunc(logBuffer *log_buffer.LogBuffer, startTime, stopTim
 
 	// One piece at a time, each retried on its own so a partial success is not
 	// replayed, and the piece size follows the limit the volume servers report.
+	// While the filer keeps running the retry is unbounded so no metadata is
+	// dropped; once Shutdown arms the flush deadline the shared context cancels
+	// and the flush drops what is left instead of holding shutdown open.
 	limit := metadataLogUploadLimit
+	ctx := f.flushCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for len(buf) > 0 {
 		piece := nextLogPiece(buf, limit)
-		if err := f.appendToFile(targetFile, piece); err != nil {
+		if err := f.appendToFile(ctx, targetFile, piece); err != nil {
 			glog.V(0).Infof("metadata log write failed %s: %v", targetFile, err)
 			if reported := volumeFileSizeLimit(err); reported > 0 && reported < limit {
 				glog.V(0).Infof("metadata log upload limit lowered to %d bytes", reported)
 				limit = reported
 				continue
 			}
-			time.Sleep(737 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				logBuffer.NoteFlushDropped(len(buf))
+				glog.V(0).Infof("metadata log flush abandoned during shutdown, %d bytes left for %s: %v", len(buf), targetFile, ctx.Err())
+				return
+			case <-time.After(737 * time.Millisecond):
+			}
 			continue
 		}
 		buf = buf[len(piece):]

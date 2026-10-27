@@ -10,7 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::MinFreeSpace;
 use crate::storage::erasure_coding::ec_bitrot::remove_bitrot_sidecars;
@@ -37,10 +37,18 @@ pub struct DiskLocation {
     pub tags: Vec<String>,
     pub max_volume_count: AtomicI32,
     pub original_max_volume_count: i32,
-    volumes: HashMap<VolumeId, Volume>,
+    volumes: HashMap<VolumeId, Arc<Volume>>,
     ec_volumes: HashMap<VolumeId, EcVolume>,
     pub is_disk_space_low: Arc<AtomicBool>,
+    /// Go's `DiskLocation.readOnlyMount`: dir or idx_dir is on a read-only
+    /// filesystem. Volumes load read-only and the location offers no free
+    /// slots. Fixed at startup.
+    pub read_only_mount: bool,
     pub available_space: AtomicU64,
+    /// Headroom promised to in-flight copies that statfs cannot see yet.
+    /// Probes keep it out of available_space so they cannot re-spend it; a
+    /// copy that lands ends its charge, one that fails removes only its own.
+    pub reserved_space: AtomicU64,
     // Physical filesystem capacity from the latest check_disk_space probe, reported
     // to the master so balancing can see real disk fullness, not just slot counts.
     pub disk_total_bytes: AtomicU64,
@@ -67,11 +75,19 @@ impl DiskLocation {
             fs::create_dir_all(idx_directory)?;
             idx_directory.to_string()
         };
+        let read_only_mount = is_read_only_mount(directory) || is_read_only_mount(&idx_dir);
+        if read_only_mount {
+            info!(
+                "{} is on a read-only filesystem: its volumes load read-only, no new volumes",
+                directory
+            );
+        }
         let directory_uuid = Self::generate_directory_uuid(directory)?;
 
         Ok(DiskLocation {
             directory: directory.to_string(),
             idx_directory: idx_dir,
+            read_only_mount,
             directory_uuid,
             disk_type,
             tags,
@@ -81,6 +97,7 @@ impl DiskLocation {
             ec_volumes: HashMap::new(),
             is_disk_space_low: Arc::new(AtomicBool::new(false)),
             available_space: AtomicU64::new(0),
+            reserved_space: AtomicU64::new(0),
             disk_total_bytes: AtomicU64::new(0),
             disk_free_bytes: AtomicU64::new(0),
             min_free_space,
@@ -97,8 +114,35 @@ impl DiskLocation {
         }
 
         let dir_uuid = uuid::Uuid::new_v4().to_string();
-        fs::write(path, &dir_uuid)?;
-        Ok(dir_uuid)
+        match fs::write(&path, &dir_uuid) {
+            Ok(()) => Ok(dir_uuid),
+            // The uuid file cannot be written on a read-only mount; derive a
+            // stable one from the directory plus its device and host so
+            // restarts report the same id and independent disks at the same
+            // path differ.
+            Err(_) if is_read_only_mount(directory) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                directory.hash(&mut h);
+                if let Ok(meta) = fs::metadata(directory) {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        meta.dev().hash(&mut h);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = meta;
+                    }
+                }
+                if let Ok(host) = std::env::var("HOSTNAME") {
+                    host.hash(&mut h);
+                }
+                let derived = (h.finish() as u128) << 64 | h.finish() as u128;
+                Ok(uuid::Uuid::from_u128(derived).to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // ---- Volume management ----
@@ -237,6 +281,7 @@ impl DiskLocation {
         }
 
         for (collection, vid, v) in self.open_volumes(to_load, needle_map_kind) {
+            let v = Arc::new(v);
             crate::metrics::VOLUME_GAUGE
                 .with_label_values(&[&collection, "volume"])
                 .inc();
@@ -549,20 +594,23 @@ impl DiskLocation {
         None
     }
 
-    /// Find a volume by ID.
-    pub fn find_volume(&self, vid: VolumeId) -> Option<&Volume> {
-        self.volumes.get(&vid)
-    }
-
-    /// Find a volume by ID (mutable).
-    pub fn find_volume_mut(&mut self, vid: VolumeId) -> Option<&mut Volume> {
-        self.volumes.get_mut(&vid)
+    /// Find a volume by ID. Returns a shared handle like Go's findVolume:
+    /// the lookup borrows the map briefly and I/O runs on the handle after.
+    pub fn find_volume(&self, vid: VolumeId) -> Option<Arc<Volume>> {
+        self.volumes.get(&vid).cloned()
     }
 
     /// Add a volume to this location.
     pub fn set_volume(&mut self, vid: VolumeId, volume: Volume) {
         let collection = volume.collection.clone();
-        self.volumes.insert(vid, volume);
+        if let Some(old) = self.volumes.insert(vid, Arc::new(volume)) {
+            // A held handle would keep writing the same files against a stale
+            // in-memory index; close it so the stale handle fails closed.
+            crate::metrics::VOLUME_GAUGE
+                .with_label_values(&[&old.collection, "volume"])
+                .dec();
+            old.close();
+        }
         crate::metrics::VOLUME_GAUGE
             .with_label_values(&[&collection, "volume"])
             .inc();
@@ -586,13 +634,20 @@ impl DiskLocation {
         crate::metrics::VOLUME_GAUGE
             .with_label_values(&[spec.collection, "volume"])
             .inc();
-        self.volumes.insert(vid, v);
+        if let Some(old) = self.volumes.insert(vid, Arc::new(v)) {
+            // Same fail-closed rule as set_volume: a stale handle must not
+            // keep writing the files the replacement just reopened.
+            crate::metrics::VOLUME_GAUGE
+                .with_label_values(&[&old.collection, "volume"])
+                .dec();
+            old.close();
+        }
         Ok(())
     }
 
     /// Remove and close a volume.
-    pub fn unload_volume(&mut self, vid: VolumeId) -> Option<Volume> {
-        if let Some(mut v) = self.volumes.remove(&vid) {
+    pub fn unload_volume(&mut self, vid: VolumeId) -> Option<Arc<Volume>> {
+        if let Some(v) = self.volumes.remove(&vid) {
             crate::metrics::VOLUME_GAUGE
                 .with_label_values(&[&v.collection, "volume"])
                 .dec();
@@ -619,12 +674,21 @@ impl DiskLocation {
         {
             return Err(v.compacting_error());
         }
-        if let Some(mut v) = self.volumes.remove(&vid) {
-            crate::metrics::VOLUME_GAUGE
-                .with_label_values(&[&v.collection, "volume"])
-                .dec();
-            v.destroy(only_empty, only_garbage, keep_remote_data)?;
-            Ok(())
+        if let Some(v) = self.volumes.remove(&vid) {
+            match v.destroy(only_empty, only_garbage, keep_remote_data) {
+                Ok(()) => {
+                    crate::metrics::VOLUME_GAUGE
+                        .with_label_values(&[&v.collection, "volume"])
+                        .dec();
+                    Ok(())
+                }
+                Err(e) => {
+                    // A failed destroy left the local files in place, so the
+                    // replica stays registered rather than becoming a phantom.
+                    self.volumes.insert(vid, v);
+                    Err(e)
+                }
+            }
         } else {
             Err(VolumeError::NotFound)
         }
@@ -640,12 +704,14 @@ impl DiskLocation {
             .collect();
 
         for vid in vids {
-            if let Some(mut v) = self.volumes.remove(&vid) {
-                crate::metrics::VOLUME_GAUGE
-                    .with_label_values(&[&v.collection, "volume"])
-                    .dec();
+            if let Some(v) = self.volumes.remove(&vid) {
                 if let Err(e) = v.destroy(false, false, false) {
                     warn!(volume_id = vid.0, error = %e, "delete collection: failed to destroy volume");
+                    self.volumes.insert(vid, v);
+                } else {
+                    crate::metrics::VOLUME_GAUGE
+                        .with_label_values(&[&v.collection, "volume"])
+                        .dec();
                 }
             }
         }
@@ -686,13 +752,16 @@ impl DiskLocation {
 
     /// Iterate over all volumes.
     pub fn iter_volumes(&self) -> impl Iterator<Item = (&VolumeId, &Volume)> {
-        self.volumes.iter()
+        self.volumes.iter().map(|(k, v)| (k, v.as_ref()))
     }
 
     /// Number of free volume slots.
     /// Matches Go's FindFreeLocation formula:
     ///   free = ((MaxVolumeCount - VolumesLen()) * DataShardsCount - EcShardCount()) / DataShardsCount
     pub fn free_volume_count(&self) -> i32 {
+        if self.read_only_mount {
+            return 0;
+        }
         use crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT;
         let max = self.max_volume_count.load(Ordering::Relaxed);
         let free_count = (max as i64 - self.volumes.len() as i64) * DATA_SHARDS_COUNT as i64
@@ -707,12 +776,7 @@ impl DiskLocation {
 
     /// Iterate over all volumes.
     pub fn volumes(&self) -> impl Iterator<Item = (&VolumeId, &Volume)> {
-        self.volumes.iter()
-    }
-
-    /// Iterate over all volumes (mutable).
-    pub fn volumes_mut(&mut self) -> impl Iterator<Item = (&VolumeId, &mut Volume)> {
-        self.volumes.iter_mut()
+        self.volumes.iter().map(|(k, v)| (k, v.as_ref()))
     }
 
     /// Sum of unused space in writable volumes (volumeSizeLimit - actual size per volume).
@@ -723,7 +787,11 @@ impl DiskLocation {
             if vol.is_read_only() {
                 continue;
             }
-            let dat_size = vol.dat_file_size().unwrap_or(0);
+            // A preallocated volume already holds its space on disk.
+            let dat_size = vol
+                .dat_file_size()
+                .unwrap_or(0)
+                .max(vol.dat_allocated_size());
             let idx_size = vol.idx_file_size();
             let used = dat_size + idx_size;
             if volume_size_limit > used {
@@ -740,15 +808,16 @@ impl DiskLocation {
             return;
         }
         let used = total.saturating_sub(free);
-        let is_low = match &self.min_free_space {
-            MinFreeSpace::Percent(pct) => {
-                let free_pct = (free as f64 / total as f64) * 100.0;
-                free_pct < *pct
-            }
-            MinFreeSpace::Bytes(min_bytes) => free < *min_bytes,
-        };
+        let is_low = self.min_free_space.is_low(free, total);
         self.is_disk_space_low.store(is_low, Ordering::Relaxed);
-        self.available_space.store(free, Ordering::Relaxed);
+        // Go's DiskLocation.AvailableSpace counts only free space above the
+        // -volume.minFreeSpace floor, so space checks stay above it too.
+        self.available_space.store(
+            self.min_free_space
+                .available_space(free, total)
+                .saturating_sub(self.reserved_space.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         self.disk_total_bytes.store(total, Ordering::Relaxed);
         self.disk_free_bytes.store(free, Ordering::Relaxed);
 
@@ -1152,6 +1221,27 @@ impl DiskLocation {
     }
 }
 
+/// Mirror of Go's `util.IsReadOnlyMount`: access(2) with W_OK answers EROFS
+/// for a filesystem mounted read-only regardless of the permission bits, and
+/// also for root, unlike a permission-bits check.
+#[cfg(unix)]
+pub(crate) fn is_read_only_mount(path: &str) -> bool {
+    use std::ffi::CString;
+    let c_path = match CString::new(path.as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0 {
+        return false;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EROFS)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_read_only_mount(_path: &str) -> bool {
+    false
+}
+
 /// Get total and free disk space for a given path.
 /// Returns (total_bytes, free_bytes).
 pub fn get_disk_stats(path: &str) -> (u64, u64) {
@@ -1422,6 +1512,73 @@ mod tests {
         let (total, free) = get_disk_stats(tmp.path().to_str().unwrap());
         assert!(total > 0, "expected total>0, got {total}");
         assert!(free > 0, "expected free>0, got {free}");
+    }
+
+    // Mirrors Go's DiskLocation.AvailableSpace: the cached figure a copy is
+    // checked against counts only free space above the min-free-space floor.
+    #[test]
+    fn test_check_disk_space_counts_only_space_above_floor() {
+        const FLOOR: u64 = 1 << 20;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(FLOOR),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.check_disk_space();
+        assert_eq!(
+            loc.available_space.load(Ordering::Relaxed),
+            loc.disk_free_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(FLOOR)
+        );
+
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(u64::MAX),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.check_disk_space();
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), 0);
+    }
+
+    // Mirrors Go's CheckDiskSpace pending subtraction: an in-flight copy's
+    // charge stays out of the cache across a probe, so another copy cannot
+    // re-spend the headroom the live reading still shows as free.
+    #[test]
+    fn test_check_disk_space_keeps_pending_reservation_out_of_cache() {
+        const FLOOR: u64 = 1 << 20;
+        const RESERVED: u64 = 512 * 1024;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let loc = DiskLocation::new(
+            dir,
+            dir,
+            0,
+            DiskType::HardDrive,
+            MinFreeSpace::Bytes(FLOOR),
+            Vec::new(),
+        )
+        .unwrap();
+        loc.reserved_space.store(RESERVED, Ordering::Relaxed);
+        loc.check_disk_space();
+        let expected = loc
+            .min_free_space
+            .available_space(
+                loc.disk_free_bytes.load(Ordering::Relaxed),
+                loc.disk_total_bytes.load(Ordering::Relaxed),
+            )
+            .saturating_sub(RESERVED);
+        assert_eq!(loc.available_space.load(Ordering::Relaxed), expected);
     }
 
     /// When `-dir.idx` is configured the EC `.vif` may live in the idx

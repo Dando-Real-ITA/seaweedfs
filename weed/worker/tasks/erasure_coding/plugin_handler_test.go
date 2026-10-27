@@ -2,6 +2,7 @@ package erasure_coding
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +129,57 @@ func TestDeriveErasureCodingWorkerConfig(t *testing.T) {
 	if cfg.TaskConfig.MinSizeMB != 128 {
 		t.Fatalf("expected min_size_mb 128, got %d", cfg.TaskConfig.MinSizeMB)
 	}
+	if cfg.TaskConfig.FreeSlotsDeadband != 0 {
+		t.Fatalf("expected default free_slots_deadband 0, got %d", cfg.TaskConfig.FreeSlotsDeadband)
+	}
+
+	values["free_slots_deadband"] = &plugin_pb.ConfigValue{
+		Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 12},
+	}
+	cfg = deriveErasureCodingWorkerConfig(values)
+	if cfg.TaskConfig.FreeSlotsDeadband != 12 {
+		t.Fatalf("expected free_slots_deadband 12, got %d", cfg.TaskConfig.FreeSlotsDeadband)
+	}
+	if cfg.TaskConfig.MaxShardTransfers != nil {
+		t.Fatalf("missing max_shard_transfers must stay unset, got %d", *cfg.TaskConfig.MaxShardTransfers)
+	}
+}
+
+func TestDeriveErasureCodingWorkerConfigMaxShardTransfers(t *testing.T) {
+	if got := deriveErasureCodingWorkerConfig(nil).TaskConfig.MaxShardTransfers; got != nil {
+		t.Fatalf("nil values: got %d, want unset", *got)
+	}
+	if got := deriveErasureCodingWorkerConfig(map[string]*plugin_pb.ConfigValue{}).TaskConfig.MaxShardTransfers; got != nil {
+		t.Fatalf("missing key: got %d, want unset", *got)
+	}
+
+	cfg := deriveErasureCodingWorkerConfig(map[string]*plugin_pb.ConfigValue{
+		"max_shard_transfers": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0}},
+	})
+	if cfg.TaskConfig.MaxShardTransfers == nil || *cfg.TaskConfig.MaxShardTransfers != 0 {
+		t.Fatalf("0: got %v, want 0 (sequential)", cfg.TaskConfig.MaxShardTransfers)
+	}
+
+	cfg = deriveErasureCodingWorkerConfig(map[string]*plugin_pb.ConfigValue{
+		"max_shard_transfers": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 4}},
+	})
+	if cfg.TaskConfig.MaxShardTransfers == nil || *cfg.TaskConfig.MaxShardTransfers != 4 {
+		t.Fatalf("4: got %v, want 4", cfg.TaskConfig.MaxShardTransfers)
+	}
+
+	cfg = deriveErasureCodingWorkerConfig(map[string]*plugin_pb.ConfigValue{
+		"max_shard_transfers": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: -3}},
+	})
+	if cfg.TaskConfig.MaxShardTransfers == nil || *cfg.TaskConfig.MaxShardTransfers != 0 {
+		t.Fatalf("negative: got %v, want 0", cfg.TaskConfig.MaxShardTransfers)
+	}
+
+	cfg = deriveErasureCodingWorkerConfig(map[string]*plugin_pb.ConfigValue{
+		"max_shard_transfers": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: math.MaxInt32 + 1}},
+	})
+	if cfg.TaskConfig.MaxShardTransfers == nil || *cfg.TaskConfig.MaxShardTransfers != math.MaxInt32 {
+		t.Fatalf("above int32: got %v, want clamp to %d", cfg.TaskConfig.MaxShardTransfers, int64(math.MaxInt32))
+	}
 }
 
 func TestBuildErasureCodingProposal(t *testing.T) {
@@ -246,6 +298,60 @@ func TestEmitErasureCodingDetectionDecisionTraceNoTasks(t *testing.T) {
 	}
 	if !strings.Contains(sender.events[1].Message, "ERASURE CODING: Volume 20: size=0.0MB") {
 		t.Fatalf("unexpected first detail message: %q", sender.events[1].Message)
+	}
+}
+
+func TestErasureCodingDescriptorExposesFreeSlotsDeadband(t *testing.T) {
+	descriptor := NewErasureCodingHandler(nil, "").Descriptor()
+	if descriptor == nil || descriptor.WorkerConfigForm == nil {
+		t.Fatalf("expected worker config form in descriptor")
+	}
+	if descriptor.DescriptorVersion != 1 {
+		t.Fatalf("descriptor version = %d, want 1", descriptor.DescriptorVersion)
+	}
+	if !workerConfigFormHasField(descriptor.WorkerConfigForm, "free_slots_deadband") {
+		t.Fatal("worker config form omitted free_slots_deadband")
+	}
+	var sectionID, prev string
+	for _, section := range descriptor.WorkerConfigForm.Sections {
+		if section == nil {
+			continue
+		}
+		for _, field := range section.Fields {
+			if field != nil && field.Name == "free_slots_deadband" {
+				sectionID = section.SectionId
+				if field.Label != "Free Volume Deadband (M)" {
+					t.Fatalf("free_slots_deadband label = %q, want Free Volume Deadband (M)", field.Label)
+				}
+			}
+			if field != nil && field.Name == "replica_placement" {
+				prev = section.SectionId
+			}
+		}
+	}
+	if sectionID != "placement" {
+		t.Fatalf("free_slots_deadband section = %q, want placement", sectionID)
+	}
+	if !workerConfigFormHasField(descriptor.WorkerConfigForm, "max_shard_transfers") {
+		t.Fatal("worker config form omitted max_shard_transfers")
+	}
+	if _, ok := descriptor.WorkerConfigForm.DefaultValues["max_shard_transfers"]; ok {
+		t.Fatal("max_shard_transfers default would collapse unset into 0")
+	}
+	if _, ok := descriptor.WorkerDefaultValues["max_shard_transfers"]; ok {
+		t.Fatal("worker default max_shard_transfers would collapse unset into 0")
+	}
+	if prev != "placement" {
+		t.Fatalf("replica_placement section = %q, want placement next to free_slots_deadband", prev)
+	}
+	for _, section := range descriptor.WorkerConfigForm.Sections {
+		if section != nil && section.SectionId == "thresholds" {
+			for _, field := range section.Fields {
+				if field != nil && field.Name == "free_slots_deadband" {
+					t.Fatal("free_slots_deadband must not sit under Detection Thresholds")
+				}
+			}
+		}
 	}
 }
 

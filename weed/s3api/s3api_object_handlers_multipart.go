@@ -40,6 +40,12 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Reject before the auto-create check so a refused upload cannot leave a bucket behind
+	if errCode := ValidateRequestEncryption(r.Header); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
 	// Check if bucket exists, and create it if it doesn't (auto-create bucket)
 	if err := s3a.checkBucket(r, bucket); err == s3err.ErrNoSuchBucket {
 		// Auto-create bucket if it doesn't exist (requires Admin permission)
@@ -89,6 +95,15 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 			s3err.WriteErrorResponse(w, r, s3err.ErrMalformedDate)
 			return
 		}
+	}
+
+	// An explicit ACL on initiate applies to the completed object and requires
+	// s3:PutObjectAcl, same as PUT. The validated grants ride on the upload
+	// entry so CompleteMultipartUpload cannot be handed forged internal headers.
+	r, aclCode := s3a.preparePutObjectACL(r, bucket)
+	if aclCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, aclCode)
+		return
 	}
 
 	createMultipartUploadInput := &s3.CreateMultipartUploadInput{
@@ -245,10 +260,16 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	prefix, keyMarker, uploadIDMarker, delimiter, maxUploads, encodingType := getBucketMultipartResources(r.URL.Query())
+	prefix, multipartKeyMarker, uploadIDMarker, delimiter, maxUploads, encodingType := getBucketMultipartResources(r.URL.Query())
 	if maxUploads < 0 {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidMaxUploads)
 		return
+	}
+	// The decode mirrors the response encoding: under encoding-type=url the
+	// markers go out url-escaped, otherwise they carry the token form.
+	keyMarker := decodeListContinuationToken(multipartKeyMarker)
+	if encodingType == s3.EncodingTypeUrl {
+		keyMarker = decodeEscapedEcho(multipartKeyMarker, true, urlQueryEscape)
 	}
 	if keyMarker != "" {
 		// Marker not common with prefix is not implemented.
@@ -274,8 +295,6 @@ func (s3a *S3ApiServer) ListMultipartUploadsHandler(w http.ResponseWriter, r *ht
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
-
-	// TODO handle encodingType
 
 	writeSuccessResponseXML(w, r, response)
 }
@@ -328,6 +347,12 @@ func (s3a *S3ApiServer) ListObjectPartsHandler(w http.ResponseWriter, r *http.Re
 // PutObjectPartHandler - Put an object part in a multipart upload.
 func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Request) {
 	bucket, object := s3_constants.GetBucketAndObject(r)
+	if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
+		// Well-formed copy sources are claimed by the CopyObjectPart route; what
+		// is left here has no "bucket/key" form and is not a plain PutObjectPart.
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidArgument)
+		return
+	}
 	_, err := validateContentMd5(r.Header)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidDigest)
@@ -350,16 +375,8 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 
 	partIDString := r.URL.Query().Get("partNumber")
 	partID, err := strconv.Atoi(partIDString)
-	if err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
-		return
-	}
-	if partID > s3_constants.MaxS3MultipartParts {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
-		return
-	}
-	if partID < 1 {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidPart)
+	if err != nil || partID < 1 || partID > s3_constants.MaxS3MultipartParts {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidArgument)
 		return
 	}
 

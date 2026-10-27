@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/mux"
 	iamlib "github.com/seaweedfs/seaweedfs/weed/iam"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/stretchr/testify/require"
 )
 
@@ -225,5 +226,85 @@ func TestObjectLockActionsRoundTrip(t *testing.T) {
 				t.Errorf("MapToIdentitiesAction(%q) = %q, want %q", tc.identityAction, got, tc.policyAction)
 			}
 		})
+	}
+}
+
+// Anonymous misses must not disclose bucket or key existence: 404 is only
+// served when anonymous listing is allowed.
+func TestAnonymousBucketListAuthorization(t *testing.T) {
+	s3a := &S3ApiServer{iam: &IdentityAccessManagement{}, bucketConfigCache: NewBucketConfigCache(time.Minute)}
+	s3a.bucketConfigCache.Set("open", &BucketConfig{Name: "open", IsPublicRead: true})
+	s3a.bucketConfigCache.Set("private", &BucketConfig{Name: "private"})
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8333/open/key", nil)
+	if got := s3a.authorizeAnonymousBucketList(req, "open"); got != s3err.ErrNone {
+		t.Errorf("listable bucket: %v, want ErrNone", got)
+	}
+	if got := s3a.authorizeAnonymousBucketList(req, "private"); got != s3err.ErrAccessDenied {
+		t.Errorf("private bucket: %v, want AccessDenied", got)
+	}
+}
+
+// Internal Seaweed-X-Amz-* headers carry server-validated object lock values
+// into entry metadata; client-supplied ones must be dropped on entry or the
+// dedicated-permission check on x-amz-object-lock-* is bypassed.
+func TestInternalObjectLockHeadersStrippedOnAuth(t *testing.T) {
+	iam := newTestIAM()
+
+	internal := []string{
+		s3_constants.ExtObjectLockModeKey,
+		s3_constants.ExtRetentionUntilDateKey,
+		s3_constants.ExtLegalHoldKey,
+		s3_constants.ExtVersionIdKey,
+		s3_constants.SeaweedFSSSEKMSBaseIVHeader,
+		s3_constants.SeaweedFSSSES3BaseIVHeader,
+		s3_constants.SeaweedFSSSES3KeyDataHeader,
+	}
+	req := httptest.NewRequest(http.MethodPut, "http://localhost:8333/worm/doc.txt", nil)
+	for _, k := range internal {
+		req.Header.Set(k, "injected")
+	}
+	require.NoError(t, signRawHTTPRequest(context.Background(), req,
+		"AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "us-east-1"))
+
+	_, _, _ = iam.authenticateRequestInternal(req)
+
+	for _, k := range internal {
+		if got := req.Header.Get(k); got != "" {
+			t.Errorf("client-supplied %s survived authentication: %q", k, got)
+		}
+	}
+}
+
+// With IAM disabled the Auth wrapper calls the handler directly; internal
+// headers must still be stripped so they never reach putToFiler.
+func TestInternalHeadersStrippedWithoutAuth(t *testing.T) {
+	iam := &IdentityAccessManagement{}
+
+	internal := []string{
+		s3_constants.ExtObjectLockModeKey,
+		s3_constants.ExtRetentionUntilDateKey,
+		s3_constants.ExtLegalHoldKey,
+		s3_constants.ExtVersionIdKey,
+		s3_constants.SeaweedFSSSEKMSBaseIVHeader,
+		s3_constants.SeaweedFSSSES3BaseIVHeader,
+		s3_constants.SeaweedFSSSES3KeyDataHeader,
+	}
+	var leaked []string
+	handler := iam.Auth(func(w http.ResponseWriter, r *http.Request) {
+		for _, k := range internal {
+			if v := r.Header.Get(k); v != "" {
+				leaked = append(leaked, k)
+			}
+		}
+	}, s3_constants.ACTION_WRITE)
+
+	req := httptest.NewRequest(http.MethodPut, "http://localhost:8333/worm/doc.txt", nil)
+	for _, k := range internal {
+		req.Header.Set(k, "injected")
+	}
+	handler(httptest.NewRecorder(), req)
+	if len(leaked) > 0 {
+		t.Errorf("client-supplied internal headers reached handler with auth disabled: %v", leaked)
 	}
 }

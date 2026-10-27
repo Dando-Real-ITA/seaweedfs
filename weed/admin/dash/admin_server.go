@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/seaweedfs/seaweedfs/weed/admin/maintenance"
 	adminplugin "github.com/seaweedfs/seaweedfs/weed/admin/plugin"
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -1155,6 +1156,7 @@ func (s *AdminServer) SetBucketLifecycle(bucketName string, rules []BucketLifecy
 		bucketPath := filerConfig.BucketsPath + "/" + bucketName
 		resp, err := client.ObjectTransaction(context.Background(), &filer_pb.ObjectTransactionRequest{
 			LockKey:   bucketPath,
+			RequestId: uuid.NewString(),
 			RouteKey:  s3_constants.ObjectWriteRouteKeyPrefix + bucketPath,
 			Mutations: []*filer_pb.ObjectMutation{bucketLifecycleMutation(filerConfig.BucketsPath, bucketName, lifecycleXML)},
 		})
@@ -1638,6 +1640,14 @@ func (s *AdminServer) StartWorkerGrpcServer(bindIp string, grpcPort int, listene
 // grpc.admin mTLS credentials, not just whether they were configured.
 func (s *AdminServer) WorkerGrpcMTLSEnabled() bool {
 	return s.workerGrpcServer != nil && s.workerGrpcServer.mtlsEnabled
+}
+
+// ServeWorkerGrpcOn serves the worker gRPC API on an additional already-bound
+// listener, e.g. a legacy compat port kept for backward compatibility.
+func (s *AdminServer) ServeWorkerGrpcOn(listener net.Listener) {
+	if s.workerGrpcServer != nil {
+		s.workerGrpcServer.ServeOn(listener)
+	}
 }
 
 // StopWorkerGrpcServer stops the worker gRPC server

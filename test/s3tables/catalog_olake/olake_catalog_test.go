@@ -275,7 +275,7 @@ func (env *TestEnvironment) StartSeaweedFS(t *testing.T) {
 		t.Fatalf("Failed to create IAM config: %v", err)
 	}
 
-	cmd := exec.Command(env.weedBinary, "mini",
+	miniArgs := append([]string{"mini",
 		"-master.port", fmt.Sprintf("%d", env.masterPort),
 		"-master.port.grpc", fmt.Sprintf("%d", env.masterGrpcPort),
 		"-volume.port", fmt.Sprintf("%d", env.volumePort),
@@ -292,7 +292,9 @@ func (env *TestEnvironment) StartSeaweedFS(t *testing.T) {
 		"-ip", env.bindIP,
 		"-ip.bind", "0.0.0.0",
 		"-dir", env.dataDir,
-	)
+	}, testutil.MiniAdminArgs(testutil.MustFreeMiniPort(t, "admin"))...)
+	miniArgs = append(miniArgs, "-webdav=false", "-s3.port.lance=0")
+	cmd := exec.Command(env.weedBinary, miniArgs...)
 	cmd.Dir = env.dataDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -376,8 +378,8 @@ func (env *TestEnvironment) execSQL(t *testing.T, sqlText string) {
 // writeOLakeConfigs writes the source and destination configs. The destination
 // is the point of this test: nothing in it is SeaweedFS-specific. catalog_type
 // is the generic "rest", auth is the standard OAuth2 client-credentials flow,
-// and path-style access is not even set here because OLake turns it on by
-// itself whenever s3_endpoint is non-empty.
+// and path-style access is set explicitly here; OLake also turns it on by
+// itself whenever s3_endpoint is non-empty, so either form works.
 func (env *TestEnvironment) writeOLakeConfigs(t *testing.T) {
 	t.Helper()
 

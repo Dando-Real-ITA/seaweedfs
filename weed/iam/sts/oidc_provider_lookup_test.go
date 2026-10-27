@@ -11,8 +11,8 @@ import (
 // lookupOIDCProviderForAccount; the lookup never calls Authenticate.
 type stubIdentityProvider struct{ name string }
 
-func (s *stubIdentityProvider) Name() string                       { return s.name }
-func (s *stubIdentityProvider) Initialize(interface{}) error       { return nil }
+func (s *stubIdentityProvider) Name() string                 { return s.name }
+func (s *stubIdentityProvider) Initialize(interface{}) error { return nil }
 func (s *stubIdentityProvider) Authenticate(context.Context, string) (*providers.ExternalIdentity, error) {
 	return nil, nil
 }

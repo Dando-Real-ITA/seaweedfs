@@ -48,7 +48,7 @@ func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSo
 		now := time.Now().UnixNano()
 		glog.V(0).Infof("remote sync %s progressed to %v %0.2f/sec", *option.filerAddress, time.Unix(0, offsetTsNs), float64(counter)/(float64(now-lastLogTsNs)/1e9))
 		lastLogTsNs = now
-		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, offsetTsNs)
+		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, resumeTsNsFor(processor))
 	})
 
 	option.clientEpoch++
@@ -65,7 +65,7 @@ func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSo
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
 		GetResumeTsNs: func() int64 {
-			return processor.processedTsWatermark.Load()
+			return resumeTsNsFor(processor)
 		},
 		Resubscribe: processor.ResubscribeCh(),
 	}
@@ -214,9 +214,15 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 		}
 		if filer_pb.IsCreate(resp) {
 			if message.NewParentPath == option.bucketsDir {
+				if isSystemPath(message.NewParentPath, message.NewEntry.Name) {
+					return nil
+				}
 				return handleCreateBucket(message.NewEntry)
 			}
 			if isMultipartUploadFile(message.NewParentPath, message.NewEntry.Name) {
+				return nil
+			}
+			if isSystemPath(message.NewParentPath, message.NewEntry.Name) {
 				return nil
 			}
 			// Propagate delete markers as deletions on the remote.
@@ -248,9 +254,9 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			if err != nil {
 				return err
 			}
-			glog.V(2).Infof("create: %+v", resp)
+			glog.V(2).Infof("create: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 			if !shouldSendToRemote(message.NewEntry) {
-				glog.V(2).Infof("skipping creating: %+v", resp)
+				glog.V(2).Infof("skipping creating: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 				return nil
 			}
 			// Rewrite internal versioning paths to the original S3 key
@@ -287,13 +293,23 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 		if filer_pb.IsDelete(resp) {
+			if filer.IsMetadataOnlyDelete(message.OldEntry) {
+				glog.V(2).Infof("skipping remote delete of metadata-only delete: %s/%s", resp.Directory, message.OldEntry.Name)
+				return nil
+			}
 			if resp.Directory == option.bucketsDir {
+				if isSystemPath(resp.Directory, message.OldEntry.Name) {
+					return nil
+				}
 				return handleDeleteBucket(message.OldEntry)
 			}
 			// Skip deletion of internal version files; individual version
 			// deletes should not propagate to the remote object
 			if isVersionedPath(resp.Directory, message.OldEntry.Name, message.OldEntry.IsDirectory) {
 				glog.V(2).Infof("skipping delete of internal version path: %s/%s", resp.Directory, message.OldEntry.Name)
+				return nil
+			}
+			if isSystemPath(resp.Directory, message.OldEntry.Name) {
 				return nil
 			}
 			bucket, remoteStorageMountLocation, remoteStorage, ok := option.detectBucketInfo(resp.Directory)
@@ -304,7 +320,7 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			if err != nil {
 				return err
 			}
-			glog.V(2).Infof("delete: %+v", resp)
+			glog.V(2).Infof("delete: %s/%s ts_ns=%d", resp.Directory, message.GetOldEntry().GetName(), resp.TsNs)
 			dest := toRemoteStorageLocation(bucket, util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
 			if message.OldEntry.IsDirectory {
 				glog.V(0).Infof("rmdir  %s", remote_storage.FormatLocation(dest))
@@ -317,6 +333,9 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			if resp.Directory == option.bucketsDir {
 				if message.NewParentPath == option.bucketsDir {
 					if message.OldEntry.Name == message.NewEntry.Name {
+						return nil
+					}
+					if isSystemPath(resp.Directory, message.OldEntry.Name) || isSystemPath(message.NewParentPath, message.NewEntry.Name) {
 						return nil
 					}
 					if err := handleCreateBucket(message.NewEntry); err != nil {
@@ -335,11 +354,14 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 				glog.V(2).Infof("skipping update of internal version path: %s/%s", message.NewParentPath, message.NewEntry.Name)
 				return nil
 			}
+			if isSystemPath(message.NewParentPath, message.NewEntry.Name) {
+				return nil
+			}
 			oldBucket, oldRemoteStorageMountLocation, oldRemoteStorage, oldOk := option.detectBucketInfo(resp.Directory)
 			newBucket, newRemoteStorageMountLocation, newRemoteStorage, newOk := option.detectBucketInfo(message.NewParentPath)
 			if oldOk && newOk {
 				if !shouldSendToRemote(message.NewEntry) {
-					glog.V(2).Infof("skipping updating: %+v", resp)
+					glog.V(2).Infof("skipping updating: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 					return nil
 				}
 				client, err := remote_storage.GetRemoteStorage(oldRemoteStorage)
@@ -353,9 +375,24 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 						return nil
 					}
 					if message.OldEntry.RemoteEntry != nil && filer.IsSameData(message.OldEntry, message.NewEntry) {
-						glog.V(2).Infof("update meta: %+v", resp)
+						glog.V(2).Infof("update meta: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 						oldDest := toRemoteStorageLocation(oldBucket, util.NewFullPath(resp.Directory, message.OldEntry.Name), oldRemoteStorageMountLocation)
-						return client.UpdateFileMetadata(oldDest, message.OldEntry, message.NewEntry)
+						updated, err := client.UpdateFileMetadata(oldDest, message.OldEntry, message.NewEntry)
+						if err != nil {
+							return err
+						}
+						remoteEntry := message.NewEntry.RemoteEntry
+						if remoteEntry == nil {
+							remoteEntry = message.OldEntry.RemoteEntry
+						}
+						// the metadata write can rewrite the object (S3 copies
+						// it in place for a Content-Encoding change, minting a
+						// new ETag): restamp from the object the update
+						// produced when the backend reports it
+						if updated != nil {
+							remoteEntry = updated
+						}
+						return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 					} else {
 						newDest := toRemoteStorageLocation(newBucket, util.NewFullPath(message.NewParentPath, message.NewEntry.Name), newRemoteStorageMountLocation)
 						remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewParentPath, message.NewEntry, newDest)
@@ -388,7 +425,7 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			}
 			if newOk {
 				if !shouldSendToRemote(message.NewEntry) {
-					glog.V(2).Infof("skipping updating: %+v", resp)
+					glog.V(2).Infof("skipping updating: %s/%s ts_ns=%d", filer_pb.MetadataEventTargetDirectory(resp), message.GetNewEntry().GetName(), resp.TsNs)
 					return nil
 				}
 				client, err := remote_storage.GetRemoteStorage(newRemoteStorage)

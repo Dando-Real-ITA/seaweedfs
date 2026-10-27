@@ -43,7 +43,12 @@ type Volume struct {
 
 	super_block.SuperBlock
 
-	dataFileAccessLock   sync.RWMutex
+	dataFileAccessLock sync.RWMutex
+	// Serializes a data-file mutation with the sync that makes it durable:
+	// write, delete, lifecycle and compaction paths hold it for their whole
+	// critical section, while the fsync itself runs with dataFileAccessLock
+	// released so readers of this volume do not wait on it.
+	dataFileSyncLock     sync.Mutex
 	superBlockAccessLock sync.Mutex
 
 	// The batch worker exists only once the volume takes a durable write. Most
@@ -54,8 +59,12 @@ type Volume struct {
 	asyncRequestsChan chan *needle.AsyncRequest
 	asyncWorkerClosed bool
 
-	lastModifiedTsSeconds uint64 // unix time in seconds
-	lastAppendAtNs        uint64 // unix time in nanoseconds
+	lastModifiedTsSeconds    uint64         // unix time in seconds
+	lastAppendAtNs           uint64         // unix time in nanoseconds
+	lastWriteAppendAtNs      uint64         // AppendAtNs of the newest write; tombstones don't move it
+	lastWriteNeedleKey       types.NeedleId // the write behind the watermark
+	lastWriteDeleted         bool           // that write was deleted, so recovery has to rescan
+	keepLastModifiedTsOnLoad bool
 
 	lastCompactIndexOffset uint64
 	lastCompactRevision    uint16
@@ -125,6 +134,8 @@ func (v *Volume) FileName(ext string) (fileName string) {
 // gone. A no-op when the index already lives in newIdxDir. A derived .ldb is
 // not moved: the reload rebuilds it in newIdxDir from the .idx.
 func (v *Volume) RelocateIndexTo(newIdxDir string) error {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
@@ -177,6 +188,35 @@ func (v *Volume) Version() needle.Version {
 	return v.SuperBlock.Version
 }
 
+// UpdateReplicaPlacement records rp in the live volume — the in-memory .vif
+// copy and the superblock — and rewrites the .dat header when the data file
+// is local. Keeps a mounted volume consistent with the .vif the caller just
+// configured on disk, so heartbeats and later compactions report and rewrite
+// the same placement.
+func (v *Volume) UpdateReplicaPlacement(rp *super_block.ReplicaPlacement) error {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
+	v.superBlockAccessLock.Lock()
+	defer v.superBlockAccessLock.Unlock()
+	v.volumeInfoRWLock.Lock()
+	defer v.volumeInfoRWLock.Unlock()
+
+	v.SuperBlock.ReplicaPlacement = rp
+	if v.volumeInfo != nil {
+		v.volumeInfo.Replication = rp.String()
+	}
+	diskFile, ok := v.DataBackend.(*backend.DiskFile)
+	if !ok {
+		return nil // remote-tiered: the .vif carries the placement
+	}
+	if _, err := diskFile.WriteAt(v.SuperBlock.Bytes(), 0); err != nil {
+		return fmt.Errorf("volume %d failed to write superblock: %v", v.Id, err)
+	}
+	return diskFile.Sync()
+}
+
 func (v *Volume) FileStat() (datSize uint64, idxSize uint64, modTime time.Time) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
@@ -191,6 +231,22 @@ func (v *Volume) FileStat() (datSize uint64, idxSize uint64, modTime time.Time) 
 	}
 	glog.V(0).Infof("Failed to read file size %s %v", v.DataBackend.Name(), e)
 	return // -1 causes integer overflow and the volume to become unwritable.
+}
+
+// datAllocatedSize returns the disk space held by the .dat file, or 0 when it is unknown.
+func (v *Volume) datAllocatedSize() uint64 {
+	v.dataFileAccessLock.RLock()
+	defer v.dataFileAccessLock.RUnlock()
+
+	df, ok := v.DataBackend.(*backend.DiskFile)
+	if !ok {
+		return 0
+	}
+	fi, err := df.File.Stat()
+	if err != nil {
+		return 0
+	}
+	return AllocatedSize(fi)
 }
 
 func (v *Volume) ContentSize() uint64 {
@@ -286,32 +342,41 @@ func (v *Volume) DiskType() types.DiskType {
 }
 
 func (v *Volume) SyncToDisk() {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
-	if v.nm != nil {
-		if err := v.nm.Sync(); err != nil {
+	// Flush with the access lock dropped so readers are not stalled by the
+	// fsync; writers and file swaps stay excluded by dataFileSyncLock.
+	nm, backend := v.nm, v.DataBackend
+	v.dataFileAccessLock.Unlock()
+	if nm != nil {
+		if err := nm.Sync(); err != nil {
 			glog.Warningf("Volume Close fail to sync volume idx %d", v.Id)
 		}
 	}
-	if v.DataBackend != nil {
-		if err := v.DataBackend.Sync(); err != nil {
+	if backend != nil {
+		if err := backend.Sync(); err != nil {
 			glog.Warningf("Volume Close fail to sync volume %d", v.Id)
 		}
 	}
+	v.dataFileAccessLock.Lock()
 }
 
 // Close cleanly shuts down this volume
 func (v *Volume) Close() {
 	// Wait for any in-progress compaction to finish and claim the flag so no
 	// new compaction can start. This must happen BEFORE acquiring
-	// dataFileAccessLock to avoid deadlocking with CommitCompact which holds
-	// the flag while waiting for the lock.
+	// dataFileSyncLock and dataFileAccessLock to avoid deadlocking with
+	// CommitCompact which holds the flag while waiting for the locks.
 	for !v.isCompactionInProgress.CompareAndSwap(false, true) {
 		time.Sleep(521 * time.Millisecond)
 		glog.Warningf("Volume Close wait for compaction %d", v.Id)
 	}
 	defer v.isCompactionInProgress.Store(false)
 
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
@@ -327,6 +392,8 @@ func (v *Volume) Close() {
 // stale-false flag would make doDeleteRequest skip the new .dat's tombstones and
 // disable the phantom-.dat guard.
 func (v *Volume) SwapDataBackend(newBackend backend.BackendStorageFile, hasRemoteFile bool) {
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 	v.swapDataBackendLocked(newBackend, hasRemoteFile)

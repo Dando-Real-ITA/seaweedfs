@@ -13,6 +13,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/viant/ptrie"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -116,6 +117,16 @@ func (c *FileChunk) GetFileIdString() string {
 	return ""
 }
 
+// FileIdsString lists chunks by file id only, for logging that must not print
+// per-chunk fields like CipherKey.
+func FileIdsString(chunks []*FileChunk) []string {
+	fileIds := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		fileIds = append(fileIds, chunk.GetFileIdString())
+	}
+	return fileIds
+}
+
 func BeforeEntrySerialization(chunks []*FileChunk) {
 
 	for _, chunk := range chunks {
@@ -210,7 +221,18 @@ func UpdateEntryWithResponse(ctx context.Context, client SeaweedFilerClient, req
 func LookupEntry(ctx context.Context, client SeaweedFilerClient, request *LookupDirectoryEntryRequest) (*LookupDirectoryEntryResponse, error) {
 	resp, err := client.LookupDirectoryEntry(ctx, request)
 	if err != nil {
-		if err == ErrNotFound || strings.Contains(err.Error(), ErrNotFound.Error()) {
+		if err == ErrNotFound {
+			return nil, ErrNotFound
+		}
+		// The filer converts its own miss to codes.NotFound; a raw sentinel
+		// crossing gRPC arrives as codes.Unknown carrying only its text. The
+		// same text on any other status is a failed read, not a miss.
+		if st, ok := util.ServerStatus(err); ok {
+			if st.Code() == codes.NotFound ||
+				(st.Code() == codes.Unknown && strings.Contains(st.Message(), ErrNotFound.Error())) {
+				return nil, ErrNotFound
+			}
+		} else if strings.Contains(err.Error(), ErrNotFound.Error()) {
 			return nil, ErrNotFound
 		}
 		glog.V(3).InfofCtx(ctx, "read %s/%v: %v", request.Directory, request.Name, err)
@@ -235,6 +257,7 @@ var (
 	ErrExistingIsFile      = errors.New("existing entry is a file")
 	ErrEntryAlreadyExists  = errors.New("entry already exists")
 	ErrReadOnly            = errors.New("read only")
+	ErrPreconditionFailed  = errors.New("precondition failed")
 )
 
 // FilerErrorToSentinel maps a proto FilerError code to its sentinel error.
@@ -253,6 +276,8 @@ func FilerErrorToSentinel(code FilerError) error {
 		return ErrEntryAlreadyExists
 	case FilerError_READ_ONLY:
 		return ErrReadOnly
+	case FilerError_PRECONDITION_FAILED:
+		return ErrPreconditionFailed
 	default:
 		return nil
 	}

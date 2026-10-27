@@ -45,10 +45,11 @@ type VendedCredentials struct {
 }
 
 // CredentialVendor mints credentials limited to a single table's prefix for a
-// caller the catalog has already authenticated and authorized. A nil result with
-// no error means the deployment has vending switched off.
+// caller the catalog has already authenticated and authorized, read-only when
+// readOnly is set. A nil result with no error means the deployment has vending
+// switched off.
 type CredentialVendor interface {
-	VendTableCredentials(ctx context.Context, principal, bucket, prefix string) (*VendedCredentials, error)
+	VendTableCredentials(ctx context.Context, principal, bucket, prefix string, readOnly bool) (*VendedCredentials, error)
 }
 
 // Server implements the Lance Namespace REST spec.
@@ -176,9 +177,11 @@ func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
 		// different error that clients cannot act on.
 		// The auth scheme is case-insensitive (RFC 7235).
 		if strings.HasPrefix(strings.ToLower(r.Header.Get("Authorization")), "bearer ") {
-			if identityName, identity, ok := s.authenticateBearer(r); ok {
+			if identityName, identity, accessKey, secretKey, ok := s.authenticateBearerKey(r); ok {
 				ctx := r.Context()
 				ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
+				ctx = s3_constants.SetAccessKeyIdInContext(ctx, accessKey)
+				ctx = s3_constants.SetStoredAccessKeyIdInContext(ctx, accessKey, secretKey)
 				if identity != nil {
 					ctx = s3_constants.SetIdentityInContext(ctx, identity)
 				}
@@ -193,8 +196,11 @@ func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
 
 		if apiKey := r.Header.Get("x-api-key"); apiKey != "" {
 			if identityName, identity, ok := s.authenticateApiKey(apiKey); ok {
+				accessKey, secretKey, _ := strings.Cut(apiKey, ":")
 				ctx := r.Context()
 				ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
+				ctx = s3_constants.SetAccessKeyIdInContext(ctx, accessKey)
+				ctx = s3_constants.SetStoredAccessKeyIdInContext(ctx, accessKey, secretKey)
 				if identity != nil {
 					ctx = s3_constants.SetIdentityInContext(ctx, identity)
 				}
@@ -211,6 +217,9 @@ func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// The verifier records the key of the credential that matched into
+		// this holder; the vended credentials name it.
+		r = s3_constants.EnsureIdentityHolder(r)
 		identityName, identity, errCode := s.authenticator.AuthenticateRequest(r)
 		if errCode != s3err.ErrNone {
 			apiErr := s3err.GetAPIError(errCode)

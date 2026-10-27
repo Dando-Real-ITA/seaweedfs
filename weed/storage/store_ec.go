@@ -89,6 +89,14 @@ func (s *Store) FindEcShardTargetLocation(collection string, vid needle.VolumeId
 	)
 	for _, loc := range s.Locations {
 		owned := ownedEcShardCount(loc, vid, shardIds)
+		if loc.readOnlyMount {
+			// A read-only owner still owns the shard: placing another copy
+			// on a writable sibling would register it on two disks.
+			if owned > 0 {
+				return nil
+			}
+			continue
+		}
 		freeCount := ecFreeShardCount(loc, dataShardCount)
 		if owned == 0 {
 			if loc.isDiskSpaceLow.Load() {
@@ -304,6 +312,7 @@ func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId er
 				DiskId:      uint32(diskId),
 				EncodeTsNs:  ecVolume.EncodeTsNs,
 			}
+			s.UpdateMaxVolumeIdSeen(vid)
 			return nil
 		}
 		if errors.Is(err, os.ErrNotExist) {
@@ -567,7 +576,7 @@ const ecIntervalReadConcurrency = 8
 
 func (s *Store) readEcShardIntervals(needleId types.NeedleId, ecVolume *erasure_coding.EcVolume, intervals []erasure_coding.Interval) (data []byte, is_deleted bool, err error) {
 	if err = s.cachedLookupEcShardLocations(ecVolume); err != nil {
-		return nil, false, fmt.Errorf("failed to locate shard via master grpc %s: %v", s.MasterAddress, err)
+		return nil, false, fmt.Errorf("failed to locate shard via master grpc %s: %v", s.masterAddress(), err)
 	}
 
 	var totalSize int
@@ -720,7 +729,7 @@ func (s *Store) cachedLookupEcShardLocations(ecVolume *erasure_coding.EcVolume) 
 
 	glog.V(3).Infof("lookup and cache ec volume %d locations", ecVolume.VolumeId)
 
-	err = operation.WithMasterServerClient(context.Background(), false, s.MasterAddress, s.grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+	err = operation.WithMasterServerClient(context.Background(), false, s.masterAddress(), s.grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 		req := &master_pb.LookupEcVolumeRequest{
 			VolumeId: uint32(ecVolume.VolumeId),
 		}

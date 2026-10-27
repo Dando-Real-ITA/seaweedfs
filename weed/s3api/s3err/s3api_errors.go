@@ -99,6 +99,7 @@ const (
 	ErrPolicyTooLarge
 	ErrMissingSignHeadersTag
 	ErrMissingSignTag
+	ErrAuthorizationHeaderMalformed
 	ErrUnsignedHeaders
 	ErrInvalidQueryParams
 	ErrInvalidQuerySignatureAlgo
@@ -114,6 +115,7 @@ const (
 	ErrRequestTimeTooSkewed
 	ErrMissingDateHeader
 	ErrInvalidRequest
+	ErrInvalidArgument
 	ErrAuthNotSetup
 	ErrNotImplemented
 	ErrPreconditionFailed
@@ -141,6 +143,8 @@ const (
 	ErrSSECustomerKeyMissing
 	ErrSSECustomerKeyNotNeeded
 	ErrSSEEncryptionTypeMismatch
+	ErrInvalidEncryptionMethod
+	ErrIncompatibleEncryptionMethod
 
 	// SSE-KMS related errors
 	ErrKMSKeyNotFound
@@ -178,6 +182,7 @@ const (
 
 // Error message constants for checksum validation
 const (
+	ErrMsgContentSha256Mismatch     = "the provided 'x-amz-content-sha256' header does not match what was computed"
 	ErrMsgPayloadChecksumMismatch   = "payload checksum does not match"
 	ErrMsgChunkSignatureMismatch    = "chunk signature does not match"
 	ErrMsgChecksumAlgorithmMismatch = "checksum algorithm mismatch"
@@ -483,8 +488,13 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrMissingSignTag: {
-		Code:           "AccessDenied",
+		Code:           "AuthorizationHeaderMalformed",
 		Description:    "Signature header missing Signature field.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAuthorizationHeaderMalformed: {
+		Code:           "AuthorizationHeaderMalformed",
+		Description:    "The authorization header is malformed.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
@@ -561,11 +571,16 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrMissingDateHeader: {
 		Code:           "AccessDenied",
 		Description:    "AWS authentication requires a valid Date or x-amz-date header",
-		HTTPStatusCode: http.StatusBadRequest,
+		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrInvalidRequest: {
 		Code:           "InvalidRequest",
 		Description:    "Invalid Request",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidArgument: {
+		Code:           "InvalidArgument",
+		Description:    "Invalid Argument",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrAccessControlListNotSupported: {
@@ -614,12 +629,12 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		HTTPStatusCode: http.StatusConflict,
 	},
 	ErrTooManyRequest: {
-		Code:           "ErrTooManyRequest",
+		Code:           "SlowDown",
 		Description:    "Too many simultaneous request count",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrRequestBytesExceed: {
-		Code:           "ErrRequestBytesExceed",
+		Code:           "SlowDown",
 		Description:    "Simultaneous request bytes exceed limitations",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
@@ -674,6 +689,16 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrSSEEncryptionTypeMismatch: {
 		Code:           "InvalidRequest",
 		Description:    "The encryption method specified in the request does not match the encryption method used to encrypt the object.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidEncryptionMethod: {
+		Code:           "InvalidArgument",
+		Description:    "The encryption method specified is not supported",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrIncompatibleEncryptionMethod: {
+		Code:           "InvalidArgument",
+		Description:    "Server Side Encryption with Customer provided key is incompatible with the encryption method specified",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 

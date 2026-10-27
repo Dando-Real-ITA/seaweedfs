@@ -82,6 +82,8 @@ AWS_ACCESS_KEY_ID=admin AWS_SECRET_ACCESS_KEY=secret \
 
 The same process also runs the master, a volume server, the filer, WebDAV, the Iceberg REST catalog, and the Admin UI. Add `S3_TABLE_BUCKET=warehouse` to also create an Iceberg table bucket, or `warehouse:LANCE` for a Lance one. Drop the AWS keys to run without authentication for development.
 
+Without Admin authentication or mTLS, `weed mini` binds the Admin UI/API and its worker gRPC control plane to loopback rather than `-ip.bind`. Set `WEED_ADMIN_PASSWORD` or configure `https.admin` mTLS to keep the network bind. Remote workers must opt in with `-admin.worker.ip=<address>` and should configure `grpc.admin` mTLS. `-admin.allowInsecureBind` restores the legacy unauthenticated network bind and should only be used on an isolated network.
+
 > macOS: if the binary is quarantined, run `xattr -d com.apple.quarantine ./weed` first.
 
 `weed mini` is auto-tuned for one node and is fine for single-node production, such as an S3 gateway that issues presigned URLs. See [Quick Start with weed mini][WeedMini].
@@ -223,7 +225,7 @@ The full operation list is in [Amazon S3 API][AmazonS3API], and [Supported APIs 
 
 SeaweedFS is a lakehouse in one system. [S3 Table Buckets][S3TableBucket] hold Apache Iceberg tables by default, or [Lance][LanceCatalog] tables for vectors and multimodal data, and the built-in [Iceberg REST Catalog][IcebergCatalog] and Lance namespace serve them directly. There is no Hive Metastore, Glue, or separate catalog service to deploy, secure, and back up.
 
-* Query engines operate on the same tables at the same time: [Spark][SparkIceberg], [Trino][TrinoIceberg], [Dremio][DremioIceberg], [DuckDB][DuckDBIceberg], [Apache Doris][DorisIceberg], [RisingWave][RisingWaveIceberg], ClickHouse, and [LanceDB][LanceDB]. Catalog commits are atomic compare-and-swap, so concurrent writers are safe. [Lakekeeper][Lakekeeper] can front the same storage with STS-vended credentials.
+* Query engines operate on the same tables at the same time: [Spark][SparkIceberg], [Trino][TrinoIceberg], [Dremio][DremioIceberg], [DuckDB][DuckDBIceberg], [Apache Doris][DorisIceberg], [RisingWave][RisingWaveIceberg], ClickHouse, and [LanceDB][LanceDB]. Catalog commits are atomic compare-and-swap, so concurrent writers are safe. [Lakekeeper][Lakekeeper] can front the same storage with STS-vended credentials. [OLake Go][OLake] is a high-performance, open-source EL (Extract–Load) platform that bridges operational databases and open lakehouse storage - writing Apache Iceberg tables or Parquet files on Amazon S3.
 * [Automated table maintenance][IcebergMaintenance]: compaction, snapshot expiration, orphan file removal, and manifest rewriting, configured per bucket or table through the S3 Tables maintenance APIs, and the same for [Lance][LanceMaintenance].
 * IAM at the bucket, namespace, and table level with standard bucket policies, see [S3 Tables Security][S3TablesSecurity].
 * A [Hadoop compatible file system][Hadoop] for Spark, Flink, and HBase.
@@ -485,6 +487,7 @@ Your support will be really appreciated by me and other supporters!
 [RisingWaveIceberg]: https://github.com/seaweedfs/seaweedfs/wiki/RisingWave-Iceberg-Integration
 [LanceDB]: https://github.com/seaweedfs/seaweedfs/wiki/LanceDB-Integration
 [Lakekeeper]: https://github.com/seaweedfs/seaweedfs/wiki/Lakekeeper-Iceberg-Integration
+[OLake]: https://github.com/seaweedfs/seaweedfs/wiki/OLake-Go-Iceberg-Integration
 [IcebergMaintenance]: https://github.com/seaweedfs/seaweedfs/wiki/Iceberg-Table-Maintenance
 [LanceMaintenance]: https://github.com/seaweedfs/seaweedfs/wiki/Lance-Maintenance-Worker
 [S3TablesSecurity]: https://github.com/seaweedfs/seaweedfs/wiki/S3-Tables-Security

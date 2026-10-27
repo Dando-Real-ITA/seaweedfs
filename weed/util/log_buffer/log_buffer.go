@@ -195,13 +195,17 @@ type LogBuffer struct {
 	// Notified only when a flush lands, for readers that cannot act on an append
 	flushSubscribers map[string]*subscription
 	isStopping       *atomic.Bool
-	shutdownCh       chan struct{}  // closed by ShutdownLogBuffer to wake blocked subscribers
-	loopsDone        sync.WaitGroup // loopFlush and loopInterval signal exit
-	isAllFlushed     bool
-	flushChan        chan *dataToFlush
-	flushBudget      *flushBudget
-	flushSeq         uint64     // seal counter, assigned under the write lock
-	writeMu          sync.Mutex // serializes sealing and enqueueing, including shutdown
+	shutdownCh       chan struct{} // closed by ShutdownLogBuffer to wake blocked subscribers
+	// flushDroppedBytes counts bytes the flushFn gave up on during shutdown.
+	// loopFlush reads it after each window so an abandoned flush does not
+	// advance the flushed watermark or wake subscribers as if it had landed.
+	flushDroppedBytes atomic.Int64
+	loopsDone         sync.WaitGroup // loopFlush and loopInterval signal exit
+	isAllFlushed      bool
+	flushChan         chan *dataToFlush
+	flushBudget       *flushBudget
+	flushSeq          uint64     // seal counter, assigned under the write lock
+	writeMu           sync.Mutex // serializes sealing and enqueueing, including shutdown
 	// Offset range tracking for Kafka integration
 	hasOffsets bool
 	// Disk chunk cache for historical data reads
@@ -554,6 +558,14 @@ func (logBuffer *LogBuffer) AddLogEntryToBuffer(logEntry *filer_pb.LogEntry) err
 }
 
 func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processingTsNs int64) error {
+	_, err := logBuffer.AddDataToBufferAndGetTs(partitionKey, data, processingTsNs)
+	return err
+}
+
+// AddDataToBufferAndGetTs appends like AddDataToBuffer and returns the
+// position the entry was assigned, bumped past processingTsNs when the
+// buffer must stay monotone.
+func (logBuffer *LogBuffer) AddDataToBufferAndGetTs(partitionKey, data []byte, processingTsNs int64) (int64, error) {
 
 	// An entry this large gets a window to itself, so it will seal and copy one;
 	// wait for the queue to have room before joining the queue for the lock.
@@ -578,7 +590,7 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	}
 
 	if !logBuffer.beginWrite() {
-		return ErrBufferStopped
+		return 0, ErrBufferStopped
 	}
 	var toFlush *dataToFlush
 	var marshalErr error
@@ -649,7 +661,7 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 			if size < 0 || size > math.MaxInt-4 || size > maxBufferSize-4 {
 				marshalErr = fmt.Errorf("message size %d exceeds maximum allowed size", size)
 				glog.Errorf("%v", marshalErr)
-				return marshalErr
+				return 0, marshalErr
 			}
 			// Fit the entry exactly. Doubling left room for a second oversized
 			// record in the same window, which only doubles the flush copy and
@@ -665,7 +677,7 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	if _, err := logEntry.MarshalToSizedBufferVT(logBuffer.buf[logBuffer.pos+4 : logBuffer.pos+4+size]); err != nil {
 		marshalErr = fmt.Errorf("failed to marshal LogEntry: %w", err)
 		glog.Errorf("%v", marshalErr)
-		return marshalErr
+		return 0, marshalErr
 	}
 	logBuffer.idx = append(logBuffer.idx, logBuffer.pos)
 	util.Uint32toBytes(logBuffer.sizeBuf, uint32(size))
@@ -680,7 +692,7 @@ func (logBuffer *LogBuffer) AddDataToBuffer(partitionKey, data []byte, processin
 	}
 
 	logBuffer.offset++
-	return nil
+	return logEntry.TsNs, nil
 }
 
 func (logBuffer *LogBuffer) IsStopping() bool {
@@ -755,6 +767,14 @@ func (logBuffer *LogBuffer) WaitForShutdown() {
 	logBuffer.loopsDone.Wait()
 }
 
+// NoteFlushDropped records that the flush function abandoned n bytes instead
+// of writing them (a shutdown-bounded retry giving up). loopFlush then skips
+// the watermark advance and subscriber notifications for that window, so no
+// reader is told the bytes were flushed when they were not.
+func (logBuffer *LogBuffer) NoteFlushDropped(n int) {
+	logBuffer.flushDroppedBytes.Add(int64(n))
+}
+
 // IsAllFlushed returns true if all data in the buffer has been flushed, after calling ShutdownLogBuffer().
 func (logBuffer *LogBuffer) IsAllFlushed() bool {
 	return logBuffer.isAllFlushed
@@ -775,8 +795,16 @@ func (logBuffer *LogBuffer) loopFlush() {
 			break // shutdown sentinel
 		}
 		logBuffer.flushFn(logBuffer, d.startTime, d.stopTime, d.data, d.minOffset, d.maxOffset)
+		dropped := logBuffer.flushDroppedBytes.Swap(0)
 		d.releaseMemory()
 		logBuffer.flushBudget.release(d.budget)
+		if dropped > 0 {
+			glog.Warningf("log buffer %s: shutdown flush dropped %d bytes", logBuffer.name, dropped)
+			if d.done != nil {
+				close(d.done)
+			}
+			continue
+		}
 		// local logbuffer is different from aggregate logbuffer here
 		if d.maxOffset >= 0 {
 			logBuffer.lastFlushedOffset.Store(d.maxOffset)

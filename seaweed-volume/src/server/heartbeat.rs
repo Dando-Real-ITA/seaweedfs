@@ -155,7 +155,11 @@ pub async fn run_heartbeat_with_state(
                 }
                 PostAction::SleepPulse => {
                     new_leader = None;
-                    tokio::time::sleep(pulse).await;
+                    // The lookup spends part of the retry delay rather than
+                    // adding to it.
+                    let retry_at = tokio::time::Instant::now() + pulse;
+                    refresh_leader_from_peers(&config, &state, pulse).await;
+                    tokio::time::sleep_until(retry_at).await;
                 }
             }
 
@@ -254,8 +258,54 @@ pub async fn try_get_master_configuration(
     Ok(resp.into_inner())
 }
 
+/// Publish the leader the configured masters report, so lookups stop going
+/// to the master the heartbeat just lost while the loop retries. Without an
+/// answer inside `timeout` the published master is cleared: the lost master
+/// is dead or no longer leader, and a follower answers lookups from its own
+/// cache rather than refusing them. Mirrors Go's refreshLeaderFromPeers.
+async fn refresh_leader_from_peers(
+    config: &HeartbeatConfig,
+    state: &Arc<VolumeServerState>,
+    timeout: Duration,
+) {
+    let lookup = lookup_leader_from_peers(
+        &config.master_addresses,
+        state.outgoing_grpc_tls.as_ref(),
+    );
+    match tokio::time::timeout(timeout, lookup).await {
+        Ok(Some(leader)) => publish_current_master(state, &leader).await,
+        _ => state.current_master_url.write().await.clear(),
+    }
+}
+
+/// Ask each seed master for the raft leader and return the first answer, or
+/// None when none replies with one. Mirrors Go's
+/// `operation.LookupRaftLeaderMaster`.
+pub async fn lookup_leader_from_peers(
+    master_addrs: &[String],
+    tls: Option<&super::grpc_client::OutgoingGrpcTlsConfig>,
+) -> Option<String> {
+    for master_addr in master_addrs {
+        let grpc_addr = to_grpc_address(master_addr);
+        if let Ok(resp) = try_get_master_configuration(&grpc_addr, tls).await
+            && !resp.leader.is_empty()
+        {
+            return Some(resp.leader);
+        }
+    }
+    None
+}
+
 fn is_stopping(state: &VolumeServerState) -> bool {
     *state.is_stopping.read().unwrap()
+}
+
+/// Store the master lookups should go to, in the address form it was
+/// announced in — `host:port` or `host:port.grpcPort` — so an explicit gRPC
+/// port survives to the gRPC callers, mirroring Go's setCurrentMaster.
+/// The heartbeat calls this only for a master known to lead.
+async fn publish_current_master(state: &Arc<VolumeServerState>, master: &str) {
+    *state.current_master_url.write().await = master.to_string();
 }
 
 fn duplicate_uuid_retry_delay(retry_count: u32) -> Duration {
@@ -430,14 +480,6 @@ async fn do_heartbeat(
     let mut response_stream = client.send_heartbeat(stream).await?.into_inner();
 
     info!("Heartbeat stream established with {}", grpc_addr);
-    // Publish the master we're now talking to in canonical http host:port
-    // form so Ping admission can recognise it once a leader change moves us
-    // off the seed list. Mirrors Go's vs.setCurrentMaster(masterAddress).
-    {
-        let normalised = super::volume_server::to_http_address(current_master).into_owned();
-        let mut guard = state.current_master_url.write().await;
-        *guard = normalised;
-    }
     if is_stopping(state) {
         state.is_heartbeating.store(false, Ordering::Relaxed);
         send_deregister_heartbeat(config, state, &tx).await;
@@ -451,13 +493,31 @@ async fn do_heartbeat(
     volume_tick.tick().await;
     ec_tick.tick().await;
 
+    let mut confirmed_leader = false;
     loop {
         tokio::select! {
             resp = response_stream.message() => {
                 match resp {
                     Ok(Some(hb_resp)) => {
-                        // Match Go ordering: DuplicatedUuids first, then volume
-                        // options, then leader redirect.
+                        // A reply names the leader or comes from it, so it
+                        // settles where lookups go before anything else on the
+                        // reply is handled: a follower reply carries no other
+                        // fields, and a leader stays the lookup target even
+                        // when it rejects this registration. Mirrors Go.
+                        if !hb_resp.leader.is_empty() {
+                            if super::volume_server::to_http_address(current_master)
+                                != super::volume_server::to_http_address(&hb_resp.leader)
+                            {
+                                publish_current_master(state, &hb_resp.leader).await;
+                                return Ok(Some(hb_resp.leader));
+                            }
+                        } else if !confirmed_leader {
+                            // The leader answers every new stream without
+                            // naming a leader, so this peer is the one lookups
+                            // go to.
+                            confirmed_leader = true;
+                            publish_current_master(state, current_master).await;
+                        }
                         if !hb_resp.duplicated_uuids.is_empty() {
                             let uuids = hb_resp.duplicated_uuids.clone();
                             let duplicate_dirs = off_runtime(config, state, move |_, state| {
@@ -474,6 +534,14 @@ async fn do_heartbeat(
                             )
                             .into());
                         }
+                        let echo_max_volume_id = hb_resp.max_volume_id;
+                        let echo_topology_id = hb_resp.topology_id.clone();
+                        off_runtime(config, state, move |_, state| {
+                            let store = state.store.read().unwrap();
+                            store.update_max_volume_id_seen(echo_max_volume_id);
+                            store.update_last_seen_topology_id(&echo_topology_id);
+                        })
+                        .await?;
                         let options_changed =
                             volume_options_pass(config, state, &hb_resp).await?;
                         if options_changed && maybe_adjust_volume_max(config, state).await? {
@@ -493,11 +561,6 @@ async fn do_heartbeat(
                         );
                         if metrics_changed {
                             state.metrics_notify.notify_waiters();
-                        }
-                        // Match Go: only redirect if leader is non-empty AND
-                        // different from the current master we're connected to.
-                        if !hb_resp.leader.is_empty() && current_master != hb_resp.leader {
-                            return Ok(Some(hb_resp.leader));
                         }
                     }
                     Ok(None) => return Ok(None),
@@ -966,7 +1029,7 @@ fn apply_volume_actions_to(store: &mut Store, actions: VolumeActions) {
         if let Some(vol) = store
             .locations
             .get_mut(disk_id)
-            .and_then(|loc| loc.find_volume_mut(vid))
+            .and_then(|loc| loc.find_volume(vid))
             && vol.should_quarantine()
         {
             vol.set_no_write_or_delete(true);
@@ -1127,7 +1190,7 @@ fn build_heartbeat_with_ec_status(
     for (disk_id, loc) in store.locations.iter().enumerate() {
         let disk_type_str = loc.disk_type.to_string();
         let mut effective_max_count = loc.max_volume_count.load(Ordering::Relaxed);
-        if loc.is_disk_space_low.load(Ordering::Relaxed) {
+        if loc.is_disk_space_low.load(Ordering::Relaxed) || loc.read_only_mount {
             let used_slots = loc.volumes_len() as i32
                 + loc
                     .ec_shard_count()
@@ -1207,10 +1270,10 @@ fn build_heartbeat_with_ec_status(
                     deleted_byte_count: vol.deleted_size(),
                     read_only: vol.is_read_only(),
                     read_only_can_delete: vol.is_no_write_can_delete(),
-                    replica_placement: vol.super_block.replica_placement.to_byte() as u32,
-                    version: vol.super_block.version.0 as u32,
-                    ttl: vol.super_block.ttl.to_u32(),
-                    compact_revision: vol.super_block.compaction_revision as u32,
+                    replica_placement: vol.super_block().replica_placement.to_byte() as u32,
+                    version: vol.super_block().version.0 as u32,
+                    ttl: vol.super_block().ttl.to_u32(),
+                    compact_revision: vol.super_block().compaction_revision as u32,
                     // The .dat mtime, as Go reports: the shell's quiet-period
                     // gates read this as "last touched", which a delete has to
                     // count towards even though the TTL clock ignores it.
@@ -1360,6 +1423,8 @@ fn build_heartbeat_with_ec_status(
         grpc_port: config.grpc_port as u32,
         location_uuids,
         disk_tags,
+        max_volume_id_seen: store.max_volume_id_seen(),
+        last_seen_topology_id: store.last_seen_topology_id(),
         ..Default::default()
     };
     (heartbeat, volumes, actions)
@@ -1485,6 +1550,8 @@ mod tests {
             rack: String::new(),
             file_size_limit_bytes: 0,
             maintenance_byte_per_second: 0,
+            vacuum_commit_slots: None,
+            vacuum_commits_waiting: std::sync::atomic::AtomicU32::new(0),
             is_heartbeating: std::sync::atomic::AtomicBool::new(false),
             has_master: true,
             pre_stop_seconds: 0,
@@ -1876,7 +1943,7 @@ mod tests {
             .store(true, Ordering::Relaxed);
 
         {
-            let (_, volume) = store.find_volume_mut(VolumeId(17)).unwrap();
+            let (_, volume) = store.find_volume(VolumeId(17)).unwrap();
             volume.set_read_only().unwrap();
             volume
                 .update_remote_files(|files| files.push(Default::default()))
@@ -1975,7 +2042,7 @@ mod tests {
             )
             .unwrap();
         {
-            let (_, volume) = store.find_volume_mut(VolumeId(21)).unwrap();
+            let (_, volume) = store.find_volume(VolumeId(21)).unwrap();
             volume.set_read_only().unwrap();
         }
 
@@ -2153,7 +2220,7 @@ mod tests {
             )
             .unwrap();
         let dat_path = {
-            let (_, volume) = store.find_volume_mut(VolumeId(41)).unwrap();
+            let (_, volume) = store.find_volume(VolumeId(41)).unwrap();
             volume.set_last_io_error_for_test(None);
             volume.set_last_modified_ts_for_test(
                 SystemTime::now()
@@ -2207,7 +2274,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let (_, volume) = store.find_volume_mut(VolumeId(51)).unwrap();
+        let (_, volume) = store.find_volume(VolumeId(51)).unwrap();
         volume.set_last_io_error_for_test(Some("input/output error"));
 
         let heartbeat = build_heartbeat(&test_config(), &mut store);
@@ -2217,7 +2284,7 @@ mod tests {
         // advertised to the master.
         assert!(heartbeat.volumes.is_empty());
         assert!(store.has_volume(VolumeId(51)));
-        let (_, volume) = store.find_volume_mut(VolumeId(51)).unwrap();
+        let (_, volume) = store.find_volume(VolumeId(51)).unwrap();
         assert!(volume.is_no_write_or_delete());
     }
 
@@ -2513,7 +2580,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let (_, volume) = store.find_volume_mut(VolumeId(id)).unwrap();
+            let (_, volume) = store.find_volume(VolumeId(id)).unwrap();
             volume.set_last_io_error_for_test(None);
             volume.set_last_modified_ts_for_test(now.saturating_sub(60 * 60));
             std::fs::OpenOptions::new()
@@ -2533,7 +2600,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let (_, volume) = store.find_volume_mut(VolumeId(64)).unwrap();
+        let (_, volume) = store.find_volume(VolumeId(64)).unwrap();
         volume.set_last_io_error_for_test(Some("input/output error"));
 
         let (heartbeat, _, actions) =
@@ -2785,7 +2852,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let (_, volume) = store.find_volume_mut(VolumeId(71)).unwrap();
+        let (_, volume) = store.find_volume(VolumeId(71)).unwrap();
         volume
             .update_remote_files(|files| {
                 files.push(crate::storage::volume::PbRemoteFile {

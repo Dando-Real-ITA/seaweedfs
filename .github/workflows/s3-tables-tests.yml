@@ -12,6 +12,10 @@ on:
       - 'go.sum'
       - '.github/workflows/s3-tables-tests.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
+
 permissions:
   contents: read
 
@@ -19,17 +23,21 @@ permissions:
 jobs:
   s3-tables-tests:
     name: S3 Tables Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Run go mod tidy
@@ -48,7 +56,8 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          # A stale FUSE mount can hang or fail df; keep diagnostics best effort.
+          timeout 15 df -h || true
           echo "=== Starting S3 Tables Tests ==="
           
           # Run S3 Tables integration tests
@@ -79,17 +88,21 @@ jobs:
 
   iceberg-catalog-tests:
     name: Iceberg Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -109,7 +122,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting Iceberg Catalog Tests ==="
           
           # Run Iceberg catalog integration tests using Makefile (handles build)
@@ -140,17 +153,21 @@ jobs:
 
   trino-iceberg-catalog-tests:
     name: Trino Iceberg Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -179,7 +196,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting Trino Iceberg Catalog Tests ==="
           
           # Run Trino + Iceberg catalog integration tests
@@ -210,17 +227,21 @@ jobs:
 
   dremio-iceberg-catalog-tests:
     name: Dremio Iceberg Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -250,7 +271,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting Dremio Iceberg Catalog Tests ==="
 
@@ -283,17 +304,21 @@ jobs:
 
   doris-iceberg-catalog-tests:
     name: Doris Iceberg Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -323,7 +348,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting Doris Iceberg Catalog Tests ==="
 
@@ -356,7 +381,7 @@ jobs:
 
   clickhouse-iceberg-catalog-tests:
     name: ClickHouse Iceberg Catalog Integration Tests (${{ matrix.tag }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -373,10 +398,14 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -408,7 +437,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting ClickHouse Iceberg Catalog Tests ==="
 
@@ -441,7 +470,7 @@ jobs:
 
   olake-iceberg-catalog-tests:
     name: OLake Iceberg Catalog Integration Tests (${{ matrix.tag }})
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -460,10 +489,14 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -496,7 +529,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting OLake Iceberg Catalog Tests ==="
 
@@ -552,17 +585,21 @@ jobs:
 
   polaris-integration-tests:
     name: Polaris Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Run go mod tidy
@@ -590,7 +627,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting Polaris Tests ==="
 
           go test -v -timeout 20m ./test/s3tables/polaris 2>&1 | tee test/s3tables/polaris/test-output.log || {
@@ -620,17 +657,21 @@ jobs:
 
   spark-iceberg-catalog-tests:
     name: Spark Iceberg Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -659,7 +700,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting Spark Iceberg Catalog Tests ==="
           
           # Run Spark + Iceberg catalog integration tests
@@ -690,17 +731,21 @@ jobs:
 
   risingwave-catalog-tests:
     name: RisingWave Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -730,7 +775,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting RisingWave Catalog Tests ==="
           
           # Run RisingWave catalog integration tests
@@ -761,17 +806,21 @@ jobs:
 
   sts-integration-tests:
     name: STS Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -785,6 +834,7 @@ jobs:
 
       - name: Restore python:3 image cache
         id: python-image
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v6
         with:
           path: /tmp/python3-image.tar
@@ -824,7 +874,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting STS Integration Tests ==="
           
           # Run STS integration tests
@@ -855,17 +905,21 @@ jobs:
 
   lakekeeper-integration-tests:
     name: Lakekeeper Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Run go mod tidy
@@ -884,7 +938,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           echo "=== Starting Lakekeeper Integration Tests ==="
           
           # Run Lakekeeper integration tests
@@ -915,17 +969,21 @@ jobs:
 
   unity-catalog-integration-tests:
     name: Unity Catalog Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -955,7 +1013,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting Unity Catalog Tests ==="
 
@@ -988,17 +1046,21 @@ jobs:
 
   lancedb-namespace-tests:
     name: LanceDB Namespace Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -1027,7 +1089,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting LanceDB Namespace Tests ==="
 
@@ -1058,7 +1120,7 @@ jobs:
 
   table-lifecycle-tests:
     name: Table Lifecycle Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
 
     steps:
@@ -1069,6 +1131,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -1126,7 +1189,7 @@ jobs:
 
   duckdb-lance-tests:
     name: DuckDB Lance Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -1137,10 +1200,14 @@ jobs:
           # so do not leave a token in the checkout for it to pick up.
           persist-credentials: false
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -1170,7 +1237,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting DuckDB Lance Tests ==="
 
@@ -1201,7 +1268,7 @@ jobs:
 
   spark-lance-namespace-tests:
     name: Spark Lance Namespace Integration Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
 
     steps:
@@ -1212,10 +1279,14 @@ jobs:
           # so do not leave a token in the checkout for it to pick up.
           persist-credentials: false
 
+      - name: Clean up stale FUSE mounts
+        uses: ./.github/actions/cleanup-stale-fuse-mounts
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Configure Docker Hub mirror
@@ -1244,7 +1315,7 @@ jobs:
           echo "=== System Information ==="
           uname -a
           free -h
-          df -h
+          timeout 15 df -h || true
           docker info
           echo "=== Starting Spark Lance Namespace Tests ==="
 
@@ -1275,7 +1346,7 @@ jobs:
 
   s3-tables-build-verification:
     name: S3 Tables Build Verification
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     
     steps:
@@ -1286,6 +1357,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Verify S3 Tables Package Builds
@@ -1340,7 +1412,7 @@ jobs:
 
   s3-tables-fmt-check:
     name: S3 Tables Format Check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     
     steps:
@@ -1351,6 +1423,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Check Go Format
@@ -1391,7 +1464,7 @@ jobs:
 
   s3-tables-vet:
     name: S3 Tables Go Vet Check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     
     steps:
@@ -1402,6 +1475,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+          cache: ${{ runner.environment == 'github-hosted' }}
         id: go
 
       - name: Run Go Vet

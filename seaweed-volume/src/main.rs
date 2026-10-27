@@ -23,7 +23,7 @@ use seaweed_volume::server::request_id::GrpcRequestIdLayer;
 use seaweed_volume::server::volume_server::{
     RuntimeMetricsConfig, VolumeServerState, build_metrics_router,
 };
-use seaweed_volume::server::write_queue::WriteQueue;
+use seaweed_volume::server::write_queue::{self, WriteQueue};
 use seaweed_volume::storage::store::Store;
 use seaweed_volume::storage::types::DiskType;
 
@@ -340,6 +340,14 @@ async fn run(
         rack: config.rack.clone(),
         file_size_limit_bytes: config.file_size_limit_bytes,
         maintenance_byte_per_second: config.maintenance_byte_per_second,
+        vacuum_commit_slots: if config.max_parallel_vacuum_commits > 0 {
+            Some(tokio::sync::Semaphore::new(
+                config.max_parallel_vacuum_commits,
+            ))
+        } else {
+            None
+        },
+        vacuum_commits_waiting: std::sync::atomic::AtomicU32::new(0),
         // Go sets isHeartbeating: true unconditionally at startup
         is_heartbeating: std::sync::atomic::AtomicBool::new(true),
         has_master: !config.masters.is_empty(),
@@ -425,12 +433,21 @@ async fn run(
         }
     }
 
-    // Initialize the batched write queue if enabled
-    if config.enable_write_queue {
-        info!("Batched write queue enabled");
-        let wq = WriteQueue::new(state.clone(), 128);
-        let _ = state.write_queue.set(wq);
-    }
+    // The write queue is always on: durable (fsync) uploads go through it so
+    // a batch shares one .dat/.idx sync, the way Go's per-volume async writer
+    // group-commits. Non-fsync writes stay on the synchronous path.
+    let min_bytes = usize::try_from(config.fsync_min_batch_bytes)
+        .map_err(|_| "fsyncMinBatchBytes exceeds this platform's maximum usize value")?;
+    let wq = WriteQueue::new(
+        state.clone(),
+        128,
+        write_queue::SyncBatchOption {
+            min_bytes,
+            min_requests: config.fsync_min_batch_requests,
+            wait: config.fsync_batch_wait,
+        },
+    );
+    let _ = state.write_queue.set(wq);
 
     // Set initial metric gauges for concurrent limits and max volumes
     metrics::CONCURRENT_UPLOAD_LIMIT.set(state.concurrent_upload_limit);

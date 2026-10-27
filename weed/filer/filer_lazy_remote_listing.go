@@ -103,6 +103,10 @@ func (f *Filer) maybeLazyListFromRemote(ctx context.Context, p util.FullPath) {
 		persistCtx := context.WithValue(context.WithoutCancel(ctx), lazyListContextKey{}, true)
 		persistCtx = context.WithValue(persistCtx, lazyFetchContextKey{}, true)
 
+		// Entries listed under p must stay reachable by a walk from the mount
+		// directory, the same reason the lazy fetch fills in missing parents.
+		f.fetchMissingRemoteParents(context.WithoutCancel(ctx), mountDir, p)
+
 		listErr := client.ListDirectory(persistCtx, objectLoc, func(dir string, name string, isDirectory bool, remoteEntry *filer_pb.RemoteEntry) error {
 			childPath := p.Child(name)
 
@@ -132,9 +136,11 @@ func (f *Filer) maybeLazyListFromRemote(ctx context.Context, p util.FullPath) {
 					existingEntry.Attr.FileSize = uint64(remoteEntry.RemoteSize)
 					existingEntry.Extended = MergeRemoteContentEncoding(remoteEntry, existingEntry.Extended)
 				}
+				f.stampEntryCommitTsNs(existingEntry)
 				if saveErr := f.Store.UpdateEntry(persistCtx, existingEntry); saveErr != nil {
 					glog.Warningf("maybeLazyListFromRemote: update %s: %v", childPath, saveErr)
 				}
+				f.releaseEntryCommitTsNs(existingEntry.CommitTsNs)
 			} else {
 				// New entry not yet in local store
 				var entry *Entry
@@ -215,7 +221,7 @@ func (f *Filer) updateDirectoryListingSyncedAt(ctx context.Context, p util.FullP
 			dirEntry.Extended = make(map[string][]byte)
 		}
 		dirEntry.Extended[xattrRemoteListingSyncedAt] = []byte(fmt.Sprintf("%d", syncTime.Unix()))
-		if saveErr := f.CreateEntry(ctx, dirEntry, nil, false, false, nil, true, f.MaxFilenameLength); saveErr != nil {
+		if saveErr := f.CreateEntry(ctx, dirEntry, nil, false, false, nil, false, f.MaxFilenameLength); saveErr != nil {
 			glog.Warningf("maybeLazyListFromRemote: create dir synced_at for %s: %v", p, saveErr)
 		}
 		return
@@ -224,7 +230,9 @@ func (f *Filer) updateDirectoryListingSyncedAt(ctx context.Context, p util.FullP
 		dirEntry.Extended = make(map[string][]byte)
 	}
 	dirEntry.Extended[xattrRemoteListingSyncedAt] = []byte(fmt.Sprintf("%d", syncTime.Unix()))
+	f.stampEntryCommitTsNs(dirEntry)
 	if saveErr := f.Store.UpdateEntry(ctx, dirEntry); saveErr != nil {
 		glog.Warningf("maybeLazyListFromRemote: update synced_at for %s: %v", p, saveErr)
 	}
+	f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 }

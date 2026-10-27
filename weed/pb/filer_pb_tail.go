@@ -120,18 +120,20 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 		}
 
 		handleErr := func(resp *filer_pb.SubscribeMetadataResponse, err error) {
+			sourcePath := filer_pb.MetadataEventSourceFullPath(resp)
+			targetPath := filer_pb.MetadataEventTargetFullPath(resp)
 			switch option.EventErrorType {
 			case TrivialOnError:
-				glog.Errorf("process %v: %v", resp, err)
+				glog.Errorf("process %s -> %s ts_ns=%d: %v", sourcePath, targetPath, resp.TsNs, err)
 			case FatalOnError:
-				glog.Fatalf("process %v: %v", resp, err)
+				glog.Fatalf("process %s -> %s ts_ns=%d: %v", sourcePath, targetPath, resp.TsNs, err)
 			case RetryForeverOnError:
 				waitTime := time.Second
 				for ctx.Err() == nil {
 					if err := processEventFn(resp); err == nil {
 						break
 					} else {
-						glog.Errorf("process %v: %v", resp, err)
+						glog.Errorf("process %s -> %s ts_ns=%d: %v", sourcePath, targetPath, resp.TsNs, err)
 					}
 					select {
 					case <-ctx.Done():
@@ -144,7 +146,7 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 			case DontLogError:
 				// pass
 			default:
-				glog.Errorf("process %v: %v", resp, err)
+				glog.Errorf("process %s -> %s ts_ns=%d: %v", sourcePath, targetPath, resp.TsNs, err)
 			}
 		}
 
@@ -200,11 +202,20 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 				return nil
 			}
 			readFromNs := option.StartTsNs
+			var progressFn func(tsNs int64)
 			if option.GetResumeTsNs != nil {
 				// The resume cursor lives in the processed watermark, so a
 				// resubscribed ref replay must not be filtered by positions the
 				// previous stream had only seen.
 				readFromNs = sinceNs
+			} else {
+				// Checkpoint each settled entry so a dropped stream resumes the
+				// replay where it stopped instead of re-reading the whole set.
+				progressFn = func(tsNs int64) {
+					if tsNs > option.StartTsNs {
+						option.StartTsNs = tsNs
+					}
+				}
 			}
 			lastTs, readErr := ReadLogFileRefs(pendingRefs, option.LogFileReaderFn,
 				readFromNs, option.StopTsNs,
@@ -213,11 +224,13 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 					AdditionalPathPrefixes: option.AdditionalPathPrefixes,
 					DirectoriesToWatch:     option.DirectoriesToWatch,
 				},
-				processEventFn)
+				processEventFn, progressFn)
 			if readErr != nil {
 				return fmt.Errorf("%w: %w", ErrLogFileRead, readErr)
 			}
-			if lastTs > 0 && option.GetResumeTsNs == nil {
+			// lastTs is the last settled entry's own timestamp; never rewind
+			// below the progress checkpoint it may lag.
+			if option.GetResumeTsNs == nil && lastTs > option.StartTsNs {
 				option.StartTsNs = lastTs
 			}
 			pendingRefs = nil
