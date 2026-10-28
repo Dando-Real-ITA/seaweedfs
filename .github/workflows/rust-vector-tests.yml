@@ -112,7 +112,7 @@ jobs:
           echo "PROTOC=$protoc" >> "$GITHUB_ENV"
       - name: Build weed-vector-server
         run: cargo build --release --manifest-path seaweed-vector/Cargo.toml -p weed-vector-server
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install test deps
