@@ -90,6 +90,37 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, entry *filer.Ent
 // etagListMatches reports whether an If-Match or If-None-Match value, "*" or a
 // list of entity tags, matches etag (RFC 9110 13.1.1, 13.1.2). If-Match uses the
 // strong comparison, so a weak tag never matches; If-None-Match the weak one.
+func setDefaultTextCharset(mimeType string) string {
+	if mimeType == "" {
+		return ""
+	}
+
+	mediaType, params, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return mimeType
+	}
+	if _, ok := params["charset"]; ok {
+		return mimeType
+	}
+
+	if strings.HasPrefix(mediaType, "text/") ||
+		mediaType == "application/json" ||
+		mediaType == "application/xml" ||
+		mediaType == "application/javascript" ||
+		mediaType == "application/x-javascript" ||
+		mediaType == "application/ecmascript" ||
+		mediaType == "application/x-ndjson" ||
+		mediaType == "application/vnd.apple.mpegurl" ||
+		mediaType == "application/x-mpegurl" ||
+		mediaType == "audio/mpegurl" ||
+		mediaType == "application/mpegurl" {
+		params["charset"] = "utf-8"
+		return mime.FormatMediaType(mediaType, params)
+	}
+
+	return mimeType
+}
+
 func etagListMatches(header, etag string, weak bool) bool {
 	if strings.TrimSpace(header) == "*" {
 		return true
@@ -205,6 +236,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 	if mimeType == "" && ext != "" {
 		mimeType = mime.TypeByExtension(ext)
 	}
+	mimeType = setDefaultTextCharset(mimeType)
 	if mimeType != "" {
 		w.Header().Set("Content-Type", mimeType)
 	} else {

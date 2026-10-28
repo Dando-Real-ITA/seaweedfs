@@ -73,6 +73,28 @@ func TestWriteJsonNoJSONP(t *testing.T) {
 	}
 }
 
+func TestSetDefaultTextCharset(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "text shellscript", in: "text/x-shellscript", want: "text/x-shellscript; charset=utf-8"},
+		{name: "text csv", in: "text/csv", want: "text/csv; charset=utf-8"},
+		{name: "already has charset", in: "text/plain; charset=iso-8859-1", want: "text/plain; charset=iso-8859-1"},
+		{name: "binary stays binary", in: "application/pdf", want: "application/pdf"},
+		{name: "json gets utf8", in: "application/json", want: "application/json; charset=utf-8"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := setDefaultTextCharset(tt.in); got != tt.want {
+				t.Fatalf("setDefaultTextCharset(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // A POST to a path with a doubled slash must reach the handler at the cleaned,
 // still-decoded path. Without CleanPathHandler, http.ServeMux answers with a
 // redirect whose Location percent-encodes the already-escaped path a second
