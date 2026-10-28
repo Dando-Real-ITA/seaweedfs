@@ -5,12 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/vector_pb"
@@ -36,6 +37,8 @@ import (
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -55,8 +58,6 @@ type S3Options struct {
 	portGrpc                  *int
 	portIceberg               *int
 	portLance                 *int
-	portVectors               *int
-	vectorsGrpc               *string
 	icebergCredentialRole     *string
 	icebergCredentialDuration *int
 	config                    *string
@@ -115,8 +116,6 @@ func init() {
 	s3StandaloneOptions.portGrpc = cmdS3.Flag.Int("port.grpc", 0, "s3 server grpc listen port")
 	s3StandaloneOptions.portIceberg = cmdS3.Flag.Int("port.iceberg", 8181, "Iceberg REST Catalog server listen port (0 to disable)")
 	s3StandaloneOptions.portLance = cmdS3.Flag.Int("port.lance", 9101, "Lance Namespace server listen port (0 to disable); credential vending uses -iceberg.credentialRole")
-	s3StandaloneOptions.portVectors = cmdS3.Flag.Int("port.vectors", 0, "S3 Vectors API server listen port (0 to disable); requires -vectors.grpc")
-	s3StandaloneOptions.vectorsGrpc = cmdS3.Flag.String("vectors.grpc", "", "weed-vector-server gRPC address for the S3 Vectors API")
 	s3StandaloneOptions.icebergCredentialRole = cmdS3.Flag.String("iceberg.credentialRole", "", "IAM role ARN the Iceberg catalog assumes to vend table-scoped credentials (empty disables vending)")
 	s3StandaloneOptions.icebergCredentialDuration = cmdS3.Flag.Int("iceberg.credentialDurationSeconds", 3600, "lifetime of credentials vended by the Iceberg catalog")
 	s3StandaloneOptions.domainName = cmdS3.Flag.String("domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
@@ -440,11 +439,19 @@ func (s3opt *S3Options) startS3Server() bool {
 		}
 	}
 
-	// Start S3 Vectors API server if enabled
-	if s3opt.portVectors != nil && *s3opt.portVectors > 0 {
-		if httpS := s3opt.startVectorsServer(s3ApiServer, grpcDialOption, listenOnLocalhost); httpS != nil {
-			httpServers = append(httpServers, httpS)
-		}
+	// The Vectors API rides the main -port listener whenever a weed-vector
+	// backend is reachable — /s3vectors/ in the SigV4 credential scope picks
+	// the vectors router.
+	vectorsHandler := http.Handler(router)
+	if vectorsRouter := s3opt.vectorsRouter(s3ApiServer, grpcDialOption, masterAddresses); vectorsRouter != nil {
+		vr, mainRouter := vectorsRouter, router
+		vectorsHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isVectorsRequest(r) {
+				vr.ServeHTTP(w, r)
+				return
+			}
+			mainRouter.ServeHTTP(w, r)
+		})
 	}
 
 	if runtime.GOOS != "windows" {
@@ -454,7 +461,8 @@ func (s3opt *S3Options) startS3Server() bool {
 			localSocket = fmt.Sprintf("/tmp/seaweedfs-s3-%d.sock", *s3opt.port)
 		}
 		if s3SocketListener := pb.ListenOnLocalSocket(localSocket); s3SocketListener != nil {
-			socketServer := newHttpServer(router, nil)
+			s3SocketListener = &util.Listener{Listener: s3SocketListener, Timeout: idleTimeoutSeconds(s3opt.idleTimeout)}
+			socketServer := newHttpServer(vectorsHandler, nil)
 			httpServers = append(httpServers, socketServer)
 			go func() {
 				if err := socketServer.Serve(s3SocketListener); err != nil && err != http.ErrServerClosed {
@@ -466,7 +474,7 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.port)
 	s3ApiListener, s3ApiLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.port, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
+		*s3opt.bindIp, *s3opt.port, idleTimeoutSeconds(s3opt.idleTimeout), listenOnLocalhost)
 	if err != nil {
 		glog.Fatalf("S3 API Server listener on %s error: %v", listenAddress, err)
 	}
@@ -507,14 +515,9 @@ func (s3opt *S3Options) startS3Server() bool {
 		}
 		grace.OnInterrupt(certProvider.Close)
 
-		caCertPool := x509.NewCertPool()
-		if *s3opt.tlsCACertificate != "" {
-			// load CA certificate file and add it to list of client CAs
-			caCertFile, err := ioutil.ReadFile(*s3opt.tlsCACertificate)
-			if err != nil {
-				glog.Fatalf("error reading CA certificate: %v", err)
-			}
-			caCertPool.AppendCertsFromPEM(caCertFile)
+		caCertPool, err := loadClientCAPool(*s3opt.tlsCACertificate)
+		if err != nil {
+			glog.Fatalf("%v", err)
 		}
 
 		clientAuth := tls.NoClientCert
@@ -534,7 +537,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		if *s3opt.portHttps == 0 {
 			glog.V(0).Infof("Start Seaweed S3 API Server %s at https port %d", version.Version(), *s3opt.port)
 			if s3ApiLocalListener != nil {
-				localServer := newHttpServer(router, tlsConfig)
+				localServer := newHttpServer(vectorsHandler, tlsConfig)
 				httpServers = append(httpServers, localServer)
 				go func() {
 					if err := localServer.ServeTLS(s3ApiLocalListener, "", ""); err != nil && err != http.ErrServerClosed {
@@ -542,7 +545,7 @@ func (s3opt *S3Options) startS3Server() bool {
 					}
 				}()
 			}
-			httpS := newHttpServer(router, tlsConfig)
+			httpS := newHttpServer(vectorsHandler, tlsConfig)
 			httpServers = append(httpServers, httpS)
 			shutdown := s3opt.newShutdown(stopGrpcServer, s3ApiServer, httpServers)
 			if err = httpS.ServeTLS(s3ApiListener, "", ""); err != nil && err != http.ErrServerClosed {
@@ -553,12 +556,12 @@ func (s3opt *S3Options) startS3Server() bool {
 		} else {
 			glog.V(0).Infof("Start Seaweed S3 API Server %s at https port %d", version.Version(), *s3opt.portHttps)
 			s3ApiListenerHttps, s3ApiLocalListenerHttps, err := util.NewIpAndLocalListeners(
-				*s3opt.bindIp, *s3opt.portHttps, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
+				*s3opt.bindIp, *s3opt.portHttps, idleTimeoutSeconds(s3opt.idleTimeout), listenOnLocalhost)
 			if err != nil {
 				glog.Fatalf("S3 API HTTPS listener on %s:%d error: %v", *s3opt.bindIp, *s3opt.portHttps, err)
 			}
 			if s3ApiLocalListenerHttps != nil {
-				localHttpsServer := newHttpServer(router, tlsConfig)
+				localHttpsServer := newHttpServer(vectorsHandler, tlsConfig)
 				httpServers = append(httpServers, localHttpsServer)
 				go func() {
 					if err := localHttpsServer.ServeTLS(s3ApiLocalListenerHttps, "", ""); err != nil && err != http.ErrServerClosed {
@@ -566,7 +569,7 @@ func (s3opt *S3Options) startS3Server() bool {
 					}
 				}()
 			}
-			httpsServer := newHttpServer(router, tlsConfig)
+			httpsServer := newHttpServer(vectorsHandler, tlsConfig)
 			httpServers = append(httpServers, httpsServer)
 			go func() {
 				if err := httpsServer.ServeTLS(s3ApiListenerHttps, "", ""); err != nil && err != http.ErrServerClosed {
@@ -578,7 +581,7 @@ func (s3opt *S3Options) startS3Server() bool {
 	if *s3opt.tlsPrivateKey == "" || *s3opt.portHttps > 0 {
 		glog.V(0).Infof("Start Seaweed S3 API Server %s at http port %d", version.Version(), *s3opt.port)
 		if s3ApiLocalListener != nil {
-			localServer := newHttpServer(router, nil)
+			localServer := newHttpServer(vectorsHandler, nil)
 			httpServers = append(httpServers, localServer)
 			go func() {
 				if err := localServer.Serve(s3ApiLocalListener); err != nil && err != http.ErrServerClosed {
@@ -586,7 +589,7 @@ func (s3opt *S3Options) startS3Server() bool {
 				}
 			}()
 		}
-		httpS := newHttpServer(router, nil)
+		httpS := newHttpServer(vectorsHandler, nil)
 		httpServers = append(httpServers, httpS)
 		shutdown := s3opt.newShutdown(stopGrpcServer, s3ApiServer, httpServers)
 		if err = httpS.Serve(s3ApiListener); err != nil && err != http.ErrServerClosed {
@@ -635,7 +638,7 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer, liste
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portIceberg)
 	icebergListener, icebergLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.portIceberg, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
+		*s3opt.bindIp, *s3opt.portIceberg, idleTimeoutSeconds(s3opt.idleTimeout), listenOnLocalhost)
 	if err != nil {
 		// The catalog is auxiliary to the S3 gateway; a port conflict must not
 		// take the whole server down.
@@ -681,7 +684,7 @@ func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer, listenO
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portLance)
 	lanceListener, lanceLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.portLance, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
+		*s3opt.bindIp, *s3opt.portLance, idleTimeoutSeconds(s3opt.idleTimeout), listenOnLocalhost)
 	if err != nil {
 		glog.Errorf("Lance Namespace listener on %s error: %v", listenAddress, err)
 		return nil
@@ -706,84 +709,241 @@ func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer, listenO
 	return httpS
 }
 
-// startVectorsServer starts the S3 Vectors API server on a separate port. It
-// fans index and data calls out to the shared VectorService over gRPC; with no
-// -vectors.grpc the API is not served.
-func (s3opt *S3Options) startVectorsServer(s3ApiServer *s3api.S3ApiServer, grpcDialOption grpc.DialOption, listenOnLocalhost bool) *http.Server {
-	if *s3opt.vectorsGrpc == "" {
-		glog.Warningf("port.vectors set without -vectors.grpc; S3 Vectors API disabled")
+// vectorsRouter builds the S3 Vectors API router — workers register to the
+// master and the backend resolves them lazily, so a worker that comes up
+// after the gateway still gets picked up on first query.
+func (s3opt *S3Options) vectorsRouter(s3ApiServer *s3api.S3ApiServer, grpcDialOption grpc.DialOption, masterAddresses []pb.ServerAddress) *mux.Router {
+	if len(masterAddresses) == 0 {
+		glog.Warningf("S3 Vectors API disabled: no weed-vector registered on master")
 		return nil
 	}
-	conn, err := pb.GrpcDial(context.Background(), *s3opt.vectorsGrpc, false, grpcDialOption)
-	if err != nil {
-		glog.Errorf("S3 Vectors: dial %s: %v", *s3opt.vectorsGrpc, err)
-		return nil
-	}
+	backend := &vectorDiscovery{masters: masterAddresses, grpcDialOption: grpcDialOption}
 	vectorsRouter := mux.NewRouter().SkipClean(true)
 
-	vectorsServer := s3vectors.NewServer(s3ApiServer, s3ApiServer, vector_pb.NewVectorServiceClient(conn))
+	vectorsServer := s3vectors.NewServer(s3ApiServer, s3ApiServer, backend)
 	vectorsServer.SetRegion(s3tables.DefaultRegion)
 	vectorsServer.SetAccountID(s3tables.DefaultAccountID)
 	vectorsServer.RegisterRoutes(vectorsRouter)
+	return vectorsRouter
+}
 
-	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portVectors)
-	vectorsListener, vectorsLocalListener, err := util.NewIpAndLocalListeners(
-		*s3opt.bindIp, *s3opt.portVectors, time.Duration(*s3opt.idleTimeout)*time.Second, listenOnLocalhost)
-	if err != nil {
-		glog.Errorf("S3 Vectors listener on %s error: %v", listenAddress, err)
-		conn.Close()
-		return nil
+// vectorDiscovery resolves the currently registered weed-vector through the
+// master and caches the connection; workers joining after gateway startup
+// are picked up on first query.
+type vectorDiscovery struct {
+	masters        []pb.ServerAddress
+	grpcDialOption grpc.DialOption
+	mu             sync.Mutex
+	worker         string
+	conn           *grpc.ClientConn
+	client         vector_pb.VectorServiceClient
+	nextResolve    time.Time
+}
+
+// reset drops the cached worker so the next call rediscovers — invoked on
+// transport errors only, and only when the failed client is still the
+// cached one (a concurrent request may have already re-resolved).
+func (d *vectorDiscovery) reset(c vector_pb.VectorServiceClient) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c != d.client {
+		return
 	}
+	if d.conn != nil {
+		d.conn.Close()
+	}
+	d.worker, d.conn, d.client = "", nil, nil
+	d.nextResolve = time.Time{}
+}
 
-	// Mirror the main API: when TLS is configured the vectors port serves
-	// HTTPS, not a second plaintext endpoint.
-	if *s3opt.tlsPrivateKey != "" {
-		getCert, _, err := security.NewReloadingServerCertificate(*s3opt.tlsCertificate, *s3opt.tlsPrivateKey)
+// Only Unavailable proves a transport failure — a request deadline or an
+// application-level error can fire on a healthy connection.
+func isTransportError(err error) bool {
+	return status.Code(err) == codes.Unavailable
+}
+
+func (d *vectorDiscovery) resolve() (vector_pb.VectorServiceClient, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workers := discoverVectorWorkers(d.masters, d.grpcDialOption)
+	if len(workers) == 0 {
+		return nil, fmt.Errorf("no weed-vector registered on master")
+	}
+	worker := workers[0]
+	for _, w := range workers {
+		if w == d.worker {
+			worker = w
+			break
+		}
+	}
+	if worker != d.worker {
+		if d.conn != nil {
+			d.conn.Close()
+		}
+		conn, err := pb.GrpcDial(context.Background(), worker, false, d.grpcDialOption)
 		if err != nil {
-			glog.Errorf("S3 Vectors: load HTTPS certificate: %v", err)
-			return nil
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if *s3opt.tlsVerifyClientCert {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-		tlsConfig := &tls.Config{GetCertificate: getCert, ClientAuth: clientAuth}
-		if err := security.FixTlsConfig(util.GetViper(), tlsConfig); err != nil {
-			glog.Errorf("S3 Vectors: tls config: %v", err)
-			return nil
-		}
-		httpS := newHttpServer(vectorsRouter, tlsConfig)
-		if vectorsLocalListener != nil {
-			go func() {
-				if err := httpS.ServeTLS(vectorsLocalListener, "", ""); err != nil && err != http.ErrServerClosed {
-					glog.V(0).Infof("S3 Vectors localhost listener error: %v", err)
-				}
-			}()
-		}
-		go func() {
-			if err := httpS.ServeTLS(vectorsListener, "", ""); err != nil && err != http.ErrServerClosed {
-				glog.Errorf("S3 Vectors API Server Fail to serve: %v", err)
-			}
-		}()
-		return httpS
+		d.worker, d.conn = worker, conn
+		d.client = vector_pb.NewVectorServiceClient(conn)
 	}
+	return d.client, nil
+}
 
-	glog.V(0).Infof("Start S3 Vectors API Server at http://%s", listenAddress)
+const vectorResolveInterval = 5 * time.Second
 
-	httpS := newHttpServer(vectorsRouter, nil)
-	if vectorsLocalListener != nil {
-		go func() {
-			if err := httpS.Serve(vectorsLocalListener); err != nil && err != http.ErrServerClosed {
-				glog.V(0).Infof("S3 Vectors localhost listener error: %v", err)
-			}
-		}()
+func (d *vectorDiscovery) cli() (vector_pb.VectorServiceClient, error) {
+	d.mu.Lock()
+	cli := d.client
+	past := !time.Now().Before(d.nextResolve)
+	if cli != nil && !past {
+		d.mu.Unlock()
+		return cli, nil
 	}
-	go func() {
-		if err := httpS.Serve(vectorsListener); err != nil && err != http.ErrServerClosed {
-			glog.Errorf("S3 Vectors API Server Fail to serve: %v", err)
+	if !past && cli == nil {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("no weed-vector registered on master")
+	}
+	d.nextResolve = time.Now().Add(vectorResolveInterval)
+	d.mu.Unlock()
+	return d.resolve()
+}
+
+func (d *vectorDiscovery) CreateIndex(ctx context.Context, in *vector_pb.CreateIndexRequest, opts ...grpc.CallOption) (resp *vector_pb.CreateIndexResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
 		}
-	}()
-	return httpS
+		if resp, err = c.CreateIndex(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+func (d *vectorDiscovery) DropIndex(ctx context.Context, in *vector_pb.DropIndexRequest, opts ...grpc.CallOption) (resp *vector_pb.DropIndexResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
+		}
+		if resp, err = c.DropIndex(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+func (d *vectorDiscovery) PutVectors(ctx context.Context, in *vector_pb.PutVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.PutVectorsResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
+		}
+		if resp, err = c.PutVectors(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+func (d *vectorDiscovery) GetVectors(ctx context.Context, in *vector_pb.GetVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.GetVectorsResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
+		}
+		if resp, err = c.GetVectors(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+func (d *vectorDiscovery) DeleteVectors(ctx context.Context, in *vector_pb.DeleteVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.DeleteVectorsResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
+		}
+		if resp, err = c.DeleteVectors(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+func (d *vectorDiscovery) ListVectors(ctx context.Context, in *vector_pb.ListVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.ListVectorsResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
+		}
+		if resp, err = c.ListVectors(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+func (d *vectorDiscovery) QueryVectors(ctx context.Context, in *vector_pb.QueryVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.QueryVectorsResponse, err error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var c vector_pb.VectorServiceClient
+		if c, err = d.cli(); err != nil {
+			return nil, err
+		}
+		if resp, err = c.QueryVectors(ctx, in, opts...); err == nil {
+			return resp, nil
+		}
+		if !isTransportError(err) {
+			return nil, err
+		}
+		d.reset(c)
+	}
+	return nil, err
+}
+
+// isVectorsRequest routes by the SigV4 credential scope — the s3vectors
+// service name lives there, not in the path.
+func isVectorsRequest(r *http.Request) bool {
+	if v := r.Header.Get("Authorization"); v != "" {
+		return strings.Contains(v, "/s3vectors/")
+	}
+	return strings.Contains(r.URL.Query().Get("X-Amz-Credential"), "/s3vectors/")
+}
+
+func loadClientCAPool(caCertFile string) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if caCertFile == "" {
+		return pool, nil
+	}
+	pem, err := os.ReadFile(caCertFile)
+	if err != nil {
+		return nil, fmt.Errorf("error reading CA certificate: %w", err)
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no valid certificates found in %s", caCertFile)
+	}
+	return pool, nil
 }
 
 // deriveLanceStorageEndpoint picks the endpoint the Lance namespace puts in
@@ -895,4 +1055,40 @@ func (v lanceCredentialVendor) VendTableCredentials(ctx context.Context, princip
 		SessionToken:    credentials.SessionToken,
 		Expiration:      credentials.Expiration,
 	}, nil
+}
+
+// discoverVectorWorker resolves one registered weed-vector server through the
+// master's cluster-nodes list; OSS fans every vector call to that single
+// backend.
+// discoverVectorWorkers returns every registered weed-vector address —
+// callers keep their current worker when it is still listed so
+// membership-order changes cannot churn live connections.
+func discoverVectorWorkers(masters []pb.ServerAddress, grpcDialOption grpc.DialOption) []string {
+	for _, master := range masters {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := pb.GrpcDial(ctx, master.ToGrpcAddress(), false, grpcDialOption)
+		if err != nil {
+			cancel()
+			continue
+		}
+		resp, err := master_pb.NewSeaweedClient(conn).ListClusterNodes(ctx, &master_pb.ListClusterNodesRequest{
+			ClientType: "vector",
+		})
+		conn.Close()
+		cancel()
+		if err != nil {
+			continue
+		}
+		workers := make([]string, 0, len(resp.ClusterNodes))
+		for _, node := range resp.ClusterNodes {
+			glog.V(0).Infof("S3 Vectors: discovered weed-vector at %s via master %s", node.Address, master)
+			workers = append(workers, node.Address)
+		}
+		// A follower can answer with an empty list — workers register with
+		// the leader, so keep looking rather than accept "none."
+		if len(workers) > 0 {
+			return workers
+		}
+	}
+	return nil
 }

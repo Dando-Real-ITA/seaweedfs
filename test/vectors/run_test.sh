@@ -19,16 +19,18 @@ PIDS+=($!)
 
 ./weed s3 \
   -filer 127.0.0.1:8888 \
+  -config s3.json \
   -ip 127.0.0.1 \
   -ip.bind 127.0.0.1 \
   -port 8334 \
-  -port.lance 9102 \
-  -port.vectors 9201 \
-  -vectors.grpc 127.0.0.1:9301 &
+  -port.lance 9102 &
 PIDS+=($!)
 
-./weed-vector-server \
+./weed-vector \
   --namespace http://127.0.0.1:9102 \
+  --masters 127.0.0.1:9333 \
+  --storage-option aws_access_key_id=test \
+  --storage-option aws_secret_access_key=test \
   --listen 127.0.0.1:9301 &
 PIDS+=($!)
 

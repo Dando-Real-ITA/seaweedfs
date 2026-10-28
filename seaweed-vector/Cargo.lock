@@ -6465,6 +6465,7 @@ dependencies = [
  "lance-index",
  "lance-linalg",
  "lance-table",
+ "object_store",
  "roaring",
  "serde",
  "serde_json",
@@ -6472,6 +6473,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "weed-lance-worker",
 ]
 
@@ -6486,6 +6488,7 @@ dependencies = [
  "clap",
  "futures",
  "lance",
+ "lance-arrow",
  "lance-linalg",
  "prost",
  "prost-types",
@@ -6494,6 +6497,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

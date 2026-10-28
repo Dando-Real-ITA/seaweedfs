@@ -9,13 +9,14 @@ description = "VectorService gRPC server over SeaweedFS Lance table buckets"
 name = "weed_vector_server"
 
 [[bin]]
-name = "weed-vector-server"
+name = "weed-vector"
 path = "src/main.rs"
 
 [dependencies]
 weed-vector-core = { path = "../core" }
 weed-lance-worker = { path = "../../../seaweed-worker/crates/lance" }
 lance = { version = "10", default-features = false, features = ["aws"] }
+lance-arrow = "10"
 lance-linalg = "10"
 arrow-array = "58"
 arrow-cast = "58"
@@ -31,6 +32,7 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

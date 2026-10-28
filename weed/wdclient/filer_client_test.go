@@ -1,13 +1,20 @@
 package wdclient
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func newTestFilerClient(addrs ...pb.ServerAddress) *FilerClient {
@@ -274,5 +281,111 @@ func TestOnPeerUpdateRejoinBumpsGeneration(t *testing.T) {
 
 	if got := filerAddressList(fc); len(got) != 1 || got[0] != old {
 		t.Fatalf("rejoined filer was pruned by an in-flight snapshot: %v", got)
+	}
+}
+
+// stallingFiler answers LookupVolume only when the call is abandoned.
+type stallingFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+}
+
+func (s *stallingFiler) LookupVolume(ctx context.Context, _ *filer_pb.LookupVolumeRequest) (*filer_pb.LookupVolumeResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func startStallingFiler(t *testing.T) pb.ServerAddress {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	filer_pb.RegisterSeaweedFilerServer(grpcServer, &stallingFiler{})
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(grpcServer.Stop)
+
+	_, port, _ := net.SplitHostPort(lis.Addr().String())
+	return pb.ServerAddress(fmt.Sprintf("127.0.0.1:0.%s", port))
+}
+
+// lapsedDeadlineCtx mimics the moment after a caller's deadline has passed but
+// before the runtime marks the context done.
+type lapsedDeadlineCtx struct{ context.Context }
+
+func (lapsedDeadlineCtx) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+func (lapsedDeadlineCtx) Done() <-chan struct{}       { return nil }
+func (lapsedDeadlineCtx) Err() error                  { return nil }
+
+// A caller giving up must not count as a filer failure, the filer's own timeout must.
+func TestLookupVolumeIdsCountsOnlyFilerFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		callerCtx    func() (context.Context, context.CancelFunc)
+		grpcTimeout  time.Duration
+		wantErr      error
+		wantFailures int32
+	}{
+		{
+			name: "caller cancelled",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				time.AfterFunc(50*time.Millisecond, cancel)
+				return ctx, cancel
+			},
+			grpcTimeout:  5 * time.Second,
+			wantErr:      context.Canceled,
+			wantFailures: 0,
+		},
+		{
+			name: "caller deadline",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 50*time.Millisecond)
+			},
+			grpcTimeout:  5 * time.Second,
+			wantErr:      context.DeadlineExceeded,
+			wantFailures: 0,
+		},
+		{
+			name: "caller deadline already elapsed",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				return lapsedDeadlineCtx{context.Background()}, func() {}
+			},
+			grpcTimeout:  5 * time.Second,
+			wantErr:      context.DeadlineExceeded,
+			wantFailures: 0,
+		},
+		{
+			name: "filer timeout",
+			callerCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.Background())
+			},
+			grpcTimeout:  50 * time.Millisecond,
+			wantFailures: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fc := newTestFilerClient(startStallingFiler(t))
+			fc.grpcDialOption = grpc.WithTransportCredentials(insecure.NewCredentials())
+			fc.grpcTimeout = tt.grpcTimeout
+			fc.maxRetries = 1
+			fc.failureThreshold = 3
+			fc.resetTimeout = time.Minute
+
+			ctx, cancel := tt.callerCtx()
+			defer cancel()
+			_, err := (&filerVolumeProvider{filerClient: fc}).LookupVolumeIds(ctx, []string{"4"})
+
+			if err == nil {
+				t.Fatal("lookup against a stalling filer succeeded")
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("err = %v, want %v", err, tt.wantErr)
+			}
+			if got := atomic.LoadInt32(&fc.filerHealth[0].failureCount); got != tt.wantFailures {
+				t.Errorf("failureCount = %d, want %d", got, tt.wantFailures)
+			}
+		})
 	}
 }

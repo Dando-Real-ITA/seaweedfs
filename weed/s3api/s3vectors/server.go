@@ -9,6 +9,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/vector_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 )
@@ -24,10 +25,11 @@ type S3Authenticator interface {
 	DefaultAllow() bool
 }
 
-// Server implements the AWS S3 Vectors JSON API.
+// Server implements the AWS S3 Vectors API.
 type Server struct {
 	filerClient   FilerClient
 	tables        *s3tables.Manager
+	internal      *s3tables.Manager
 	vectors       vector_pb.VectorServiceClient
 	authenticator S3Authenticator
 	region        string
@@ -40,9 +42,15 @@ func NewServer(filerClient FilerClient, authenticator S3Authenticator, vectors v
 	if authenticator != nil {
 		manager.SetDefaultAllow(authenticator.DefaultAllow())
 	}
+	// Bookkeeping calls that ride along an operation the catalog already
+	// authorizes — format lookups, the implicit index namespace — must not
+	// demand read grants the API does not require.
+	internal := s3tables.NewManager()
+	internal.SetTrusted(true)
 	return &Server{
 		filerClient:   filerClient,
 		tables:        manager,
+		internal:      internal,
 		vectors:       vectors,
 		authenticator: authenticator,
 	}
@@ -83,12 +91,13 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 // Auth authenticates the caller and puts the identity in the request context.
 func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		identity, _, errCode := s.authenticator.AuthenticateRequest(r)
+		identity, identityObj, errCode := s.authenticator.AuthenticateRequest(r)
 		if errCode != s3err.ErrNone {
 			writeError(w, http.StatusForbidden, "AccessDenied", "authentication failed")
 			return
 		}
-		r = r.WithContext(contextWithIdentity(r.Context(), identity))
+		r = r.WithContext(s3_constants.SetIdentityInContext(
+			contextWithIdentity(r.Context(), identity), identityObj))
 		handler(w, r)
 	}
 }

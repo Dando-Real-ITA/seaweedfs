@@ -42,6 +42,8 @@ fn query_for(vector: Vec<f32>, k: usize) -> Query {
         postfilter: false,
         distance: DistanceType::L2,
         nprobes: Some(4),
+        index_segments: None,
+        fragments: None,
     }
 }
 
@@ -142,9 +144,9 @@ async fn deletes_are_not_returned() {
 /// $WEED_VECTOR_SPIKE_DIR for exercising the `weed-vector` CLI:
 ///
 ///   WEED_VECTOR_SPIKE_DIR=/tmp/vds cargo test make_spike_dataset -- --ignored
-///   weed-vector describe /tmp/vds
-///   weed-vector coverage /tmp/vds
-///   weed-vector query /tmp/vds --vector 0,0,0,0 --k 5
+///   weed-vector-cli describe /tmp/vds
+///   weed-vector-cli coverage /tmp/vds
+///   weed-vector-cli query /tmp/vds --vector 0,0,0,0 --k 5
 #[tokio::test]
 #[ignore]
 async fn make_spike_dataset() {

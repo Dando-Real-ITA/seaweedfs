@@ -68,6 +68,7 @@ type FilerOptions struct {
 	port                      *int
 	portGrpc                  *int
 	publicPort                *int
+	idleTimeout               *int
 	filerGroup                *string
 	collection                *string
 	defaultReplicaPlacement   *string
@@ -107,6 +108,15 @@ type FilerOptions struct {
 	// gracefulStopTimeout caps how long startFiler waits for gRPC graceful
 	// stop before forcing the server to stop. Zero means the default of 15s.
 	gracefulStopTimeout time.Duration
+	// skipEmptyMembershipConfirm forwards to FilerOption: a single-master
+	// weed mini's embedded filer announces on the startup scan instead of
+	// holding registration for the confirm window.
+	skipEmptyMembershipConfirm bool
+	// clusterFreshHint, when non-nil, reports that the embedded master minted
+	// a fresh TopologyId this boot — proof the peer scan's empty result is
+	// final rather than a settling master, so the announce gate can end the
+	// empty-membership confirm early. Used by weed server; nil elsewhere.
+	clusterFreshHint func() bool
 }
 
 func init() {
@@ -119,6 +129,7 @@ func init() {
 	f.port = cmdFiler.Flag.Int("port", 8888, "filer server http listen port")
 	f.portGrpc = cmdFiler.Flag.Int("port.grpc", 0, "filer server grpc listen port")
 	f.publicPort = cmdFiler.Flag.Int("port.readonly", 0, "readonly port opened to public")
+	f.idleTimeout = cmdFiler.Flag.Int("idleTimeout", 10, "connection idle seconds")
 	f.defaultReplicaPlacement = cmdFiler.Flag.String("defaultReplicaPlacement", "", "default replication type. If not specified, use master setting.")
 	f.disableDirListing = cmdFiler.Flag.Bool("disableDirListing", false, "turn off directory listing")
 	f.maxMB = cmdFiler.Flag.Int("maxMB", 4, "split files larger than the limit")
@@ -197,15 +208,18 @@ func init() {
 	filerWebDavOptions.cacheSizeMB = cmdFiler.Flag.Int64("webdav.cacheCapacityMB", 0, "local cache capacity in MB")
 	filerWebDavOptions.maxMB = cmdFiler.Flag.Int("webdav.maxMB", 4, "split files larger than the limit")
 	filerWebDavOptions.filerRootPath = cmdFiler.Flag.String("webdav.filer.path", "/", "use this remote path from filer server")
+	filerWebDavOptions.idleTimeout = cmdFiler.Flag.Int("webdav.idleTimeout", 10, "connection idle seconds")
 
 	// start iam on filer
 	filerStartIam = cmdFiler.Flag.Bool("iam", false, "whether to start IAM service")
 	filerIamOptions.ip = cmdFiler.Flag.String("iam.ip", *f.ip, "iam server http listen ip address")
 	filerIamOptions.port = cmdFiler.Flag.Int("iam.port", 8111, "iam server http listen port")
+	filerIamOptions.idleTimeout = cmdFiler.Flag.Int("iam.idleTimeout", 10, "connection idle seconds")
 	filerIamOptions.selfServiceRequiresGrant = filerS3Options.iamSelfServiceRequiresGrant
 
 	filerStartSftp = cmdFiler.Flag.Bool("sftp", false, "whether to start the SFTP server")
 	filerSftpOptions.port = cmdFiler.Flag.Int("sftp.port", 2022, "SFTP server listen port")
+	filerSftpOptions.idleTimeout = cmdFiler.Flag.Int("sftp.idleTimeout", 10, "connection idle seconds")
 	filerSftpOptions.sshPrivateKey = cmdFiler.Flag.String("sftp.sshPrivateKey", "", "path to the SSH private key file for host authentication")
 	filerSftpOptions.hostKeysFolder = cmdFiler.Flag.String("sftp.hostKeysFolder", "", "path to folder containing SSH private key files for host authentication")
 	filerSftpOptions.authMethods = cmdFiler.Flag.String("sftp.authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, certificate")
@@ -371,6 +385,7 @@ func (fo *FilerOptions) startFiler() {
 	if fo.listenOnLocalhost != nil {
 		listenOnLocalhost = *fo.listenOnLocalhost
 	}
+	idleTimeout := idleTimeoutSeconds(fo.idleTimeout)
 	if *fo.bindIp == "" {
 		*fo.bindIp = *fo.ip
 	}
@@ -404,32 +419,34 @@ func (fo *FilerOptions) startFiler() {
 
 	announce := make(chan struct{})
 	fs, nfs_err := weed_server.NewFilerServer(defaultMux, publicVolumeMux, &weed_server.FilerOption{
-		Masters:                   fo.masters,
-		AnnounceCh:                announce,
-		FilerGroup:                *fo.filerGroup,
-		Collection:                *fo.collection,
-		DefaultReplication:        *fo.defaultReplicaPlacement,
-		DisableDirListing:         *fo.disableDirListing,
-		MaxMB:                     *fo.maxMB,
-		DirListingLimit:           *fo.dirListingLimit,
-		DataCenter:                *fo.dataCenter,
-		Rack:                      *fo.rack,
-		DefaultLevelDbDir:         defaultLevelDbDirectory,
-		DisableHttp:               *fo.disableHttp,
-		Host:                      filerAddress,
-		Cipher:                    *fo.cipher,
-		SaveToFilerLimit:          int64(*fo.saveToFilerLimit),
-		ConcurrentUploadLimit:     int64(*fo.concurrentUploadLimitMB) * 1024 * 1024,
-		ConcurrentFileUploadLimit: int64(*fo.concurrentFileUploadLimit),
-		ShowUIDirectoryDelete:     *fo.showUIDirectoryDelete,
-		DownloadMaxBytesPs:        int64(*fo.downloadMaxMBps) * 1024 * 1024,
-		DiskType:                  *fo.diskType,
-		AllowedOrigins:            strings.Split(*fo.allowedOrigins, ","),
-		ExposeDirectoryData:       *fo.exposeDirectoryData,
-		TusBasePath:               *fo.tusBasePath,
-		TusMaxSize:                int64(*fo.tusMaxSizeMB) * 1024 * 1024,
-		TusSessionExpiry:          *fo.tusSessionExpiry,
-		CredentialManager:         credentialManager,
+		Masters:                    fo.masters,
+		AnnounceCh:                 announce,
+		SkipEmptyMembershipConfirm: fo.skipEmptyMembershipConfirm,
+		ClusterFreshHint:           fo.clusterFreshHint,
+		FilerGroup:                 *fo.filerGroup,
+		Collection:                 *fo.collection,
+		DefaultReplication:         *fo.defaultReplicaPlacement,
+		DisableDirListing:          *fo.disableDirListing,
+		MaxMB:                      *fo.maxMB,
+		DirListingLimit:            *fo.dirListingLimit,
+		DataCenter:                 *fo.dataCenter,
+		Rack:                       *fo.rack,
+		DefaultLevelDbDir:          defaultLevelDbDirectory,
+		DisableHttp:                *fo.disableHttp,
+		Host:                       filerAddress,
+		Cipher:                     *fo.cipher,
+		SaveToFilerLimit:           int64(*fo.saveToFilerLimit),
+		ConcurrentUploadLimit:      int64(*fo.concurrentUploadLimitMB) * 1024 * 1024,
+		ConcurrentFileUploadLimit:  int64(*fo.concurrentFileUploadLimit),
+		ShowUIDirectoryDelete:      *fo.showUIDirectoryDelete,
+		DownloadMaxBytesPs:         int64(*fo.downloadMaxMBps) * 1024 * 1024,
+		DiskType:                   *fo.diskType,
+		AllowedOrigins:             strings.Split(*fo.allowedOrigins, ","),
+		ExposeDirectoryData:        *fo.exposeDirectoryData,
+		TusBasePath:                *fo.tusBasePath,
+		TusMaxSize:                 int64(*fo.tusMaxSizeMB) * 1024 * 1024,
+		TusSessionExpiry:           *fo.tusSessionExpiry,
+		CredentialManager:          credentialManager,
 
 		AllowUntrustedRemoteEndpoints: *fo.allowUntrustedRemoteEndpoints,
 		RemoteCacheEvictThreshold:     *fo.remoteCacheEvictThreshold,
@@ -448,7 +465,7 @@ func (fo *FilerOptions) startFiler() {
 	if *fo.publicPort != 0 {
 		publicListeningAddress := util.JoinHostPort(*fo.bindIp, *fo.publicPort)
 		glog.V(0).Infoln("Start Seaweed filer server", version.Version(), "public at", publicListeningAddress)
-		publicListener, localPublicListener, e := util.NewIpAndLocalListeners(*fo.bindIp, *fo.publicPort, 0, listenOnLocalhost)
+		publicListener, localPublicListener, e := util.NewIpAndLocalListeners(*fo.bindIp, *fo.publicPort, idleTimeout, listenOnLocalhost)
 		if e != nil {
 			glog.Fatalf("Filer server public listener error on port %d:%v", *fo.publicPort, e)
 		}
@@ -474,7 +491,7 @@ func (fo *FilerOptions) startFiler() {
 	glog.V(0).Infof("Start Seaweed Filer %s at %s:%d", version.Version(), *fo.ip, *fo.port)
 	filerListener, filerLocalListener, e := util.NewIpAndLocalListeners(
 		*fo.bindIp, *fo.port,
-		time.Duration(10)*time.Second, listenOnLocalhost,
+		idleTimeout, listenOnLocalhost,
 	)
 	if e != nil {
 		glog.Fatalf("Filer listener error: %v", e)
@@ -543,6 +560,7 @@ func (fo *FilerOptions) startFiler() {
 			localSocket = fmt.Sprintf("/tmp/seaweedfs-filer-%d.sock", *fo.port)
 		}
 		if filerSocketListener := pb.ListenOnLocalSocket(localSocket); filerSocketListener != nil {
+			filerSocketListener = &util.Listener{Listener: filerSocketListener, Timeout: idleTimeout}
 			socketServer := newHttpServer(defaultHandler, nil)
 			httpServers = append(httpServers, socketServer)
 			go socketServer.Serve(filerSocketListener)

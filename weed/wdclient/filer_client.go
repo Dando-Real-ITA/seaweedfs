@@ -788,6 +788,21 @@ func (p *filerVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []s
 			}()
 
 			if err != nil {
+				// a caller that gave up says nothing about this filer; gRPC can
+				// surface its own DeadlineExceeded a tick before ctx.Err()
+				// becomes visible, so reinterpret only deadline errors this way
+				ctxErr := ctx.Err()
+				if ctxErr == nil && isDeadlineExceededErr(err) {
+					if dl, ok := ctx.Deadline(); ok && !dl.After(time.Now()) {
+						ctxErr = context.DeadlineExceeded
+					}
+				}
+				if ctxErr != nil {
+					if lastErr != nil {
+						return nil, fmt.Errorf("%w (earlier filer error: %v)", ctxErr, lastErr)
+					}
+					return nil, ctxErr
+				}
 				glog.V(1).Infof("FilerClient: filer %s lookup failed (attempt %d/%d, retry %d/%d): %v", filerAddress, x+1, n, retry+1, maxRetries, err)
 				fc.recordFilerFailureWithHealth(health)
 				lastErr = err

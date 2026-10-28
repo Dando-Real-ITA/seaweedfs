@@ -195,6 +195,10 @@ type CreateTableRequest struct {
 	MetadataVersion  int               `json:"metadataVersion,omitempty"`
 	MetadataLocation string            `json:"metadataLocation,omitempty"`
 	Tags             map[string]string `json:"tags,omitempty"`
+	// AllowMissingNamespace lets an authorization gate evaluate a create whose
+	// namespace is implicit and not yet declared; the write path still
+	// validates existence. Never deserialized: internal callers set it.
+	AllowMissingNamespace bool `json:"-"`
 }
 
 type CreateTableResponse struct {
@@ -204,10 +208,11 @@ type CreateTableResponse struct {
 }
 
 type RegisterTableRequest struct {
-	TableBucketARN   string   `json:"tableBucketARN"`
-	Namespace        []string `json:"namespace"`
-	Name             string   `json:"name"`
-	MetadataLocation string   `json:"metadataLocation"`
+	TableBucketARN   string         `json:"tableBucketARN"`
+	Namespace        []string       `json:"namespace"`
+	Name             string         `json:"name"`
+	MetadataLocation string         `json:"metadataLocation"`
+	Metadata         *TableMetadata `json:"metadata,omitempty"`
 }
 
 type RegisterTableResponse struct {
@@ -277,6 +282,9 @@ type UpdateTableRequest struct {
 	Metadata         *TableMetadata `json:"metadata,omitempty"`
 	MetadataVersion  int            `json:"metadataVersion,omitempty"`
 	MetadataLocation string         `json:"metadataLocation,omitempty"`
+	// ClearFullMetadata drops the record's stored metadata copy; a table whose
+	// metadata no longer fits in a request is tracked by location alone.
+	ClearFullMetadata bool `json:"clearFullMetadata,omitempty"`
 }
 
 type UpdateTableResponse struct {

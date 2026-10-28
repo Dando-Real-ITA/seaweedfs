@@ -560,7 +560,7 @@ jobs:
                   print("cluster alias: hook waits on the renamed names and the chart's addresses")
 
           # Keys kept in a Secret are referenced, not inlined, so the hook
-          # must render valueFrom for non-string extraEnvironmentVars.
+          # must render valueFrom for map-valued extraEnvironmentVars.
           out = render(dict(jwt, **{
               "global.seaweedfs.extraEnvironmentVars.WEED_JWT_FILER_SIGNING_KEY.secretKeyRef.name": "signing-keys",
               "global.seaweedfs.extraEnvironmentVars.WEED_JWT_FILER_SIGNING_KEY.secretKeyRef.key": "filerWrite",
@@ -636,12 +636,47 @@ jobs:
             --set filer.secretExtraEnvironmentVars.WEED_MYSQL_PASSWORD.secretKeyRef.name=db \
             --set filer.secretExtraEnvironmentVars.WEED_MYSQL_PASSWORD.secretKeyRef.key=password > /tmp/filer-mysql-on-secret.yaml
           grep -A 4 -- "- name: WEED_MYSQL_PASSWORD$" /tmp/filer-mysql-on-secret.yaml | grep -q "name: db"
+          # It replaces the db secret's entry rather than adding a second one, which
+          # Helm 4's server-side apply rejects as a duplicate.
+          test "$(grep -c -- "- name: WEED_MYSQL_PASSWORD$" /tmp/filer-mysql-on-secret.yaml)" -eq 1
+          test "$(grep -c -- "- name: WEED_MYSQL_USERNAME$" /tmp/filer-mysql-on-secret.yaml)" -eq 1
+          helm template test $CHART_DIR \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_USERNAME=app > /tmp/filer-mysql-on-plain.yaml
+          test "$(grep -c -- "- name: WEED_MYSQL_USERNAME$" /tmp/filer-mysql-on-plain.yaml)" -eq 1
+          grep -A 1 -- "- name: WEED_MYSQL_USERNAME$" /tmp/filer-mysql-on-plain.yaml | grep -q 'value: "app"'
+          # Credentials render ahead of the merged vars so a $(...) reference resolves.
+          helm template test $CHART_DIR \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_USERNAME=app \
+            --set-string 'filer.extraEnvironmentVars.WEED_MYSQL_DSN=$(WEED_MYSQL_USERNAME)@tcp(h)/db' > /tmp/filer-mysql-dsn.yaml
+          test "$(grep -n -- "- name: WEED_MYSQL_USERNAME$" /tmp/filer-mysql-dsn.yaml | cut -d: -f1)" -lt "$(grep -n -- "- name: WEED_MYSQL_DSN$" /tmp/filer-mysql-dsn.yaml | cut -d: -f1)"
+          # Vars a credential's own $(...) references point at render before it.
+          helm template test $CHART_DIR \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true \
+            --set-string filer.extraEnvironmentVars.DB_USER=app \
+            --set-string 'filer.extraEnvironmentVars.WEED_MYSQL_USERNAME=$(DB_USER)' > /tmp/filer-mysql-ref.yaml
+          test "$(grep -n -- "- name: DB_USER$" /tmp/filer-mysql-ref.yaml | cut -d: -f1)" -lt "$(grep -n -- "- name: WEED_MYSQL_USERNAME$" /tmp/filer-mysql-ref.yaml | cut -d: -f1)"
+          helm template test $CHART_DIR \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true \
+            --set filer.secretExtraEnvironmentVars.DB_USER.secretKeyRef.name=db \
+            --set filer.secretExtraEnvironmentVars.DB_USER.secretKeyRef.key=user \
+            --set-string 'filer.extraEnvironmentVars.WEED_MYSQL_USERNAME=$(DB_USER)' > /tmp/filer-mysql-ref-secret.yaml
+          test "$(grep -c -- "- name: DB_USER$" /tmp/filer-mysql-ref-secret.yaml)" -eq 1
+          test "$(grep -n -- "- name: DB_USER$" /tmp/filer-mysql-ref-secret.yaml | cut -d: -f1)" -lt "$(grep -n -- "- name: WEED_MYSQL_USERNAME$" /tmp/filer-mysql-ref-secret.yaml | cut -d: -f1)"
           # A flag the chart cannot read counts as selected, not as off.
           helm template test $CHART_DIR \
             --set filer.secretExtraEnvironmentVars.WEED_MYSQL_ENABLED.secretKeyRef.name=store \
             --set filer.secretExtraEnvironmentVars.WEED_MYSQL_ENABLED.secretKeyRef.key=enabled > /tmp/filer-mysql-secret.yaml
           grep -q "name: test-seaweedfs-db-secret" /tmp/filer-mysql-secret.yaml
           grep -q "name: WEED_MYSQL_HOSTNAME" /tmp/filer-mysql-secret.yaml
+          # A secret-backed key also replaces the matching plain entry, not adds one.
+          test "$(grep -c -- "- name: WEED_MYSQL_ENABLED$" /tmp/filer-mysql-secret.yaml)" -eq 1
+          helm template test $CHART_DIR \
+            --set-string filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true \
+            --set filer.secretExtraEnvironmentVars.WEED_MYSQL_HOSTNAME.secretKeyRef.name=db \
+            --set filer.secretExtraEnvironmentVars.WEED_MYSQL_HOSTNAME.secretKeyRef.key=host > /tmp/filer-mysql-hostname-secret.yaml
+          test "$(grep -c -- "- name: WEED_MYSQL_HOSTNAME$" /tmp/filer-mysql-hostname-secret.yaml)" -eq 1
           helm template test $CHART_DIR \
             --set-string filer.extraEnvironmentVars.WEED_MYSQL2_HOSTNAME=other > /tmp/filer-mysql2.yaml
           grep -q "name: WEED_MYSQL2_HOSTNAME" /tmp/filer-mysql2.yaml
@@ -1222,6 +1257,43 @@ jobs:
                     file=sys.stderr)
               sys.exit(1)
           print("all-in-one env: shared key renders once, component value wins")
+          PYEOF
+
+          echo "=== Testing extraEnvironmentVars: numbers and booleans render as values ==="
+          # Only a string rendered as value; anything else went to valueFrom, so an
+          # unquoted 3306 or true in a values file (or --set) became "valueFrom: 3306"
+          # and the API server rejected the workload. A map still renders valueFrom,
+          # and a null still renders an empty variable. --set-json decodes numbers as
+          # float64, as values files do, which quote would print as 1e+06.
+          helm template test $CHART_DIR \
+            --set-json global.seaweedfs.extraEnvironmentVars.WEED_GLOBAL_INT=1000000 \
+            --set master.extraEnvironmentVars.WEED_MASTER_VOLUME_GROWTH_COPY_1=7 \
+            --set master.extraEnvironmentVars.WEED_EMPTY=null \
+            --set filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true \
+            --set filer.extraEnvironmentVars.WEED_MYSQL_PORT=3306 \
+            --set filer.extraEnvironmentVars.WEED_REF.secretKeyRef.name=s \
+            --set filer.extraEnvironmentVars.WEED_REF.secretKeyRef.key=k > /tmp/env-scalars.yaml
+          python3 - /tmp/env-scalars.yaml <<'PYEOF'
+          import sys, yaml
+          docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+          def env(suffix):
+              sts = next(d for d in docs if d.get("kind") == "StatefulSet"
+                         and d["metadata"]["name"].endswith(suffix))
+              return {e["name"]: e for e in sts["spec"]["template"]["spec"]["containers"][0]["env"]}
+          master, filer = env("-master"), env("-filer")
+          want = [(master, "WEED_MASTER_VOLUME_GROWTH_COPY_1", "7"), (master, "WEED_GLOBAL_INT", "1000000"),
+                  (filer, "WEED_MYSQL_ENABLED", "true"), (filer, "WEED_MYSQL_PORT", "3306"),
+                  (filer, "WEED_GLOBAL_INT", "1000000")]
+          failed = [f"{name}: {e.get(name)}" for e, name, value in want
+                    if e.get(name) != {"name": name, "value": value}]
+          if master.get("WEED_EMPTY") != {"name": "WEED_EMPTY"}:
+              failed.append(f"WEED_EMPTY: {master.get('WEED_EMPTY')}")
+          if filer.get("WEED_REF", {}).get("valueFrom") != {"secretKeyRef": {"name": "s", "key": "k"}}:
+              failed.append(f"WEED_REF: {filer.get('WEED_REF')}")
+          if failed:
+              print("FAIL: extraEnvironmentVars rendered wrong:", *failed, sep="\n  ", file=sys.stderr)
+              sys.exit(1)
+          print("extraEnvironmentVars: numbers and booleans render as values, a map as valueFrom, a null as empty")
           PYEOF
 
           echo "=== Testing bucket versioning: YAML bool false suspends like string \"false\" ==="
@@ -1996,6 +2068,38 @@ jobs:
 
           kubectl delete namespace "$NS"
           echo "SFTP host key lifecycle tests passed"
+
+      - name: Verify the filer db secret survives uninstall and install
+        run: |
+          set -e
+          CHART_DIR="k8s/charts/seaweedfs"
+          NS="filer-db-secret"
+          SECRET="db-seaweedfs-db-secret"
+          DB_ARGS="--set image.tag=$IMAGE_TAG --set-string filer.extraEnvironmentVars.WEED_MYSQL_ENABLED=true --set master.enabled=false --set volume.enabled=false"
+          kubectl create namespace "$NS"
+
+          echo "=== install generates the db credentials ==="
+          helm install db $CHART_DIR -n "$NS" $DB_ARGS
+          [ "$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.user}' | base64 -d)" = YourSWUser ] \
+            || { echo "FAIL: install did not create the default user"; exit 1; }
+          [ "$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.password}' | base64 -d | wc -c)" -eq 32 ] \
+            || { echo "FAIL: install did not generate a 32-character password"; exit 1; }
+
+          echo "=== credentials in the kept Secret survive uninstall and install ==="
+          PASSWORD='p"a\ss: #x {{ .Values }}'
+          kubectl patch secret "$SECRET" -n "$NS" --type merge \
+            -p "$(jq -n --arg p "$PASSWORD" '{stringData: {user: "seaweed_app", password: $p}}')"
+          helm uninstall db -n "$NS"
+          kubectl get secret "$SECRET" -n "$NS" >/dev/null || { echo "FAIL: uninstall removed the db secret"; exit 1; }
+          helm install db $CHART_DIR -n "$NS" $DB_ARGS
+          [ "$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.user}' | base64 -d)" = seaweed_app ] \
+            || { echo "FAIL: reinstall reset the db user"; exit 1; }
+          [ "$(kubectl get secret "$SECRET" -n "$NS" -o jsonpath='{.data.password}' | base64 -d)" = "$PASSWORD" ] \
+            || { echo "FAIL: reinstall replaced the db password"; exit 1; }
+
+          helm uninstall db -n "$NS"
+          kubectl delete namespace "$NS"
+          echo "Filer db secret reinstall test passed"
 
       - name: Verify JWT signing key persistence across upgrades
         run: |

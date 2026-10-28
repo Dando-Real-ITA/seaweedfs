@@ -10,7 +10,7 @@ use lance::io::ObjectStoreParams;
 use lance::io::StorageOptionsAccessor;
 use lance_linalg::distance::DistanceType;
 use prost_types::{ListValue, Struct, Value, value::Kind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use weed_lance_worker::catalog::NamespaceClient;
@@ -74,17 +74,18 @@ fn schema_for(
         .into_iter()
         .collect(),
     );
-    let mut metadata_field = Field::new(METADATA_COLUMN, DataType::Utf8, true);
+    // The arrow.json extension marks the Utf8 column as JSON: lance stores it
+    // as jsonb, which is what the json_get_* filter functions take.
+    let mut metadata_meta =
+        HashMap::from_iter([("ARROW:extension:name".to_string(), "arrow.json".to_string())]);
     if !non_filterable.is_empty() {
-        metadata_field = metadata_field.with_metadata(
-            [(
-                "non_filterable_metadata_keys".to_string(),
-                serde_json::to_string(non_filterable).unwrap_or_default(),
-            )]
-            .into_iter()
-            .collect(),
+        metadata_meta.insert(
+            "non_filterable_metadata_keys".to_string(),
+            serde_json::to_string(non_filterable).unwrap_or_default(),
         );
     }
+    let metadata_field =
+        Field::new(METADATA_COLUMN, DataType::Utf8, true).with_metadata(metadata_meta);
     Arc::new(Schema::new(vec![
         Field::new(KEY_COLUMN, DataType::Utf8, false),
         vector_field,
@@ -110,12 +111,18 @@ fn batch_of(vectors: &[pb::Vector], dimension: usize, schema: Arc<Schema>) -> Re
         .flat_map(|v| v.data.iter().copied())
         .collect::<Vec<_>>();
     let values: ArrayRef = Arc::new(Float32Array::from(flat));
-    let vectors_array = FixedSizeListArray::try_new(
-        Field::new("item", DataType::Float32, false).into(),
-        dimension as i32,
-        values,
-        None,
-    )?;
+    // Lance stores the list item as nullable even when the write schema
+    // declared it non-null, so the child field must come from the batch's
+    // schema rather than a fixed declaration.
+    let DataType::FixedSizeList(item_field, _) = schema
+        .field_with_name(VECTOR_COLUMN)
+        .map_err(anyhow::Error::from)?
+        .data_type()
+    else {
+        bail!("vector column is not a fixed-size list");
+    };
+    let vectors_array =
+        FixedSizeListArray::try_new(item_field.clone(), dimension as i32, values, None)?;
     let metas = vectors
         .iter()
         .map(|v| {
@@ -125,13 +132,20 @@ fn batch_of(vectors: &[pb::Vector], dimension: usize, schema: Arc<Schema>) -> Re
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // The stored column is lance's jsonb (LargeBinary) once the field carries
+    // the arrow.json extension; encode the strings, else keep the Utf8 batch.
+    let metadata_array: ArrayRef = match schema
+        .field_with_name(METADATA_COLUMN)
+        .map(|f| f.data_type())
+    {
+        Ok(DataType::LargeBinary) => {
+            Arc::new(lance_arrow::json::JsonArray::try_from_iter(metas)?.into_inner())
+        }
+        _ => Arc::new(StringArray::from(metas)),
+    };
     RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(keys),
-            Arc::new(vectors_array),
-            Arc::new(StringArray::from(metas)),
-        ],
+        vec![Arc::new(keys), Arc::new(vectors_array), metadata_array],
     )
     .map_err(Into::into)
 }
@@ -368,6 +382,11 @@ impl VectorService for VectorServer {
             .table
             .ok_or_else(|| Status::invalid_argument("missing table"))?;
         let dataset = self.open(&table).await.map_err(open_status)?;
+        // Lease the resolved version so maintenance cannot reclaim its files
+        // while this query runs against it.
+        let _lease = weed_vector_core::maintenance::try_pin(&dataset)
+            .await
+            .map_err(internal)?;
         let resolved = VectorTable::resolve(&dataset, None, Some(KEY_COLUMN)).map_err(invalid)?;
         let batches = query::get(&dataset, &resolved, &req.keys)
             .await
@@ -462,6 +481,11 @@ impl VectorService for VectorServer {
             .table
             .ok_or_else(|| Status::invalid_argument("missing table"))?;
         let dataset = self.open(&table).await.map_err(open_status)?;
+        // Lease the resolved version so maintenance cannot reclaim its files
+        // while this query runs against it.
+        let _lease = weed_vector_core::maintenance::try_pin(&dataset)
+            .await
+            .map_err(internal)?;
         let resolved = VectorTable::resolve(&dataset, None, Some(KEY_COLUMN)).map_err(invalid)?;
         if req.query_vector.len() != resolved.dimension {
             return Err(Status::invalid_argument(format!(
@@ -494,6 +518,8 @@ impl VectorService for VectorServer {
             postfilter: req.postfilter,
             distance,
             nprobes: None,
+            index_segments: None,
+            fragments: None,
         };
         let hits = query::ann(&dataset, &resolved, &query)
             .await

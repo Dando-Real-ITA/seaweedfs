@@ -92,8 +92,14 @@ type Topology struct {
 	lastPersistedTopologyId   atomic.Value
 	lastPersistedGrowthFrozen atomic.Bool
 
-	growthFrozen            atomic.Bool
-	growthFrozenAt          atomic.Int64
+	// growthFrozenState packs the freeze flag and its generation into one
+	// value: 0 = unfrozen, -1 = frozen without a recorded instant (entries
+	// written before the field existed), >0 = frozen at that instant. Every
+	// transition is a single atomic swap or compare-and-swap, so a lift can
+	// only clear the exact generation it was bound to — a stale unfreeze
+	// cannot erase a newer freeze, a resume cannot lift a generation it did
+	// not observe, and stamps need not be monotonic across masters.
+	growthFrozenState       atomic.Int64
 	metaReadOnly            atomic.Bool
 	freezeOnMismatch        atomic.Bool
 	stateLossRecoveryWait   atomic.Int64
@@ -101,18 +107,32 @@ type Topology struct {
 	allocationEvidenceSince atomic.Int64
 	allocationDeferral      atomic.Int64
 	topologyInitPending     atomic.Bool
+	// freshMinted marks that this boot minted the TopologyId instead of
+	// recovering one: the master's persisted state was empty, so no cluster
+	// member registered under a prior control-plane instance.
+	freshMinted atomic.Bool
 
 	// releaseAllocOnReport lifts a post-mint allocation hold as soon as a full
-	// volume-server inventory has been applied, for single-reporter setups
-	// (weed mini) whose embedded volume server is the only possible source of
-	// prior cluster state. inventoryApplied records that at least one full
-	// volume list has been synced into this topology.
+	// volume-server inventory has been applied, for setups with a known
+	// reporter (weed mini, single-master weed server) whose embedded volume
+	// server reports the full inventory in its first heartbeat. singleReporter
+	// additionally refuses every other reporter, so its report drops the hold
+	// outright; expectedReporter only gates which report may lift the hold,
+	// and the lift leaves a confirm pulse for reporters still admitted.
+	// inventoryApplied records that the expected report has been synced into
+	// this topology.
 	releaseAllocOnReport atomic.Bool
 	inventoryApplied     atomic.Bool
 	singleReporter       atomic.Value // string
+	expectedReporter     atomic.Value // string
 
 	reportedTopologyIdsLock    sync.Mutex
 	pendingReportedTopologyIds map[string]struct{}
+	// growthFreezeApplyLock serializes replicated freeze writes so the log
+	// order of concurrent mismatch reports cannot land an older freeze
+	// instant after a newer one. Unfreezes skip it: the state machine
+	// applies a lift only against the freeze generation it targeted.
+	growthFreezeApplyLock sync.Mutex
 
 	// quarantinedVolumeIds are (node, vid) pairs force-read-only because the
 	// vid collided across layouts. Kept separate from the reported flag so
@@ -869,6 +889,14 @@ func (t *Topology) RegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
 		})
 		t.quarantineLock.Unlock()
 		if registered {
+			// RegisterVolume rebuilds only the read-only flags, so a
+			// location list recreated flagless would pass the writable
+			// check before the next heartbeat re-measures the volume.
+			// This report carries the size; mark from it first. A report
+			// that carries none leaves the remembered verdict in place.
+			if v.Size > 0 {
+				vl.UpdateOversizedState(&v, dn)
+			}
 			vl.EnsureCorrectWritables(&v)
 			t.flagDuplicateVolumeIdAsync(v, dn)
 			return
@@ -1176,6 +1204,83 @@ func (t *Topology) GetDataCenter(dcName string) (dc *DataCenter) {
 		}
 	}
 	return dc
+}
+
+// GrowthBlocker reports why a volume grow under option could never place the
+// replica set it needs, mirroring findEmptySlotsForOneVolume's feasibility:
+// the option's location binds only the first replica's data center, rack, and
+// data node — later replicas land anywhere with room — so counting every
+// candidate against the named location condemns growth that can succeed. Nil
+// means a grow can still place. Free slots are leaf-summed and ignore
+// reservations, so an in-flight grow's own holds still read as room and its
+// delivery lands as a writable the assign re-picks.
+func (t *Topology) GrowthBlocker(option *VolumeGrowOption) error {
+	rp := option.ReplicaPlacement
+	needDCs := rp.DiffDataCenterCount + 1
+	needRacks := rp.DiffRackCount + 1
+	needNodes := rp.SameRackCount + 1
+	t.RLock()
+	defer t.RUnlock()
+	roomDCs := 0
+	mainFits := false
+	var errs []string
+	for _, c := range t.children {
+		var dcFree int64
+		okRacks := 0
+		mainRackFits := false
+		for _, r := range c.Children() {
+			var rackFree int64
+			nodesWithRoom := 0
+			namedNodeFits := option.DataNode == ""
+			for _, dn := range r.Children() {
+				free := dn.AvailableSpaceFor(option)
+				if free <= 0 {
+					continue
+				}
+				nodesWithRoom++
+				rackFree += free
+				if string(dn.Id()) == option.DataNode {
+					namedNodeFits = true
+				}
+			}
+			dcFree += rackFree
+			if nodesWithRoom >= needNodes {
+				okRacks++
+			}
+			if nodesWithRoom >= needNodes && namedNodeFits &&
+				(option.Rack == "" || string(r.Id()) == option.Rack) {
+				mainRackFits = true
+			}
+		}
+		if dcFree > 0 {
+			roomDCs++
+		}
+		if option.DataCenter != "" && string(c.Id()) != option.DataCenter {
+			continue
+		}
+		switch {
+		case len(c.Children()) < needRacks:
+			errs = append(errs, fmt.Sprintf("%s: %d racks, needs %d", c.Id(), len(c.Children()), needRacks))
+		case okRacks < needRacks:
+			errs = append(errs, fmt.Sprintf("%s: %d racks with %d data nodes with room, needs %d", c.Id(), okRacks, needNodes, needRacks))
+		case (option.Rack != "" || option.DataNode != "") && !mainRackFits:
+			errs = append(errs, fmt.Sprintf("%s: no rack fits the named placement", c.Id()))
+		case dcFree < int64(needRacks-1+needNodes):
+			errs = append(errs, fmt.Sprintf("%s: %d free volume slots, needs %d", c.Id(), dcFree, needRacks-1+needNodes))
+		default:
+			mainFits = true
+		}
+	}
+	if mainFits && roomDCs >= needDCs {
+		return nil
+	}
+	if mainFits {
+		return fmt.Errorf("%s can grow in %s: %d data centers with room, needs %d", NoWritableVolumes, option, roomDCs, needDCs)
+	}
+	if len(errs) == 0 {
+		return fmt.Errorf("%s: no data center matches %s", NoWritableVolumes, option)
+	}
+	return fmt.Errorf("%s can grow in %s: %s", NoWritableVolumes, option, strings.Join(errs, "; "))
 }
 
 func (t *Topology) GetOrCreateDataCenter(dcName string) *DataCenter {
@@ -1497,15 +1602,22 @@ func (t *Topology) CheckReportedTopologyId(reported string) {
 		return
 	}
 	t.reportedTopologyIdsLock.Lock()
-	defer t.reportedTopologyIdsLock.Unlock()
-	t.checkReportedTopologyIdLocked(reported)
+	freeze := t.checkReportedTopologyIdLocked(reported)
+	t.reportedTopologyIdsLock.Unlock()
+	if freeze {
+		// The decision landed under the lock; the raft wait must not, or a
+		// slow apply would stall every later report — including one that
+		// needs to trigger the next freeze.
+		t.applyGrowthFreeze()
+	}
 }
 
 // checkReportedTopologyIdLocked runs the mismatch check inside
 // reportedTopologyIdsLock, the same critical section the init gate drains
 // under: a report received before the gate opens is either stashed or frozen
-// before the gate can release.
-func (t *Topology) checkReportedTopologyIdLocked(reported string) {
+// before the gate can release. It returns whether the freeze must be
+// replicated, which the caller does after releasing the lock.
+func (t *Topology) checkReportedTopologyIdLocked(reported string) (freeze bool) {
 	own := t.GetTopologyId()
 	if own == "" {
 		// The local topology id is still being minted. Keep the report so a
@@ -1515,82 +1627,187 @@ func (t *Topology) checkReportedTopologyIdLocked(reported string) {
 			t.pendingReportedTopologyIds = make(map[string]struct{})
 		}
 		t.pendingReportedTopologyIds[reported] = struct{}{}
-		return
+		return false
 	}
 	if reported == own {
-		return
+		return false
 	}
-	t.growthFrozenAt.Store(time.Now().UnixNano())
-	if t.growthFrozen.CompareAndSwap(false, true) {
+	// Only the first mismatch stamps a generation: a re-stamp never reaches
+	// the log, so bound lifts would target a generation followers never saw.
+	if t.growthFrozenState.CompareAndSwap(0, time.Now().UnixNano()) {
 		stats.MasterVolumeGrowthFrozen.Set(1)
 		glog.Errorf("volume growth frozen: a volume server reports topology id %s but this cluster is %s; the master state was rebuilt. Verify the cluster inventory, then run: volume.growth.resume", reported, own)
-		t.applyGrowthFreeze(true)
+		return true
 	}
+	return false
 }
 
 func (t *Topology) IsGrowthFrozen() bool {
-	if !t.growthFrozen.Load() {
-		return false
+	frozen, _ := t.GrowthFreezeState()
+	return frozen
+}
+
+// GrowthFreezeState returns the freeze flag and its generation from one
+// load, so snapshots persisting both cannot split the pair across a lift.
+func (t *Topology) GrowthFreezeState() (frozen bool, frozenAt int64) {
+	state := t.growthFrozenState.Load()
+	if state == 0 {
+		return false, 0
 	}
 	if wait := t.stateLossRecoveryWait.Load(); wait > 0 {
-		if time.Duration(time.Now().UnixNano()-t.growthFrozenAt.Load()) > time.Duration(wait) {
-			if t.growthFrozen.CompareAndSwap(true, false) {
+		// A legacy generation carries no instant; its window counts as
+		// already elapsed.
+		if state < 0 || time.Duration(time.Now().UnixNano()-state) > time.Duration(wait) {
+			if t.growthFrozenState.CompareAndSwap(state, 0) {
 				stats.MasterVolumeGrowthFrozen.Set(0)
 				glog.V(0).Infof("volume growth unfrozen after %v", time.Duration(wait))
+				go t.replicateGrowthUnfreeze(state)
+				return false, 0
 			}
-			return false
+			state = t.growthFrozenState.Load()
 		}
 	}
-	return true
+	return state != 0, state
+}
+
+// replicateGrowthUnfreeze pushes the recovery-wait lift through raft like
+// ResumeVolumeGrowth, so a restart does not replay the freeze. The command
+// carries the generation it lifts: a newer freeze — even one committed but
+// not yet applied when this node won an election — makes the apply a no-op
+// instead of being erased. If the write never lands, the generation is
+// re-armed so a later IsGrowthFrozen retries the lift.
+func (t *Topology) replicateGrowthUnfreeze(frozenAt int64) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		// The caller's lift already cleared the flag, so unfrozen is the
+		// state to expect; anything else armed is a newer generation this
+		// lift must not touch — and falling through to the re-arm would
+		// undo a resume that followed it.
+		if s := t.growthFrozenState.Load(); s != 0 && s != frozenAt {
+			return
+		}
+		if err := t.applyGrowthUnfreeze(frozenAt); err == nil {
+			return
+		}
+	}
+	if frozenAt != 0 && t.growthFrozenState.CompareAndSwap(0, frozenAt) {
+		stats.MasterVolumeGrowthFrozen.Set(1)
+		glog.Warningf("volume growth unfreeze not replicated; freeze re-armed for retry")
+	}
 }
 
 func (t *Topology) ResumeVolumeGrowth() bool {
-	if !t.growthFrozen.CompareAndSwap(true, false) {
-		return false
+	for {
+		// The compare binds the resume to the generation it observed: a
+		// freeze landing between the load and the swap just moves to the
+		// next iteration, which lifts the generation actually armed.
+		frozenAt := t.growthFrozenState.Load()
+		if frozenAt == 0 {
+			return false
+		}
+		if t.growthFrozenState.CompareAndSwap(frozenAt, 0) {
+			stats.MasterVolumeGrowthFrozen.Set(0)
+			glog.V(0).Infof("volume growth resumed by operator")
+			t.applyGrowthUnfreeze(frozenAt)
+			return true
+		}
 	}
-	stats.MasterVolumeGrowthFrozen.Set(0)
-	glog.V(0).Infof("volume growth resumed by operator")
-	t.applyGrowthFreeze(false)
-	return true
 }
 
-// SetGrowthFrozen applies a replicated freeze state on every master. The
-// timestamp lands before the flag so a reader can never see frozen with a
-// zero time and misjudge the auto-resume window.
-func (t *Topology) SetGrowthFrozen(frozen bool) {
+// SetGrowthFrozen applies a replicated freeze transition on every master. A
+// positive frozenAt pins the instant so all nodes share one recovery
+// window; a non-positive one — entries written before the field existed —
+// becomes the ageless generation, a stable identity a bound lift can still
+// match and the recovery check reads as already elapsed. An unfreeze bound
+// to unfreezeFor applies only while that exact generation is armed, so a
+// stale lift cannot erase a newer freeze; zero lifts unconditionally, for
+// entries written before the binding existed.
+func (t *Topology) SetGrowthFrozen(frozen bool, frozenAt int64, unfreezeFor int64) {
 	if frozen {
-		t.growthFrozenAt.Store(time.Now().UnixNano())
-		if t.growthFrozen.CompareAndSwap(false, true) {
+		gen := frozenAt
+		if gen == 0 {
+			gen = -1
+		}
+		if t.growthFrozenState.Swap(gen) == 0 {
 			stats.MasterVolumeGrowthFrozen.Set(1)
 			glog.V(0).Infof("volume growth freeze applied from raft")
 		}
 		return
 	}
-	if t.growthFrozen.CompareAndSwap(true, false) {
+	if unfreezeFor == 0 {
+		if t.growthFrozenState.Swap(0) != 0 {
+			stats.MasterVolumeGrowthFrozen.Set(0)
+		}
+		return
+	}
+	if t.growthFrozenState.CompareAndSwap(unfreezeFor, 0) {
 		stats.MasterVolumeGrowthFrozen.Set(0)
 	}
 }
 
-// applyGrowthFreeze replicates the freeze flag so followers keep it across a
-// leader change. No raft server (single-master test topologies) just sets it.
-func (t *Topology) applyGrowthFreeze(frozen bool) {
+// applyGrowthFreeze replicates the current freeze flag and instant so
+// followers keep both across a leader change.
+func (t *Topology) applyGrowthFreeze() error {
+	t.growthFreezeApplyLock.Lock()
+	defer t.growthFreezeApplyLock.Unlock()
 	cmd := NewMaxVolumeIdCommand(t.GetMaxVolumeId(), t.GetTopologyId())
+	frozen := true
 	cmd.GrowthFrozen = &frozen
+	cmd.GrowthFrozenAt = t.growthFrozenState.Load()
+	return t.applyGrowthFreezeCommand(cmd)
+}
+
+// applyGrowthUnfreeze replicates a lift bound to the freeze instant the
+// caller observed.
+func (t *Topology) applyGrowthUnfreeze(frozenAt int64) error {
+	cmd := NewMaxVolumeIdCommand(t.GetMaxVolumeId(), t.GetTopologyId())
+	frozen := false
+	cmd.GrowthFrozen = &frozen
+	cmd.GrowthUnfreezeFor = frozenAt
+	return t.applyGrowthFreezeCommand(cmd)
+}
+
+// applyGrowthFreezeCommand sends the transition through raft. With no raft
+// server (single-master test topologies) it applies locally.
+func (t *Topology) applyGrowthFreezeCommand(cmd *MaxVolumeIdCommand) error {
+	frozen := cmd.GrowthFrozen != nil && *cmd.GrowthFrozen
 	t.RaftServerAccessLock.RLock()
 	defer t.RaftServerAccessLock.RUnlock()
 	if t.RaftServer != nil {
 		if _, err := t.RaftServer.Do(cmd); err != nil {
 			glog.Warningf("apply growth freeze %v: %v", frozen, err)
+			return err
 		}
-	} else if t.HashicorpRaft != nil {
-		if b, err := json.Marshal(cmd); err != nil {
-			glog.Warningf("marshal growth freeze %v: %v", frozen, err)
-		} else if future := t.HashicorpRaft.Apply(b, time.Second); future.Error() != nil {
-			glog.Warningf("apply growth freeze %v: %v", frozen, future.Error())
-		}
-	} else {
-		t.SetGrowthFrozen(frozen)
+		return nil
 	}
+	if t.HashicorpRaft != nil {
+		b, err := json.Marshal(cmd)
+		if err != nil {
+			glog.Warningf("marshal growth freeze %v: %v", frozen, err)
+			return err
+		}
+		if future := t.HashicorpRaft.Apply(b, time.Second); future.Error() != nil {
+			glog.Warningf("apply growth freeze %v: %v", frozen, future.Error())
+			return future.Error()
+		}
+		return nil
+	}
+	t.SetGrowthFrozen(*cmd.GrowthFrozen, cmd.GrowthFrozenAt, cmd.GrowthUnfreezeFor)
+	return nil
+}
+
+// MarkFreshMint records that this boot minted the TopologyId rather than
+// recovering a persisted one — the strongest in-process proof that the
+// control plane holds no prior cluster state.
+func (t *Topology) MarkFreshMint() {
+	t.freshMinted.Store(true)
+}
+
+// FreshMinted reports whether the current TopologyId was minted this boot.
+func (t *Topology) FreshMinted() bool {
+	return t.freshMinted.Load()
 }
 
 // SetTopologyInitPending gates allocation while a topology id is being
@@ -1607,13 +1824,17 @@ func (t *Topology) SetTopologyInitPending(pending bool) {
 	// a mismatching report checked here, or still in flight under the same
 	// lock, lands its freeze before any allocation can observe the open gate.
 	t.reportedTopologyIdsLock.Lock()
-	defer t.reportedTopologyIdsLock.Unlock()
 	reported := t.pendingReportedTopologyIds
 	t.pendingReportedTopologyIds = nil
+	freeze := false
 	for id := range reported {
-		t.checkReportedTopologyIdLocked(id)
+		freeze = t.checkReportedTopologyIdLocked(id) || freeze
 	}
 	t.topologyInitPending.Store(false)
+	t.reportedTopologyIdsLock.Unlock()
+	if freeze {
+		t.applyGrowthFreeze()
+	}
 }
 
 // ReleaseAllocationOnFirstReport opts the topology into lifting the post-mint
@@ -1624,11 +1845,24 @@ func (t *Topology) SetTopologyInitPending(pending bool) {
 func (t *Topology) ReleaseAllocationOnFirstReport(onlyReporter ...string) {
 	if len(onlyReporter) > 0 {
 		t.singleReporter.Store(onlyReporter[0])
+		t.expectedReporter.Store(onlyReporter[0])
 	}
 	t.releaseAllocOnReport.Store(true)
 }
 
-// AdmitVolumeReporter enforces the single-reporter restriction the early
+// ReleaseAllocationOnReport lifts the post-mint allocation hold once the named
+// reporter's first clean full inventory has been applied. Unlike
+// ReleaseAllocationOnFirstReport it does not refuse other reporters: a
+// single-master weed server still admits outside volume servers, so the
+// release collapses the hold to a confirm pulse rather than clearing it —
+// outside reporters keep a heartbeat interval to land prior-state evidence
+// or a freeze before new ids issue.
+func (t *Topology) ReleaseAllocationOnReport(expected string) {
+	t.expectedReporter.Store(expected)
+	t.releaseAllocOnReport.Store(true)
+}
+
+// AdmitVolumeReporter enforces the single-reporter restriction the outright
 // release relies on: a late-arriving foreign server would carry cluster state
 // the dropped hold was meant to wait for.
 func (t *Topology) AdmitVolumeReporter(addr string) bool {
@@ -1640,13 +1874,41 @@ func (t *Topology) AdmitVolumeReporter(addr string) bool {
 }
 
 // NoteInventoryApplied marks a heartbeat's full volume list as applied to this
-// topology. Under ReleaseAllocationOnFirstReport it also lifts the post-mint
-// allocation hold: the bound raise and topology-id freeze checks run while the
-// heartbeat is processed, so nothing protected remains pending afterwards.
-func (t *Topology) NoteInventoryApplied() {
+// topology. Under releaseAllocOnReport it also lifts the post-mint allocation
+// hold once the report comes from the expected reporter: the bound raise and
+// topology-id freeze checks run while the heartbeat is processed, so nothing
+// protected remains pending afterwards.
+func (t *Topology) NoteInventoryApplied(reporter string) {
+	if expected, _ := t.expectedReporter.Load().(string); expected != "" && expected != reporter {
+		return
+	}
 	t.inventoryApplied.Store(true)
 	if t.releaseAllocOnReport.Load() {
+		t.releaseAllocationHold()
+	}
+}
+
+// releaseAllocationHold ends a post-mint allocation hold on the expected
+// reporter's clean inventory. A pinned single reporter is the only reporter
+// admitted, so its inventory settles prior cluster state outright and the
+// hold can drop. With outside reporters still admitted the release collapses
+// the hold to one heartbeat interval instead: the expected report cannot
+// prove no other reporter carries prior cluster state, so they keep a pulse
+// to land their evidence or a freeze before new ids issue.
+func (t *Topology) releaseAllocationHold() {
+	if pinned, _ := t.singleReporter.Load().(string); pinned != "" {
 		t.allocationNotBefore.Store(0)
+		return
+	}
+	confirm := time.Now().Add(time.Duration(t.pulse) * time.Second).UnixNano()
+	for {
+		cur := t.allocationNotBefore.Load()
+		if cur <= confirm {
+			return
+		}
+		if t.allocationNotBefore.CompareAndSwap(cur, confirm) {
+			return
+		}
 	}
 }
 
@@ -1654,10 +1916,17 @@ func (t *Topology) NoteInventoryApplied() {
 // mints a fresh topology id: on a rebuilt master that window gives veteran
 // servers a pulse to raise the bound or trip the freeze.
 func (t *Topology) DeferAllocation(d time.Duration) {
-	// Under release-on-report a hold is pointless once inventory has landed:
-	// the veteran heartbeat that mattered has already been applied.
+	// Under release-on-report a full hold is pointless once inventory has
+	// landed: the veteran heartbeat that mattered has already been applied.
+	// Outside reporters stay admitted without a pinned single reporter, so
+	// the hold caps at one confirm pulse rather than disappearing.
 	if t.releaseAllocOnReport.Load() && t.inventoryApplied.Load() {
-		return
+		if pinned, _ := t.singleReporter.Load().(string); pinned != "" {
+			return
+		}
+		if pulse := time.Duration(t.pulse) * time.Second; d > pulse {
+			d = pulse
+		}
 	}
 	now := time.Now()
 	t.allocationNotBefore.Store(now.Add(d).UnixNano())
@@ -1665,7 +1934,7 @@ func (t *Topology) DeferAllocation(d time.Duration) {
 	// Close the race with a report applied between the check above and the
 	// store, which would otherwise leave the full window armed.
 	if t.releaseAllocOnReport.Load() && t.inventoryApplied.Load() {
-		t.allocationNotBefore.Store(0)
+		t.releaseAllocationHold()
 	}
 }
 
@@ -1725,7 +1994,7 @@ func (t *Topology) SetMaxVolumeIdFile(file string) {
 	}
 	if cmd.GrowthFrozen != nil {
 		t.lastPersistedGrowthFrozen.Store(*cmd.GrowthFrozen)
-		t.SetGrowthFrozen(*cmd.GrowthFrozen)
+		t.SetGrowthFrozen(*cmd.GrowthFrozen, cmd.GrowthFrozenAt, 0)
 	}
 }
 
@@ -1734,7 +2003,7 @@ func (t *Topology) SetMaxVolumeIdFile(file string) {
 // recovery, so follower mirrors stay current too.
 func (t *Topology) PersistMaxVolumeId(vid needle.VolumeId) error {
 	topoId := t.GetTopologyId()
-	frozen := t.IsGrowthFrozen()
+	frozen, frozenAt := t.GrowthFreezeState()
 	mirrored := func() bool {
 		return t.lastPersistedMaxVolumeId.Load() >= uint32(vid) && t.lastPersistedTopologyId.Load() == topoId && t.lastPersistedGrowthFrozen.Load() == frozen
 	}
@@ -1754,6 +2023,9 @@ func (t *Topology) PersistMaxVolumeId(vid needle.VolumeId) error {
 	}
 	cmd := NewMaxVolumeIdCommand(vid, topoId)
 	cmd.GrowthFrozen = &frozen
+	if frozen {
+		cmd.GrowthFrozenAt = frozenAt
+	}
 	b, err := json.Marshal(cmd)
 	if err != nil {
 		return err
