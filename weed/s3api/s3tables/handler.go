@@ -33,9 +33,20 @@ const (
 	ExtendedKeyMaintenanceStatus = s3_constants.ExtS3TablesPrefix + "maintenanceStatus"
 	ExtendedKeyEntryType         = s3_constants.ExtS3TablesPrefix + "entryType"
 	// ExtendedKeyDeleting marks a catalog record claimed by an in-flight
-	// delete or rename, so the claim survives until the operation finishes
-	// or releases it.
+	// create, delete or rename, so the claim survives until the operation
+	// finishes or releases it. A table carries "create", "delete" or "rename";
+	// a namespace being deleted carries the random claim token written by
+	// claimForDelete.
 	ExtendedKeyDeleting = s3_constants.ExtS3TablesPrefix + "deleting"
+	// ExtendedKeyMoving holds the metadata an update moving a record's root is
+	// about to write, so the record holds both roots until the move lands.
+	ExtendedKeyMoving = s3_constants.ExtS3TablesPrefix + "moving"
+
+	// ExtendedKeyVectorPolicy is written by the S3 Vectors service on table
+	// buckets. It lives here rather than in the vectors package so the catalog
+	// can assert it in its update preconditions: a whole-entry write that does
+	// not know the key could silently erase a concurrently saved vector policy.
+	ExtendedKeyVectorPolicy = "s3vectors-policy"
 
 	// Entry-type marker values for ExtendedKeyEntryType. Absent or "table" means
 	// a table; views are stored like tables but tagged "view".
@@ -68,6 +79,7 @@ type S3TablesHandler struct {
 	trusted         bool // Trusted local tooling (shell/admin) bypasses authorization
 	iamAuthorizer   IAMAuthorizer
 	localAccountIDs func(string) bool
+	canEncrypt      func() bool
 }
 
 // NewS3TablesHandler creates a new S3 Tables handler
@@ -111,6 +123,13 @@ func (h *S3TablesHandler) SetLocalAccountChecker(fn func(string) bool) {
 	h.localAccountIDs = fn
 }
 
+// SetEncryptionChecker injects the predicate that tells whether the gateway
+// holds an SSE-S3 key, so a bucket whose declared AES256 the write path
+// applies is not created where every write would then fail.
+func (h *S3TablesHandler) SetEncryptionChecker(fn func() bool) {
+	h.canEncrypt = fn
+}
+
 // FilerClient interface for filer operations
 type FilerClient interface {
 	WithFilerClient(streamingMode bool, fn func(client filer_pb.SeaweedFilerClient) error) error
@@ -135,6 +154,10 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 	// the status the handler answers decides how its error is logged (logRequestError)
 	sw := &statusRecorder{ResponseWriter: w}
 	w = sw
+	fence := h.fenceVectorNamespace(w, r, filerClient, operation)
+	if fence != nil {
+		w, filerClient = fence, fence
+	}
 
 	var err error
 	switch operation {
@@ -231,6 +254,9 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if fence != nil {
+		fence.settle()
+	}
 	if err != nil {
 		logRequestError(operation, sw.status, err)
 	}

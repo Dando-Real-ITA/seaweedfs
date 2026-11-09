@@ -27,6 +27,10 @@ const (
 	defaultReconnectDelay      = 5
 	defaultPendingSchemaBuffer = 1
 	adminScriptJobType         = "admin_script"
+	// How often an in-flight detection re-checks that its worker is still
+	// registered and heartbeating; a session that went stale fails the
+	// detection the same way a closed stream does.
+	defaultDetectionLivenessInterval = 30 * time.Second
 )
 
 type Options struct {
@@ -59,6 +63,8 @@ type Plugin struct {
 	outgoingBuffer int
 	sendTimeout    time.Duration
 
+	detectionLivenessInterval time.Duration
+
 	schedulerTick          time.Duration
 	clusterContextProvider func(context.Context) (*plugin_pb.ClusterContext, error)
 	configDefaultsProvider func(config *plugin_pb.PersistedJobTypeConfig) *plugin_pb.PersistedJobTypeConfig
@@ -73,16 +79,19 @@ type Plugin struct {
 
 	lanes map[SchedulerLane]*schedulerLaneState
 
-	schedulerExecMu           sync.Mutex
-	schedulerExecReservations map[string]int
-	adminScriptRunMu          sync.RWMutex
-	schedulerDetectionMu      sync.Mutex
-	schedulerDetection        map[string]*schedulerDetectionInfo
-	schedulerRunMu            sync.Mutex
-	schedulerRun              map[string]*schedulerRunInfo
-	schedulerLoopMu           sync.Mutex
-	schedulerLoopState        schedulerLoopState
-	schedulerWakeCh           chan struct{}
+	// Execution slots this admin holds on workers, one entry per job in
+	// flight; see executorLoadLocked for how they meet the heartbeat.
+	execResMu            sync.Mutex
+	execRes              map[uint64]execReservation
+	execResSeq           uint64
+	adminScriptRunMu     sync.RWMutex
+	schedulerDetectionMu sync.Mutex
+	schedulerDetection   map[string]*schedulerDetectionInfo
+	schedulerRunMu       sync.Mutex
+	schedulerRun         map[string]*schedulerRunInfo
+	schedulerLoopMu      sync.Mutex
+	schedulerLoopState   schedulerLoopState
+	schedulerWakeCh      chan struct{}
 
 	dedupeMu           sync.Mutex
 	recentDedupeByType map[string]map[string]time.Time
@@ -97,7 +106,7 @@ type Plugin struct {
 	pendingDetection   map[string]*pendingDetectionState
 
 	pendingExecutionMu sync.Mutex
-	pendingExecution   map[string]chan *plugin_pb.JobCompleted
+	pendingExecution   map[string]*pendingExecutionState
 
 	pendingPreviewMu sync.Mutex
 	pendingPreview   map[string]chan *plugin_pb.ObjectPreviewResponse
@@ -108,6 +117,9 @@ type Plugin struct {
 	jobs   map[string]*TrackedJob
 	// serialize stale job cleanup to avoid duplicate expirations
 	staleJobsMu sync.Mutex
+
+	undeliveredCancelsMu sync.Mutex
+	undeliveredCancels   map[string]undeliveredCancel
 
 	jobDetailsMu sync.Mutex
 
@@ -138,6 +150,23 @@ type pendingDetectionState struct {
 	complete  chan *plugin_pb.DetectionComplete
 	jobType   string
 	workerID  string
+}
+
+// detectionWorkerDisconnectedError reports a detection whose worker session
+// ended (stream closed, replaced by a reconnect, or heartbeat went stale)
+// before it answered.
+type detectionWorkerDisconnectedError struct {
+	WorkerID string
+	Reason   string
+	session  *streamSession
+}
+
+func (e *detectionWorkerDisconnectedError) Error() string {
+	msg := fmt.Sprintf("detection worker %s disconnected", e.WorkerID)
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	return msg
 }
 
 // DetectionReport captures one detection run including request metadata.
@@ -178,6 +207,7 @@ func New(options Options) (*Plugin, error) {
 		registry:                  NewRegistry(),
 		outgoingBuffer:            bufferSize,
 		sendTimeout:               sendTimeout,
+		detectionLivenessInterval: defaultDetectionLivenessInterval,
 		schedulerTick:             schedulerTick,
 		clusterContextProvider:    options.ClusterContextProvider,
 		configDefaultsProvider:    options.ConfigDefaultsProvider,
@@ -186,13 +216,13 @@ func New(options Options) (*Plugin, error) {
 		sessions:                  make(map[string]*streamSession),
 		pendingSchema:             make(map[string]chan *plugin_pb.ConfigSchemaResponse),
 		pendingDetection:          make(map[string]*pendingDetectionState),
-		pendingExecution:          make(map[string]chan *plugin_pb.JobCompleted),
+		pendingExecution:          make(map[string]*pendingExecutionState),
 		pendingPreview:            make(map[string]chan *plugin_pb.ObjectPreviewResponse),
 		observations:              NewObservationStore(),
 		nextDetectionAt:           make(map[string]time.Time),
 		detectionInFlight:         make(map[string]bool),
 		detectorLeases:            make(map[string]string),
-		schedulerExecReservations: make(map[string]int),
+		execRes:                   make(map[uint64]execReservation),
 		schedulerDetection:        make(map[string]*schedulerDetectionInfo),
 		schedulerRun:              make(map[string]*schedulerRunInfo),
 		recentDedupeByType:        make(map[string]map[string]time.Time),
@@ -259,8 +289,8 @@ func (r *Plugin) Shutdown() {
 	r.pendingDetectionMu.Unlock()
 
 	r.pendingExecutionMu.Lock()
-	for requestID, ch := range r.pendingExecution {
-		close(ch)
+	for requestID, pending := range r.pendingExecution {
+		close(pending.completed)
 		delete(r.pendingExecution, requestID)
 	}
 	r.pendingExecutionMu.Unlock()
@@ -290,15 +320,13 @@ func (r *Plugin) WorkerStream(stream plugin_pb.PluginControlService_WorkerStream
 	}
 
 	workerID := hello.WorkerId
-	r.registry.UpsertFromHello(hello)
-
 	session := &streamSession{
 		workerID: workerID,
 		outgoing: make(chan *plugin_pb.AdminToWorkerMessage, r.outgoingBuffer),
 		done:     make(chan struct{}),
 	}
-	r.putSession(session)
-	defer r.cleanupSession(workerID)
+	r.registerSession(session, hello)
+	defer r.cleanupSession(session)
 
 	glog.V(0).Infof("Plugin worker connected: %s (%s)", workerID, hello.Address)
 
@@ -309,7 +337,7 @@ func (r *Plugin) WorkerStream(stream plugin_pb.PluginControlService_WorkerStream
 		sendErrCh <- r.sendLoop(stream.Context(), stream, session)
 	}()
 
-	if err := r.sendAdminHello(workerID); err != nil {
+	if err := r.sendAdminHello(session); err != nil {
 		glog.Warningf("failed to send plugin admin hello to %s: %v", workerID, err)
 	}
 	go r.prefetchDescriptorsFromHello(hello)
@@ -324,7 +352,7 @@ func (r *Plugin) WorkerStream(stream plugin_pb.PluginControlService_WorkerStream
 				recvErrCh <- recvErr
 				return
 			}
-			r.handleWorkerMessage(workerID, message)
+			r.handleWorkerMessage(session, message)
 		}
 	}()
 
@@ -361,7 +389,10 @@ func (r *Plugin) RequestConfigSchema(ctx context.Context, jobType string, forceR
 	if err != nil {
 		return nil, err
 	}
+	return r.requestConfigSchema(ctx, jobType, forceRefresh, provider.WorkerID)
+}
 
+func (r *Plugin) requestConfigSchema(ctx context.Context, jobType string, forceRefresh bool, workerID string) (*plugin_pb.JobTypeDescriptor, error) {
 	requestID, err := newRequestID("schema")
 	if err != nil {
 		return nil, err
@@ -388,7 +419,7 @@ func (r *Plugin) RequestConfigSchema(ctx context.Context, jobType string, forceR
 		},
 	}
 
-	if err := r.sendToWorker(provider.WorkerID, requestMessage); err != nil {
+	if err := r.sendToWorker(workerID, requestMessage); err != nil {
 		return nil, err
 	}
 
@@ -460,10 +491,22 @@ func (r *Plugin) RunDetectionWithReport(
 	clusterContext *plugin_pb.ClusterContext,
 	maxResults int32,
 ) (*DetectionReport, error) {
+	return r.runDetectionWithReport(ctx, jobType, clusterContext, maxResults, nil)
+}
+
+// runDetectionWithReport is RunDetectionWithReport with a stream the pick
+// must avoid: the one whose closure a retry is recovering from.
+func (r *Plugin) runDetectionWithReport(
+	ctx context.Context,
+	jobType string,
+	clusterContext *plugin_pb.ClusterContext,
+	maxResults int32,
+	avoid *streamSession,
+) (*DetectionReport, error) {
 	releaseGate := r.acquireDetectionExecutionGate(jobType, false)
 	defer releaseGate()
 
-	detector, err := r.pickDetector(jobType)
+	detector, err := r.pickDetector(jobType, avoid)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +570,16 @@ func (r *Plugin) RunDetectionWithReport(
 		},
 	}
 
-	if err := r.sendToWorker(detector.WorkerID, message); err != nil {
+	// The request is bound to the stream it was sent on: if that stream ends
+	// (disconnect or a reconnect with a new session) the answer can never
+	// arrive, so the wait below fails instead of running out the timeout.
+	session, connected := r.getSession(detector.WorkerID)
+	if !connected {
+		err = fmt.Errorf("worker %s is not connected", detector.WorkerID)
+	} else {
+		err = r.sendToSession(session, message)
+	}
+	if err != nil {
 		r.clearDetectorLease(jobType, detector.WorkerID)
 		r.appendActivity(JobActivity{
 			JobType:    jobType,
@@ -541,36 +593,40 @@ func (r *Plugin) RunDetectionWithReport(
 		return nil, err
 	}
 
-	select {
-	case <-ctx.Done():
-		r.sendCancel(detector.WorkerID, requestID, plugin_pb.WorkKind_WORK_KIND_DETECTION, ctx.Err())
-		r.appendActivity(JobActivity{
-			JobType:    jobType,
-			RequestID:  requestID,
-			WorkerID:   detector.WorkerID,
-			Source:     "detector",
-			Stage:      "canceled",
-			Message:    "detection canceled",
-			OccurredAt: timeToPtr(time.Now().UTC()),
-		})
+	return r.awaitDetectionOutcome(ctx, jobType, requestID, session, state)
+}
+
+// awaitDetectionOutcome waits for the request's completion, the end of the
+// stream it was sent on, a stale worker heartbeat, or ctx. A completion the
+// worker delivered before its stream ended is buffered in state.complete, and
+// the stream's closure can be observed in the same select: that completion
+// wins, so a scan that finished right before its worker went away is reported
+// as the success it was, not as a disconnect. A ctx that ended stands as is:
+// the caller stopped wanting the answer.
+func (r *Plugin) awaitDetectionOutcome(
+	ctx context.Context,
+	jobType string,
+	requestID string,
+	session *streamSession,
+	state *pendingDetectionState,
+) (*DetectionReport, error) {
+	workerID := session.workerID
+	emptyReport := func() *DetectionReport {
 		return &DetectionReport{
 			RequestID: requestID,
 			JobType:   jobType,
-			WorkerID:  detector.WorkerID,
-		}, ctx.Err()
-	case complete, ok := <-state.complete:
+			WorkerID:  workerID,
+		}
+	}
+	finish := func(complete *plugin_pb.DetectionComplete, ok bool) (*DetectionReport, error) {
 		if !ok {
-			return &DetectionReport{
-				RequestID: requestID,
-				JobType:   jobType,
-				WorkerID:  detector.WorkerID,
-			}, fmt.Errorf("detection request %s interrupted", requestID)
+			return emptyReport(), fmt.Errorf("detection request %s interrupted", requestID)
 		}
 		proposals := cloneJobProposals(state.proposals)
 		report := &DetectionReport{
 			RequestID: requestID,
 			JobType:   jobType,
-			WorkerID:  detector.WorkerID,
+			WorkerID:  workerID,
 			Proposals: proposals,
 			Complete:  complete,
 		}
@@ -582,6 +638,82 @@ func (r *Plugin) RunDetectionWithReport(
 		}
 		return report, nil
 	}
+	// finishIfCompleted takes a completion that is already queued when the
+	// worker is judged lost. The lease still goes: the worker that answered
+	// is gone or unreachable, so the next pick must start fresh.
+	finishIfCompleted := func() (bool, *DetectionReport, error) {
+		select {
+		case complete, ok := <-state.complete:
+			r.clearDetectorLease(jobType, workerID)
+			report, err := finish(complete, ok)
+			return true, report, err
+		default:
+			return false, nil, nil
+		}
+	}
+
+	livenessInterval := r.detectionLivenessInterval
+	if livenessInterval <= 0 {
+		livenessInterval = defaultDetectionLivenessInterval
+	}
+	liveness := time.NewTicker(livenessInterval)
+	defer liveness.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			r.sendCancel(workerID, requestID, plugin_pb.WorkKind_WORK_KIND_DETECTION, ctx.Err())
+			r.appendActivity(JobActivity{
+				JobType:    jobType,
+				RequestID:  requestID,
+				WorkerID:   workerID,
+				Source:     "detector",
+				Stage:      "canceled",
+				Message:    "detection canceled",
+				OccurredAt: timeToPtr(time.Now().UTC()),
+			})
+			return emptyReport(), ctx.Err()
+		case <-session.done:
+			if completed, report, err := finishIfCompleted(); completed {
+				return report, err
+			}
+			return emptyReport(), r.failDetectionWorkerLost(jobType, requestID, session, "", false)
+		case <-liveness.C:
+			if r.isWorkerAvailable(workerID) {
+				continue
+			}
+			if completed, report, err := finishIfCompleted(); completed {
+				return report, err
+			}
+			// The stream may still be open, so the worker is told to stop.
+			return emptyReport(), r.failDetectionWorkerLost(jobType, requestID, session, "heartbeat stale", true)
+		case complete, ok := <-state.complete:
+			return finish(complete, ok)
+		}
+	}
+}
+
+// failDetectionWorkerLost closes out a detection whose worker session ended
+// before it answered. The detector lease is dropped so the next pick starts
+// fresh; the worker is only told to cancel when its stream may still be open.
+func (r *Plugin) failDetectionWorkerLost(jobType, requestID string, session *streamSession, reason string, cancelOnWorker bool) error {
+	workerID := session.workerID
+	err := &detectionWorkerDisconnectedError{WorkerID: workerID, Reason: reason, session: session}
+	r.clearDetectorLease(jobType, workerID)
+	if cancelOnWorker {
+		r.sendCancel(workerID, requestID, plugin_pb.WorkKind_WORK_KIND_DETECTION, err)
+	}
+	glog.Warningf("Plugin detection %s for %s failed: %v", requestID, jobType, err)
+	r.appendActivity(JobActivity{
+		JobType:    jobType,
+		RequestID:  requestID,
+		WorkerID:   workerID,
+		Source:     "detector",
+		Stage:      "disconnected",
+		Message:    err.Error(),
+		OccurredAt: timeToPtr(time.Now().UTC()),
+	})
+	return err
 }
 
 // RunDetection requests one detector worker to produce job proposals for a job type.
@@ -683,17 +815,30 @@ func (r *Plugin) executeJobWithExecutor(
 	// the single active worker, not 1/N of it.
 	clusterContext = r.decorateClusterContextForJob(clusterContext, job.JobType, adminConfigValues, int(adminRuntime.GetMaxJobsPerDetection()))
 
+	// The request goes out on this stream and no other, so a newer stream
+	// of the worker can tell it never received it.
+	session, ok := r.getSession(executor.WorkerID)
+	if !ok {
+		return nil, fmt.Errorf("worker %s is not connected", executor.WorkerID)
+	}
+
+	r.trackExecutionStart(requestID, executor.WorkerID, job, attempt)
+
 	completedCh := make(chan *plugin_pb.JobCompleted, 1)
+	pending := &pendingExecutionState{
+		completed: completedCh,
+		jobID:     job.JobId,
+		jobType:   job.JobType,
+		session:   session,
+	}
 	r.pendingExecutionMu.Lock()
-	r.pendingExecution[requestID] = completedCh
+	r.pendingExecution[requestID] = pending
 	r.pendingExecutionMu.Unlock()
 	defer func() {
 		r.pendingExecutionMu.Lock()
 		delete(r.pendingExecution, requestID)
 		r.pendingExecutionMu.Unlock()
 	}()
-
-	r.trackExecutionStart(requestID, executor.WorkerID, job, attempt)
 
 	message := &plugin_pb.AdminToWorkerMessage{
 		RequestId: requestID,
@@ -711,7 +856,23 @@ func (r *Plugin) executeJobWithExecutor(
 		},
 	}
 
-	if err := r.sendToWorker(executor.WorkerID, message); err != nil {
+	if err := r.sendToSession(session, message); err != nil {
+		// The worker never got the request, so no report will close the
+		// attempt unless an expiry already claimed it. Unregister first:
+		// nobody reads completedCh any more. Shutdown may have done so.
+		r.pendingExecutionMu.Lock()
+		delete(r.pendingExecution, requestID)
+		claimed := pending.failed
+		r.pendingExecutionMu.Unlock()
+		if !claimed {
+			r.handleJobCompleted(&plugin_pb.JobCompleted{
+				JobId:        job.JobId,
+				JobType:      job.JobType,
+				RequestId:    requestID,
+				ErrorMessage: err.Error(),
+				CompletedAt:  timestamppb.Now(),
+			})
+		}
 		return nil, err
 	}
 
@@ -831,17 +992,20 @@ func (r *Plugin) FilterProposalsWithActiveJobs(jobType string, proposals []*plug
 }
 
 func (r *Plugin) PickDetectorWorker(jobType string) (*WorkerSession, error) {
-	return r.pickDetector(jobType)
+	return r.pickDetector(jobType, nil)
 }
 
 func (r *Plugin) PickExecutorWorker(jobType string) (*WorkerSession, error) {
 	return r.registry.PickExecutor(jobType)
 }
 
-func (r *Plugin) pickDetector(jobType string) (*WorkerSession, error) {
+// pickDetector picks a detector that can actually be sent to: registered,
+// with an open stream, and not the stream in avoid. The registry alone is
+// not enough because a stream can close before its entry is removed.
+func (r *Plugin) pickDetector(jobType string, avoid *streamSession) (*WorkerSession, error) {
 	leasedWorkerID := r.getDetectorLease(jobType)
 	if leasedWorkerID != "" {
-		if worker, ok := r.registry.Get(leasedWorkerID); ok {
+		if worker, ok := r.registry.Get(leasedWorkerID); ok && r.sessionIsOpen(leasedWorkerID, avoid) {
 			if capability := worker.Capabilities[jobType]; capability != nil && capability.CanDetect {
 				return worker, nil
 			}
@@ -849,13 +1013,31 @@ func (r *Plugin) pickDetector(jobType string) (*WorkerSession, error) {
 		r.clearDetectorLease(jobType, leasedWorkerID)
 	}
 
-	detector, err := r.registry.PickDetector(jobType)
-	if err != nil {
-		return nil, err
+	var excluded []string
+	for {
+		detector, err := r.registry.PickDetector(jobType, excluded...)
+		if err != nil {
+			return nil, err
+		}
+		if r.sessionIsOpen(detector.WorkerID, avoid) {
+			r.setDetectorLease(jobType, detector.WorkerID)
+			return detector, nil
+		}
+		excluded = append(excluded, detector.WorkerID)
 	}
+}
 
-	r.setDetectorLease(jobType, detector.WorkerID)
-	return detector, nil
+func (r *Plugin) sessionIsOpen(workerID string, avoid *streamSession) bool {
+	session, ok := r.getSession(workerID)
+	if !ok || session == avoid {
+		return false
+	}
+	select {
+	case <-session.done:
+		return false
+	default:
+		return true
+	}
 }
 
 func (r *Plugin) getDetectorLease(jobType string) string {
@@ -887,9 +1069,9 @@ func (r *Plugin) clearDetectorLease(jobType string, workerID string) {
 	delete(r.detectorLeases, jobType)
 }
 
-func (r *Plugin) sendCancel(workerID, targetID string, kind plugin_pb.WorkKind, cause error) {
+func (r *Plugin) sendCancel(workerID, targetID string, kind plugin_pb.WorkKind, cause error) error {
 	if strings.TrimSpace(workerID) == "" || strings.TrimSpace(targetID) == "" {
-		return
+		return nil
 	}
 
 	requestID, err := newRequestID("cancel")
@@ -912,12 +1094,14 @@ func (r *Plugin) sendCancel(workerID, targetID string, kind plugin_pb.WorkKind, 
 			},
 		},
 	}
-	if err := r.sendToWorker(workerID, message); err != nil {
+	err = r.sendToWorker(workerID, message)
+	if err != nil {
 		glog.V(1).Infof("Plugin failed to send cancel request to worker=%s target=%s: %v", workerID, targetID, err)
 	}
+	return err
 }
 
-func (r *Plugin) sendAdminHello(workerID string) error {
+func (r *Plugin) sendAdminHello(session *streamSession) error {
 	msg := &plugin_pb.AdminToWorkerMessage{
 		RequestId: "",
 		SentAt:    timestamppb.Now(),
@@ -930,7 +1114,7 @@ func (r *Plugin) sendAdminHello(workerID string) error {
 			},
 		},
 	}
-	return r.sendToWorker(workerID, msg)
+	return r.sendToSession(session, msg)
 }
 
 func (r *Plugin) sendLoop(
@@ -957,37 +1141,52 @@ func (r *Plugin) sendLoop(
 	}
 }
 
-func (r *Plugin) sendToWorker(workerID string, message *plugin_pb.AdminToWorkerMessage) error {
+func (r *Plugin) getSession(workerID string) (*streamSession, bool) {
 	r.sessionsMu.RLock()
 	session, ok := r.sessions[workerID]
 	r.sessionsMu.RUnlock()
+	return session, ok
+}
+
+func (r *Plugin) sendToWorker(workerID string, message *plugin_pb.AdminToWorkerMessage) error {
+	session, ok := r.getSession(workerID)
 	if !ok {
 		return fmt.Errorf("worker %s is not connected", workerID)
 	}
+	return r.sendToSession(session, message)
+}
 
+func (r *Plugin) sendToSession(session *streamSession, message *plugin_pb.AdminToWorkerMessage) error {
 	select {
 	case <-r.shutdownCh:
 		return fmt.Errorf("plugin is shutting down")
 	case <-session.done:
-		return fmt.Errorf("worker %s session is closed", workerID)
+		return fmt.Errorf("worker %s session is closed", session.workerID)
 	case session.outgoing <- message:
 		return nil
 	case <-time.After(r.sendTimeout):
-		return fmt.Errorf("timed out sending message to worker %s", workerID)
+		return fmt.Errorf("timed out sending message to worker %s", session.workerID)
 	}
 }
 
-func (r *Plugin) handleWorkerMessage(workerID string, message *plugin_pb.WorkerToAdminMessage) {
+func (r *Plugin) handleWorkerMessage(session *streamSession, message *plugin_pb.WorkerToAdminMessage) {
 	if message == nil {
 		return
 	}
+	workerID := session.workerID
 
 	switch body := message.Body.(type) {
 	case *plugin_pb.WorkerToAdminMessage_Hello:
-		r.registry.UpsertFromHello(body.Hello)
+		if !r.updateRegistryFromSession(session, func() { r.registry.UpsertFromHello(body.Hello) }) {
+			return
+		}
 		r.wakeScheduler()
 	case *plugin_pb.WorkerToAdminMessage_Heartbeat:
-		r.registry.UpdateHeartbeat(workerID, body.Heartbeat)
+		if !r.updateRegistryFromSession(session, func() { r.registry.UpdateHeartbeat(workerID, body.Heartbeat) }) {
+			return
+		}
+		r.resendUndeliveredCancels(workerID, body.Heartbeat)
+		r.failExecutionsMissingFromHeartbeat(session, body.Heartbeat)
 	case *plugin_pb.WorkerToAdminMessage_ConfigSchemaResponse:
 		r.handleConfigSchemaResponse(body.ConfigSchemaResponse)
 	case *plugin_pb.WorkerToAdminMessage_DetectionProposals:
@@ -1230,6 +1429,19 @@ func (r *Plugin) handleDetectionComplete(workerID string, message *plugin_pb.Det
 		if messageText == "" {
 			messageText = "detection failed"
 		}
+	} else if message.SkippedReason != "" {
+		stage = "skipped"
+		messageText = message.SkippedReason
+	}
+	details := map[string]interface{}{
+		"success":         message.Success,
+		"total_proposals": message.TotalProposals,
+	}
+	if message.SkippedReason != "" {
+		details["skipped_reason"] = message.SkippedReason
+	}
+	if message.EligibleAfter != nil {
+		details["eligible_after"] = message.EligibleAfter.AsTime().UTC().Format(time.RFC3339)
 	}
 	r.appendActivity(JobActivity{
 		JobType:    resolvedJobType,
@@ -1239,10 +1451,7 @@ func (r *Plugin) handleDetectionComplete(workerID string, message *plugin_pb.Det
 		Stage:      stage,
 		Message:    messageText,
 		OccurredAt: timeToPtr(time.Now().UTC()),
-		Details: map[string]interface{}{
-			"success":         message.Success,
-			"total_proposals": message.TotalProposals,
-		},
+		Details:    details,
 	})
 
 	r.safeSendDetectionComplete(message.RequestId, message)
@@ -1269,6 +1478,12 @@ func (r *Plugin) handleJobCompleted(completed *plugin_pb.JobCompleted) {
 
 	if completed.RequestId != "" {
 		r.safeSendJobCompleted(completed.RequestId, completed)
+	}
+	r.jobsMu.RLock()
+	ended := attemptEnded(r.jobs[completed.JobId], completed.RequestId)
+	r.jobsMu.RUnlock()
+	if ended {
+		return
 	}
 
 	tracked := r.trackExecutionCompletion(completed)
@@ -1316,33 +1531,83 @@ func (r *Plugin) handleJobCompleted(completed *plugin_pb.JobCompleted) {
 }
 
 func (r *Plugin) safeSendJobCompleted(requestID string, completed *plugin_pb.JobCompleted) {
+	var ch chan *plugin_pb.JobCompleted
 	r.pendingExecutionMu.Lock()
-	ch := r.pendingExecution[requestID]
+	if pending := r.pendingExecution[requestID]; pending != nil {
+		ch = pending.completed
+		pending.completionSent = true
+	}
 	r.pendingExecutionMu.Unlock()
 	safeSendCh(ch, completed, r.shutdownCh)
 }
 
+// The registry entry for a worker always describes the stream that is
+// currently sendable for it: every registry write for a worker happens under
+// sessionsMu, together with or checked against r.sessions[workerID].
+
 func (r *Plugin) putSession(session *streamSession) {
 	r.sessionsMu.Lock()
 	defer r.sessionsMu.Unlock()
-
-	if old, exists := r.sessions[session.workerID]; exists {
-		old.close()
-	}
-	r.sessions[session.workerID] = session
+	r.publishSessionLocked(session)
 }
 
-func (r *Plugin) cleanupSession(workerID string) {
-	r.registry.Remove(workerID)
+// registerSession publishes a stream and its hello as one step so a second
+// stream for the same worker cannot leave the registry describing the older
+// hello while only the newer stream is sendable.
+func (r *Plugin) registerSession(session *streamSession, hello *plugin_pb.WorkerHello) {
+	r.sessionsMu.Lock()
+	defer r.sessionsMu.Unlock()
+	r.registry.UpsertFromHello(hello)
+	r.publishSessionLocked(session)
+}
+
+// publishSessionLocked installs the stream and closes the one it replaces.
+// Anything waiting on the old stream's done wakes to a registry and session
+// map that already describe the replacement.
+func (r *Plugin) publishSessionLocked(session *streamSession) {
+	old, exists := r.sessions[session.workerID]
+	r.sessions[session.workerID] = session
+	if exists && old != session {
+		old.close()
+	}
+}
+
+// updateRegistryFromSession applies a registry write for a stream's worker
+// only while that stream is the registered one; a superseded stream's late
+// hello or heartbeat must not describe the live stream.
+func (r *Plugin) updateRegistryFromSession(session *streamSession, update func()) bool {
+	r.sessionsMu.RLock()
+	defer r.sessionsMu.RUnlock()
+	if current, ok := r.sessions[session.workerID]; !ok || current != session {
+		return false
+	}
+	update()
+	return true
+}
+
+// cleanupSession ends one stream. Only the stream currently registered for
+// the worker takes the registry entry down with it; a stream that a reconnect
+// already replaced must not evict its successor. The registry entry goes
+// before done closes so nothing woken by the closure can still pick it.
+func (r *Plugin) cleanupSession(session *streamSession) {
+	workerID := session.workerID
 
 	r.sessionsMu.Lock()
-	session, exists := r.sessions[workerID]
-	if exists {
+	current, exists := r.sessions[workerID]
+	superseded := exists && current != session
+	if exists && !superseded {
 		delete(r.sessions, workerID)
-		session.close()
 	}
+	if !superseded {
+		r.registry.Remove(workerID)
+	}
+	session.close()
 	r.sessionsMu.Unlock()
 
+	if superseded {
+		glog.V(1).Infof("Plugin worker stream closed: %s (replaced by a newer session)", workerID)
+		return
+	}
 	glog.V(0).Infof("Plugin worker disconnected: %s", workerID)
 }
 
@@ -1481,5 +1746,9 @@ func (r *Plugin) WorkerConnectForTest(hello *plugin_pb.WorkerHello) {
 
 // WorkerDisconnectForTest simulates a worker disconnecting (test helper).
 func (r *Plugin) WorkerDisconnectForTest(workerID string) {
+	if session, ok := r.getSession(workerID); ok {
+		r.cleanupSession(session)
+		return
+	}
 	r.registry.Remove(workerID)
 }

@@ -118,6 +118,17 @@ fn reject_https_downgrade(attempt: reqwest::redirect::Attempt) -> reqwest::redir
     }
 }
 
+/// A peer that never answers a SYN (silent partition) must not stall new
+/// outgoing connections; requests set their own overall bounds as needed.
+const OUTGOING_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Base of every outgoing HTTP client: redirect policy and connect bound.
+fn outgoing_client_builder(redirect_policy: reqwest::redirect::Policy) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(redirect_policy)
+        .connect_timeout(OUTGOING_CONNECT_TIMEOUT)
+}
+
 fn build_outgoing_http_client(
     config: &VolumeServerConfig,
 ) -> Result<(reqwest::Client, String), Box<dyn std::error::Error>> {
@@ -129,14 +140,12 @@ fn build_outgoing_http_client(
     let redirect_policy = reqwest::redirect::Policy::custom(reject_https_downgrade);
     if !config.https_client_enabled {
         return Ok((
-            reqwest::Client::builder()
-                .redirect(redirect_policy)
-                .build()?,
+            outgoing_client_builder(redirect_policy).build()?,
             scheme.to_string(),
         ));
     }
 
-    let mut builder = reqwest::Client::builder().redirect(redirect_policy);
+    let mut builder = outgoing_client_builder(redirect_policy);
     if !config.https_client_ca_file.is_empty() {
         let ca_pem = std::fs::read(&config.https_client_ca_file).map_err(|e| {
             format!(
@@ -217,29 +226,29 @@ fn build_grpc_server_tls_acceptor(
     tls_policy: &TlsPolicy,
     allowed_wildcard_domain: &str,
     allowed_common_names: &[String],
-) -> Option<TlsAcceptor> {
-    if cert_path.is_empty() || key_path.is_empty() || ca_path.is_empty() {
-        return None;
+) -> Result<Option<TlsAcceptor>, Box<dyn std::error::Error>> {
+    if cert_path.is_empty() && key_path.is_empty() {
+        return Ok(None);
+    }
+    if cert_path.is_empty() || key_path.is_empty() {
+        return Err("grpc.volume.cert and grpc.volume.key must both be set".into());
+    }
+    if ca_path.is_empty() {
+        return Err("grpc.volume cert and key are set but grpc.ca is not".into());
     }
     let client_auth_policy = GrpcClientAuthPolicy {
         allowed_common_names: allowed_common_names.to_vec(),
         allowed_wildcard_domain: allowed_wildcard_domain.to_string(),
     };
-    let mut server_config = match build_rustls_server_config_with_grpc_client_auth(
+    let mut server_config = build_rustls_server_config_with_grpc_client_auth(
         cert_path,
         key_path,
         ca_path,
         tls_policy,
         &client_auth_policy,
-    ) {
-        Ok(server_config) => server_config,
-        Err(e) => {
-            warn!("Failed to build gRPC TLS config: {}", e);
-            return None;
-        }
-    };
+    )?;
     server_config.alpn_protocols = vec![b"h2".to_vec()];
-    Some(TlsAcceptor::from(Arc::new(server_config)))
+    Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
 }
 
 fn build_http_server_tls_acceptor(
@@ -324,6 +333,12 @@ async fn run(
     store.data_center = config.data_center.clone();
     store.rack = config.rack.clone();
 
+    // Shared between the gRPC claims and the disk locations' load scans so
+    // a reload cannot sweep files an in-flight VolumeCopy still writes.
+    let volume_copies_in_flight =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    store.set_volume_load_guard(volume_copies_in_flight.clone());
+
     // Build shared state
     let guard = Guard::new(
         &config.white_list,
@@ -402,6 +417,7 @@ async fn run(
                 .into_owned()
         },
         ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        volume_copies_in_flight,
         ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
         ec_decode_tail_notify: tokio::sync::Notify::new(),
     });
@@ -533,7 +549,7 @@ async fn run(
         &config.tls_policy,
         &config.grpc_allowed_wildcard_domain,
         &config.grpc_volume_allowed_common_names,
-    );
+    )?;
 
     info!("Starting HTTP server on {}", admin_addr);
     info!("Starting gRPC server on {}", grpc_addr);
@@ -701,7 +717,8 @@ async fn run(
                 .build_v1alpha()
                 .expect("Failed to build gRPC reflection v1alpha service");
             let result = if let Some(tls_acceptor) = grpc_tls_acceptor {
-                let incoming = grpc_tls_incoming(grpc_listener, tls_acceptor);
+                let incoming =
+                    grpc_tls_incoming(grpc_listener, tls_acceptor, GRPC_TLS_HANDSHAKE_TIMEOUT);
                 info!("gRPC server listening on {} (TLS enabled)", grpc_local_addr);
                 build_grpc_server_builder()
                     .layer(GrpcRequestIdLayer)
@@ -838,40 +855,39 @@ async fn run(
         }))
     };
 
-    // Wait for servers. Use select! with &mut so the losing handle is not
-    // dropped, then await it explicitly afterward.
+    // Whichever server stops first takes the other down, as a serve failure
+    // is fatal for the Go volume server.
     let mut server_err: Option<String> = None;
-    let mut http_handle = http_handle;
     let mut grpc_handle = grpc_handle;
-    let grpc_finished_first = tokio::select! {
-        _ = &mut http_handle => false,
-        _ = &mut grpc_handle => true,
+    let mut http_handle = http_handle;
+    let (http_result, grpc_result) = tokio::select! {
+        r = &mut grpc_handle => {
+            let _ = shutdown_tx.send(());
+            (http_handle.await, r)
+        }
+        r = &mut http_handle => {
+            let _ = shutdown_tx.send(());
+            (r, grpc_handle.await)
+        }
     };
-    // Inspect the gRPC result (already resolved if it finished first,
-    // otherwise await it now).
-    let grpc_result = if grpc_finished_first {
-        grpc_handle.await
-    } else {
-        // HTTP finished first; gRPC is still running. Await it.
-        grpc_handle.await
-    };
+    if let Err(e) = http_result {
+        let msg = format!("HTTP task panicked: {}", e);
+        error!("{}", msg);
+        server_err = Some(msg);
+    }
     match grpc_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let msg = format!("gRPC server exited with error: {}", e);
             error!("{}", msg);
             server_err = Some(msg);
-            // serve error already sent shutdown inside the task
         }
         Err(e) => {
             let msg = format!("gRPC task panicked: {}", e);
             error!("{}", msg);
             server_err = Some(msg);
-            let _ = shutdown_tx.send(());
         }
     }
-    // Ensure the HTTP handle completes too.
-    let _ = http_handle.await;
     if let Some(h) = public_handle {
         let _ = h.await;
     }
@@ -939,28 +955,64 @@ async fn run_metrics_push_loop(
     }
 }
 
+/// grpc-go's default ConnectionTimeout, which bounds a Go server's handshake.
+const GRPC_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Each handshake runs on its own task, so a peer that connects and stays
+/// silent holds up no other connection, as with a Go gRPC server.
 fn grpc_tls_incoming(
     listener: tokio::net::TcpListener,
     tls_acceptor: TlsAcceptor,
+    handshake_timeout: std::time::Duration,
 ) -> impl tokio_stream::Stream<
     Item = Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::io::Error>,
 > {
-    async_stream::stream! {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut retry_delay = std::time::Duration::ZERO;
         loop {
-            match listener.accept().await {
-                Ok((tcp_stream, remote_addr)) => match tls_acceptor.accept(tcp_stream).await {
-                    Ok(tls_stream) => yield Ok(tls_stream),
-                    Err(e) => {
+            let accepted = tokio::select! {
+                _ = tx.closed() => return,
+                accepted = listener.accept() => accepted,
+            };
+            let (tcp_stream, remote_addr) = match accepted {
+                Ok(accepted) => {
+                    retry_delay = std::time::Duration::ZERO;
+                    accepted
+                }
+                Err(e) => {
+                    // Back off and retry like grpc-go, so running out of file
+                    // descriptors does not close the gRPC port for good.
+                    retry_delay = (retry_delay * 2).clamp(
+                        std::time::Duration::from_millis(5),
+                        std::time::Duration::from_secs(1),
+                    );
+                    tracing::warn!("gRPC accept error: {}; retrying in {:?}", e, retry_delay);
+                    tokio::select! {
+                        _ = tx.closed() => return,
+                        _ = tokio::time::sleep(retry_delay) => continue,
+                    }
+                }
+            };
+            let tls_acceptor = tls_acceptor.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(handshake_timeout, tls_acceptor.accept(tcp_stream)).await
+                {
+                    Ok(Ok(tls_stream)) => {
+                        let _ = tx.send(Ok(tls_stream)).await;
+                    }
+                    Ok(Err(e)) => {
                         tracing::debug!("gRPC TLS handshake failed from {}: {}", remote_addr, e);
                     }
-                },
-                Err(e) => {
-                    yield Err(e);
-                    break;
+                    Err(_) => {
+                        tracing::debug!("gRPC TLS handshake from {} timed out", remote_addr);
+                    }
                 }
-            }
+            });
         }
-    }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
 /// Serve an axum Router over TLS using tokio-rustls.
@@ -1067,14 +1119,119 @@ async fn serve_https<F>(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_grpc_server_tls_acceptor, effective_http_tls_policy, tls_policy_is_configured,
+        GRPC_TLS_HANDSHAKE_TIMEOUT, build_grpc_server_tls_acceptor, effective_http_tls_policy,
+        grpc_tls_incoming, tls_policy_is_configured,
     };
     use seaweed_volume::security::tls::TlsPolicy;
+
+    /// A connect that never finishes fails at the 5 s bound. It stalls in the
+    /// resolver, which the connect bound also covers, because that needs no
+    /// routing: a real unanswered SYN depends on the host's network.
+    #[tokio::test(start_paused = true)]
+    async fn outgoing_client_bounds_a_stalled_connect() {
+        struct Stalled;
+        impl reqwest::dns::Resolve for Stalled {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(std::future::pending())
+            }
+        }
+        let client = super::outgoing_client_builder(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(Stalled))
+            .build()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            client.get("http://silent-peer.invalid:8080/status").send(),
+        )
+        .await
+        .expect("a stalled connect must not outlive its bound");
+        assert!(sent.is_err(), "a stalled connect cannot answer");
+        assert_eq!(started.elapsed(), super::OUTGOING_CONNECT_TIMEOUT);
+    }
 
     fn write_pem(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
         let path = dir.path().join(name);
         std::fs::write(&path, body).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    // A CA and a leaf it signed for localhost, usable on either side.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBhzCCAS2gAwIBAgIUWQMpep+B+ShfbwEfk20OGMkBgpAwCgYIKoZIzj0EAwIw\nGTEXMBUGA1UEAwwOdm9sdW1lLXRlc3QtY2EwHhcNMjYxMTAzMTgzOTI2WhcNMzYx\nMDMxMTgzOTI2WjAZMRcwFQYDVQQDDA52b2x1bWUtdGVzdC1jYTBZMBMGByqGSM49\nAgEGCCqGSM49AwEHA0IABD8L549bGTiFShKDcA2UFhz2MH9wxVuFCWCfJ7OVYM2x\nweY/5uCLjBRAnFx5FuWnaNtdTWkImXBSguHe861foCajUzBRMB0GA1UdDgQWBBQH\nOSZ93m5jmlLJpS5cFzH2hicEdjAfBgNVHSMEGDAWgBQHOSZ93m5jmlLJpS5cFzH2\nhicEdjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIEetcimwxiDU\n8RS0b5uaev3c/kbnOT1nOV6n2wdtplZ4AiEAlWDH77I9ssy+yqXArkdiEadePIl5\nUyXg6crXqITwUeE=\n-----END CERTIFICATE-----\n";
+    const TEST_LEAF_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBuTCCAV+gAwIBAgIUC4xhlzsyNZi0XHzyCwV/xquGQLkwCgYIKoZIzj0EAwIw\nGTEXMBUGA1UEAwwOdm9sdW1lLXRlc3QtY2EwHhcNMjYxMTAzMTgzOTI2WhcNMzYx\nMDMxMTgzOTI2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggq\nhkjOPQMBBwNCAASKt0T/i1pt7Aw3DloYFRoaX8+w/reR3tIEaMo911/fIvQhqkg4\nLPCXKocq0KNw3Na3HnZeU9Ls+FLoSHynBsyIo4GJMIGGMBoGA1UdEQQTMBGCCWxv\nY2FsaG9zdIcEfwAAATAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwCQYD\nVR0TBAIwADAdBgNVHQ4EFgQUp8jNqBiE0UeYRkCny2In6SyKEKkwHwYDVR0jBBgw\nFoAUBzkmfd5uY5pSyaUuXBcx9oYnBHYwCgYIKoZIzj0EAwIDSAAwRQIhAIzNfGpS\n+rIxr3eGInfD+0DzQxSuqfcQZTkV2eGkebcuAiAIV73Y7wKg7D08qfmmrH/TaAZB\nm2wr/1assOVDaw8dMg==\n-----END CERTIFICATE-----\n";
+    const TEST_LEAF_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmMs2vKPN5ymhYOXl\nztUUiSWAcmKVVWxveajzfxIwqBehRANCAASKt0T/i1pt7Aw3DloYFRoaX8+w/reR\n3tIEaMo911/fIvQhqkg4LPCXKocq0KNw3Na3HnZeU9Ls+FLoSHynBsyI\n-----END PRIVATE KEY-----\n";
+
+    fn test_grpc_tls_acceptor(dir: &tempfile::TempDir) -> tokio_rustls::TlsAcceptor {
+        seaweed_volume::security::tls::install_default_crypto_provider();
+        let ca = write_pem(dir, "ca.pem", TEST_CA_PEM);
+        let cert = write_pem(dir, "leaf.pem", TEST_LEAF_PEM);
+        let key = write_pem(dir, "leaf.key", TEST_LEAF_KEY_PEM);
+        build_grpc_server_tls_acceptor(&cert, &key, &ca, &TlsPolicy::default(), "", &[])
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_grpc_tls_incoming_serves_past_a_silent_peer() {
+        use tokio_stream::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let acceptor = test_grpc_tls_acceptor(&dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming = Box::pin(grpc_tls_incoming(
+            listener,
+            acceptor,
+            GRPC_TLS_HANDSHAKE_TIMEOUT,
+        ));
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut TEST_CA_PEM.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                rustls_pemfile::certs(&mut TEST_LEAF_PEM.as_bytes())
+                    .map(|c| c.unwrap())
+                    .collect(),
+                rustls_pemfile::private_key(&mut TEST_LEAF_KEY_PEM.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+                .connect("localhost".try_into().unwrap(), tcp)
+                .await
+        });
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.next()).await;
+        assert!(
+            matches!(served, Ok(Some(Ok(_)))),
+            "the handshake waited behind a silent peer"
+        );
+        client.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_grpc_tls_incoming_closes_a_silent_peer_after_the_handshake_timeout() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let acceptor = test_grpc_tls_acceptor(&dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _incoming =
+            grpc_tls_incoming(listener, acceptor, std::time::Duration::from_millis(100));
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), silent.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "the silent peer stayed connected past the handshake timeout"
+        );
     }
 
     #[test]
@@ -1093,12 +1250,12 @@ mod tests {
 
         assert!(
             build_grpc_server_tls_acceptor(&cert, &key, "", &TlsPolicy::default(), "", &[])
-                .is_none()
+                .is_err()
         );
     }
 
     #[test]
-    fn test_grpc_server_tls_returns_none_when_files_are_missing() {
+    fn test_grpc_server_tls_errors_when_files_are_missing() {
         assert!(
             build_grpc_server_tls_acceptor(
                 "/missing/server.crt",
@@ -1108,12 +1265,12 @@ mod tests {
                 "",
                 &[],
             )
-            .is_none()
+            .is_err()
         );
     }
 
     #[test]
-    fn test_grpc_server_tls_disables_on_unsupported_tls_policy() {
+    fn test_grpc_server_tls_errors_on_unsupported_tls_policy() {
         let dir = tempfile::tempdir().unwrap();
         let cert = write_pem(
             &dir,
@@ -1144,7 +1301,7 @@ mod tests {
                 "",
                 &[],
             )
-            .is_none()
+            .is_err()
         );
     }
 

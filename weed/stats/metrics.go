@@ -300,6 +300,22 @@ var (
 			Help:      "Counter of filer store requests.",
 		}, []string{"store", "type"})
 
+	FilerRemoteDeletionTombstones = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "remote_deletion_tombstones",
+			Help:      "Paths deleted under a remote mount whose remote delete the write-back daemon has not consumed yet.",
+		})
+
+	FilerRemoteDeletionTombstonesFull = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemFiler,
+			Name:      "remote_deletion_tombstones_full",
+			Help:      "1 from a delete the full table could not record until the table has room and that delete is past the TTL; lazy remote fetches are off meanwhile. 0 otherwise.",
+		})
+
 	FilerStoreHistogram = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: Namespace,
@@ -668,6 +684,18 @@ var (
 			Help:      "Counter of EC shard rebuild operations by result.",
 		}, []string{"result"})
 
+	// VolumeServerECReconstructedIntervalCounter counts reads of an EC shard
+	// interval that could not be read directly and were served by reconstructing
+	// it from the other shards. success means the reconstruction produced data,
+	// not that the needle then passed validation.
+	VolumeServerECReconstructedIntervalCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemVolumeServer,
+			Name:      "ec_reconstructed_interval_total",
+			Help:      "Reads of an EC interval served by reconstructing from other shards; success means reconstruction produced data, not that the needle passed validation.",
+		}, []string{"result"})
+
 	S3RequestCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
@@ -1025,6 +1053,8 @@ func init() {
 	Gather.MustRegister(FilerInFlightUploadCountGauge)
 	Gather.MustRegister(FilerStoreCounter)
 	Gather.MustRegister(FilerStoreHistogram)
+	Gather.MustRegister(FilerRemoteDeletionTombstones)
+	Gather.MustRegister(FilerRemoteDeletionTombstonesFull)
 	Gather.MustRegister(FilerSyncOffsetGauge)
 	Gather.MustRegister(FilerSyncEventsReceivedCounter)
 	Gather.MustRegister(FilerSyncEventsProcessedCounter)
@@ -1077,6 +1107,7 @@ func init() {
 	Gather.MustRegister(VolumeServerReplicationFailures)
 	Gather.MustRegister(VolumeServerECRebuildHistogram)
 	Gather.MustRegister(VolumeServerECRebuildCounter)
+	Gather.MustRegister(VolumeServerECReconstructedIntervalCounter)
 	Gather.MustRegister(MasterUnderReplicatedVolumes)
 	Gather.MustRegister(MasterVolumeCreationCounter)
 

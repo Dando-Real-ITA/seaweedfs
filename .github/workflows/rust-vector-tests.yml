@@ -5,6 +5,7 @@ on:
     branches: [ master ]
     paths:
       - 'seaweed-vector/**'
+      - 'seaweed-volume/**'
       - 'seaweed-worker/**'
       - 'seaweed-common/**'
       - 'weed/pb/plugin.proto'
@@ -12,12 +13,13 @@ on:
       - 'weed/pb/vector_pb/**'
       - 'weed/s3api/**'
       - 'weed/command/**'
-      - 'test/vectors/**'
+      - 'test/s3vectors/**'
       - '.github/workflows/rust-vector-tests.yml'
   push:
     branches: [ master, main ]
     paths:
       - 'seaweed-vector/**'
+      - 'seaweed-volume/**'
       - 'seaweed-worker/**'
       - 'seaweed-common/**'
       - 'weed/pb/plugin.proto'
@@ -25,7 +27,7 @@ on:
       - 'weed/pb/vector_pb/**'
       - 'weed/s3api/**'
       - 'weed/command/**'
-      - 'test/vectors/**'
+      - 'test/s3vectors/**'
       - '.github/workflows/rust-vector-tests.yml'
 
 concurrency:
@@ -66,19 +68,6 @@ jobs:
           restore-keys: |
             rust-vector-${{ steps.toolchain.outputs.fingerprint }}-
 
-      # lance's build scripts compile their own protos and look for a protoc.
-      # Point them at the one protoc-bin-vendored ships, so no job depends on a
-      # system package and every build sees the same version.
-      - name: Use the vendored protoc
-        run: |
-          cd seaweed-vector
-          cargo fetch
-          version=$(awk '/^name = "protoc-bin-vendored-linux-x86_64"$/{found=1; next} found && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
-          test -n "$version" || { echo "protoc-bin-vendored-linux-x86_64 is not in Cargo.lock" >&2; exit 1; }
-          protoc=$(find ~/.cargo/registry/src -path "*protoc-bin-vendored-linux-x86_64-$version/bin/protoc" | head -1)
-          test -x "$protoc" || { echo "no vendored protoc $version in the registry" >&2; exit 1; }
-          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
-
       - name: Build the vector crates
         run: cd seaweed-vector && cargo build --release
 
@@ -87,38 +76,111 @@ jobs:
 
 
   vectors-e2e:
-    name: S3 Vectors End-to-End
-    runs-on: ubuntu-latest
+    name: S3 Vectors Integration (${{ matrix.volume }} volume${{ matrix.hardened && ', hardened' || '' }}${{ matrix.worker && ', worker' || '' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        volume: [go, rust]
+        # Hardened: volume servers behind mutual TLS, every gRPC hop (master,
+        # volume, filer, gateway, engine) under mutual TLS, read JWTs
+        # required, and every chunk encrypted by the gateway.
+        hardened: ["", "1"]
+        worker: [""]
+        # Worker: the admin server and the Lance maintenance worker join the
+        # cluster, for the tests that build vector indexes through a job.
+        include:
+          - volume: go
+            hardened: ""
+            worker: "1"
+          - volume: rust
+            hardened: ""
+            worker: "1"
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/seaweed-vector/target
+      VOLUME_SERVER_IMPL: ${{ matrix.volume }}
+      VECTOR_QUERY_MODE: single
+      VECTOR_TLS: ${{ matrix.hardened }}
+      VECTOR_READ_JWT: ${{ matrix.hardened }}
+      VECTOR_ENCRYPT_VOLUMES: ${{ matrix.hardened }}
+      VECTOR_WORKER: ${{ matrix.worker }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Build weed
-        run: go build -o test/vectors/weed ./weed
+          cache: ${{ runner.environment == 'github-hosted' }}
       - uses: dtolnay/rust-toolchain@stable
-      # Same as the unit-test job: lance's build scripts need a protoc; use
-      # the vendored one so no system package is required.
-      - name: Use the vendored protoc
+      - name: Fingerprint build toolchain
+        id: toolchain
+        run: echo "fingerprint=$(getconf GNU_LIBC_VERSION | tr ' ' '-')-rustc-$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo registry and target
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            seaweed-vector/target/debug
+          key: vectors-e2e-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-vector/Cargo.lock', 'seaweed-volume/Cargo.lock') }}
+          restore-keys: |
+            vectors-e2e-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-
+      - name: Test Go vector gateway
         run: |
-          cd seaweed-vector
-          cargo fetch
+          go test ./weed/s3api/s3vectors -count=1
+          go test ./weed/command -run 'Vector|Vectors' -count=1
+      # The worker workspace has no protoc of its own for lance's build
+      # scripts; use the vendored one its lock names, as its own workflow does.
+      - name: Use the vendored protoc for the worker
+        if: matrix.worker == '1'
+        run: |
+          cd seaweed-worker
+          cargo fetch --locked
           version=$(awk '/^name = "protoc-bin-vendored-linux-x86_64"$/{found=1; next} found && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
           test -n "$version" || { echo "protoc-bin-vendored-linux-x86_64 is not in Cargo.lock" >&2; exit 1; }
           protoc=$(find ~/.cargo/registry/src -path "*protoc-bin-vendored-linux-x86_64-$version/bin/protoc" | head -1)
           test -x "$protoc" || { echo "no vendored protoc $version in the registry" >&2; exit 1; }
           echo "PROTOC=$protoc" >> "$GITHUB_ENV"
-      - name: Build weed-vector-server
-        run: cargo build --release --manifest-path seaweed-vector/Cargo.toml -p weed-vector-server
-      - uses: actions/setup-python@v5
+      - name: Build integration binaries
+        working-directory: test/s3vectors
+        # dev profile: correctness suite, no release codegen needed. weed-volume
+        # (the heaviest crate) only builds on the rust leg.
+        run: |
+          set -e
+          make ./weed ./weed-vector CARGO_PROFILE=dev
+          if [ "${{ matrix.volume }}" = "rust" ]; then make ./weed-volume CARGO_PROFILE=dev; fi
+          if [ "${{ matrix.worker }}" = "1" ]; then make ./weed-vector-cli ./weed-worker CARGO_PROFILE=dev; fi
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Install test deps
-        run: pip install boto3 pytest
-      - name: Run the s3vectors conformance subset
-        working-directory: test/vectors
+      - name: Install test dependencies
+        run: python -m pip install -r test/s3vectors/requirements.txt
+      - name: Run the S3 Vectors integration matrix
+        working-directory: test/s3vectors
         run: |
-          cp ../../seaweed-vector/target/release/weed-vector weed-vector
-          ./run_test.sh
+          ./run_test.sh --basetemp="$RUNNER_TEMP/vector-tests" --junitxml="$RUNNER_TEMP/vector-results.xml"
+          python - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          cases = ET.parse(Path(os.environ["RUNNER_TEMP"]) / "vector-results.xml").findall(".//testcase")
+          assert len(cases) >= 17, f"expected at least 17 cases, got {len(cases)}"
+          assert not any(case.find("skipped") is not None for case in cases), "integration cases were skipped"
+          volume = os.environ["VOLUME_SERVER_IMPL"]
+          assert all(case.get("name", "").endswith(f"[{volume}-single]") for case in cases), volume
+          PYTHON
+      - name: Upload integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vectors-e2e-diagnostics-${{ matrix.volume }}${{ matrix.hardened && '-hardened' || '' }}${{ matrix.worker && '-worker' || '' }}
+          path: |
+            ${{ runner.temp }}/vector-tests
+            ${{ runner.temp }}/vector-results.xml
+          if-no-files-found: ignore
+          retention-days: 7

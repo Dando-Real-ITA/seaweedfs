@@ -2,6 +2,7 @@ package lance
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables/s3tablestest"
@@ -23,6 +25,14 @@ func (openAuthenticator) AuthenticateRequest(*http.Request) (string, interface{}
 }
 
 func (openAuthenticator) DefaultAllow() bool { return true }
+
+func (openAuthenticator) AuthEnabled() bool { return false }
+
+// signedAuthenticator admits the same caller on a gateway that checks
+// credentials.
+type signedAuthenticator struct{ openAuthenticator }
+
+func (signedAuthenticator) AuthEnabled() bool { return true }
 
 type testHarness struct {
 	router *mux.Router
@@ -134,6 +144,28 @@ func decode[T any](t *testing.T, recorder *httptest.ResponseRecorder) T {
 	return out
 }
 
+// While the S3 port takes unsigned requests the catalog says so, and a client
+// with no credentials of its own still reaches the data. Once auth is on it
+// has to sign again.
+func TestStorageOptionsSkipSignatureOnlyWhileS3AuthIsOff(t *testing.T) {
+	h := newTestHarness(t)
+	h.createBucket(t, "open", s3tables.FormatLance)
+	h.mustDo(t, http.MethodPost, "/v1/namespace/open$ns/create", `{}`, http.StatusOK)
+
+	declared := decode[DeclareTableResponse](t,
+		h.mustDo(t, http.MethodPost, "/v1/table/open$ns$t/declare", `{}`, http.StatusOK))
+	if declared.StorageOptions["aws_skip_signature"] != "true" {
+		t.Fatalf("auth off: storage options = %v, want aws_skip_signature", declared.StorageOptions)
+	}
+
+	h.server.authenticator = signedAuthenticator{}
+	described := decode[DescribeTableResponse](t,
+		h.mustDo(t, http.MethodPost, "/v1/table/open$ns$t/describe", `{}`, http.StatusOK))
+	if _, ok := described.StorageOptions["aws_skip_signature"]; ok {
+		t.Fatalf("auth on: storage options = %v, want no aws_skip_signature", described.StorageOptions)
+	}
+}
+
 // The lifecycle a Lance client drives: create the namespace, declare the table
 // before any data exists, resolve it to a location, then deregister and bring it
 // back by registering the same location.
@@ -203,8 +235,10 @@ func TestRegisterOverwriteKeepsTheOldDataset(t *testing.T) {
 	h.createBucket(t, "analytics", s3tables.FormatLance)
 	h.mustDo(t, http.MethodPost, "/v1/namespace/analytics$sales/create", `{}`, http.StatusOK)
 	h.mustDo(t, http.MethodPost, "/v1/table/analytics$sales$orders/declare", `{}`, http.StatusOK)
-	h.mustDo(t, http.MethodPost, "/v1/table/analytics$sales$archive/declare", `{}`, http.StatusOK)
+	h.mustDo(t, http.MethodPost, "/v1/table/analytics$sales$current/declare", `{}`, http.StatusOK)
 
+	h.mustDo(t, http.MethodPost, "/v1/table/analytics$sales$orders/register",
+		`{"location":"s3://analytics/sales/current","mode":"Overwrite"}`, http.StatusConflict)
 	h.mustDo(t, http.MethodPost, "/v1/table/analytics$sales$orders/register",
 		`{"location":"s3://analytics/sales/archive","mode":"Overwrite"}`, http.StatusOK)
 
@@ -413,5 +447,111 @@ func TestDataPlaneIsUnsupported(t *testing.T) {
 	recorder := h.mustDo(t, http.MethodPost, "/v1/table/analytics$sales$orders/query", `{}`, http.StatusNotImplemented)
 	if got := decode[errorResponse](t, recorder); got.Code != codeUnsupported {
 		t.Fatalf("error code = %d, want %d", got.Code, codeUnsupported)
+	}
+}
+
+// createOnlyAuthenticator signs in an identity that may create and read tables
+// but not update them.
+type createOnlyAuthenticator struct{}
+
+func (createOnlyAuthenticator) AuthenticateRequest(*http.Request) (string, interface{}, s3err.ErrorCode) {
+	return "creator", &struct {
+		Name    string
+		Actions []string
+	}{Name: "creator", Actions: []string{"s3tables:CreateTable", "s3tables:GetTable"}}, s3err.ErrNone
+}
+
+func (createOnlyAuthenticator) DefaultAllow() bool { return false }
+
+func (createOnlyAuthenticator) AuthEnabled() bool { return true }
+
+// The right to create a name is the write evidence for a table the declare
+// creates, but not for one it only finds.
+func TestDeclareVendsWriteOnlyForATableItCreates(t *testing.T) {
+	h := newTestHarness(t)
+	h.createBucket(t, "lnc", s3tables.FormatLance)
+	h.mustDo(t, http.MethodPost, "/v1/namespace/lnc$ns/create", `{}`, http.StatusOK)
+	h.mustDo(t, http.MethodPost, "/v1/table/lnc$ns$theirs/declare", `{}`, http.StatusOK)
+	h.mustDo(t, http.MethodPost, "/v1/table/lnc$ns$theirs/deregister", `{}`, http.StatusOK)
+
+	server := NewServer(s3tables.NewManagerClient(h.filer.Client), createOnlyAuthenticator{})
+	server.SetCredentialVendor(recordingVendor{})
+	router := mux.NewRouter().SkipClean(true)
+	server.RegisterRoutes(router)
+	creator := &testHarness{router: router, filer: h.filer, admin: h.admin, server: server}
+
+	for _, tc := range []struct{ name, want string }{
+		{"theirs", "read-only"},
+		{"mine", "read-write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := creator.vendedKey(t, "/v1/table/lnc$ns$"+tc.name+"/declare", ""); got != tc.want {
+				t.Errorf("vended %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if h.filer.Get("/buckets/lnc/ns/theirs", deregisteredMarker) == nil {
+		t.Error("a declare that may not write the table brought it back")
+	}
+}
+
+// An in-process describe for a trusted caller resolves the table without the
+// caller's catalog grants, and still refuses a deregistered one.
+func TestDescribeTableInternalIgnoresCatalogGrants(t *testing.T) {
+	h := newTestHarness(t)
+	h.createBucket(t, "lnc", s3tables.FormatLance)
+	h.mustDo(t, http.MethodPost, "/v1/namespace/lnc$ns/create", `{}`, http.StatusOK)
+	h.mustDo(t, http.MethodPost, "/v1/table/lnc$ns$t/declare", `{}`, http.StatusOK)
+
+	server := NewServer(s3tables.NewManagerClient(h.filer.Client), createOnlyAuthenticator{})
+	server.SetS3Endpoint("http://127.0.0.1:8333")
+	anonymous := httptest.NewRequest(http.MethodPost, "/", nil)
+	anonymous = anonymous.WithContext(s3_constants.SetIdentityNameInContext(anonymous.Context(), "stranger"))
+	if _, _, err := server.DescribeTable(anonymous, []string{"lnc", "ns", "t"}); err == nil {
+		t.Fatal("DescribeTable without grants resolved the table")
+	}
+	location, options, err := server.DescribeTableInternal(anonymous, []string{"lnc", "ns", "t"})
+	if err != nil {
+		t.Fatalf("DescribeTableInternal: %v", err)
+	}
+	if location != "s3://lnc/ns/t" || options["aws_endpoint"] != "http://127.0.0.1:8333" {
+		t.Fatalf("resolved %q %v", location, options)
+	}
+
+	h.mustDo(t, http.MethodPost, "/v1/table/lnc$ns$t/deregister", `{}`, http.StatusOK)
+	_, _, err = server.DescribeTableInternal(anonymous, []string{"lnc", "ns", "t"})
+	var apiErr *s3tables.S3TablesError
+	if !errors.As(err, &apiErr) || apiErr.Type != s3tables.ErrCodeNoSuchTable {
+		t.Fatalf("a deregistered table resolved: %v, want %s", err, s3tables.ErrCodeNoSuchTable)
+	}
+}
+
+// The options an internal describe vends may write a vector index, whose
+// writer is the engine, but not a table whose writes s3tables grants gate.
+func TestDescribeTableInternalVendsWriteForTheVectorNamespace(t *testing.T) {
+	h := newTestHarness(t)
+	h.seedVectorIndex(t, "vec", s3tables.FormatLance)
+	h.createBucket(t, "lnc", s3tables.FormatLance)
+	h.mustDo(t, http.MethodPost, "/v1/namespace/lnc$ns/create", `{}`, http.StatusOK)
+	h.mustDo(t, http.MethodPost, "/v1/table/lnc$ns$t/declare", `{}`, http.StatusOK)
+
+	server := NewServer(s3tables.NewManagerClient(h.filer.Client), createOnlyAuthenticator{})
+	server.SetCredentialVendor(recordingVendor{})
+	stranger := httptest.NewRequest(http.MethodPost, "/", nil)
+	stranger = stranger.WithContext(s3_constants.SetIdentityNameInContext(stranger.Context(), "stranger"))
+	for _, tc := range []struct {
+		id   []string
+		want string
+	}{
+		{[]string{"vec", "vector", "idx"}, "read-write"},
+		{[]string{"lnc", "ns", "t"}, "read-only"},
+	} {
+		_, options, err := server.DescribeTableInternal(stranger, tc.id)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.id, err)
+		}
+		if got := options["aws_access_key_id"]; got != tc.want {
+			t.Errorf("%v: vended %q, want %q", tc.id, got, tc.want)
+		}
 	}
 }

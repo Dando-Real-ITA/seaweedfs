@@ -29,7 +29,7 @@ type ReplicationSink interface {
 // committed destination, a directory move never deletes descendants before they
 // are recreated, and the entry's chunks are neither re-copied nor leaked.
 type EntryMover interface {
-	MoveEntry(oldKey, newKey string, newEntry *filer_pb.Entry, signatures []int32) error
+	MoveEntry(oldKey, newKey string, oldEntry, newEntry *filer_pb.Entry, signatures []int32) error
 }
 
 // MetadataOnlyDeleter is an optional capability for sinks whose own delete
@@ -38,6 +38,22 @@ type EntryMover interface {
 // metadata-only there too.
 type MetadataOnlyDeleter interface {
 	DeleteEntryKeepingRemoteObject(key string, isDirectory, deleteIncludeChunks bool, signatures []int32) error
+}
+
+// LatestVersionWriter is an optional capability for sinks whose CreateEntry
+// guards a replayed write against the live source at the key's own path. A
+// caller that already resolved the current source state — a flattened latest
+// version lives under a different source path than the key it lands on — must
+// not be skipped as stale by that check.
+type LatestVersionWriter interface {
+	CreateEntryLatest(key string, entry *filer_pb.Entry, signatures []int32) error
+}
+
+func CreateEntryLatest(s ReplicationSink, key string, entry *filer_pb.Entry, signatures []int32) error {
+	if w, ok := s.(LatestVersionWriter); ok {
+		return w.CreateEntryLatest(key, entry, signatures)
+	}
+	return s.CreateEntry(key, entry, signatures)
 }
 
 func DeleteEntry(s ReplicationSink, key string, isDirectory, deleteIncludeChunks, keepRemoteObject bool, signatures []int32) error {

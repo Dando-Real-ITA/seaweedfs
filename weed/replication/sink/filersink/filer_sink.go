@@ -1,6 +1,7 @@
 package filersink
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/security"
 
@@ -223,7 +225,7 @@ var _ sink.EntryMover = (*FilerSink)(nil)
 // is re-checked with a direct lookup rather than inferred from the rename error,
 // so a rolled-back move that left the old entry intact propagates for retry
 // instead of being mistaken for "gone".
-func (fs *FilerSink) MoveEntry(oldKey, newKey string, newEntry *filer_pb.Entry, signatures []int32) error {
+func (fs *FilerSink) MoveEntry(oldKey, newKey string, oldEntry, newEntry *filer_pb.Entry, signatures []int32) error {
 	oldDir, oldName := util.FullPath(oldKey).DirAndName()
 	newDir, newName := util.FullPath(newKey).DirAndName()
 
@@ -238,7 +240,15 @@ func (fs *FilerSink) MoveEntry(oldKey, newKey string, newEntry *filer_pb.Entry, 
 		return err
 	})
 	if err == nil {
-		return nil
+		// The rename relocates whatever version the destination held, which can
+		// predate the event's snapshot — e.g. a queued update skipped after the
+		// source already moved to the new name. Reconcile content the same way
+		// an in-place update does.
+		if oldEntry == nil {
+			return nil
+		}
+		_, uerr := fs.UpdateEntry(newKey, oldEntry, newDir, newEntry, true, signatures)
+		return uerr
 	}
 	if missing, lookupErr := fs.entryMissing(oldKey); lookupErr == nil && missing {
 		glog.V(2).Infof("move %s => %s: old path gone, creating %s", oldKey, newKey, newKey)
@@ -274,6 +284,17 @@ func (fs *FilerSink) entryMissing(key string) (bool, error) {
 }
 
 func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int32) error {
+	return fs.createEntry(key, entry, signatures, true)
+}
+
+// CreateEntryLatest writes an entry the caller already resolved as the current
+// source state, so the stale-replay check against the key's own source path
+// does not apply.
+func (fs *FilerSink) CreateEntryLatest(key string, entry *filer_pb.Entry, signatures []int32) error {
+	return fs.createEntry(key, entry, signatures, false)
+}
+
+func (fs *FilerSink) createEntry(key string, entry *filer_pb.Entry, signatures []int32, checkSourceVersion bool) error {
 
 	return fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
@@ -286,7 +307,14 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 		}
 		// glog.V(1).Infof("lookup: %v", lookupRequest)
 		if resp, err := filer_pb.LookupEntry(context.Background(), client, lookupRequest); err == nil {
-			if destinationSatisfiesSource(resp.Entry, entry) {
+			// A resolved-latest write carries the caller's pick of the current
+			// version, which can be older than the destination copy it replaces
+			// (the deleted latest) — only provably identical content skips it.
+			skip := destinationHoldsContent(resp.Entry, entry)
+			if checkSourceVersion {
+				skip = destinationSatisfiesSource(resp.Entry, entry)
+			}
+			if skip {
 				glog.V(3).Infof("skip overwriting %s", key)
 				return nil
 			}
@@ -294,7 +322,23 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 				key, len(resp.Entry.GetChunks()), len(entry.GetChunks()))
 		}
 
-		replicatedChunks, err := fs.replicateChunks(context.Background(), entry.GetChunks(), key, getEntryMtimeNs(entry), "")
+		// A version the source already moved past is superseded by a later
+		// event, so fetching its chunks only feeds a write that is obsolete on
+		// arrival — skip before any read. When the source holds a newer live
+		// version, replicate it directly: the superseding event may never be
+		// delivered to this sink.
+		if checkSourceVersion {
+			if live, movedOn := fs.sourceVersion(key, entry); movedOn {
+				if live == nil {
+					glog.Warningf("skip stale entry %s, source superseded before replicate", key)
+					return nil
+				}
+				glog.Warningf("entry %s superseded before replicate; syncing live version", key)
+				entry = live
+			}
+		}
+
+		replicatedChunks, err := fs.replicateChunks(context.Background(), entry.GetChunks(), key, entry, "")
 
 		if err != nil {
 			// don't swallow: committing mismatched bytes would propagate corruption
@@ -366,7 +410,28 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 	// now, which for a rename is newParentPath/newEntry.Name, not the old key.
 	targetKey := updatedEntryKey(key, newParentPath, newEntry)
 
-	switch chooseUpdateAction(existingEntry, oldEntry, newEntry) {
+	action := chooseUpdateAction(existingEntry, oldEntry, newEntry)
+	if action != updateSkip {
+		if live, movedOn := fs.sourceVersion(targetKey, newEntry); movedOn {
+			if live == nil {
+				glog.Warningf("skip stale entry %s, source superseded before replicate", targetKey)
+				return true, nil
+			}
+			glog.Warningf("entry %s superseded before replicate; syncing live version", targetKey)
+			newEntry = live
+			// The live snapshot is the source's current state, not a replay:
+			// a newer destination mtime does not make it stale, and the
+			// replayed oldEntry predates it, so an incremental diff could
+			// resolve manifests the overwrite already vacuumed. Repair from
+			// the snapshot unless the destination already holds it.
+			action = updateRepair
+			if destinationHoldsContent(existingEntry, live) {
+				action = updateSkip
+			}
+		}
+	}
+
+	switch action {
 	case updateSkip:
 		// a newer, complete version already landed (out-of-order); leave it
 		glog.V(2).Infof("late updates %s", key)
@@ -374,7 +439,7 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 	case updateRepair:
 		glog.Warningf("repair %s: destination diverged from source (dst %d chunks, src %d chunks); re-replicating full source content",
 			key, len(existingEntry.GetChunks()), len(newEntry.GetChunks()))
-		replicatedChunks, err := fs.replicateChunks(context.Background(), newEntry.GetChunks(), targetKey, getEntryMtimeNs(newEntry), "")
+		replicatedChunks, err := fs.replicateChunks(context.Background(), newEntry.GetChunks(), targetKey, newEntry, "")
 		if err != nil {
 			if errors.Is(err, errChunkSizeMismatch) {
 				return true, fs.onCorruptChunk(targetKey, newEntry, err)
@@ -402,7 +467,7 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		}
 
 		// replicate the chunks that are new in the source
-		replicatedChunks, err := fs.replicateChunks(context.Background(), newChunks, targetKey, getEntryMtimeNs(newEntry), "")
+		replicatedChunks, err := fs.replicateChunks(context.Background(), newChunks, targetKey, newEntry, "")
 		if err != nil {
 			if errors.Is(err, errChunkSizeMismatch) {
 				return true, fs.onCorruptChunk(targetKey, newEntry, err)
@@ -506,34 +571,55 @@ func (fs *FilerSink) onReplicateChunkError(key string, entry *filer_pb.Entry, er
 	return fmt.Errorf("replicate entry chunks %s: %w", key, err)
 }
 
-// sourceMovedOn reports whether the live source entry moved past the replayed
-// version: gone, strictly newer, or rewritten in place so it no longer
-// references the same chunks — the last is invisible to the mtime check. A live
-// entry older than the replayed version proves nothing about it.
-func (fs *FilerSink) sourceMovedOn(targetPath string, entry *filer_pb.Entry) bool {
+// sourceVersion returns the source's live entry for targetPath and whether it
+// moved past the replayed version: gone (live == nil), strictly newer, or
+// rewritten so it no longer references the same chunks — the last is invisible
+// to the mtime check, and holds whatever mtime the rewrite was stamped with,
+// since timestamp-preserving writers make a newer version read older. A failed
+// lookup proves nothing, and neither does a live entry committed before the
+// replayed version: the lookup lags the event, as when a peer filer's event
+// reaches subscribers before the local store applies it.
+func (fs *FilerSink) sourceVersion(targetPath string, entry *filer_pb.Entry) (live *filer_pb.Entry, movedOn bool) {
 	sourcePath, ok := fs.targetPathToSourcePath(targetPath)
 	if !ok {
-		return false
+		return nil, false
 	}
-	replayedMtimeNs := getEntryMtimeNs(entry)
-	live, _, _, lookupErr := filer_pb.GetEntry(context.Background(), fs.filerSource, sourcePath)
-	if sourceSupersedes(sourcePath, live, lookupErr, replayedMtimeNs) {
-		return true
+	live, lookupErr := fs.sourceEntry(sourcePath)
+	if lookupErr == nil && live != nil && committedBefore(live, entry) {
+		return nil, false
 	}
-	if lookupErr != nil || live == nil || replayedMtimeNs <= 0 || getEntryMtimeNs(live) < replayedMtimeNs {
-		return false
+	if sourceSupersedes(sourcePath, live, lookupErr, getEntryMtimeNs(entry)) {
+		return live, true
+	}
+	if lookupErr != nil || live == nil {
+		return nil, false
 	}
 	liveIds := chunkFileIds(live.GetChunks())
 	replayedIds := chunkFileIds(entry.GetChunks())
 	if len(liveIds) != len(replayedIds) {
-		return true
+		return live, true
 	}
 	for id := range replayedIds {
 		if !liveIds[id] {
-			return true
+			return live, true
 		}
 	}
-	return false
+	return nil, false
+}
+
+// committedBefore reports whether the source committed live before replayed.
+// Both stamps come from the source's meta log, so they order versions that
+// mtime cannot; an unstamped live entry predates a stamped replay.
+func committedBefore(live, replayed *filer_pb.Entry) bool {
+	return replayed.GetCommitTsNs() > 0 && live.GetCommitTsNs() < replayed.GetCommitTsNs()
+}
+
+// sourceMovedOn reports whether the live source entry moved past the replayed
+// version: gone, strictly newer, or rewritten in place so it no longer
+// references the same chunks — the last is invisible to the mtime check.
+func (fs *FilerSink) sourceMovedOn(targetPath string, entry *filer_pb.Entry) bool {
+	_, movedOn := fs.sourceVersion(targetPath, entry)
+	return movedOn
 }
 
 // updateAction decides how UpdateEntry reconciles an incoming source version with
@@ -597,6 +683,77 @@ func chooseUpdateAction(existing, oldEntry, incoming *filer_pb.Entry) updateActi
 	return updateNormal
 }
 
+// destinationHoldsContent reports whether the destination already holds exactly
+// the resolved entry for a CreateEntryLatest write, where a newer destination
+// mtime proves nothing: the resolved version may be older than the copy it
+// replaces. Skip only when the writable metadata already matches and the content
+// is identical — chunk provenance, or an equal ETag over full byte coverage.
+func destinationHoldsContent(existing, reference *filer_pb.Entry) bool {
+	if existing == nil {
+		return false
+	}
+	// A skip keeps the destination's stored metadata, so identical bytes are not
+	// enough: the resolved version's writable attributes and extended entries
+	// must already match what the write would install, or a stale tag/version id
+	// survives under equal content.
+	if !sameWritableMetadata(existing, reference) {
+		return false
+	}
+	if destinationMatchesReference(existing, reference) {
+		return true
+	}
+	return sameInlineContent(existing, reference) &&
+		coversReference(existing, reference) &&
+		filer.ETag(existing) == filer.ETag(reference)
+}
+
+// sameWritableMetadata reports whether the destination already stores the metadata
+// the resolved write would install. Inode and creation time are filer-assigned or
+// preserved across rewrites — comparing them would re-replicate forever on fields
+// a write can never change — so only the writable fields decide.
+func sameWritableMetadata(existing, reference *filer_pb.Entry) bool {
+	exAttr, refAttr := normalizedAttributes(existing.GetAttributes()), normalizedAttributes(reference.GetAttributes())
+	if exAttr != nil && refAttr.GetTtlSec() == 0 {
+		// a TTL-less write inherits the destination's storage-rule TTL, so the
+		// stored value is one a rewrite reproduces, not one it would change
+		exAttr.TtlSec = 0
+	}
+	if !proto.Equal(exAttr, refAttr) {
+		return false
+	}
+	ex, ref := existing.GetExtended(), reference.GetExtended()
+	if len(ex) != len(ref) {
+		return false
+	}
+	for k, v := range ex {
+		refValue, found := ref[k]
+		if !found || !bytes.Equal(v, refValue) {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizedAttributes masks the fields the destination filer assigns or preserves
+// on write and applies the store's zero-value defaults (access/change time fall
+// back to mtime), so the comparison covers only fields a rewrite controls.
+func normalizedAttributes(attr *filer_pb.FuseAttributes) *filer_pb.FuseAttributes {
+	if attr == nil {
+		return nil
+	}
+	a := proto.Clone(attr).(*filer_pb.FuseAttributes)
+	a.Inode = 0
+	a.Crtime = 0
+	a.CrtimeNs = 0
+	if a.Atime == 0 && a.AtimeNs == 0 {
+		a.Atime, a.AtimeNs = a.Mtime, a.MtimeNs
+	}
+	if a.Ctime == 0 {
+		a.Ctime, a.CtimeNs = a.Mtime, a.MtimeNs
+	}
+	return a
+}
+
 // destinationSatisfiesSource reports whether an existing destination entry already
 // satisfies the incoming source entry, so CreateEntry can skip the write. Coverage
 // is checked first: a chunk-truncated destination (covering fewer bytes than the
@@ -613,6 +770,9 @@ func destinationSatisfiesSource(existing, incoming *filer_pb.Entry) bool {
 		return true // destination strictly newer: incoming is older → keep destination
 	}
 	if !destinationMatchesReference(existing, incoming) {
+		if !sameInlineContent(existing, incoming) {
+			return false // equal chunk lists hide nothing: the inline bytes differ
+		}
 		if !coversReference(existing, incoming) {
 			return false // missing a byte range the source covers (truncated/gapped)
 		}
@@ -652,7 +812,27 @@ func destinationMatchesReference(existing, reference *filer_pb.Entry) bool {
 			return false
 		}
 	}
-	return true
+	// Identical chunk lists say nothing about content stored outside them:
+	// a chunk-less entry keeps its bytes in Content, a remote-only entry in the
+	// object RemoteEntry points at. Both must compare equal to claim a match.
+	return sameInlineContent(existing, reference)
+}
+
+// sameInlineContent reports whether two entries carry the same out-of-chunk
+// content — inline bytes, or the same remote object — so a destination can be
+// trusted to hold the reference's bytes when the chunk comparison is done.
+func sameInlineContent(a, b *filer_pb.Entry) bool {
+	ra, rb := a.GetRemoteEntry(), b.GetRemoteEntry()
+	if (ra == nil) != (rb == nil) {
+		return false
+	}
+	if ra != nil && (ra.StorageName != rb.StorageName ||
+		ra.RemoteETag != rb.RemoteETag ||
+		ra.RemoteMtime != rb.RemoteMtime ||
+		ra.RemoteSize != rb.RemoteSize) {
+		return false
+	}
+	return bytes.Equal(a.GetContent(), b.GetContent())
 }
 
 // hasStaleBackupChunk reports whether existing holds a chunk that this backup

@@ -64,6 +64,9 @@ type AdminOptions struct {
 	debugPort         *int
 	cpuProfile        *string
 	memProfile        *string
+	uploadMaxSizeMB   *int
+	// nil for callers other than runAdmin; the lock keeps its default then
+	lockFairnessWindow *time.Duration
 
 	// workerGrpcListener, when set, is a listener already bound to grpcPort by
 	// the caller. `weed mini` reserves the port this way because the admin
@@ -125,6 +128,8 @@ func init() {
 	a.debugPort = cmdAdmin.Flag.Int("debug.port", 6060, "http port for debugging")
 	a.cpuProfile = cmdAdmin.Flag.String("cpuprofile", "", "cpu profile output file")
 	a.memProfile = cmdAdmin.Flag.String("memprofile", "", "memory profile output file")
+	a.uploadMaxSizeMB = cmdAdmin.Flag.Int("uploadMaxSizeMB", dash.DefaultUploadMaxSizeMB, "maximum total size in MB of one file browser upload (0 for no limit)")
+	a.lockFairnessWindow = cmdAdmin.Flag.Duration("adminLock.fairnessWindow", dash.DefaultAdminLockFairnessWindow, "once scheduled jobs have held the cluster admin lock this long, new jobs wait until every holder releases it so shell clients get a turn; 0 lets jobs keep joining the hold, and shell clients then get the lock when the scheduler next drains")
 }
 
 var cmdAdmin = &Command{
@@ -500,6 +505,12 @@ func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, 
 		s3PublicEndpoint = options.defaultS3PublicEndpoint
 	}
 	adminServer := dash.NewAdminServer(*options.master, *options.filerGroup, nil, dataDir, icebergPort, lancePort, s3PublicEndpoint)
+	if options.uploadMaxSizeMB != nil {
+		adminServer.SetUploadMaxSize(int64(*options.uploadMaxSizeMB) << 20)
+	}
+	if options.lockFairnessWindow != nil {
+		adminServer.SetAdminLockFairnessWindow(*options.lockFairnessWindow)
+	}
 
 	if err := adminServer.ApplyPluginConfigFromToml(util.GetViper()); err != nil {
 		return fmt.Errorf("apply admin.toml to plugin config: %w", err)

@@ -4,13 +4,14 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ include "seaweedfs.componentName" (list . "filer") }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "seaweedfs.namespace" . | quote }}
   labels:
     app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: filer
+    {{- with include "seaweedfs.commonLabels" $ }}{{ . | nindent 4 }}{{ end }}
 {{- if .Values.filer.annotations }}
   annotations:
     {{- toYaml .Values.filer.annotations | nindent 4 }}
@@ -45,7 +46,7 @@ spec:
       {{- end }}
       {{- $podAnnotations := mergeOverwrite (deepCopy (.Values.podAnnotations | default dict)) (.Values.filer.podAnnotations | default dict) }}
       {{- if .Values.filer.s3.existingConfigSecret }}
-      {{- $configSecret := (lookup "v1" "Secret" .Release.Namespace .Values.filer.s3.existingConfigSecret) | default dict }}
+      {{- $configSecret := (lookup "v1" "Secret" (include "seaweedfs.namespace" .) .Values.filer.s3.existingConfigSecret) | default dict }}
       {{- $_ := set $podAnnotations "checksum/s3config" ($configSecret | toYaml | sha256sum) }}
       {{- else }}
       {{- $_ := set $podAnnotations "checksum/s3config" (include "seaweedfs.s3.configChecksum" .) }}
@@ -209,7 +210,7 @@ spec:
             - "-ec"
             - |
               exec /usr/bin/weed \
-              {{- if or (eq .Values.filer.logs.type "hostPath") (eq .Values.filer.logs.type "persistentVolumeClaim") (eq .Values.filer.logs.type "emptyDir") }}
+              {{- if or (eq .Values.filer.logs.type "hostPath") (eq .Values.filer.logs.type "persistentVolumeClaim") (eq .Values.filer.logs.type "emptyDir") (eq .Values.filer.logs.type "existingClaim") }}
               -logdir=/logs \
               {{- else }}
               -logtostderr=true \
@@ -284,7 +285,7 @@ spec:
               {{- end }}
           volumeMounts:
             {{- include "seaweedfs.tmpDirVolumeMount" (list . .Values.filer.containerSecurityContext (tpl (.Values.filer.extraVolumeMounts | default "") .) (tpl (.Values.filer.extraVolumes | default "") .)) | nindent 12 }}
-            {{- if (or (eq .Values.filer.logs.type "hostPath") (eq .Values.filer.logs.type "persistentVolumeClaim") (eq .Values.filer.logs.type "emptyDir")) }}
+            {{- if (or (eq .Values.filer.logs.type "hostPath") (eq .Values.filer.logs.type "persistentVolumeClaim") (eq .Values.filer.logs.type "emptyDir") (eq .Values.filer.logs.type "existingClaim")) }}
             - name: seaweedfs-filer-log-volume
               mountPath: "/logs/"
             {{- end }}
@@ -293,7 +294,7 @@ spec:
               mountPath: /etc/sw
               readOnly: true
             {{- end }}
-            {{- if (or .Values.filer.enablePVC (or (eq .Values.filer.data.type "hostPath") (eq .Values.filer.data.type "persistentVolumeClaim") (eq .Values.filer.data.type "emptyDir"))) }}
+            {{- if (or .Values.filer.enablePVC (or (eq .Values.filer.data.type "hostPath") (eq .Values.filer.data.type "persistentVolumeClaim") (eq .Values.filer.data.type "emptyDir") (eq .Values.filer.data.type "existingClaim"))) }}
             - name: data-filer
               mountPath: /data
             {{- end }}

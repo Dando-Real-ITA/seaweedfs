@@ -35,6 +35,20 @@ import (
 // still exists is registered again.
 var missingSourceChunkGrace = 30 * time.Minute
 
+// sourceLookupTimeout bounds a best-effort source entry probe: a source that
+// accepts the call but whose metadata store never answers must stall
+// replication only this long, not forever. A variable so tests can shorten it.
+var sourceLookupTimeout = 30 * time.Second
+
+// sourceEntry returns the source's live entry at sourcePath within
+// sourceLookupTimeout.
+func (fs *FilerSink) sourceEntry(sourcePath util.FullPath) (*filer_pb.Entry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sourceLookupTimeout)
+	defer cancel()
+	entry, _, _, err := filer_pb.GetEntry(ctx, fs.filerSource, sourcePath)
+	return entry, err
+}
+
 // errSourceChunkMissing is a permanent replication failure: the source cluster
 // no longer holds the chunk's data, so no later attempt can fetch it.
 var errSourceChunkMissing = errors.New("source chunk missing")
@@ -90,7 +104,7 @@ func (g *missingSourceChunkGate) wrap(err error) error {
 // topLevelId anchors nested chunks to the entry-level chunk that contains them:
 // supersession is judged by whether the live entry still lists that chunk, since
 // a manifest's id is the identity of its contents.
-func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_pb.FileChunk, path string, sourceMtimeNs int64, topLevelId string) (replicatedChunks []*filer_pb.FileChunk, err error) {
+func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (replicatedChunks []*filer_pb.FileChunk, err error) {
 	if len(sourceChunks) == 0 {
 		return
 	}
@@ -141,7 +155,7 @@ func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_
 			if anchor == "" {
 				anchor = sourceChunk.GetFileIdString()
 			}
-			replicatedChunk, replicateErr := fs.replicateOneManifestChunk(ctx, sourceChunk, path, sourceMtimeNs, anchor)
+			replicatedChunk, replicateErr := fs.replicateOneManifestChunk(ctx, sourceChunk, path, replayed, anchor)
 			if replicateErr != nil {
 				setError(replicateErr)
 				break
@@ -159,7 +173,7 @@ func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_
 			defer wg.Done()
 			var replicatedChunk *filer_pb.FileChunk
 			retryErr := util.Retry("replicate chunks", func() error {
-				chunk, e := fs.replicateOneChunk(source, path, sourceMtimeNs, topLevelId)
+				chunk, e := fs.replicateOneChunk(source, path, replayed, topLevelId)
 				if e != nil {
 					return e
 				}
@@ -182,9 +196,9 @@ func (fs *FilerSink) replicateChunks(ctx context.Context, sourceChunks []*filer_
 	return
 }
 
-func (fs *FilerSink) replicateOneChunk(sourceChunk *filer_pb.FileChunk, path string, sourceMtimeNs int64, topLevelId string) (*filer_pb.FileChunk, error) {
+func (fs *FilerSink) replicateOneChunk(sourceChunk *filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (*filer_pb.FileChunk, error) {
 
-	fileId, err := fs.fetchAndWrite(sourceChunk, path, sourceMtimeNs, topLevelId)
+	fileId, err := fs.fetchAndWrite(sourceChunk, path, replayed, topLevelId)
 	if err != nil {
 		return nil, fmt.Errorf("copy %s: %w", sourceChunk.GetFileIdString(), err)
 	}
@@ -203,7 +217,7 @@ func (fs *FilerSink) replicateOneChunk(sourceChunk *filer_pb.FileChunk, path str
 	}, nil
 }
 
-func (fs *FilerSink) replicateOneManifestChunk(ctx context.Context, sourceChunk *filer_pb.FileChunk, path string, sourceMtimeNs int64, topLevelId string) (*filer_pb.FileChunk, error) {
+func (fs *FilerSink) replicateOneManifestChunk(ctx context.Context, sourceChunk *filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (*filer_pb.FileChunk, error) {
 	// LookupFileId can transiently fail during a write burst (volume not yet
 	// registered). Retry like the data-chunk path does; the gate stops on
 	// supersession or, when that cannot be checked, after a few attempts.
@@ -217,12 +231,12 @@ func (fs *FilerSink) replicateOneManifestChunk(ctx context.Context, sourceChunk 
 		}
 		resolvedChunks = rc
 		return nil
-	}, fs.manifestResolveRetryGate(path, sourceMtimeNs, topLevelId, missingGate))
+	}, fs.manifestResolveRetryGate(path, replayed, topLevelId, missingGate))
 	if err != nil {
 		return nil, fmt.Errorf("resolve manifest %s: %w", sourceChunk.GetFileIdString(), missingGate.wrap(err))
 	}
 
-	replicatedResolvedChunks, err := fs.replicateChunks(ctx, resolvedChunks, path, sourceMtimeNs, topLevelId)
+	replicatedResolvedChunks, err := fs.replicateChunks(ctx, resolvedChunks, path, replayed, topLevelId)
 	if err != nil {
 		return nil, fmt.Errorf("replicate manifest data chunks %s: %w", sourceChunk.GetFileIdString(), err)
 	}
@@ -239,7 +253,7 @@ func (fs *FilerSink) replicateOneManifestChunk(ctx context.Context, sourceChunk 
 		return nil, fmt.Errorf("marshal manifest %s: %w", sourceChunk.GetFileIdString(), err)
 	}
 
-	manifestFileId, err := fs.uploadManifestChunk(path, sourceMtimeNs, sourceChunk.GetFileIdString(), manifestData)
+	manifestFileId, err := fs.uploadManifestChunk(path, replayed, sourceChunk.GetFileIdString(), manifestData)
 	if err != nil {
 		return nil, err
 	}
@@ -268,11 +282,11 @@ const maxUnverifiableResolveAttempts = 3
 // dated target keys don't map back to a source path) — propagating lets
 // filer.backup decide with the event's real source key instead of spinning
 // here forever.
-func (fs *FilerSink) manifestResolveRetryGate(path string, sourceMtimeNs int64, chunkName string, missingGate *missingSourceChunkGate) func(error) bool {
+func (fs *FilerSink) manifestResolveRetryGate(path string, replayed *filer_pb.Entry, chunkName string, missingGate *missingSourceChunkGate) func(error) bool {
 	_, canCheckSupersession := fs.targetPathToSourcePath(path)
 	attempts := 0
 	return func(resolveErr error) (shouldContinue bool) {
-		if fs.hasSourceNewerVersion(path, sourceMtimeNs) {
+		if fs.sourceMovedOn(path, replayed) {
 			glog.V(1).Infof("skip retrying stale source manifest %s for %s: %v", chunkName, path, resolveErr)
 			return false
 		}
@@ -281,7 +295,7 @@ func (fs *FilerSink) manifestResolveRetryGate(path string, sourceMtimeNs int64, 
 				chunkName, path, missingSourceChunkGrace, resolveErr)
 			return false
 		}
-		if isSourceChunkMissing(resolveErr) && fs.sourceDroppedChunk(path, chunkName, sourceMtimeNs) {
+		if isSourceChunkMissing(resolveErr) && fs.sourceDroppedChunk(path, chunkName, replayed) {
 			glog.V(0).Infof("source no longer lists manifest %s for %s, skipping the obsolete version: %v",
 				chunkName, path, resolveErr)
 			return false
@@ -316,7 +330,7 @@ func isTransientResolveError(err error) bool {
 		(strings.Contains(errStr, "volume id") && strings.Contains(errStr, "not found"))
 }
 
-func (fs *FilerSink) uploadManifestChunk(path string, sourceMtimeNs int64, sourceFileId string, manifestData []byte) (fileId string, err error) {
+func (fs *FilerSink) uploadManifestChunk(path string, replayed *filer_pb.Entry, sourceFileId string, manifestData []byte) (fileId string, err error) {
 	uploader, err := fs.getUploader()
 	if err != nil {
 		glog.V(0).Infof("upload manifest data %v: %v", sourceFileId, err)
@@ -361,7 +375,7 @@ func (fs *FilerSink) uploadManifestChunk(path string, sourceMtimeNs int64, sourc
 		fileId = currentFileId
 		return nil
 	}, func(uploadErr error) (shouldContinue bool) {
-		if fs.hasSourceNewerVersion(path, sourceMtimeNs) {
+		if fs.sourceMovedOn(path, replayed) {
 			glog.V(1).Infof("skip retrying stale source manifest %s for %s: %v", sourceFileId, path, uploadErr)
 			return false
 		}
@@ -375,7 +389,7 @@ func (fs *FilerSink) uploadManifestChunk(path string, sourceMtimeNs int64, sourc
 	return fileId, nil
 }
 
-func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string, sourceMtimeNs int64, topLevelId string) (fileId string, err error) {
+func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string, replayed *filer_pb.Entry, topLevelId string) (fileId string, err error) {
 	uploader, err := fs.getUploader()
 	if err != nil {
 		glog.V(0).Infof("upload source data %v: %v", sourceChunk.GetFileIdString(), err)
@@ -491,7 +505,7 @@ func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string,
 			transferStatus.mu.Unlock()
 			return false
 		}
-		if fs.hasSourceNewerVersion(path, sourceMtimeNs) {
+		if fs.sourceMovedOn(path, replayed) {
 			glog.V(1).Infof("skip retrying stale source %s for %s: %v", sourceChunk.GetFileIdString(), path, retryErr)
 			return false
 		}
@@ -508,7 +522,7 @@ func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string,
 			if anchorId == "" {
 				anchorId = sourceChunk.GetFileIdString()
 			}
-			if fs.sourceDroppedChunk(path, anchorId, sourceMtimeNs) {
+			if fs.sourceDroppedChunk(path, anchorId, replayed) {
 				glog.V(0).Infof("source no longer lists %s for %s, skipping the obsolete version: %v",
 					anchorId, path, retryErr)
 				return false
@@ -639,30 +653,19 @@ func (fs *FilerSink) sourceStillServesChunks() bool {
 	return true
 }
 
-// hasSourceNewerVersion reports whether the source's current entry for targetPath
-// has moved past sourceMtimeNs — gone, or a strictly-newer mtime — meaning the
-// version being replayed is stale. The lookup runs regardless of sourceMtimeNs so
-// a deleted source is detected even when the replayed mtime is epoch/unset.
-func (fs *FilerSink) hasSourceNewerVersion(targetPath string, sourceMtimeNs int64) bool {
-	sourcePath, ok := fs.targetPathToSourcePath(targetPath)
-	if !ok {
-		return false
-	}
-	return SourceSupersedes(context.Background(), fs.filerSource, sourcePath, sourceMtimeNs)
-}
-
 // sourceDroppedChunk reports whether the live source entry still exists but no
 // longer references fileId — a version rewritten in place, which the mtime
-// supersession check cannot see. Only a live entry at least as new as the
-// replayed version can prove that; an older one means the source was rolled
-// back and says nothing about whether the chunk is still needed.
-func (fs *FilerSink) sourceDroppedChunk(targetPath string, fileId string, sourceMtimeNs int64) bool {
+// supersession check cannot see. The live entry's mtime does not matter: a
+// client that preserves timestamps stamps a rewrite with an older mtime, and
+// the chunk it stopped referencing is just as gone. A live entry committed
+// before the replayed version lags the event and proves nothing.
+func (fs *FilerSink) sourceDroppedChunk(targetPath string, fileId string, replayed *filer_pb.Entry) bool {
 	sourcePath, ok := fs.targetPathToSourcePath(targetPath)
 	if !ok {
 		return false
 	}
-	live, _, _, err := filer_pb.GetEntry(context.Background(), fs.filerSource, sourcePath)
-	if err != nil || live == nil || sourceMtimeNs <= 0 || getEntryMtimeNs(live) < sourceMtimeNs {
+	live, err := fs.sourceEntry(sourcePath)
+	if err != nil || live == nil || committedBefore(live, replayed) {
 		return false
 	}
 	return !chunkFileIds(live.GetChunks())[fileId]

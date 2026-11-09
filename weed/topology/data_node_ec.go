@@ -78,6 +78,12 @@ func (dn *DataNode) UpdateEcShards(actualShards []*erasure_coding.EcVolumeInfo) 
 				deletedShards = append(deletedShards, d)
 				deletedShardCount += d.ShardsInfo.Count()
 			}
+			// Counts move without any shard changing hands, and the
+			// rewrite below only runs on a membership change, so publish
+			// the new counts on their own.
+			if ecCountsChanged(ecShards, actualEcShards) {
+				disk.refreshEcShardCounts(key.vid, key.diskId, actualEcShards.FileCount, actualEcShards.DeleteCount)
+			}
 		}
 
 		if (newShardCount - deletedShardCount) != 0 {
@@ -113,6 +119,18 @@ func (dn *DataNode) UpdateEcShards(actualShards []*erasure_coding.EcVolumeInfo) 
 	return
 }
 
+// ecCountsChanged reports whether a heartbeat moves the stored FileCount or
+// DeleteCount. A message reporting 0/0 did not count (older volume servers omit
+// the fields), so it keeps the stored values and carries them onto the incoming
+// record in case the map is rewritten.
+func ecCountsChanged(stored, actual *erasure_coding.EcVolumeInfo) bool {
+	if actual.FileCount == 0 && actual.DeleteCount == 0 {
+		actual.FileCount, actual.DeleteCount = stored.FileCount, stored.DeleteCount
+		return false
+	}
+	return actual.FileCount != stored.FileCount || actual.DeleteCount != stored.DeleteCount
+}
+
 // getEcShardsLocked returns the flat list of per-physical-disk EC shard
 // entries across all children. Caller MUST hold dn.Lock (or RLock); each
 // disk's ecShardsLock is taken internally via Disk.GetEcShards.
@@ -134,6 +152,29 @@ func (dn *DataNode) HasEcShards(volumeId needle.VolumeId) (found bool) {
 		has := ok && len(byDisk) > 0
 		disk.ecShardsLock.RUnlock()
 		if has {
+			return true
+		}
+	}
+	return
+}
+
+// HasEcShard reports whether any disk on this node still holds the shard.
+// Registration lookups key on the node alone, so a shard moving between its
+// disks must not drop the node from the lookup while a copy remains.
+func (dn *DataNode) HasEcShard(volumeId needle.VolumeId, shardId erasure_coding.ShardId) (found bool) {
+	dn.RLock()
+	defer dn.RUnlock()
+	for _, c := range dn.children {
+		disk := c.(*Disk)
+		disk.ecShardsLock.RLock()
+		for _, ev := range disk.ecShards[volumeId] {
+			if ev.ShardsInfo.Has(shardId) {
+				found = true
+				break
+			}
+		}
+		disk.ecShardsLock.RUnlock()
+		if found {
 			return true
 		}
 	}

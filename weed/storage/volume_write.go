@@ -17,6 +17,7 @@ import (
 var ErrorNotFound = errors.New("not found")
 var ErrorDeleted = errors.New("already deleted")
 var ErrorSizeMismatch = errors.New("size mismatch")
+var ErrorReadOnly = errors.New("read only")
 
 // isFileUnchanged checks whether this needle to write is same as last one.
 // It requires serialized access in the same volume.
@@ -182,7 +183,7 @@ func (v *Volume) syncWrite(n *needle.Needle, checkCookie bool, fsync bool) (offs
 		return 0, 0, false, err
 	}
 	if v.IsReadOnly() {
-		return 0, 0, false, fmt.Errorf("volume %d is read only", v.Id)
+		return 0, 0, false, fmt.Errorf("volume %d is %w", v.Id, ErrorReadOnly)
 	}
 
 	// A caller can still hold the volume after it was closed or destroyed, which
@@ -235,17 +236,40 @@ func (v *Volume) syncWrite(n *needle.Needle, checkCookie bool, fsync bool) (offs
 		return 0, 0, false, syncErr
 	}
 	if !isUnchanged {
-		err = v.publishWriteRequest(n, offset, fsync)
+		if err = v.publishWriteRequest(n, offset, fsync); err == nil {
+			err = v.dropCancelledWrite(n, offset)
+		}
 	}
 	// The .idx row goes down before the write is acknowledged, same as the
 	// .dat record above; the access lock is dropped for the fsync the same
 	// way, since the row is already published.
 	v.dataFileAccessLock.Unlock()
-	if idxErr := v.syncIndex(); err == nil {
+	var idxErr error
+	if errors.Is(err, ErrorDeleted) {
+		idxErr = v.syncTakenBack(backend)
+	}
+	if idxErr == nil {
+		idxErr = v.syncIndex()
+	}
+	if err == nil {
 		err = idxErr
 	}
 	v.dataFileAccessLock.Lock()
 	return
+}
+
+// syncTakenBack flushes the tombstones dropCancelledWrite appended after the
+// .dat sync, so their .idx rows never outlive them. Like syncIndex, a failure
+// cannot be undone and stops the volume taking writes.
+func (v *Volume) syncTakenBack(backend backend.BackendStorageFile) error {
+	if err := backend.Sync(); err != nil {
+		v.checkReadWriteError(err)
+		v.noWriteLock.Lock()
+		v.noWriteOrDelete = true
+		v.noWriteLock.Unlock()
+		return fmt.Errorf("sync volume %d tombstone: %w", v.Id, err)
+	}
+	return nil
 }
 
 // syncIndex flushes the .idx, the second half of a durable write: the row is
@@ -277,6 +301,8 @@ func (v *Volume) writeNeedle2(n *needle.Needle, checkCookie bool, fsync bool, is
 		return 0, 0, false, err
 	}
 
+	defer v.untrackPendingWrite(v.trackPendingWrite(n))
+
 	if n.Ttl == needle.EMPTY_TTL && v.Ttl != needle.EMPTY_TTL {
 		n.SetHasTtl()
 		n.Ttl = v.Ttl
@@ -303,7 +329,9 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool, fsync bool) 
 	if err != nil || isUnchanged {
 		return
 	}
-	err = v.publishWriteRequest(n, offset, fsync)
+	if err = v.publishWriteRequest(n, offset, fsync); err == nil {
+		err = v.dropCancelledWrite(n, offset)
+	}
 	return
 }
 
@@ -314,7 +342,7 @@ func (v *Volume) appendWriteRequest(n *needle.Needle, checkCookie bool, fsync bo
 	// Re-check under the write lock: the outer checks run before the needle
 	// is assembled, and VolumeMarkReadonly can land in between.
 	if v.IsReadOnly() {
-		return 0, 0, false, fmt.Errorf("volume %d is read only", v.Id)
+		return 0, 0, false, fmt.Errorf("volume %d is %w", v.Id, ErrorReadOnly)
 	}
 	if v.isFileUnchanged(n) {
 		size = Size(n.DataSize)
@@ -432,6 +460,8 @@ func (v *Volume) syncDelete(n *needle.Needle) (Size, error) {
 }
 
 func (v *Volume) deleteNeedle2(n *needle.Needle) (Size, error) {
+	v.CancelPendingWrites(n.Id, n.Cookie)
+
 	// todo: delete info is always appended no fsync, it may need fsync in future
 	fsync := false
 
@@ -564,7 +594,7 @@ func (v *Volume) processBatchRun(run []*needle.AsyncRequest) {
 			if unavailableErr := v.UnavailableError(); unavailableErr != nil {
 				run[i].UpdateResult(0, 0, false, unavailableErr)
 			} else if v.IsReadOnly() {
-				run[i].UpdateResult(0, 0, false, fmt.Errorf("volume %d is read only", v.Id))
+				run[i].UpdateResult(0, 0, false, fmt.Errorf("volume %d is %w", v.Id, ErrorReadOnly))
 			} else {
 				offset, size, isUnchanged, err := v.appendWriteRequest(run[i].N, true, true)
 				if err == nil {
@@ -628,6 +658,7 @@ func (v *Volume) processBatchRun(run []*needle.AsyncRequest) {
 	}
 
 	refused := false
+	tookBack := false
 	for i := 0; i < len(run); i++ {
 		if refused {
 			run[i].UpdateResult(0, 0, false, fmt.Errorf("volume %d is read only", v.Id))
@@ -638,6 +669,9 @@ func (v *Volume) processBatchRun(run []*needle.AsyncRequest) {
 				if perr := v.publishWriteRequest(run[i].N, stagedWriteOffsets[i], true); perr != nil {
 					run[i].UpdateResult(0, 0, false, perr)
 					refused = true
+				} else if derr := v.dropCancelledWrite(run[i].N, stagedWriteOffsets[i]); derr != nil {
+					run[i].UpdateResult(0, 0, false, derr)
+					tookBack = tookBack || errors.Is(derr, ErrorDeleted)
 				}
 			}
 		} else if stagedDeleteOk[i] {
@@ -651,7 +685,14 @@ func (v *Volume) processBatchRun(run []*needle.AsyncRequest) {
 	// rows cannot be rolled back, so a failed sync fails every request in the
 	// run instead of acknowledging an index entry that may not survive.
 	if needIndexSync {
-		if idxErr := v.syncIndex(); idxErr != nil {
+		var idxErr error
+		if tookBack {
+			idxErr = v.syncTakenBack(backend)
+		}
+		if idxErr == nil {
+			idxErr = v.syncIndex()
+		}
+		if idxErr != nil {
 			for i := 0; i < len(run); i++ {
 				run[i].UpdateResult(0, 0, false, idxErr)
 			}

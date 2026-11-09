@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/admin/dash"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -549,7 +550,7 @@ func initMiniS3Flags() {
 	miniS3Options.enableIam = cmdMini.Flag.Bool("s3.iam", true, "enable embedded IAM API on the same port")
 	miniS3Options.iamReadOnly = miniS3IamReadOnly
 	miniS3Options.dataCenter = cmdMini.Flag.String("s3.dataCenter", "", "prefer to read and write to volumes in this data center")
-	miniS3Options.cipher = cmdMini.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads")
+	miniS3Options.cipher = cmdMini.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads; on whenever -filer.encryptVolumeData is")
 	miniS3Options.config = miniS3Config
 	miniS3Options.iamConfig = miniIamConfig
 	miniS3Options.auditLogConfig = cmdMini.Flag.String("s3.auditLogConfig", "", "path to the audit log config file")
@@ -598,6 +599,7 @@ func initMiniAdminFlags() {
 	miniAdminOptions.allowInsecureBind = cmdMini.Flag.Bool("admin.allowInsecureBind", false, "INSECURE: allow the unauthenticated admin interface to bind to -ip.bind instead of loopback")
 	miniAdminWorkerBindIP = cmdMini.Flag.String("admin.worker.ip", "127.0.0.1", "worker gRPC bind address; expose only with grpc.admin mTLS configured")
 	miniAdminOptions.urlPrefix = cmdMini.Flag.String("admin.urlPrefix", "", "URL path prefix when running the admin UI behind a reverse proxy under a subdirectory (e.g. /seaweedfs)")
+	miniAdminOptions.uploadMaxSizeMB = cmdMini.Flag.Int("admin.uploadMaxSizeMB", dash.DefaultUploadMaxSizeMB, "maximum total size in MB of one file browser upload (0 for no limit)")
 }
 
 func init() {

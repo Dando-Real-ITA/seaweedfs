@@ -19,6 +19,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"golang.org/x/net/http/httpguts"
 )
 
 func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.Request) {
@@ -80,14 +81,21 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// Verify policy signature.
-	identity, errCode := s3a.iam.doesPolicySignatureMatch(r.Context(), formValues)
-	if errCode != s3err.ErrNone {
-		s3err.WriteErrorResponse(w, r, refineDenialForBucketName(r, identity, errCode))
-		return
-	}
-	if identity != nil {
-		r = r.WithContext(recordIdentityInContext(r, identity))
+	// Verify policy signature. With auth off there are no keys to check it against, as on the other handlers.
+	var identity *Identity
+	errCode := s3err.ErrNone
+	if s3a.iam.isEnabled() {
+		identity, errCode = s3a.iam.doesPolicySignatureMatch(r.Context(), formValues)
+		if errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, refineDenialForBucketName(r, identity, errCode))
+			return
+		}
+		if identity != nil {
+			r = r.WithContext(recordIdentityInContext(r, identity))
+			if identity.Account != nil {
+				r.Header.Set(s3_constants.AmzAccountId, identity.Account.Id)
+			}
+		}
 	}
 
 	policyBytes, err := base64.StdEncoding.DecodeString(formValues.Get("Policy"))
@@ -138,6 +146,10 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 
 	// Forward validated POST form fields to the underlying PUT as headers.
 	applyPostPolicyFormHeaders(r, formValues)
+	if !validHeaderValues(r.Header) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrMalformedPOSTRequest)
+		return
+	}
 
 	// Authorize the object like the PUT path.
 	if errCode := s3a.iam.AuthorizeObjectWrite(r, identity, bucket, object); errCode != s3err.ErrNone {
@@ -151,17 +163,39 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 			s3err.WriteErrorResponse(w, r, refineDenialForBucketName(r, identity, errCode))
 			return
 		}
+		config, errCode := s3a.getBucketConfig(bucket)
+		if errCode != s3err.ErrNone && errCode != s3err.ErrNoSuchBucket {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
+		if errCode == s3err.ErrNone && config.PublicAccessBlock.blocksPublicAcls() {
+			_, grants, aclCode := ParseAclHeaders(r, config.Ownership, config.Owner, "", false)
+			if aclCode == s3err.ErrNone {
+				aclCode = rejectPublicGrants(config, grants)
+			}
+			if aclCode != s3err.ErrNone {
+				s3err.WriteErrorResponse(w, r, aclCode)
+				return
+			}
+		}
 	}
 
 	versioningState, err := s3a.getVersioningState(bucket)
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) {
-			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			// Auto-create bucket if it doesn't exist (requires Admin permission)
+			if !s3a.handleAutoCreateBucket(w, r, bucket, "PostPolicyBucketHandler") {
+				return
+			}
+			// Re-fetch versioning state to handle race conditions where
+			// another process might have created the bucket with versioning enabled.
+			versioningState, err = s3a.getVersioningState(bucket)
+		}
+		if err != nil {
+			glog.Errorf("PostPolicyBucketHandler: versioning state for bucket %s: %v", bucket, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 			return
 		}
-		glog.Errorf("PostPolicyBucketHandler: versioning state for bucket %s: %v", bucket, err)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		return
 	}
 	objectLockEnabled, err := s3a.isObjectLockEnabled(bucket)
 	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
@@ -281,6 +315,19 @@ func applyPostPolicyFormHeaders(r *http.Request, formValues http.Header) {
 			r.Header.Set(k, formValues.Get(k))
 		}
 	}
+}
+
+// validHeaderValues rejects form values carrying control characters, which a
+// real PUT could not send and which would corrupt the volume upload framing.
+func validHeaderValues(h http.Header) bool {
+	for _, values := range h {
+		for _, v := range values {
+			if !httpguts.ValidHeaderFieldValue(v) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // postRequestsAcl reports whether the request carries ACL headers, whether

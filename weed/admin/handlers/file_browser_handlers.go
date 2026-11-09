@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -247,17 +249,28 @@ func (h *FileBrowserHandlers) CreateFolder(w http.ResponseWriter, r *http.Reques
 
 // UploadFile handles file upload requests
 func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request) {
-	// Get the current path
+	maxSize := h.adminServer.GetUploadMaxSize()
+	if maxSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxSize+uploadFormOverhead)
+	}
+
+	// Parts beyond 32MB spill to temporary files instead of memory
+	err := r.ParseMultipartForm(32 << 20)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, uploadTooLargeMessage(maxSize))
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "Failed to parse multipart form: "+err.Error())
+		return
+	}
+	// The router hands us a copy of the request, so the server cannot remove the spooled parts itself
+	defer r.MultipartForm.RemoveAll()
+
 	currentPath := r.FormValue("path")
 	if currentPath == "" {
 		currentPath = "/"
-	}
-
-	// Parse multipart form
-	err := r.ParseMultipartForm(1 << 30) // 1GB max memory for large file uploads
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "Failed to parse multipart form: "+err.Error())
-		return
 	}
 
 	// Get uploaded files (supports multiple files)
@@ -266,14 +279,37 @@ func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusBadRequest, "No files uploaded")
 		return
 	}
+	if maxSize > 0 {
+		var totalSize int64
+		for _, fileHeader := range files {
+			totalSize += fileHeader.Size
+		}
+		if totalSize > maxSize {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, uploadTooLargeMessage(maxSize))
+			return
+		}
+	}
+
+	// A folder upload names each file by its path inside the folder; the multipart
+	// file name keeps only the base name.
+	var relativePaths []string
+	if v, ok := r.MultipartForm.Value["relativePaths"]; ok {
+		if len(v) != 1 || json.Unmarshal([]byte(v[0]), &relativePaths) != nil || len(relativePaths) != len(files) {
+			writeJSONError(w, http.StatusBadRequest, "relativePaths must list one path per uploaded file")
+			return
+		}
+	}
 
 	var uploadResults []map[string]interface{}
 	var failedUploads []string
 
 	// Process each uploaded file
-	for _, fileHeader := range files {
+	for i, fileHeader := range files {
 		// Validate file name
 		fileName := fileHeader.Filename
+		if relativePaths != nil {
+			fileName = relativePaths[i]
+		}
 		if fileName == "" {
 			failedUploads = append(failedUploads, "invalid filename")
 			continue
@@ -281,6 +317,10 @@ func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request)
 
 		// Normalize Windows-style backslashes to forward slashes
 		fileName = util.CleanWindowsPath(fileName)
+		if relativePaths != nil && !isRelativeUploadPath(fileName) {
+			failedUploads = append(failedUploads, fmt.Sprintf("%s: invalid relative path", fileName))
+			continue
+		}
 
 		// Create full path for the file using path.Join for URL path semantics
 		// path.Join handles double slashes and is not OS-specific like filepath.Join
@@ -325,6 +365,25 @@ func (h *FileBrowserHandlers) UploadFile(w http.ResponseWriter, r *http.Request)
 		response["message"] = "All file uploads failed"
 		writeJSON(w, http.StatusInternalServerError, response)
 	}
+}
+
+// isRelativeUploadPath reports whether name stays inside the upload directory.
+func isRelativeUploadPath(name string) bool {
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// uploadFormOverhead allows for the multipart headers and the path field on
+// top of the file bytes an upload may carry. Go's multipart parser accepts at
+// most 1000 parts, whose headers take about half of this.
+const uploadFormOverhead = 1 << 20
+
+func uploadTooLargeMessage(maxSize int64) string {
+	return fmt.Sprintf("Total upload size exceeds the %d MB limit", maxSize>>20)
 }
 
 // uploadFileToFiler uploads a file to the cluster via filer gRPC + volume

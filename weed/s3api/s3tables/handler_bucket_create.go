@@ -39,6 +39,11 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 		bucketFormat = normalized
 	}
 
+	if err := ValidateEncryptionConfiguration(req.EncryptionConfiguration, "sseAlgorithm"); err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
+		return err
+	}
+
 	principal := h.getAccountID(r)
 	identityActions := getIdentityActions(r)
 	identityPolicyNames := getIdentityPolicyNames(r)
@@ -73,6 +78,12 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 			h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table buckets")
 			return NewAuthError("CreateTableBucket", principal, "not authorized to create table buckets")
 		}
+	}
+
+	if len(req.EncryptionConfiguration) > 0 && IsCatalogOnlyFormat(bucketFormat) && h.canEncrypt != nil && !h.canEncrypt() {
+		msg := "AES256 encryption needs an SSE-S3 key on the S3 gateway: set s3.sse.kek or s3.sse.key in security.toml"
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, msg)
+		return errors.New(msg)
 	}
 
 	bucketPath := GetTableBucketPath(req.Name)
@@ -127,10 +138,11 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 	// Create the bucket directory and set metadata as extended attributes
 	now := time.Now()
 	metadata := &tableBucketMetadata{
-		Name:           req.Name,
-		CreatedAt:      now,
-		OwnerAccountID: principal,
-		Format:         bucketFormat,
+		Name:                    req.Name,
+		CreatedAt:               now,
+		OwnerAccountID:          principal,
+		Format:                  bucketFormat,
+		EncryptionConfiguration: req.EncryptionConfiguration,
 	}
 
 	metadataBytes, err := json.Marshal(metadata)

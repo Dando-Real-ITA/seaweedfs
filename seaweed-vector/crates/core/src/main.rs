@@ -1,17 +1,21 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use weed_lance_worker::catalog::{NamespaceClient, parse_id};
-use weed_lance_worker::dataset::{self, FallbackOptions};
+use weed_lance_worker::catalog::{NamespaceClient, SigningKey, TableDescription, parse_id};
+use weed_lance_worker::dataset::{self, Storage};
 use weed_vector_core::coverage;
+use weed_vector_core::index;
 use weed_vector_core::query::{self, Query};
 use weed_vector_core::table::VectorTable;
 
 /// Mirrors `weed-worker`'s flags where the two touch the same thing: the
-/// namespace is WEED_LANCE_NAMESPACE and the fallback storage credentials are
-/// the same env vars.
+/// namespace that says where a table is, and the masters whose filers hold
+/// it.
 #[derive(Parser, Debug)]
-#[command(name = "weed-vector", about = "SeaweedFS vector query spike")]
+#[command(
+    name = "weed-vector",
+    about = "Describe, query and index S3 Vectors tables"
+)]
 struct Args {
     /// Lance namespace the tables live in.
     #[arg(
@@ -21,12 +25,29 @@ struct Args {
     )]
     namespace: String,
 
-    /// Storage credentials to use where the namespace vends none.
-    #[arg(long, env = "WEED_S3_ACCESS_KEY")]
-    access_key: Option<String>,
+    /// Comma-separated master addresses, whose filers the tables are kept
+    /// through. A table named by a local URI needs none.
+    #[arg(long, alias = "master", env = "WEED_MASTERS")]
+    masters: Option<String>,
 
-    #[arg(long, env = "WEED_S3_SECRET_KEY")]
-    secret_key: Option<String>,
+    /// The filer group whose filers hold the tables.
+    #[arg(
+        long,
+        alias = "filer.group",
+        env = "WEED_FILER_GROUP",
+        default_value = ""
+    )]
+    filer_group: String,
+
+    /// The `jwt.filer_signing.key` of the cluster, which the namespace
+    /// authenticates cluster processes with; security.toml's by default.
+    #[arg(long, env = "WEED_FILER_SIGNING_KEY")]
+    filer_signing_key: Option<String>,
+
+    /// The cluster's security.toml; by default the file weed processes find
+    /// in -config_dir, ., ~/.seaweedfs and /etc/seaweedfs.
+    #[arg(long, env = "WEED_VECTOR_SECURITY_TOML")]
+    security_toml: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -91,24 +112,67 @@ enum Command {
         #[arg(long)]
         key_column: Option<String>,
     },
+    /// Build or extend the vector index, then print its coverage.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
 }
 
-/// `id` is a delimiter-joined table id; when it looks like a URI (`s3://...`,
-/// `/path/...`, `file://...`) the dataset is opened directly, skipping the
-/// namespace — useful for a spike run against a local dataset.
+#[derive(Subcommand, Debug)]
+enum IndexAction {
+    /// An IVF_FLAT index in the table's metric; partitions default to the
+    /// square root of the row count.
+    Build {
+        id: String,
+        #[arg(long)]
+        partitions: Option<usize>,
+        #[arg(long, default_value = index::INDEX_NAME)]
+        name: String,
+        /// Rebuild an index of that name instead of failing.
+        #[arg(long)]
+        replace: bool,
+        #[arg(long)]
+        vector_column: Option<String>,
+    },
+    /// Cover the rows written since the index was built.
+    Optimize {
+        id: String,
+        /// Train the index again on every row instead of adding a segment.
+        #[arg(long)]
+        retrain: bool,
+        #[arg(long)]
+        vector_column: Option<String>,
+    },
+}
+
+/// `id` is a delimiter-joined table id; when it looks like a URI the dataset
+/// is opened directly, skipping the namespace: an `s3://` URI on the
+/// cluster's storage, a local path (`/path/...`, `file://...`) as it is.
 async fn open_dataset(
     client: &NamespaceClient,
     id: &str,
-    fallback: &FallbackOptions,
+    storage: &Storage,
 ) -> Result<lance::Dataset> {
-    if id.contains("://") || id.starts_with('/') {
-        let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(id);
-        if !fallback.is_empty() {
-            builder = builder.with_storage_options(fallback.clone());
-        }
-        return builder.load().await.with_context(|| format!("open {id}"));
+    let on_cluster = id.starts_with("s3://");
+    if !on_cluster && (id.contains("://") || id.starts_with('/')) {
+        return lance::dataset::builder::DatasetBuilder::from_uri(id)
+            .load()
+            .await
+            .with_context(|| format!("open {id}"));
     }
-    let table = dataset::open(client, &parse_id(id), fallback).await?;
+    if storage.0.is_none() {
+        bail!("{id} is kept on the cluster and needs --masters");
+    }
+    if on_cluster {
+        let description = TableDescription {
+            location: id.to_string(),
+            storage_options: Default::default(),
+            managed_versioning: false,
+        };
+        return dataset::open_at(&description, storage.wrapper(id).await?).await;
+    }
+    let table = dataset::open(client, &parse_id(id), storage).await?;
     Ok(table.dataset)
 }
 
@@ -116,6 +180,7 @@ async fn open_dataset(
 async fn main() -> Result<()> {
     weed_lance_worker::tls::install_default_crypto_provider();
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -123,12 +188,21 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let mut fallback = FallbackOptions::new();
-    if let (Some(access), Some(secret)) = (args.access_key, args.secret_key) {
-        fallback.insert("aws_access_key_id".to_string(), access);
-        fallback.insert("aws_secret_access_key".to_string(), secret);
-    }
-    let client = NamespaceClient::new(args.namespace).with_fallback(&fallback);
+    let security =
+        weed_lance_worker::security::Security::load(args.security_toml.as_deref(), None)?;
+    let signing_key = SigningKey::new(
+        args.filer_signing_key
+            .or_else(|| security.get("jwt.filer_signing.key")),
+    );
+    let client = NamespaceClient::new(args.namespace).with_signing_key(signing_key.as_ref());
+    let storage = match &args.masters {
+        Some(masters) => {
+            let cluster =
+                weed_lance_worker::cluster::Cluster::new(masters, &args.filer_group, &security)?;
+            Storage(Some(cluster.storage(&security).await?))
+        }
+        None => Storage::default(),
+    };
 
     match args.command {
         Command::Describe {
@@ -136,7 +210,7 @@ async fn main() -> Result<()> {
             vector_column,
             key_column,
         } => {
-            let dataset = open_dataset(&client, &id, &fallback).await?;
+            let dataset = open_dataset(&client, &id, &storage).await?;
             let schema: arrow_schema::Schema = dataset.schema().into();
             let resolved =
                 VectorTable::resolve(&dataset, vector_column.as_deref(), key_column.as_deref());
@@ -176,7 +250,7 @@ async fn main() -> Result<()> {
             vector_column,
             key_column,
         } => {
-            let dataset = open_dataset(&client, &id, &fallback).await?;
+            let dataset = open_dataset(&client, &id, &storage).await?;
             let vector =
                 VectorTable::resolve(&dataset, vector_column.as_deref(), key_column.as_deref())?;
             let coverages = coverage::coverage(&dataset, &vector.vector_column).await?;
@@ -188,10 +262,10 @@ async fn main() -> Result<()> {
             vector_column,
             key_column,
         } => {
-            let dataset = open_dataset(&client, &id, &fallback).await?;
+            let dataset = open_dataset(&client, &id, &storage).await?;
             let vector =
                 VectorTable::resolve(&dataset, vector_column.as_deref(), key_column.as_deref())?;
-            for batch in query::get(&dataset, &vector, &keys).await? {
+            for batch in query::get(&dataset, &vector, &keys, None).await? {
                 println!("{}", arrow_cast::pretty::pretty_format_batches(&[batch])?);
             }
         }
@@ -208,7 +282,7 @@ async fn main() -> Result<()> {
             key_column,
             nprobes,
         } => {
-            let opened = open_dataset(&client, &id, &fallback).await?;
+            let opened = open_dataset(&client, &id, &storage).await?;
             let dataset = match version {
                 Some(v) => opened.checkout_version(v).await?,
                 None => opened,
@@ -243,6 +317,49 @@ async fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
+        Command::Index { action } => {
+            let (id, vector_column) = match &action {
+                IndexAction::Build {
+                    id, vector_column, ..
+                }
+                | IndexAction::Optimize {
+                    id, vector_column, ..
+                } => (id.clone(), vector_column.clone()),
+            };
+            let mut dataset = open_dataset(&client, &id, &storage).await?;
+            let table = VectorTable::resolve(&dataset, vector_column.as_deref(), None)?;
+            let started = std::time::Instant::now();
+            match action {
+                IndexAction::Build {
+                    partitions,
+                    name,
+                    replace,
+                    ..
+                } => {
+                    let rows = dataset.count_rows(None).await?;
+                    let partitions = partitions.unwrap_or_else(|| index::partitions_for(rows));
+                    index::build(
+                        &mut dataset,
+                        &table.vector_column,
+                        &name,
+                        partitions,
+                        replace,
+                    )
+                    .await?;
+                }
+                IndexAction::Optimize { retrain, .. } => {
+                    index::optimize(&mut dataset, &table.vector_column, retrain).await?;
+                }
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": dataset.version().version,
+                    "seconds": started.elapsed().as_secs_f64(),
+                    "coverage": coverage::coverage(&dataset, &table.vector_column).await?,
+                })
+            );
+        }
     }
     Ok(())
 }
@@ -269,6 +386,58 @@ mod tests {
                 assert_eq!(k, 3);
             }
             _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn cluster_flags_mirror_the_engine_and_the_worker() {
+        let args = Args::try_parse_from([
+            "weed-vector",
+            "--masters",
+            "m:9333",
+            "--filer-group",
+            "eu",
+            "describe",
+            "t",
+        ])
+        .unwrap();
+        assert_eq!(args.masters.as_deref(), Some("m:9333"));
+        assert_eq!(args.filer_group, "eu");
+        assert!(
+            Args::try_parse_from(["weed-vector", "--encryptVolumeData", "describe", "t"]).is_err(),
+            "volume encryption follows the filer"
+        );
+    }
+
+    #[test]
+    fn index_build_takes_partitions_and_a_name() {
+        let args = Args::try_parse_from([
+            "weed-vector",
+            "index",
+            "build",
+            "b$vector$i",
+            "--partitions",
+            "32",
+            "--replace",
+        ])
+        .unwrap();
+        match args.command {
+            Command::Index {
+                action:
+                    IndexAction::Build {
+                        id,
+                        partitions,
+                        name,
+                        replace,
+                        ..
+                    },
+            } => {
+                assert_eq!(id, "b$vector$i");
+                assert_eq!(partitions, Some(32));
+                assert_eq!(name, index::INDEX_NAME);
+                assert!(replace);
+            }
+            _ => panic!("expected index build"),
         }
     }
 

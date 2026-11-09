@@ -3,7 +3,7 @@
 //! Implements the bidirectional streaming `SendHeartbeat` RPC to the master,
 //! matching Go's `server/volume_grpc_client_to_master.go`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use super::grpc_client::{GrpcDialOptions, connect_channel, master_client};
-use super::volume_server::VolumeServerState;
+use super::volume_server::{VolumeServerState, to_http_address};
 use crate::pb::master_pb;
 use crate::pb::volume_server_pb;
 use crate::remote_storage::s3_tier::{S3TierBackend, S3TierConfig};
@@ -64,12 +64,14 @@ pub async fn run_heartbeat_with_state(
     let pulse = Duration::from_secs(config.pulse_seconds.max(1));
     let mut new_leader: Option<String> = None;
     let mut duplicate_retry_count: u32 = 0;
-    // Whether a heartbeat stream was ever answered by a leader; before first
-    // registration the retry loop reconnects promptly instead of pacing a
-    // full pulse. Mirrors Go's `confirmedLeaderOnce`.
-    let mut confirmed_leader_once = false;
+    // When a stream a leader had answered last ended, `None` before first
+    // registration. Until then, and for a pulse after each loss, the retry
+    // loop reconnects promptly instead of pacing a full pulse. Mirrors Go's
+    // `confirmedLeaderOnce` and `leaderLostAt`.
+    let mut leader_lost_at: Option<tokio::time::Instant> = None;
 
     loop {
+        let mut tried_hints: HashSet<String> = HashSet::new();
         for master_addr in &config.master_addresses {
             if is_stopping(&state) {
                 state.is_heartbeating.store(false, Ordering::Relaxed);
@@ -82,112 +84,72 @@ pub async fn run_heartbeat_with_state(
                 return;
             }
 
-            // If we have a leader redirect, sleep 3s then connect to the leader
-            // instead of iterating through the seed list
-            let target_addr = if let Some(ref leader) = new_leader {
+            // Named leaders are tried on top of the seed scan rather than in
+            // the next seed's place: a peer that keeps naming a dead leader
+            // would otherwise eat that seed's slot on every pass and starve
+            // it. A fresh name is followed right away — the pending seed may
+            // be the master the stream just lost — and a name already dialed
+            // this pass is not dialed again. A hint naming the upcoming seed
+            // is covered by the seed dial itself. Mirrors Go's heartbeat loop.
+            let mut hints = 0;
+            while let Some(leader) = new_leader.clone() {
+                let leader_http = to_http_address(&leader).into_owned();
+                if leader_http == to_http_address(master_addr).as_ref()
+                    || tried_hints.contains(&leader_http)
+                    || hints >= config.master_addresses.len()
+                {
+                    break;
+                }
+                tried_hints.insert(leader_http);
+                hints += 1;
+                // the new leader may actually is the same master
+                // need to wait a bit before adding itself
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                leader.clone()
-            } else {
-                master_addr.clone()
-            };
-
-            let grpc_addr = to_grpc_address(&target_addr);
-            info!("Connecting heartbeat to master {}", grpc_addr);
-
-            // Determine what action to take after the heartbeat attempt.
-            // We convert the error to a string immediately so the non-Send
-            // Box<dyn Error> is dropped before any .await point.
-            enum PostAction {
-                LeaderRedirect(String),
-                Done,
-                SleepDuplicate(Duration),
-                SleepPulse,
+                new_leader = heartbeat_once(
+                    &config,
+                    &state,
+                    &leader,
+                    pulse,
+                    &mut shutdown_rx,
+                    &mut leader_lost_at,
+                    &mut duplicate_retry_count,
+                )
+                .await;
+                if is_stopping(&state) {
+                    break;
+                }
             }
-            let action = match do_heartbeat(
+            if is_stopping(&state) {
+                break;
+            }
+            if let Some(ref leader) = new_leader
+                && to_http_address(leader) == to_http_address(master_addr)
+            {
+                // the seed dial covers a hint that names the seed itself
+                new_leader = None;
+            }
+            tried_hints.insert(to_http_address(master_addr).into_owned());
+            if let Some(named) = heartbeat_once(
                 &config,
                 &state,
-                &grpc_addr,
-                &target_addr,
+                master_addr,
                 pulse,
                 &mut shutdown_rx,
-                &mut confirmed_leader_once,
+                &mut leader_lost_at,
+                &mut duplicate_retry_count,
             )
             .await
             {
-                Ok(Some(leader)) => {
-                    info!("Master leader changed to {}", leader);
-                    PostAction::LeaderRedirect(leader)
-                }
-                Ok(None) => {
-                    duplicate_retry_count = 0;
-                    PostAction::Done
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    // Drop `e` (non-Send) before any .await
-                    drop(e);
-                    warn!("Heartbeat to {} error: {}", grpc_addr, err_msg);
-
-                    if err_msg.contains(DUPLICATE_UUID_RETRY_MESSAGE) {
-                        if duplicate_retry_count >= MAX_DUPLICATE_UUID_RETRIES {
-                            error!(
-                                "Shut down Volume Server due to persistent duplicate volume directories after 3 retries"
-                            );
-                            error!(
-                                "Please check if another volume server is using the same directory"
-                            );
-                            std::process::exit(1);
-                        }
-                        let retry_delay = duplicate_uuid_retry_delay(duplicate_retry_count);
-                        duplicate_retry_count += 1;
-                        warn!(
-                            "Waiting {:?} before retrying due to duplicate UUID detection (attempt {}/3)...",
-                            retry_delay, duplicate_retry_count
-                        );
-                        PostAction::SleepDuplicate(retry_delay)
-                    } else {
-                        duplicate_retry_count = 0;
-                        PostAction::SleepPulse
-                    }
-                }
-            };
-
-            match action {
-                PostAction::LeaderRedirect(leader) => {
-                    new_leader = Some(leader);
-                    break;
-                }
-                PostAction::Done => {
-                    new_leader = None;
-                }
-                PostAction::SleepDuplicate(delay) => {
-                    new_leader = None;
-                    tokio::time::sleep(delay).await;
-                }
-                PostAction::SleepPulse => {
-                    new_leader = None;
-                    // The lookup spends part of the retry delay rather than
-                    // adding to it.
-                    let retry_at = tokio::time::Instant::now() + pulse;
-                    refresh_leader_from_peers(&config, &state, pulse).await;
-                    let mut wait = retry_at.saturating_duration_since(tokio::time::Instant::now());
-                    if wait > Duration::from_secs(1)
-                        && (!state.current_master().await.is_empty() || !confirmed_leader_once)
-                    {
-                        // A leader just named by the refresh usually accepts
-                        // the next stream right away, and an unregistered
-                        // server has nothing else to do, so reconnect
-                        // promptly. Once the server was registered and no
-                        // leader is known, keep the pulse backoff.
-                        wait = Duration::from_secs(1);
-                    }
-                    tokio::time::sleep(wait).await;
+                // A hint the cap left untried stays pending: the seed's
+                // answer replaces it only once it was dialed.
+                let tried = new_leader
+                    .as_ref()
+                    .is_none_or(|p| tried_hints.contains(to_http_address(p).as_ref()));
+                if tried {
+                    new_leader = Some(named);
                 }
             }
-
-            // If we connected to a leader (not seed list), break out after one attempt
-            // so we either reconnect to the new leader or fall back to seed list
-            if new_leader.is_some() {
+            if is_stopping(&state) {
                 break;
             }
         }
@@ -196,6 +158,113 @@ pub async fn run_heartbeat_with_state(
         // already slept its retry delay, so a round-losing pass over the seed
         // list restarts right away.
     }
+}
+
+/// One heartbeat attempt on `target_addr`; returns the leader the stream or
+/// the peer refresh named — `None` when neither did. Mirrors Go's
+/// `heartbeatOnce`.
+async fn heartbeat_once(
+    config: &HeartbeatConfig,
+    state: &Arc<VolumeServerState>,
+    target_addr: &str,
+    pulse: Duration,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    leader_lost_at: &mut Option<tokio::time::Instant>,
+    duplicate_retry_count: &mut u32,
+) -> Option<String> {
+    let grpc_addr = to_grpc_address(target_addr);
+    info!("Connecting heartbeat to master {}", grpc_addr);
+
+    // Determine what action to take after the heartbeat attempt.
+    // We convert the error to a string immediately so the non-Send
+    // Box<dyn Error> is dropped before any .await point.
+    enum PostAction {
+        SleepDuplicate(Duration),
+        SleepPulse,
+    }
+    let mut confirmed_leader = false;
+    let result = do_heartbeat(
+        config,
+        state,
+        &grpc_addr,
+        target_addr,
+        pulse,
+        shutdown_rx,
+        &mut confirmed_leader,
+    )
+    .await
+    .map_err(|e| e.to_string());
+    if confirmed_leader {
+        *leader_lost_at = Some(tokio::time::Instant::now());
+    }
+    let action = match result {
+        Ok(Some(leader)) => {
+            info!("Master leader changed to {}", leader);
+            return Some(leader);
+        }
+        Ok(None) => {
+            *duplicate_retry_count = 0;
+            return None;
+        }
+        Err(err_msg) => {
+            warn!("Heartbeat to {} error: {}", grpc_addr, err_msg);
+
+            if err_msg.contains(DUPLICATE_UUID_RETRY_MESSAGE) {
+                if *duplicate_retry_count >= MAX_DUPLICATE_UUID_RETRIES {
+                    error!(
+                        "Shut down Volume Server due to persistent duplicate volume directories after 3 retries"
+                    );
+                    error!("Please check if another volume server is using the same directory");
+                    std::process::exit(1);
+                }
+                let retry_delay = duplicate_uuid_retry_delay(*duplicate_retry_count);
+                *duplicate_retry_count += 1;
+                warn!(
+                    "Waiting {:?} before retrying due to duplicate UUID detection (attempt {}/3)...",
+                    retry_delay, duplicate_retry_count
+                );
+                PostAction::SleepDuplicate(retry_delay)
+            } else {
+                *duplicate_retry_count = 0;
+                PostAction::SleepPulse
+            }
+        }
+    };
+
+    match action {
+        PostAction::SleepDuplicate(delay) => {
+            tokio::time::sleep(delay).await;
+        }
+        PostAction::SleepPulse => {
+            // The lookup spends part of the retry delay rather than adding
+            // to it.
+            let retry_at = tokio::time::Instant::now() + pulse;
+            let unregistered_or_just_lost = leader_lost_at.is_none_or(|at| at.elapsed() < pulse);
+            let leader = refresh_leader_from_peers(config, state, target_addr, pulse).await;
+            let mut wait = retry_at.saturating_duration_since(tokio::time::Instant::now());
+            if wait > Duration::from_secs(1)
+                && (!state.current_master().await.is_empty() || unregistered_or_just_lost)
+            {
+                // A leader just named by the refresh usually accepts the
+                // next stream right away, an unregistered server has
+                // nothing else to do, and a master that just dropped the
+                // stream is usually back within a second, so reconnect
+                // promptly. Otherwise keep the pulse backoff.
+                wait = Duration::from_secs(1);
+            }
+            tokio::time::sleep(wait).await;
+            if let Some(leader) = leader
+                && to_http_address(&leader) != to_http_address(target_addr)
+            {
+                // Dial the leader the other masters just named rather than
+                // the next seed, which can be the master this stream just
+                // lost: an unreachable master holds each dial for the
+                // connect timeout before the loop moves on.
+                return Some(leader);
+            }
+        }
+    }
+    None
 }
 
 /// Convert a master address to a gRPC `host:port` target.
@@ -274,20 +343,45 @@ pub async fn try_get_master_configuration(
 /// to the master the heartbeat just lost while the loop retries. Without an
 /// answer inside `timeout` the published master is cleared: the lost master
 /// is dead or no longer leader, and a follower answers lookups from its own
-/// cache rather than refusing them. Mirrors Go's refreshLeaderFromPeers.
+/// cache rather than refusing them, and returns it so the loop can dial it
+/// next. The lost master is asked last: an unreachable one holds its lookup
+/// open long enough to starve the peers that know the new leader. Mirrors
+/// Go's refreshLeaderFromPeers.
 async fn refresh_leader_from_peers(
     config: &HeartbeatConfig,
     state: &Arc<VolumeServerState>,
+    lost: &str,
     timeout: Duration,
-) {
-    let lookup = lookup_leader_from_peers(
-        &config.master_addresses,
-        state.outgoing_grpc_tls.as_ref(),
-    );
+) -> Option<String> {
+    let ordered = masters_asking_last(&config.master_addresses, lost);
+    let lookup = lookup_leader_from_peers(&ordered, state.outgoing_grpc_tls.as_ref());
     match tokio::time::timeout(timeout, lookup).await {
-        Ok(Some(leader)) => publish_current_master(state, &leader).await,
-        _ => state.current_master_url.write().await.clear(),
+        Ok(Some(leader)) => {
+            publish_current_master(state, &leader).await;
+            Some(leader)
+        }
+        _ => {
+            state.current_master_url.write().await.clear();
+            None
+        }
     }
+}
+
+/// Return masters with every entry equal to `lost` (same HTTP address) moved
+/// to the end, keeping the order of the rest. Mirrors Go's mastersAskingLast.
+fn masters_asking_last(masters: &[String], lost: &str) -> Vec<String> {
+    let lost_http = to_http_address(lost);
+    let mut ordered = Vec::with_capacity(masters.len());
+    let mut tail = Vec::new();
+    for m in masters {
+        if !lost.is_empty() && to_http_address(m) == lost_http {
+            tail.push(m.clone());
+        } else {
+            ordered.push(m.clone());
+        }
+    }
+    ordered.extend(tail);
+    ordered
 }
 
 /// Ask each seed master for the raft leader and return the first answer, or
@@ -375,6 +469,9 @@ fn collect_ec_shard_delta_messages(
             if quarantined {
                 continue;
             }
+            // Same numbers the full EC heartbeat carries, read off the active
+            // generation's index and journal; one call covers every shard.
+            let (file_count, delete_count) = ec_vol.file_and_delete_count();
             for shard in ec_vol.shards.iter().flatten() {
                 messages.insert(
                     (
@@ -391,6 +488,8 @@ fn collect_ec_shard_delta_messages(
                         disk_type: ec_vol.disk_type.to_string(),
                         expire_at_sec: ec_vol.expire_at_sec,
                         disk_id: disk_id as u32,
+                        file_count,
+                        delete_count,
                         encode_ts_ns: ec_vol.encode_ts_ns,
                         ..Default::default()
                     },
@@ -413,7 +512,17 @@ fn diff_ec_shard_delta_messages(
     let mut deleted_ec_shards = Vec::new();
 
     for (key, message) in current {
-        if previous.get(key) != Some(message) {
+        // Counts move with every delete; the full EC heartbeat carries those,
+        // so only a change to the shard itself is news here.
+        let unchanged = previous.get(key).is_some_and(|prev| {
+            *message
+                == master_pb::VolumeEcShardInformationMessage {
+                    file_count: message.file_count,
+                    delete_count: message.delete_count,
+                    ..prev.clone()
+                }
+        });
+        if !unchanged {
             new_ec_shards.push(message.clone());
         }
     }
@@ -459,7 +568,7 @@ async fn do_heartbeat(
     current_master: &str,
     pulse: Duration,
     shutdown_rx: &mut broadcast::Receiver<()>,
-    confirmed_leader_once: &mut bool,
+    confirmed_leader: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let channel = connect_channel(
         grpc_addr,
@@ -506,7 +615,6 @@ async fn do_heartbeat(
     volume_tick.tick().await;
     ec_tick.tick().await;
 
-    let mut confirmed_leader = false;
     loop {
         tokio::select! {
             resp = response_stream.message() => {
@@ -524,12 +632,11 @@ async fn do_heartbeat(
                                 publish_current_master(state, &hb_resp.leader).await;
                                 return Ok(Some(hb_resp.leader));
                             }
-                        } else if !confirmed_leader {
+                        } else if !*confirmed_leader {
                             // The leader answers every new stream without
                             // naming a leader, so this peer is the one lookups
                             // go to.
-                            confirmed_leader = true;
-                            *confirmed_leader_once = true;
+                            *confirmed_leader = true;
                             publish_current_master(state, current_master).await;
                         }
                         if !hb_resp.duplicated_uuids.is_empty() {
@@ -961,15 +1068,17 @@ fn collect_heartbeat_with_snapshot(
     master_pb::Heartbeat,
     Vec<master_pb::VolumeInformationMessage>,
 ) {
-    let (_, expired_ec) = state.store.read().unwrap().find_expired_ec_volumes();
-    let mut deleted_ec_shards = Vec::new();
+    let (_, expired_ec, mut deleted_ec_shards) =
+        state.store.read().unwrap().find_expired_ec_volumes();
     if !expired_ec.is_empty() {
-        deleted_ec_shards = state
-            .store
-            .write()
-            .unwrap()
-            .remove_expired_ec_volumes(expired_ec)
-            .0;
+        deleted_ec_shards.extend(
+            state
+                .store
+                .write()
+                .unwrap()
+                .remove_expired_ec_volumes(expired_ec)
+                .0,
+        );
     }
     #[cfg(test)]
     {
@@ -1590,6 +1699,7 @@ mod tests {
             cli_white_list: vec![],
             state_file_path: String::new(),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
             ec_decode_tail_notify: tokio::sync::Notify::new(),
         })
@@ -1616,6 +1726,26 @@ mod tests {
         assert_eq!(to_grpc_address(""), "");
         assert_eq!(to_grpc_address("no-port"), "no-port");
         assert_eq!(to_grpc_address("host:not-a-port"), "host:not-a-port");
+    }
+
+    // Mirrors Go's TestMastersAskingLast: the just-lost master is asked last
+    // so an unreachable one cannot spend the whole refresh budget.
+    #[test]
+    fn test_masters_asking_last() {
+        let seeds = vec![
+            "a:9333".to_string(),
+            "b:9333".to_string(),
+            "c:9333".to_string(),
+        ];
+        assert_eq!(
+            masters_asking_last(&seeds, "a:9333.19333"),
+            vec![
+                "b:9333".to_string(),
+                "c:9333".to_string(),
+                "a:9333".to_string()
+            ]
+        );
+        assert_eq!(masters_asking_last(&seeds[..2], ""), seeds[..2]);
     }
 
     #[test]
@@ -2302,6 +2432,169 @@ mod tests {
         assert!(volume.is_no_write_or_delete());
     }
 
+    // A master that is down is redialed after about a second for a pulse after
+    // the stream to it was lost, since a restarting master is usually back by
+    // then, and at the pulse pace once the loss is older. Mirrors Go's
+    // TestHeartbeatOnceKeepsPulseBackoffOnceLossIsOld.
+    #[tokio::test]
+    async fn test_heartbeat_once_redials_promptly_only_for_a_pulse_after_a_loss() {
+        // Closing each connection fails every dial at once, where Windows takes
+        // about two seconds to refuse a closed port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                drop(conn);
+            }
+        });
+        let down = format!("127.0.0.1:{}.{}", port, port);
+        let pulse = Duration::from_secs(3);
+        let mut config = test_config();
+        config.master_addresses = vec![down.clone()];
+        config.pulse_seconds = pulse.as_secs();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_store(reporting_store(temp_dir.path().to_str().unwrap(), 0));
+        let (_shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+
+        for (lost_ago, prompt) in [(Duration::ZERO, true), (pulse, false)] {
+            let mut leader_lost_at = Some(tokio::time::Instant::now() - lost_ago);
+            let mut duplicate_retry_count = 0;
+            let started = tokio::time::Instant::now();
+            heartbeat_once(
+                &config,
+                &state,
+                &down,
+                pulse,
+                &mut shutdown_rx,
+                &mut leader_lost_at,
+                &mut duplicate_retry_count,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            if prompt {
+                assert!(
+                    elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(2),
+                    "redial right after a loss took {:?}",
+                    elapsed
+                );
+            } else {
+                assert!(
+                    elapsed >= Duration::from_millis(2500),
+                    "redial a pulse after a loss took {:?}",
+                    elapsed
+                );
+            }
+        }
+    }
+
+    /// A master that confirms each heartbeat stream and then ends it, the way
+    /// one killed right after registering this server looks. It answers
+    /// nothing else, so no peer names a leader.
+    #[derive(Clone)]
+    struct DroppingLeader;
+
+    impl tonic::server::NamedService for DroppingLeader {
+        const NAME: &'static str = "master_pb.Seaweed";
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for DroppingLeader {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+            Box::pin(async move {
+                if req.uri().path() != "/master_pb.Seaweed/SendHeartbeat" {
+                    return Ok(tonic::Status::unimplemented("").into_http());
+                }
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+                Ok(grpc.streaming(ConfirmThenDrop, req).await)
+            })
+        }
+    }
+
+    struct ConfirmThenDrop;
+
+    impl tonic::server::StreamingService<master_pb::Heartbeat> for ConfirmThenDrop {
+        type Response = master_pb::HeartbeatResponse;
+        type ResponseStream = tokio_stream::Iter<
+            std::vec::IntoIter<Result<master_pb::HeartbeatResponse, tonic::Status>>,
+        >;
+        type Future =
+            tonic::codegen::BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+
+        fn call(
+            &mut self,
+            request: tonic::Request<tonic::Streaming<master_pb::Heartbeat>>,
+        ) -> Self::Future {
+            Box::pin(async move {
+                let _ = request.into_inner().message().await;
+                Ok(tonic::Response::new(tokio_stream::iter(vec![
+                    Ok(master_pb::HeartbeatResponse {
+                        volume_size_limit: 1 << 30,
+                        ..Default::default()
+                    }),
+                    Err(tonic::Status::unavailable("master stopped")),
+                ])))
+            })
+        }
+    }
+
+    // A server registered long ago whose master just dropped the stream
+    // redials after about a second, not a pulse. Mirrors Go's
+    // TestHeartbeatOnceRedialsPromptlyAfterLosingRegisteredStream.
+    #[tokio::test]
+    async fn test_heartbeat_once_redials_promptly_after_losing_a_registered_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let master = format!("127.0.0.1:{}.{}", port, port);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(DroppingLeader)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let pulse = Duration::from_secs(3);
+        let mut config = test_config();
+        config.master_addresses = vec![master.clone()];
+        config.pulse_seconds = pulse.as_secs();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_store(reporting_store(temp_dir.path().to_str().unwrap(), 0));
+        let (_shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let registered_long_ago = tokio::time::Instant::now() - 10 * pulse;
+        let mut leader_lost_at = Some(registered_long_ago);
+        let mut duplicate_retry_count = 0;
+
+        let started = tokio::time::Instant::now();
+        heartbeat_once(
+            &config,
+            &state,
+            &master,
+            pulse,
+            &mut shutdown_rx,
+            &mut leader_lost_at,
+            &mut duplicate_retry_count,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            leader_lost_at.is_some_and(|at| at >= started),
+            "the end of the confirmed stream was not recorded"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(2),
+            "redial after losing a registered stream took {:?}",
+            elapsed
+        );
+    }
+
     // The pass only reads the store, so it must not shut out the readers that
     // serve traffic while it stats every volume.
     #[tokio::test]
@@ -2792,6 +3085,46 @@ mod tests {
         assert_eq!(last_ec_shards.len(), 1);
     }
 
+    // The volume heartbeat that quarantines an EC volume tells the master its
+    // shards are gone, once; neither the next delta nor the next heartbeat
+    // repeats it.
+    #[test]
+    fn test_ec_volume_quarantined_by_a_volume_heartbeat_is_reported_deleted_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+        let state = test_state_with_store(reporting_store(dir, 0));
+        mount_test_ec_shard(&state, dir, "ec_delta_kept", 96);
+        mount_test_ec_shard(&state, dir, "ec_delta_quarantined", 97);
+        let mut last_ec_shards = collect_ec_shard_delta_messages(&state.store.read().unwrap());
+        {
+            let store = state.store.read().unwrap();
+            let ec_vol = store.find_ec_volume(VolumeId(97)).unwrap();
+            let eio = crate::storage::volume::media_error_for_test();
+            for _ in 0..crate::storage::io_error::IO_ERROR_TOLERANCE {
+                ec_vol.check_read_write_error(Some(&eio));
+            }
+        }
+
+        let (heartbeat, new_ec_shards, deleted_ec_shards) =
+            ec_delta_after_volume_tick(&state, &mut last_ec_shards);
+        assert_eq!(
+            heartbeat
+                .deleted_ec_shards
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![97]
+        );
+        assert!(new_ec_shards.is_empty());
+        assert!(
+            deleted_ec_shards.is_empty(),
+            "a quarantined EC volume was reported deleted twice"
+        );
+
+        let (heartbeat, _, _) = ec_delta_after_volume_tick(&state, &mut last_ec_shards);
+        assert!(heartbeat.deleted_ec_shards.is_empty());
+    }
+
     #[test]
     fn test_expired_ec_volume_gone_before_removal_is_not_reported_deleted() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2820,7 +3153,7 @@ mod tests {
                 .expire_at_sec = 1;
         }
 
-        let (ec_shards, mut expired) = store.find_expired_ec_volumes();
+        let (ec_shards, mut expired, _) = store.find_expired_ec_volumes();
         expired.sort();
         assert!(ec_shards.is_empty());
         assert_eq!(expired, vec![(0, VolumeId(71)), (0, VolumeId(72))]);
@@ -3045,5 +3378,89 @@ mod tests {
         assert_eq!(deleted_after_delete.len(), 1);
         assert_eq!(deleted_after_delete[0].ec_index_bits, 1);
         assert_eq!(deleted_after_delete[0].shard_sizes, vec![0]);
+    }
+
+    #[test]
+    fn test_diff_ec_shard_delta_messages_ignores_count_changes() {
+        let key = (81, "ec_delta_case".to_string(), 0, 0);
+        let previous = HashMap::from([(
+            key.clone(),
+            master_pb::VolumeEcShardInformationMessage {
+                id: 81,
+                collection: "ec_delta_case".to_string(),
+                ec_index_bits: 1,
+                shard_sizes: vec![5],
+                file_count: 3,
+                ..Default::default()
+            },
+        )]);
+
+        let mut current = previous.clone();
+        current.get_mut(&key).unwrap().file_count = 4;
+        current.get_mut(&key).unwrap().delete_count = 1;
+        let (new_ec_shards, deleted_ec_shards) = diff_ec_shard_delta_messages(&previous, &current);
+        assert!(new_ec_shards.is_empty());
+        assert!(deleted_ec_shards.is_empty());
+
+        current.get_mut(&key).unwrap().shard_sizes = vec![6];
+        let (new_ec_shards, _) = diff_ec_shard_delta_messages(&previous, &current);
+        assert_eq!(new_ec_shards.len(), 1);
+        assert_eq!(new_ec_shards[0].delete_count, 1);
+    }
+
+    /// Both EC emission paths report the counts the Go server's
+    /// `EcVolume.FileAndDeleteCount` defines: file_count is every entry in the
+    /// active .ecx (live and tombstoned alike), delete_count the needles this
+    /// holder deleted.
+    #[test]
+    fn test_ec_shard_messages_carry_file_and_delete_counts() {
+        use crate::storage::types::{NEEDLE_MAP_ENTRY_SIZE, Offset, Size, idx_entry_to_bytes};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+
+        let mut store = Store::new(NeedleMapKind::InMemory);
+        store
+            .add_location(
+                dir,
+                dir,
+                8,
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                Vec::new(),
+            )
+            .unwrap();
+
+        std::fs::write(format!("{}/ec_counts_case_91.ec00", dir), b"shard").unwrap();
+        let mut ecx = Vec::new();
+        for (key, offset) in [(1u64, 8u32), (5, 200), (10, 500)] {
+            let mut entry = [0u8; NEEDLE_MAP_ENTRY_SIZE];
+            idx_entry_to_bytes(
+                &mut entry,
+                NeedleId(key),
+                Offset::from_actual_offset(offset as i64),
+                Size(100),
+            );
+            ecx.extend_from_slice(&entry);
+        }
+        std::fs::write(format!("{}/ec_counts_case_91.ecx", dir), &ecx).unwrap();
+        store.locations[0]
+            .mount_ec_shards(VolumeId(91), "ec_counts_case", &[0], "")
+            .unwrap();
+
+        let ec_vol = store.locations[0].find_ec_volume_mut(VolumeId(91)).unwrap();
+        ec_vol.journal_delete(NeedleId(1)).unwrap();
+
+        let delta = collect_ec_shard_delta_messages(&store);
+        let message = delta
+            .get(&(91, "ec_counts_case".to_string(), 0, 0))
+            .expect("delta message for the mounted shard");
+        assert_eq!(message.file_count, 3);
+        assert_eq!(message.delete_count, 1);
+
+        let heartbeat = collect_ec_heartbeat(&test_config(), &store);
+        assert_eq!(heartbeat.ec_shards.len(), 1);
+        assert_eq!(heartbeat.ec_shards[0].file_count, 3);
+        assert_eq!(heartbeat.ec_shards[0].delete_count, 1);
     }
 }

@@ -150,6 +150,8 @@ struct SourceReadRequest {
     is_head: bool,
     has_range: bool,
     has_image_ops: bool,
+    /// No URL extension, but the stored name may still make it a transform.
+    may_have_image_ops: bool,
     bypass_cm: bool,
 }
 
@@ -175,7 +177,10 @@ impl SourceReadRequest {
         if self.has_image_ops {
             return false;
         }
-        self.is_head || self.has_range || size.0 > STREAMING_THRESHOLD as i32
+        // A range that may need a transform reads a small needle whole, like Go.
+        self.is_head
+            || (self.has_range && !self.may_have_image_ops)
+            || size.0 > STREAMING_THRESHOLD as i32
     }
 }
 
@@ -193,11 +198,8 @@ fn read_needle_for_get(
     Option<(Needle, Option<crate::storage::volume::NeedleStreamInfo>)>,
     crate::storage::volume::VolumeError,
 > {
-    let mut plan = state
-        .store
-        .read()
-        .unwrap()
-        .needle_read_plan(vid, needle_id, read_deleted)?;
+    let mut plan =
+        crate::storage::store::Store::needle_read_plan(&state.store, vid, needle_id, read_deleted)?;
     let blank = || Needle {
         id: needle_id,
         cookie,
@@ -690,6 +692,57 @@ async fn batch_delete_file_ids(
     Ok(())
 }
 
+/// `query` with the fields named in `overrides` replaced by their values.
+fn override_query_fields(query: &str, overrides: &[(&str, String)]) -> Result<String, String> {
+    let mut fields = Vec::new();
+    for field in query.split('&').filter(|field| !field.is_empty()) {
+        let decoded: Vec<(String, String)> = serde_urlencoded::from_str(field)
+            .map_err(|e| format!("parse replication query: {e}"))?;
+        if !decoded
+            .iter()
+            .any(|(name, _)| overrides.iter().any(|(o, _)| o == name))
+        {
+            fields.push(field);
+        }
+    }
+    let encoded = serde_urlencoded::to_string(overrides)
+        .map_err(|e| format!("encode replication query: {e}"))?;
+    if !encoded.is_empty() {
+        fields.push(&encoded);
+    }
+    Ok(fields.join("&"))
+}
+
+/// Bound on one replica forward, from connecting until its response arrives.
+/// Without it a silently partitioned peer (packets dropped, no reset) holds the
+/// write until TCP gives up, minutes later; with it the forward fails and the
+/// writer gets "replication failed" (500). It bounds each forward after the
+/// master lookup, not the whole write: the lookup has only the client's connect
+/// bound. A forward with a body gets more time, see replica_request_timeout.
+pub(crate) const REPLICA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The slowest link a replica forward's body may cross within its bound, so a
+/// large write is not cut off on a link that is merely slower than a LAN.
+const REPLICA_MIN_BYTES_PER_SEC: u64 = 1 << 20;
+
+fn replica_request_timeout(body_len: usize) -> std::time::Duration {
+    REPLICA_REQUEST_TIMEOUT
+        + std::time::Duration::from_millis(
+            (body_len as u64).saturating_mul(1000) / REPLICA_MIN_BYTES_PER_SEC,
+        )
+}
+
+fn replica_request(
+    client: &reqwest::Client,
+    method: axum::http::Method,
+    url: &str,
+    body_len: usize,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, url)
+        .timeout(replica_request_timeout(body_len))
+}
+
 /// Helper to synchronously replicate a request to peer volume servers.
 async fn do_replicated_request(
     state: &VolumeServerState,
@@ -751,11 +804,7 @@ async fn do_replicated_request(
         return Ok(());
     }
 
-    let new_query = if query.is_empty() {
-        String::from("type=replicate")
-    } else {
-        format!("{}&type=replicate", query)
-    };
+    let new_query = override_query_fields(query, &[("type", "replicate".to_string())])?;
 
     let mut futures = Vec::new();
     for loc in remote_locations {
@@ -768,7 +817,8 @@ async fn do_replicated_request(
         )?;
         let client = state.http_client.clone();
 
-        let mut req_builder = client.request(method.clone(), &url);
+        let body_len = body.as_ref().map_or(0, |b| b.len());
+        let mut req_builder = replica_request(&client, method.clone(), &url, body_len);
 
         // Forward relevant headers
         if let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE) {
@@ -782,6 +832,12 @@ async fn do_replicated_request(
         }
         if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
             req_builder = req_builder.header(axum::http::header::AUTHORIZATION, auth);
+        }
+        for (name, value) in headers
+            .iter()
+            .filter(|(name, _)| name.as_str().starts_with("seaweed-"))
+        {
+            req_builder = req_builder.header(name, value);
         }
 
         if let Some(ref b) = body {
@@ -1456,6 +1512,7 @@ fn parse_read_request(
         is_head: method == Method::HEAD,
         has_range,
         has_image_ops: has_image_ops(&ext, query),
+        may_have_image_ops: ext.is_empty() && has_image_ops(".jpg", query),
         bypass_cm: query.cm.as_deref() == Some("false"),
     };
     (ext, request_kind)
@@ -1951,8 +2008,9 @@ async fn range_from_source_response(
 ) -> Response {
     let range_str = range_str.to_string();
     let tracking = track_download.then(|| state.clone());
+    let chunk_size = streaming_chunk_size(state.read_buffer_size_bytes, info.data_size as usize);
     tokio::task::spawn_blocking(move || {
-        handle_range_request_from_source(&range_str, info, response_headers, tracking)
+        handle_range_request_from_source(&range_str, info, response_headers, tracking, chunk_size)
     })
     .await
     .unwrap_or_else(|e| {
@@ -2109,11 +2167,23 @@ fn parse_range_header(s: &str, size: i64) -> Result<Vec<HttpRange>, &'static str
             length: 0,
         };
         if start_str.is_empty() {
+            // suffix-length must be a non-negative integer (RFC 7233 Section 2.1)
+            if end_str.is_empty() || end_str.starts_with('-') {
+                return Err("invalid range");
+            }
             let mut i = end_str.parse::<i64>().map_err(|_| "invalid range")?;
+            if i < 0 {
+                return Err("invalid range");
+            }
             if i > size {
                 i = size;
             }
             r.start = size - i;
+            if r.start >= size {
+                // a zero-length suffix selects no bytes, so it does not overlap
+                no_overlap = true;
+                continue;
+            }
             r.length = size - r.start;
         } else {
             let i = start_str.parse::<i64>().map_err(|_| "invalid range")?;
@@ -2284,6 +2354,7 @@ fn handle_range_request_from_source(
     info: crate::storage::volume::NeedleStreamInfo,
     mut headers: HeaderMap,
     state: Option<Arc<VolumeServerState>>,
+    chunk_size: usize,
 ) -> Response {
     let total = info.data_size as i64;
     let ranges = match parse_range_header(range_str, total) {
@@ -2307,21 +2378,57 @@ fn handle_range_request_from_source(
         return (StatusCode::OK, headers).into_response();
     }
 
+    let block_crcs = if ranges.iter().any(|r| r.start != 0 || r.length != total) {
+        match info.verify_checksum(chunk_size) {
+            Ok(crcs) => Some(crcs),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("range read error: {}", err),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
     let read_slice = |start: i64, length: i64| -> Result<Vec<u8>, std::io::Error> {
         if length <= 0 {
             return Ok(Vec::new());
         }
-        let mut buf = vec![0u8; length as usize];
-        match info
-            .source
-            .read_exact_at(&mut buf, info.data_file_offset + start as u64)
-        {
+        let read = match &block_crcs {
+            Some(crcs) if length != total => {
+                info.read_checked_range(crcs, start as u64, length as u64)
+            }
+            _ => {
+                let mut buf = vec![0u8; length as usize];
+                info.source
+                    .read_exact_at(&mut buf, info.data_file_offset + start as u64)
+                    .map(|()| buf)
+            }
+        };
+        match read {
+            Ok(buf) if length == total && !info.checksum_matches(&buf) => {
+                metrics::HANDLER_COUNTER
+                    .with_label_values(&[metrics::ERROR_CRC])
+                    .inc();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "needle data checksum mismatch for needle {}",
+                        info.needle_id
+                    ),
+                ))
+            }
             // A finished range read clears the streak a failed meta read
             // counted, like readNeedleDataInto's terminal report.
-            Ok(()) => {
+            Ok(buf) => {
                 info.io_errors.check_read_write_error(None);
                 Ok(buf)
             }
+            // A block that fails its CRC leaves the streak alone, as Go's.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(e),
             Err(e) => {
                 info.io_errors.check_read_write_error(Some(&e));
                 Err(e)
@@ -2684,7 +2791,10 @@ pub async fn post_handler(
     }
 
     // Upload throttling: check inflight bytes against limit
-    let is_replicate = query.split('&').any(|p| p == "type=replicate");
+    let is_replicate = query_fields
+        .iter()
+        .find(|(name, _)| name == "type")
+        .is_some_and(|(_, value)| value == "replicate");
     let content_length = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -2829,8 +2939,12 @@ pub async fn post_handler(
         while let Ok(Some(field)) = multipart.next_field().await {
             let field_name = field.name().map(|s| s.to_string());
             let fname = field.file_name().map(clean_windows_path_base);
-            let fct = field.content_type().map(|m| m.to_string());
             let field_headers = field.headers().clone();
+            let fct = field_headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             let fce = field_headers
                 .get(header::CONTENT_ENCODING)
                 .and_then(|v| v.to_str().ok())
@@ -2895,6 +3009,8 @@ pub async fn post_handler(
             .find_map(|(k, v)| if k == name { Some(v.clone()) } else { None })
             .or_else(|| multipart_form_fields.get(name).cloned())
     };
+
+    let is_replicate = form_value("type").as_deref() == Some("replicate");
 
     // Check for chunk manifest flag.
     // Go uses r.FormValue("cm"), which falls back to multipart fields when present.
@@ -2994,15 +3110,18 @@ pub async fn post_handler(
     let mime_type = if let Some(ref pct) = parsed_content_type {
         pct.clone()
     } else {
-        let multipart_fallback =
-            if should_parse_multipart && !filename.is_empty() && !is_chunk_manifest {
-                mime_guess::from_path(&filename)
-                    .first()
-                    .map(|m| m.to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+        let multipart_fallback = if should_parse_multipart
+            && !filename.is_empty()
+            && !is_chunk_manifest
+            && !is_replicate
+        {
+            mime_guess::from_path(&filename)
+                .first()
+                .map(|m| m.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -3065,23 +3184,24 @@ pub async fn post_handler(
         .collect();
 
     // Fix JPEG orientation from EXIF data before storing (matches Go behavior).
-    let body_data = if state.fix_jpg_orientation && crate::images::is_jpeg(&mime_type, &path) {
-        crate::images::fix_jpg_orientation(&body_data_raw)
-    } else {
-        body_data_raw
-    };
+    let (body_data, body_rewritten) =
+        if state.fix_jpg_orientation && crate::images::is_jpeg(&mime_type, &filename) {
+            let fixed = crate::images::fix_jpg_orientation(&body_data_raw);
+            let rewritten = fixed != body_data_raw;
+            (fixed, rewritten)
+        } else {
+            (body_data_raw, false)
+        };
 
     // Auto-compress compressible file types (matches Go's IsCompressableFileType).
     // Only compress if not already gzipped and compression saves >10%.
-    // Go uses filepath.Base(pu.FileName) for extension detection (not the URL path).
-    let (final_data, final_is_gzipped) = if !is_gzipped && !is_chunk_manifest {
-        let ext = {
-            let dot_pos = filename.rfind('.');
-            dot_pos
-                .map(|p| filename[p..].to_lowercase())
-                .unwrap_or_default()
-        };
-        if is_compressible_file_type(&ext, &mime_type) {
+    // A replica keeps the compression state the primary stored.
+    let (final_data, final_is_gzipped) = if !is_gzipped && !is_chunk_manifest && !is_replicate {
+        let ext = filename
+            .rfind('.')
+            .map(|p| &filename[p..])
+            .unwrap_or_default();
+        if is_compressible_file_type(ext, &mime_type) {
             if let Some(compressed) = try_gzip_data(&body_data) {
                 if compressed.len() * 10 < body_data.len() * 9 {
                     (compressed, true)
@@ -3169,23 +3289,55 @@ pub async fn post_handler(
     };
 
     // The fan-out runs concurrently with the local needle write, like Go's
-    // ReplicatedWrite: it reads the already-buffered request body, so the two
-    // sides share no mutable state. The ack still waits for both.
+    // ReplicatedWrite: replicas get the stored bytes with their compression
+    // state, so they keep it instead of re-deriving it. The ack waits for both.
     let replication = if needs_replication {
         let state_clone = state.clone();
         let path_clone = path.clone();
         let query_clone = query.clone();
-        let headers_clone = headers.clone();
-        let body_clone = body.clone();
+        let mut overrides = vec![("ts", n.last_modified.to_string())];
+        if let Some(t) = ttl.filter(|t| !t.is_empty()) {
+            overrides.push(("ttl", t.to_string()));
+        }
+        if is_chunk_manifest {
+            overrides.push(("cm", "true".to_string()));
+        }
+        if fsync {
+            overrides.push(("fsync", "true".to_string()));
+        }
+        let mut replica_headers = HeaderMap::new();
+        if let Some(auth) = headers.get(header::AUTHORIZATION) {
+            replica_headers.insert(header::AUTHORIZATION, auth.clone());
+        }
+        if n.has_pairs() {
+            for (key, value) in &pair_map {
+                if let (Ok(name), Ok(value)) = (
+                    header::HeaderName::try_from(format!("seaweed-{key}")),
+                    header::HeaderValue::from_str(value),
+                ) {
+                    replica_headers.insert(name, value);
+                }
+            }
+        }
+        let (content_type, replica_body) = replica_upload_body(
+            &filename,
+            &mime_type,
+            n.is_compressed().then_some("gzip"),
+            original_content_md5.as_deref().filter(|_| !body_rewritten),
+            &n.data,
+        );
+        if let Ok(value) = header::HeaderValue::from_str(&content_type) {
+            replica_headers.insert(header::CONTENT_TYPE, value);
+        }
         Some(tokio::spawn(async move {
             do_replicated_request(
                 &state_clone,
                 vid.0,
                 Method::POST,
                 &path_clone,
-                &query_clone,
-                &headers_clone,
-                Some(body_clone),
+                &override_query_fields(&query_clone, &overrides)?,
+                &replica_headers,
+                Some(replica_body),
             )
             .await
         }))
@@ -3193,7 +3345,12 @@ pub async fn post_handler(
         None
     };
 
-    let write_result = write_upload_needle(&state, vid, n, fsync).await;
+    let (write_result, refused_before_append) =
+        match write_upload_needle(&state, vid, n, fsync).await {
+            Ok(Ok(written)) => (Ok(written), false),
+            Ok(Err(refused)) => (Err(refused), true),
+            Err(error) => (Err(error), false),
+        };
 
     // No leader-known gate: when the lookup cannot run, the write must fail
     // rather than be acknowledged on fewer copies than required. The local
@@ -3255,11 +3412,21 @@ pub async fn post_handler(
             metrics::HANDLER_COUNTER
                 .with_label_values(&[metrics::ERROR_WRITE_TO_LOCAL_DISK])
                 .inc();
-            json_error_with_query(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{}", e),
-                Some(&query),
-            )
+            let read_only = matches!(e, crate::storage::volume::VolumeError::ReadOnly(_));
+            let status = if read_only {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            let mut response = json_error_with_query(status, format!("{}", e), Some(&query));
+            // Replication or a failed append can leave another copy written.
+            if read_only && refused_before_append && !fsync && !needs_replication && !is_replicate {
+                response.headers_mut().insert(
+                    "x-seaweed-write-outcome",
+                    header::HeaderValue::from_static("refused-before-append"),
+                );
+            }
+            response
         }
     };
 
@@ -3267,26 +3434,38 @@ pub async fn post_handler(
     resp
 }
 
-/// Append an uploaded needle the way Go's `writeNeedle2` does: a durable
-/// write goes to the volume's batching worker, which group-commits the
-/// batch's .dat/.idx syncs, while anything else — a non-durable write, or a
-/// durable one landing while the server is stopping and the workers are
-/// winding down — takes the synchronous path and fsyncs inline.
+/// Durable uploads use the batching worker unless the server is stopping.
+/// Only an inner error proves refusal before append.
 async fn write_upload_needle(
     state: &Arc<VolumeServerState>,
     vid: VolumeId,
     mut n: Needle,
     fsync: bool,
-) -> Result<(u64, Size, bool), crate::storage::volume::VolumeError> {
+) -> Result<
+    Result<(u64, Size, bool), crate::storage::volume::VolumeError>,
+    crate::storage::volume::VolumeError,
+> {
     let queued = fsync && !*state.is_stopping.read().unwrap();
     if queued && let Some(wq) = state.write_queue.get() {
-        return wq.submit(vid, n, fsync).await;
+        return wq.submit(vid, n, fsync).await.map(Ok);
     }
     let vol = {
         let store = state.store.read().unwrap();
         store.writable_volume(vid)
     };
-    vol.and_then(|vol| vol.write_needle(&mut n, true, fsync))
+    let vol = match vol {
+        Ok(vol) => vol,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    let pending = vol.track_pending_write(&n);
+    if fsync {
+        vol.write_pending_needles(&mut [(n, true)], &[Some(pending)])
+            .pop()
+            .unwrap_or(Err(crate::storage::volume::VolumeError::NotFound))
+            .map(Ok)
+    } else {
+        vol.write_pending_needle_unsynced(&mut n, Some(&pending))
+    }
 }
 
 // ============================================================================
@@ -3478,15 +3657,29 @@ pub async fn delete_handler(
 
     // Read needle first to validate cookie (matching Go behavior)
     let original_cookie = cookie;
+    let is_replicate = serde_urlencoded::from_str::<Vec<(String, String)>>(&del_query)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(name, _)| name == "type")
+        .is_some_and(|(_, value)| value == "replicate");
     {
         let vol = {
             let store = state.store.read().unwrap();
             store.find_volume(vid).map(|(_, vol)| vol)
         };
-        match vol
+        let mut found = vol
+            .as_ref()
             .ok_or(crate::storage::volume::VolumeError::NotFound)
-            .and_then(|vol| vol.read_needle_with_option(&mut n, &mut delete_read_option()))
+            .and_then(|vol| vol.read_needle_with_option(&mut n, &mut delete_read_option()));
+        if found.is_err()
+            && is_replicate
+            && let Some(vol) = &vol
         {
+            // the write this delete undoes can still be queued here
+            vol.cancel_pending_writes(needle_id, original_cookie);
+            found = vol.read_needle_with_option(&mut n, &mut delete_read_option());
+        }
+        match found {
             Ok(_) => {}
             Err(_) => {
                 let result = DeleteResult { size: 0 };
@@ -3574,7 +3767,6 @@ pub async fn delete_handler(
         }
     };
 
-    let is_replicate = del_query.split('&').any(|p| p == "type=replicate");
     if !is_replicate && delete_result.is_ok() {
         let needs_replication = {
             let store = state.store.read().unwrap();
@@ -4677,6 +4869,15 @@ fn extract_jwt(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
 /// Check if a file type should be compressed based on extension and MIME type.
 /// Returns true only when we are sure the type is compressible.
 fn is_compressible_file_type(ext: &str, mtype: &str) -> bool {
+    let ext = ext.to_ascii_lowercase();
+    let ext = ext.as_str();
+    let mtype = mtype
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let mtype = mtype.as_str();
     // text/*
     if mtype.starts_with("text/") {
         return true;
@@ -4709,6 +4910,9 @@ fn is_compressible_file_type(ext: &str, mtype: &str) -> bool {
         if mtype.ends_with("script") {
             return true;
         }
+        if mtype.ends_with("json") || mtype.ends_with("json-seq") {
+            return true;
+        }
         if mtype.ends_with("vnd.rar") {
             return false;
         }
@@ -4720,6 +4924,41 @@ fn is_compressible_file_type(ext: &str, mtype: &str) -> bool {
         }
     }
     false
+}
+
+/// One-part multipart upload of a stored needle, the form Go's upload_content
+/// sends: the bytes as stored, labeled with their content encoding.
+fn replica_upload_body(
+    filename: &str,
+    mime: &str,
+    content_encoding: Option<&str>,
+    content_md5: Option<&str>,
+    data: &[u8],
+) -> (String, bytes::Bytes) {
+    let boundary = uuid::Uuid::new_v4().simple().to_string();
+    let mut head = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+        filename.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    if !mime.is_empty() {
+        head.push_str(&format!("Content-Type: {mime}\r\n"));
+    }
+    if let Some(encoding) = content_encoding {
+        head.push_str(&format!("Content-Encoding: {encoding}\r\n"));
+    }
+    if let Some(md5) = content_md5 {
+        head.push_str(&format!("Content-MD5: {md5}\r\n"));
+    }
+    head.push_str("\r\n");
+    let tail = format!("\r\n--{boundary}--\r\n");
+    let mut body = Vec::with_capacity(head.len() + data.len() + tail.len());
+    body.extend_from_slice(head.as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(tail.as_bytes());
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        body.into(),
+    )
 }
 
 /// Try to gzip data. Returns None on error.
@@ -4801,6 +5040,127 @@ fn parse_content_disposition_filename(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replica that reads the forward and never answers. Each request's
+    /// first line is sent on the returned channel.
+    async fn spawn_silent_replica() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received, receipts) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let received = received.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&request[..n]).into_owned();
+                    let _ = received.send(text.lines().next().unwrap_or("").to_string());
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (addr, receipts)
+    }
+
+    /// The whole replicated write path, not only the request builder: the
+    /// replica receives the forward, never answers, and the write fails at
+    /// the bound for its body with an error naming that replica.
+    #[tokio::test]
+    async fn test_replicated_write_fails_at_the_bound_when_a_peer_never_answers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (peer, mut receipts) = spawn_silent_replica().await;
+        let state = remote_manifest_state(&tmp, spawn_lookup(peer).await);
+        let body = bytes::Bytes::from(vec![0u8; REPLICA_MIN_BYTES_PER_SEC as usize]);
+        let bound = replica_request_timeout(body.len());
+        let started = std::time::Instant::now();
+        let sent = do_replicated_request(
+            &state,
+            1,
+            axum::http::Method::POST,
+            "/1,01ab",
+            "",
+            &axum::http::HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        let took = started.elapsed();
+        let forwarded = receipts
+            .try_recv()
+            .expect("the replica never received the forward");
+        assert!(
+            forwarded.starts_with("POST /1,01ab?") && forwarded.contains("type=replicate"),
+            "{forwarded}"
+        );
+        let error = sent.expect_err("a silent replica cannot ack the write");
+        assert!(error.contains(&peer.to_string()), "{error}");
+        assert!(
+            took >= bound && took < bound + std::time::Duration::from_secs(5),
+            "{took:?}"
+        );
+    }
+
+    /// A peer that accepts the connection but never answers (a silent
+    /// partition after connect) must fail the forward at the bound, not hold
+    /// the write until TCP gives up.
+    #[tokio::test(start_paused = true)]
+    async fn test_replica_request_times_out_on_a_silent_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/3,01ab?type=replicate", addr);
+        let body = vec![0u8; 1 << 20];
+        let bound = replica_request_timeout(body.len());
+        let started = tokio::time::Instant::now();
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            replica_request(&client, axum::http::Method::POST, &url, body.len())
+                .body(body)
+                .send(),
+        )
+        .await
+        .expect("replica forward must not outlive its bound");
+        let err = sent.expect_err("a silent peer cannot ack the replica");
+        assert!(err.is_timeout(), "{err}");
+        assert!(started.elapsed() >= bound && started.elapsed() < bound * 2);
+    }
+
+    /// A forward's bound grows with its body at REPLICA_MIN_BYTES_PER_SEC, so
+    /// a write near the file size limit is not cut off at the bodiless bound.
+    #[test]
+    fn test_replica_request_bound_grows_with_the_body() {
+        assert_eq!(replica_request_timeout(0), REPLICA_REQUEST_TIMEOUT);
+        let mib = REPLICA_MIN_BYTES_PER_SEC as usize;
+        assert_eq!(
+            replica_request_timeout(256 * mib),
+            REPLICA_REQUEST_TIMEOUT + std::time::Duration::from_secs(256)
+        );
+        assert_eq!(
+            replica_request_timeout(mib / 2),
+            REPLICA_REQUEST_TIMEOUT + std::time::Duration::from_millis(500)
+        );
+        let request = replica_request(
+            &reqwest::Client::new(),
+            axum::http::Method::POST,
+            "http://127.0.0.1:1/3,01ab?type=replicate",
+            64 * mib,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.timeout(),
+            Some(&(REPLICA_REQUEST_TIMEOUT + std::time::Duration::from_secs(64)))
+        );
+    }
 
     /// The upload handler reads fsync off the decoded query fields rather than
     /// matching the raw string, because Go's r.FormValue decodes and a raw
@@ -5047,13 +5407,32 @@ mod tests {
             parse_range_header("bytes=100-", 10).unwrap_err(),
             RANGE_NO_OVERLAP
         );
+        // a zero-length suffix selects no bytes; same unsatisfiable class
+        assert_eq!(
+            parse_range_header("bytes=-0", 10).unwrap_err(),
+            RANGE_NO_OVERLAP
+        );
         // 416 only when every range fails to overlap
         let ranges = parse_range_header("bytes=10-,0-1", 10).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start, ranges[0].length), (0, 2));
+        let ranges = parse_range_header("bytes=-0,0-1", 10).unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!((ranges[0].start, ranges[0].length), (0, 2));
         // an end past the size is clamped, still satisfiable
         let ranges = parse_range_header("bytes=5-100", 10).unwrap();
         assert_eq!((ranges[0].start, ranges[0].length), (5, 5));
+    }
+
+    #[test]
+    fn test_parse_range_header_rejects_negative_suffix() {
+        // a suffix-length is a non-negative integer; "--5" must not become
+        // the range {start: 15, length: -5}
+        for spec in ["bytes=--5", "bytes=--0", "bytes=-"] {
+            assert_eq!(parse_range_header(spec, 10).unwrap_err(), "invalid range");
+        }
+        let ranges = parse_range_header("bytes=-3", 10).unwrap();
+        assert_eq!((ranges[0].start, ranges[0].length), (7, 3));
     }
 
     #[test]
@@ -5102,6 +5481,8 @@ mod tests {
         let data = b"hello";
         let headers = HeaderMap::new();
         let resp = handle_range_request("bytes=999-1000", data, headers, None);
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let resp = handle_range_request("bytes=-0", data, HeaderMap::new(), None);
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
@@ -5173,6 +5554,18 @@ mod tests {
         assert!(is_compressible_file_type("", "application/javascript"));
         assert!(!is_compressible_file_type("", "application/zstd"));
         assert!(!is_compressible_file_type("", "application/vnd.rar"));
+        assert!(is_compressible_file_type("", "application/json"));
+        assert!(is_compressible_file_type(
+            "",
+            "application/json; charset=utf-8"
+        ));
+        assert!(is_compressible_file_type("", "Application/JSON"));
+        assert!(is_compressible_file_type("", "application/ld+json"));
+        assert!(is_compressible_file_type("", "application/x-ndjson"));
+        assert!(is_compressible_file_type("", "application/json-seq"));
+        assert!(is_compressible_file_type("", "text/plain; charset=utf-8"));
+        assert!(is_compressible_file_type(".JSON", ""));
+        assert!(!is_compressible_file_type(".gz", "application/json"));
 
         // Audio
         assert!(is_compressible_file_type(".wav", "audio/wav"));
@@ -5889,6 +6282,7 @@ mod tests {
             cli_white_list: vec![],
             state_file_path: String::new(),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
             ec_decode_tail_notify: tokio::sync::Notify::new(),
         })
@@ -6038,6 +6432,171 @@ mod tests {
             n.set_is_chunk_manifest();
             n.set_is_compressed();
         })
+    }
+
+    /// EC reconstructed-interval counter: one fresh volume per case, the needle (on
+    /// shard 0) EC-encoded under a known generation, the `missing` shards
+    /// unmounted and the shards in `corrupt` overwritten where the needle lies.
+    /// Returns the read's bytes and the marker lines logged at debug.
+    async fn read_ec_reconstructed(
+        vid: u32,
+        missing: &[crate::storage::erasure_coding::ec_shard::ShardId],
+        corrupt: &[crate::storage::erasure_coding::ec_shard::ShardId],
+    ) -> (Option<Vec<u8>>, Vec<String>) {
+        use crate::storage::erasure_coding::ec_encoder::write_ec_files;
+        use crate::storage::needle_map::NeedleMapKind;
+        use crate::storage::volume::{VifEcShardConfig, VifVolumeInfo, Volume, VolumeSpec};
+        use std::io::{Seek, SeekFrom, Write};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let dir = tmp.path().to_str().unwrap();
+        let v = Volume::new(
+            dir,
+            dir,
+            VolumeId(vid),
+            NeedleMapKind::InMemory,
+            &VolumeSpec::default(),
+        )
+        .unwrap();
+        let mut n = Needle {
+            id: NeedleId(7),
+            cookie: Cookie(TEST_COOKIE),
+            data: b"ec degraded read".to_vec(),
+            data_size: 16,
+            ..Needle::default()
+        };
+        v.write_needle(&mut n, true, false).unwrap();
+        v.sync_to_disk().unwrap();
+        v.close();
+        let block_size = write_ec_files(dir, dir, "", VolumeId(vid), 10, 4).unwrap();
+        let vif = format!("{dir}/{vid}.vif");
+        let mut info: VifVolumeInfo =
+            serde_json::from_str(&std::fs::read_to_string(&vif).unwrap()).unwrap();
+        info.ec_shard_config = Some(VifEcShardConfig {
+            data_shards: 10,
+            parity_shards: 4,
+            encode_ts_ns: EC_GENERATION,
+            block_size,
+        });
+        crate::storage::store::save_vif_volume_info(&vif, &info).unwrap();
+        for shard in corrupt {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("{dir}/{vid}.ec{shard:02}"))
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xA5; 256]).unwrap();
+        }
+        let mounted: Vec<_> = (0..14).filter(|s| !missing.contains(s)).collect();
+        state
+            .store
+            .write()
+            .unwrap()
+            .mount_ec_shards(VolumeId(vid), "", &mounted)
+            .unwrap();
+
+        let out = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(out.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Another test may have reached the marker's callsite first, with no
+        // subscriber, and cached it as never enabled.
+        tracing::callsite::rebuild_interest_cache();
+        let read = crate::server::store_ec::read_ec_shard_needle_or_miss(
+            &state,
+            VolumeId(vid),
+            NeedleId(7),
+        )
+        .await;
+        drop(guard);
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let lines = text
+            .lines()
+            .filter(|l| l.contains("ec reconstructed interval:"))
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        (read.ok().and_then(Result::ok).map(|n| n.data), lines)
+    }
+
+    const EC_GENERATION: i64 = 1_700_000_000_123_456_789;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What the counter and line mean, case by case. A direct read logs nothing;
+    /// a read that rebuilds shard 0 logs and counts one success; one with 5
+    /// shards left fails and logs one failure; a corrupt interval read directly
+    /// goes to the repair path and isn't marked. `success` is not needle
+    /// validation: rebuilt from corrupt parity, the interval logs success while
+    /// the read fails.
+    #[tokio::test]
+    async fn test_ec_reconstructed_interval() {
+        use crate::metrics::EC_RECONSTRUCTED_INTERVAL_COUNTER as C;
+        let prefix = |vid: u32| {
+            format!(
+                "ec reconstructed interval: volume={vid} generation={EC_GENERATION} needle=7 shard=0 "
+            )
+        };
+        let data = Some(b"ec degraded read".to_vec());
+
+        assert_eq!(
+            read_ec_reconstructed(61, &[], &[]).await,
+            (data.clone(), vec![])
+        );
+
+        let success = C.with_label_values(&["success"]).get();
+        let (read, lines) = read_ec_reconstructed(62, &[0], &[]).await;
+        assert_eq!(read, data);
+        assert!(
+            matches!(&lines[..], [l] if l.ends_with(&(prefix(62) + "result=success error=<nil>"))),
+            "{lines:?}"
+        );
+        assert!(C.with_label_values(&["success"]).get() > success);
+
+        let failure = C.with_label_values(&["failure"]).get();
+        let (read, lines) = read_ec_reconstructed(63, &[0, 6, 7, 8, 9, 10, 11, 12, 13], &[]).await;
+        assert_eq!(read, None);
+        assert!(
+            matches!(&lines[..], [l] if l.contains(&(prefix(63) + "result=failure error=")) && !l.ends_with("error=")),
+            "{lines:?}"
+        );
+        assert!(C.with_label_values(&["failure"]).get() > failure);
+
+        let (read, lines) = read_ec_reconstructed(64, &[], &[0, 10, 11, 12, 13]).await;
+        assert_eq!(
+            (read, lines),
+            (None, vec![]),
+            "an unrepairable corrupt read was marked"
+        );
+
+        let success = C.with_label_values(&["success"]).get();
+        let (read, lines) = read_ec_reconstructed(65, &[0], &[10, 11, 12, 13]).await;
+        assert_eq!(read, None, "a read rebuilt from corrupt parity was served");
+        assert!(
+            matches!(&lines[..], [l] if l.ends_with(&(prefix(65) + "result=success error=<nil>"))),
+            "{lines:?}"
+        );
+        assert!(C.with_label_values(&["success"]).get() > success);
     }
 
     /// Write `data` as a chunk manifest on a fresh EC volume 2. Chunks stay on volume 1.
@@ -6393,6 +6952,41 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// A range streams a small needle from the data file, unless it has no
+    /// URL extension and asks for a resize or crop the stored name may call
+    /// for: then the needle is read whole, like Go.
+    #[test]
+    fn test_range_reads_meta_first_unless_it_may_need_a_transform() {
+        let small = Size(4096);
+        let width = ReadQueryParams {
+            width: Some(100),
+            ..Default::default()
+        };
+        let crop = ReadQueryParams {
+            crop_x2: Some(10),
+            crop_y2: Some(10),
+            ..Default::default()
+        };
+        for (path, query, want) in [
+            ("/1,abc", ReadQueryParams::default(), true),
+            ("/1,abc", width, false),
+            ("/1,abc", crop, false),
+            (
+                "/1,abc.bin",
+                ReadQueryParams {
+                    width: Some(100),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let (_, request) = parse_read_request(path, true, &query, &Method::GET);
+            assert_eq!(request.try_meta_first(small), want, "{path}");
+            let (_, request) = parse_read_request(path, false, &query, &Method::GET);
+            assert!(!request.try_meta_first(small), "{path} without a range");
+        }
+    }
+
     /// HEAD and ranged reads keep answering from the needle meta and the
     /// data file, and a missing or wrong-cookie needle is still a 404.
     #[tokio::test]
@@ -6457,11 +7051,143 @@ mod tests {
             io_unavailable: Arc::default(),
             io_errors: io_errors.clone(),
             needle_id: NeedleId(1),
-            checksum: 0,
+            checksum: CRC::new(&data).0,
+            append_at_ns: 0,
+            load_generation: u64::MAX,
         };
-        let resp = handle_range_request_from_source("bytes=10-19", info, HeaderMap::new(), None);
+        // The checksum pass leaves the streak to the range read.
+        info.verify_checksum(64).unwrap();
+        assert_eq!(io_errors.get_io_error_state().1, 2);
+        let resp =
+            handle_range_request_from_source("bytes=10-19", info, HeaderMap::new(), None, 64);
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(io_errors.get_io_error_state().1, 0);
+    }
+
+    /// A range carries no checksum of its own, so the first ranged read of a
+    /// needle checks the whole needle's CRC and sends none of the range on a
+    /// mismatch; the reader can then fall back to another replica. A verified
+    /// needle is checked again once the volume reloads.
+    #[tokio::test]
+    async fn test_range_read_checks_the_needle_checksum() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let payload =
+            |seed: u32| -> Vec<u8> { (0..3000u32).map(|i| ((i * 7 + seed) % 251) as u8).collect() };
+        let damage = |data: &[u8]| {
+            let dat = tmp.path().join("1.dat");
+            let mut bytes = std::fs::read(&dat).unwrap();
+            let at = bytes.windows(data.len()).position(|w| w == data).unwrap();
+            bytes[at + 10] ^= 0xff;
+            std::fs::write(&dat, bytes).unwrap();
+        };
+
+        let intact = payload(1);
+        let path = put_test_needle(&state, 0x6e7a_0c01, &intact);
+        let (status, _, body) =
+            send_read(&state, Method::GET, &path, Some(b"bytes=1000-1499")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, &intact[1000..1500]);
+
+        // Damage a byte outside the range: the range itself is intact, but
+        // the needle is not, so this replica must not serve it.
+        let damaged = payload(2);
+        let path = put_test_needle(&state, 0x6e7a_0c02, &damaged);
+        damage(&damaged);
+        for range in [&b"bytes=1000-1499"[..], b"bytes=0-", b"bytes=0-1,1000-1001"] {
+            let (status, _, body) = send_read(&state, Method::GET, &path, Some(range)).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{range:?}");
+            assert!(
+                !body.windows(2).any(|w| w == &damaged[1000..1002]),
+                "{range:?}"
+            );
+        }
+
+        // Concurrent first ranges of a needle all see the outcome of the check.
+        for (seed, damage_it) in [(3, false), (4, true)] {
+            let data = payload(seed);
+            let path = put_test_needle(&state, 0x6e7a_0c00 + seed as u64, &data);
+            if damage_it {
+                damage(&data);
+            }
+            let reads = (0..8).map(|_| send_read(&state, Method::GET, &path, Some(b"bytes=10-19")));
+            for (status, _, _) in futures::future::join_all(reads).await {
+                assert_eq!(status == StatusCode::PARTIAL_CONTENT, !damage_it, "{seed}");
+            }
+        }
+
+        // A verified needle is checked again after a reload, as a compaction
+        // commit does; until then later ranges skip the check.
+        let data = payload(5);
+        let path = put_test_needle(&state, 0x6e7a_0c05, &data);
+        let (status, _, _) = send_read(&state, Method::GET, &path, Some(b"bytes=10-19")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        let (_, v) = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap();
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        v.commit_compact().unwrap();
+        damage(&data);
+        let (status, _, _) = send_read(&state, Method::GET, &path, Some(b"bytes=10-19")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Damage that appears after a needle passed its check is caught by
+        // the block it falls in, while ranges over intact blocks still read.
+        let block = 64 * 1024;
+        let data: Vec<u8> = (0..5 * block - 100)
+            .map(|i| (i * 7 + i / 251) as u8)
+            .collect();
+        let path = put_test_needle(&state, 0x6e7a_0c06, &data);
+        let range = |from: usize, to: usize| format!("bytes={}-{}", from, to - 1).into_bytes();
+        let damaged_ranges = [
+            (3 * block + 10, 3 * block + 110),
+            (block - 50, 4 * block - 50),
+        ];
+        for (from, to) in damaged_ranges {
+            let (status, _, body) =
+                send_read(&state, Method::GET, &path, Some(&range(from, to))).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+            assert_eq!(body, &data[from..to]);
+        }
+        let dat = tmp.path().join("1.dat");
+        let mut bytes = std::fs::read(&dat).unwrap();
+        let at = bytes.windows(64).position(|w| w == &data[..64]).unwrap();
+        bytes[at + 3 * block + 500] ^= 0xff;
+        std::fs::write(&dat, bytes).unwrap();
+        for (from, to) in damaged_ranges {
+            let (status, _, _) =
+                send_read(&state, Method::GET, &path, Some(&range(from, to))).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{from}-{to}");
+        }
+        for (from, to) in [
+            (10, 110),
+            (2 * block + 1, 3 * block),
+            (4 * block + 5, data.len()),
+        ] {
+            let (status, _, body) =
+                send_read(&state, Method::GET, &path, Some(&range(from, to))).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{from}-{to}");
+            assert_eq!(body, &data[from..to]);
+        }
+    }
+
+    #[test]
+    fn test_range_check_block_size() {
+        use crate::storage::volume::range_check_block_size;
+        let block = 64 * 1024;
+        let mib = 1024 * 1024;
+        for (size, want) in [
+            (0, block),
+            (64 * block, block),
+            (64 * block + 1, 2 * block),
+            (64 * mib, mib),
+            (1 << 34, mib),
+        ] {
+            assert_eq!(range_check_block_size(size), want, "{size}");
+        }
     }
 
     /// Range is read as Go reads it: a byte its parseRange cannot parse is a
@@ -7101,10 +7827,10 @@ mod tests {
         assert_eq!(taken(&reads), vec![0]);
     }
 
-    /// A negative suffix must not shrink the covered length under the sum.
-    /// Duplicate ranges stay an empty 200 and read nothing.
+    /// A negative suffix makes the whole header invalid, so the read is
+    /// rejected before any chunk is fetched.
     #[tokio::test]
-    async fn test_chunk_manifest_negative_suffix_stays_empty() {
+    async fn test_chunk_manifest_negative_suffix_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = volume_test_state(&tmp);
         let ten = put_test_needle(&state, 0x6e7a_0c41, b"0123456789");
@@ -7114,16 +7840,14 @@ mod tests {
             &ten[1..]
         );
         let path = put_manifest(&state, 0x6e7a_0c42, &json);
-        let (status, headers, body) = send_read(
+        let (status, _, _) = send_read(
             &state,
             Method::GET,
             &path,
             Some(b"bytes=0-7,0-7,--1073741824"),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.is_empty());
-        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(taken(&reads), vec![0]);
     }
 
@@ -7856,12 +8580,13 @@ mod tests {
             .delete_volume_needle(VolumeId(1), &mut filler)
             .unwrap();
         let data_offset = || {
-            let mut plan = state
-                .store
-                .read()
-                .unwrap()
-                .needle_read_plan(VolumeId(1), NeedleId(ID), false)
-                .unwrap();
+            let mut plan = crate::storage::store::Store::needle_read_plan(
+                &state.store,
+                VolumeId(1),
+                NeedleId(ID),
+                false,
+            )
+            .unwrap();
             let mut n = Needle::default();
             plan.read_meta(&mut n).unwrap();
             plan.into_stream_info(&n).data_file_offset
@@ -7902,6 +8627,708 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn http_sealed_volume_reports_refused_before_append_without_changing_data() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let volume = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        volume.set_read_only().unwrap();
+        let before = volume.dat_file_size().unwrap();
+        let response = super::super::volume_server::build_admin_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/1,{:x}{TEST_COOKIE:08x}", 0x6e7a_0c01u64))
+                    .body(Body::from("kv-http-bytes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-seaweed-write-outcome")
+                .map(|value| value.to_str().unwrap()),
+            Some("refused-before-append")
+        );
+        assert_eq!(volume.dat_file_size().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn http_local_refusal_after_replica_append_is_not_marked() {
+        for local_read_only in [true, false] {
+            use crate::storage::super_block::ReplicaPlacement;
+            use axum::{Json, Router, routing::get};
+            use tower::ServiceExt;
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut state = volume_test_state(&tmp);
+            Arc::get_mut(&mut state).unwrap().self_url = "127.0.0.1:8080".to_string();
+            let volume = state
+                .store
+                .read()
+                .unwrap()
+                .find_volume(VolumeId(1))
+                .unwrap()
+                .1;
+            volume
+                .set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+                .unwrap();
+            if local_read_only {
+                volume.set_read_only().unwrap();
+            }
+            let before = volume.dat_file_size().unwrap();
+
+            let peer_tmp = tempfile::TempDir::new().unwrap();
+            let peer = volume_test_state(&peer_tmp);
+            let peer_volume = peer
+                .store
+                .read()
+                .unwrap()
+                .find_volume(VolumeId(1))
+                .unwrap()
+                .1;
+            if !local_read_only {
+                peer_volume.set_read_only().unwrap();
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = listener.local_addr().unwrap();
+            let peer_server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    super::super::volume_server::build_admin_router(peer),
+                )
+                .await
+                .unwrap();
+            });
+
+            // The master's writable view can lag behind the local seal.
+            let master = Router::new().route(
+                "/dir/lookup",
+                get(move || async move {
+                    Json(serde_json::json!({"locations": [
+                        {"url": "127.0.0.1:8080"},
+                        {"url": peer_addr.to_string()}
+                    ]}))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            *state.current_master_url.write().await = listener.local_addr().unwrap().to_string();
+            let master_server = tokio::spawn(async move {
+                axum::serve(listener, master).await.unwrap();
+            });
+
+            let id = 0x6e7a_0c03u64;
+            let payload = b"replicated bytes";
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::volume_server::build_admin_router(state).oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/1,{id:x}{TEST_COOKIE:08x}"))
+                        .body(Body::from(payload.as_slice()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                if local_read_only {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            );
+            assert!(response.headers().get("x-seaweed-write-outcome").is_none());
+            let (refused, written) = if local_read_only {
+                (&volume, &peer_volume)
+            } else {
+                (&peer_volume, &volume)
+            };
+            assert_eq!(refused.dat_file_size().unwrap(), before);
+            let mut stored = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(TEST_COOKIE),
+                ..Needle::default()
+            };
+            written.read_needle(&mut stored).unwrap();
+            assert_eq!(stored.data, payload);
+            master_server.abort();
+            peer_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn http_replication_preserves_query_authentication() {
+        use crate::security::{SigningKey, gen_jwt};
+        use crate::storage::super_block::ReplicaPlacement;
+        use axum::{Json, Router, middleware, routing::get};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        Arc::get_mut(&mut state).unwrap().self_url = "127.0.0.1:8080".to_string();
+        let volume = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        volume
+            .set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+            .unwrap();
+        let peer_tmp = tempfile::TempDir::new().unwrap();
+        let peer = volume_test_state(&peer_tmp);
+        let peer_volume = peer
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        let key = SigningKey(b"replication-secret".to_vec());
+        state.guard.write().unwrap().signing_key = key.clone();
+        peer.guard.write().unwrap().signing_key = key.clone();
+
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = queries.clone();
+        let app = super::super::volume_server::build_admin_router(peer).layer(middleware::from_fn(
+            move |request: Request<Body>, next: middleware::Next| {
+                received
+                    .lock()
+                    .unwrap()
+                    .push(request.uri().query().unwrap().to_string());
+                async move { next.run(request).await }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let master = Router::new().route(
+            "/dir/lookup",
+            get(move || async move {
+                Json(serde_json::json!({"locations": [
+                    {"url": "127.0.0.1:8080"},
+                    {"url": peer_addr.to_string()}
+                ]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        *state.current_master_url.write().await = listener.local_addr().unwrap().to_string();
+        let master_server =
+            tokio::spawn(async move { axum::serve(listener, master).await.unwrap() });
+        let id = 0x6e7a_0c05u64;
+        let fid = format!("1,{id:x}{TEST_COOKIE:08x}");
+        let token = gen_jwt(&key, 60, &fid).unwrap();
+        let query =
+            "%6Awt=expired&tag=a%2Fb+%2B&tag=x%20y&bare&ts=1700000000&%74ype=client&type=old";
+        let expected_query =
+            "%6Awt=expired&tag=a%2Fb+%2B&tag=x%20y&bare&ts=1700000000&type=replicate";
+        let payload = b"authenticated replica bytes";
+        for method in [Method::POST, Method::DELETE] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::volume_server::build_admin_router(state.clone()).oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(format!("/{fid}?{query}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::from(if method == Method::POST {
+                            payload.as_slice()
+                        } else {
+                            &[]
+                        }))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                if method == Method::POST {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::ACCEPTED
+                }
+            );
+            for stored_volume in [&volume, &peer_volume] {
+                let mut stored = Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(TEST_COOKIE),
+                    ..Needle::default()
+                };
+                let result = stored_volume.read_needle(&mut stored);
+                if method == Method::POST {
+                    result.unwrap();
+                    assert_eq!(stored.data, payload);
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
+        assert_eq!(*queries.lock().unwrap(), [expected_query, expected_query]);
+        master_server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_replica_stores_the_primary_needle() {
+        use crate::storage::super_block::ReplicaPlacement;
+        use axum::{Json, Router, routing::get};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        Arc::get_mut(&mut state).unwrap().self_url = "127.0.0.1:8080".to_string();
+        let volume = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        volume
+            .set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+            .unwrap();
+        let peer_tmp = tempfile::TempDir::new().unwrap();
+        let peer = volume_test_state(&peer_tmp);
+        let peer_volume = peer
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                super::super::volume_server::build_admin_router(peer),
+            )
+            .await
+            .unwrap();
+        });
+        let master = Router::new().route(
+            "/dir/lookup",
+            get(move || async move {
+                Json(serde_json::json!({"locations": [
+                    {"url": "127.0.0.1:8080"},
+                    {"url": peer_addr.to_string()}
+                ]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        *state.current_master_url.write().await = listener.local_addr().unwrap().to_string();
+        let master_server =
+            tokio::spawn(async move { axum::serve(listener, master).await.unwrap() });
+
+        let payload = "compressible replica text ".repeat(64);
+        let boundary = "replica-boundary";
+        let multipart = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"ttl\"\r\n\r\n3m\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a \\\"b\\\".txt\"\r\n\
+             Content-Type: text/plain\r\n\r\n{payload}\r\n--{boundary}--\r\n"
+        );
+        let cases = [
+            (
+                0x6e7a_0c06u64,
+                Request::builder()
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .header(
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"notes.txt\"",
+                    )
+                    .header("Content-MD5", compute_md5_base64(payload.as_bytes()))
+                    .header("Seaweed-Color", "blue"),
+                Body::from(payload.clone()),
+            ),
+            (
+                0x6e7a_0c07u64,
+                Request::builder().header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                ),
+                Body::from(multipart),
+            ),
+            (
+                0x6e7a_0c0au64,
+                Request::builder().header(
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"untyped.txt\"",
+                ),
+                Body::from(payload.clone()),
+            ),
+            (
+                0x6e7a_0c0bu64,
+                Request::builder().header(
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}.txt\"", "n".repeat(300)),
+                ),
+                Body::from(payload.clone()),
+            ),
+            (
+                0x6e7a_0c0eu64,
+                Request::builder()
+                    .header(header::CONTENT_TYPE, "Text/Plain; charset=UTF-8")
+                    .header(
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"upper.txt\"",
+                    ),
+                Body::from(payload.clone()),
+            ),
+        ];
+        for (id, request, body) in cases {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::super::volume_server::build_admin_router(state.clone()).oneshot(
+                    request
+                        .method(Method::POST)
+                        .uri(format!("/1,{id:x}{TEST_COOKIE:08x}?ts=1700000000"))
+                        .body(body)
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let read = |v: &Arc<crate::storage::volume::Volume>| {
+                let mut stored = Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(TEST_COOKIE),
+                    ..Needle::default()
+                };
+                v.read_needle(&mut stored).unwrap();
+                stored
+            };
+            let (primary, replica) = (read(&volume), read(&peer_volume));
+            assert!(primary.is_compressed());
+            assert_eq!(
+                maybe_decompress_gzip(&primary.data).unwrap(),
+                payload.as_bytes()
+            );
+            assert_eq!(replica.data, primary.data);
+            assert_eq!(replica.flags, primary.flags);
+            assert_eq!(replica.name, primary.name);
+            assert_eq!(replica.mime, primary.mime);
+            assert_eq!(replica.pairs, primary.pairs);
+            assert_eq!(replica.ttl, primary.ttl);
+            assert_eq!(replica.last_modified, 1700000000);
+        }
+        master_server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_replica_keeps_uncompressed_bytes() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let volume = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        let payload = "compressible replica text ".repeat(64);
+        for (id, query, compressed) in [
+            (0x6e7a_0c08u64, "?type=replicate", false),
+            (0x6e7a_0c09u64, "", true),
+        ] {
+            let response = super::super::volume_server::build_admin_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/1,{id:x}{TEST_COOKIE:08x}{query}"))
+                        .header(header::CONTENT_TYPE, "text/plain")
+                        .body(Body::from(payload.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let mut stored = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(TEST_COOKIE),
+                ..Needle::default()
+            };
+            volume.read_needle(&mut stored).unwrap();
+            assert_eq!(stored.is_compressed(), compressed, "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_orientation_fix_follows_the_filename() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        Arc::get_mut(&mut state).unwrap().fix_jpg_orientation = true;
+        let volume = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(3, 2))
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .unwrap();
+        let exif: &[u8] =
+            b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x03\0\0\0\0\0\0";
+        let mut tagged = vec![0xFF, 0xD8, 0xFF, 0xE1, 0, exif.len() as u8 + 2];
+        tagged.extend_from_slice(exif);
+        tagged.extend_from_slice(&encoded.into_inner()[2..]);
+        let upload = |id: u64, suffix: &'static str, filename: &'static str, body: Vec<u8>| {
+            let (state, volume) = (state.clone(), volume.clone());
+            async move {
+                let response = super::super::volume_server::build_admin_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!("/1,{id:x}{TEST_COOKIE:08x}{suffix}"))
+                            .header(header::CONTENT_TYPE, "application/octet-stream")
+                            .header(
+                                header::CONTENT_DISPOSITION,
+                                format!("attachment; filename=\"{filename}\""),
+                            )
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::CREATED,
+                    "{suffix} {filename}"
+                );
+                let mut stored = Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(TEST_COOKIE),
+                    ..Needle::default()
+                };
+                volume.read_needle(&mut stored).unwrap();
+                stored.data
+            }
+        };
+        let rotated = upload(0x6e7a_0c10, "", "photo.jpg", tagged.clone()).await;
+        assert_ne!(rotated, tagged);
+        assert_eq!(
+            upload(0x6e7a_0c11, ".jpg", "photo.png", tagged.clone()).await,
+            tagged
+        );
+        assert_eq!(
+            upload(0x6e7a_0c12, "?type=replicate", "photo.jpg", tagged.clone()).await,
+            rotated
+        );
+        assert_eq!(
+            upload(0x6e7a_0c13, "?type=replicate", "photo.jpg", rotated.clone()).await,
+            rotated
+        );
+    }
+
+    #[tokio::test]
+    async fn http_multipart_replica_refusal_is_not_marked() {
+        use tower::ServiceExt;
+        for field_first in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = volume_test_state(&tmp);
+            let volume = state
+                .store
+                .read()
+                .unwrap()
+                .find_volume(VolumeId(1))
+                .unwrap()
+                .1;
+            volume.set_read_only().unwrap();
+            let before = volume.dat_file_size().unwrap();
+            let field =
+                "--boundary\r\nContent-Disposition: form-data; name=\"type\"\r\n\r\nreplicate\r\n";
+            let file = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nreplica bytes\r\n";
+            let body = if field_first {
+                format!("{field}{file}--boundary--\r\n")
+            } else {
+                format!("{file}{field}--boundary--\r\n")
+            };
+            let response = super::super::volume_server::build_admin_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/1,{:x}{TEST_COOKIE:08x}", 0x6e7a_0c04u64))
+                        .header(
+                            header::CONTENT_TYPE,
+                            "multipart/form-data; boundary=boundary",
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(response.headers().get("x-seaweed-write-outcome").is_none());
+            assert_eq!(volume.dat_file_size().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_write_errors_without_no_append_proof_are_not_marked() {
+        use tower::ServiceExt;
+        for query in [
+            "",
+            "?fsync=true",
+            "?type=replicate",
+            "?type=%72eplicate",
+            "?%74ype=replicate",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = volume_test_state(&tmp);
+            let volume = state
+                .store
+                .read()
+                .unwrap()
+                .find_volume(VolumeId(1))
+                .unwrap()
+                .1;
+            let id = 0x6e7a_0c02u64;
+            if query.is_empty() {
+                // This error is injected after the append. Its error variant
+                // cannot prove a safe retry, even if rollback later succeeds.
+                volume.fail_append_for_test(&[NeedleId(id)]);
+            } else {
+                volume.set_read_only().unwrap();
+            }
+            let response = super::super::volume_server::build_admin_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/1,{id:x}{TEST_COOKIE:08x}{query}"))
+                        .body(Body::from("kv-http-bytes"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if query.is_empty() {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::CONFLICT
+                },
+                "{query}"
+            );
+            assert!(
+                response.headers().get("x-seaweed-write-outcome").is_none(),
+                "{query}"
+            );
+        }
+    }
+
+    /// A write queued behind another write's fsync is not indexed yet, so a
+    /// replicate delete of it finds nothing. The delete cancels the write, so
+    /// it is taken back when it lands instead of reviving the needle on this
+    /// copy alone, even when its handler was dropped while it waited in the
+    /// durable queue. A plain delete that finds nothing is not sent on to the
+    /// replicas, so it leaves the write alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_replicate_delete_cancels_a_queued_write() {
+        use crate::server::write_queue::{SyncBatchOption, WriteQueue};
+        use crate::storage::volume::VolumeError;
+        use std::time::{Duration, Instant};
+
+        for (id, fsync, query, abandon) in [
+            (0x6e7a_0c01u64, false, "?type=replicate", false),
+            (0x6e7a_0c02, true, "?type=replicate", false),
+            (0x6e7a_0c03, true, "?type=replicate", true),
+            (0x6e7a_0c04, false, "", false),
+            (0x6e7a_0c05, false, "?%74ype=replicat%65", false),
+        ] {
+            let replicate = !query.is_empty();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = volume_test_state(&tmp);
+            assert!(
+                state
+                    .write_queue
+                    .set(WriteQueue::new(
+                        state.clone(),
+                        128,
+                        SyncBatchOption::default()
+                    ))
+                    .is_ok()
+            );
+            let vol = state
+                .store
+                .read()
+                .unwrap()
+                .find_volume(VolumeId(1))
+                .unwrap()
+                .1;
+            let held = vol.sync_lock_for_test();
+
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(TEST_COOKIE),
+                data: b"late write".to_vec(),
+                data_size: 10,
+                ..Needle::default()
+            };
+            n.checksum = CRC::new(&n.data);
+            let write = tokio::spawn({
+                let state = state.clone();
+                async move { write_upload_needle(&state, VolumeId(1), n, fsync).await }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while vol.pending_writes_for_test(NeedleId(id)) == 0 {
+                assert!(Instant::now() < deadline, "the write never registered");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            let path = format!("/1,{:x}{:08x}{}", id, TEST_COOKIE, query);
+            assert_eq!(send_delete(&state, &path).await, StatusCode::NOT_FOUND);
+            if abandon {
+                write.abort();
+                drop(held);
+                while vol.pending_writes_for_test(NeedleId(id)) > 0 {
+                    assert!(Instant::now() < deadline, "the queued write never settled");
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            } else {
+                drop(held);
+                let written = write.await.unwrap();
+                if replicate {
+                    assert!(matches!(written, Err(VolumeError::Deleted)), "{id:x}");
+                } else {
+                    assert!(matches!(written, Ok(Ok(_))), "{id:x}");
+                }
+                assert_eq!(vol.pending_writes_for_test(NeedleId(id)), 0);
+            }
+
+            let read = vol.read_needle(&mut Needle {
+                id: NeedleId(id),
+                ..Needle::default()
+            });
+            if replicate {
+                assert!(read.is_err(), "{id:x}: the cancelled write is live");
+            } else {
+                assert!(read.is_ok(), "{id:x}: {read:?}");
+            }
+        }
+    }
+
     /// Issue #801: an fsync upload takes the per-volume worker so its sync is
     /// shared across the batch (Go's `writeNeedle2` split); a non-fsync write,
     /// or an fsync write landing while the server is stopping, takes the
@@ -7936,17 +9363,20 @@ mod tests {
 
         write_upload_needle(&state, VolumeId(1), needle(0x6e7a_0b01), true)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(queue.submits_for_test(), 1);
 
         write_upload_needle(&state, VolumeId(1), needle(0x6e7a_0b02), false)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(queue.submits_for_test(), 1);
 
         *state.is_stopping.write().unwrap() = true;
         write_upload_needle(&state, VolumeId(1), needle(0x6e7a_0b03), true)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(queue.submits_for_test(), 1);
     }

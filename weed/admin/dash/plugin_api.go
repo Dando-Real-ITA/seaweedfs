@@ -152,12 +152,21 @@ func (s *AdminServer) GetPluginJobsAPI(w http.ResponseWriter, r *http.Request) {
 	state := strings.TrimSpace(query.Get("state"))
 	laneFilter := strings.TrimSpace(query.Get("lane"))
 	limit := parsePositiveInt(query.Get("limit"), 200)
-	jobs := s.ListPluginJobs(jobType, state, limit)
+	// Apply the lane before the limit, or a busy lane's newest rows crowd out a quiet lane.
+	listLimit := limit
+	if laneFilter != "" {
+		listLimit = 0
+	}
+	jobs := s.ListPluginJobs(jobType, state, listLimit)
 	if jobs == nil {
 		writeJSON(w, http.StatusOK, []interface{}{})
 		return
 	}
-	writeJSON(w, http.StatusOK, filterTrackedJobsByLane(jobs, laneFilter))
+	jobs = filterTrackedJobsByLane(jobs, laneFilter)
+	if len(jobs) > limit {
+		jobs = jobs[:limit]
+	}
+	writeJSON(w, http.StatusOK, jobs)
 }
 
 // GetPluginJobAPI returns one tracked job.
@@ -248,12 +257,20 @@ func (s *AdminServer) GetPluginActivitiesAPI(w http.ResponseWriter, r *http.Requ
 	jobType := strings.TrimSpace(query.Get("job_type"))
 	laneFilter := strings.TrimSpace(query.Get("lane"))
 	limit := parsePositiveInt(query.Get("limit"), 500)
-	activities := s.ListPluginActivities(jobType, limit)
+	listLimit := limit
+	if laneFilter != "" {
+		listLimit = 0
+	}
+	activities := s.ListPluginActivities(jobType, listLimit)
 	if activities == nil {
 		writeJSON(w, http.StatusOK, []interface{}{})
 		return
 	}
-	writeJSON(w, http.StatusOK, filterActivitiesByLane(activities, laneFilter))
+	activities = filterActivitiesByLane(activities, laneFilter)
+	if len(activities) > limit {
+		activities = activities[:limit]
+	}
+	writeJSON(w, http.StatusOK, activities)
 }
 
 // GetPluginSchedulerStatesAPI returns per-job-type scheduler status for monitoring.
@@ -304,6 +321,26 @@ func (s *AdminServer) GetPluginSchedulerStatusAPI(w http.ResponseWriter, r *http
 
 	laneFilter := strings.TrimSpace(r.URL.Query().Get("lane"))
 
+	var lockStatus LockStatus
+	if s.pluginLock != nil && (laneFilter == "" || plugin.LaneRequiresLock(plugin.SchedulerLane(laneFilter))) {
+		lockStatus = s.pluginLock.Status()
+		if len(lockStatus.Waiters) > 0 && s.masterClient != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+			err := s.masterClient.WithClient(ctx, false, func(client master_pb.SeaweedClient) error {
+				holder, err := client.GetAdminLockStatus(ctx, &master_pb.GetAdminLockStatusRequest{LockName: cluster.AdminShellLockName})
+				if err == nil && holder.GetIsLocked() {
+					lockStatus.Holder = holder.GetClientName()
+					lockStatus.HolderMessage = holder.GetMessage()
+				}
+				return err
+			})
+			cancel()
+			if err != nil {
+				lockStatus.HolderError = "Lock owner unavailable"
+			}
+		}
+	}
+
 	if laneFilter != "" {
 		lane := plugin.SchedulerLane(laneFilter)
 		response := map[string]interface{}{
@@ -311,7 +348,7 @@ func (s *AdminServer) GetPluginSchedulerStatusAPI(w http.ResponseWriter, r *http
 			"scheduler": pluginSvc.GetLaneSchedulerStatus(lane),
 		}
 		if s.pluginLock != nil {
-			response["lock"] = s.pluginLock.Status()
+			response["lock"] = lockStatus
 		}
 		writeJSON(w, http.StatusOK, response)
 		return
@@ -322,7 +359,7 @@ func (s *AdminServer) GetPluginSchedulerStatusAPI(w http.ResponseWriter, r *http
 		"scheduler": pluginSvc.GetSchedulerStatus(),
 	}
 	if s.pluginLock != nil {
-		response["lock"] = s.pluginLock.Status()
+		response["lock"] = lockStatus
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -583,6 +620,12 @@ func (s *AdminServer) TriggerPluginDetectionAPI(w http.ResponseWriter, r *http.R
 		"count":              len(proposalPayloads),
 		"proposals":          proposalPayloads,
 		"activities":         filteredActivities,
+	}
+	if report != nil && report.Complete != nil {
+		response["skipped_reason"] = report.Complete.SkippedReason
+		if at := report.Complete.EligibleAfter; at != nil {
+			response["eligible_after"] = at.AsTime()
+		}
 	}
 
 	if err != nil {

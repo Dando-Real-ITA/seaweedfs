@@ -248,6 +248,8 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 			DiscoveryInterval: 5 * time.Minute,
 		})
 		masterClient.SetOnPeerUpdateFn(filerClient.OnPeerUpdate)
+		masterClient.SetOnVolumeLocationChangeFn(filerClient.OnVolumeLocationChange)
+		masterClient.SetOnVidMapResetFn(filerClient.OnVidMapReset)
 
 		// Start the master client connection loop - required for GetMaster() to work
 		go masterClient.KeepConnectedToMaster(context.Background())
@@ -364,7 +366,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		}
 		s3ApiServer.objectWriteLockClient = objectWriteLockClient
 		s3ApiServer.newObjectWriteLock = func(bucket, object string) (objectWriteLock, error) {
-			lockKey := objectWriteRouteKeyPrefix + s3ApiServer.toFilerPath(bucket, object)
+			lockKey := s3ApiServer.objectRouteKey(bucket, object)
 			owner := fmt.Sprintf("s3api-%d", s3ApiServer.randomClientId)
 			lock := objectWriteLockClient.NewShortLivedLock(lockKey, owner)
 			if lock == nil {
@@ -1097,16 +1099,16 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		// GetBucketCors
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketCorsHandler, ACTION_READ)), "GET")).Queries("cors", "")
 		// PutBucketCors
-		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketCorsHandler, ACTION_WRITE)), "PUT")).Queries("cors", "")
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketCorsHandler, ACTION_PUT_BUCKET_CORS)), "PUT")).Queries("cors", "")
 		// DeleteBucketCors
-		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketCorsHandler, ACTION_WRITE)), "DELETE")).Queries("cors", "")
+		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketCorsHandler, ACTION_DELETE_BUCKET_CORS)), "DELETE")).Queries("cors", "")
 
 		// GetBucketLifecycleConfiguration
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketLifecycleConfigurationHandler, ACTION_READ)), "GET")).Queries("lifecycle", "")
 		// PutBucketLifecycleConfiguration
-		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketLifecycleConfigurationHandler, ACTION_WRITE)), "PUT")).Queries("lifecycle", "")
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketLifecycleConfigurationHandler, ACTION_ADMIN)), "PUT")).Queries("lifecycle", "")
 		// DeleteBucketLifecycleConfiguration
-		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketLifecycleHandler, ACTION_WRITE)), "DELETE")).Queries("lifecycle", "")
+		bucket.Methods(http.MethodDelete).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.DeleteBucketLifecycleHandler, ACTION_ADMIN)), "DELETE")).Queries("lifecycle", "")
 
 		// GetBucketLocation
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketLocationHandler, ACTION_READ)), "GET")).Queries("location", "")
@@ -1132,7 +1134,7 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 
 		// GetBucketVersioning
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetBucketVersioningHandler, ACTION_READ)), "GET")).Queries("versioning", "")
-		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketVersioningHandler, ACTION_WRITE)), "PUT")).Queries("versioning", "")
+		bucket.Methods(http.MethodPut).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.PutBucketVersioningHandler, ACTION_PUT_BUCKET_VERSIONING)), "PUT")).Queries("versioning", "")
 
 		// GetObjectLockConfiguration / PutObjectLockConfiguration (bucket-level operations)
 		bucket.Methods(http.MethodGet).HandlerFunc(track(s3a.iam.Auth(s3a.cb.Limit(s3a.GetObjectLockConfigurationHandler, ACTION_GET_BUCKET_OBJECT_LOCK_CONFIG)), "GET")).Queries("object-lock", "")
@@ -1496,6 +1498,21 @@ func (s3a *S3ApiServer) AuthenticateRequest(r *http.Request) (string, interface{
 		return identity.Name, identity, err
 	}
 	return "", nil, err
+}
+
+// FilerSigningKey is the current jwt.filer_signing.key, which follows a
+// security.toml reload.
+func (s3a *S3ApiServer) FilerSigningKey() security.SigningKey {
+	if s3a.filerGuard == nil {
+		return nil
+	}
+	return s3a.filerGuard.SigningKey()
+}
+
+// AuthEnabled reports whether requests must carry valid credentials. With no
+// identities configured, every request is allowed as the admin.
+func (s3a *S3ApiServer) AuthEnabled() bool {
+	return s3a.iam == nil || s3a.iam.isEnabled()
 }
 
 // DefaultAllow returns whether access is allowed by default when no policy is found

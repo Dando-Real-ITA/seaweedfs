@@ -13,7 +13,7 @@ use seaweed_worker_core::pb::{
 use seaweed_worker_core::{DetectionSender, ExecutionSender, JobHandler};
 use tracing::warn;
 
-use crate::catalog::{NamespaceClient, parse_id};
+use crate::catalog::{NamespaceClient, SigningKey, parse_id};
 use crate::dataset;
 use crate::jobs::{clamp, string_list, table_id};
 
@@ -31,7 +31,8 @@ const MAX_MIN_VERSIONS: i64 = 1000;
 /// the cluster owned the policy than each writer.
 pub struct CleanupVersionsHandler {
     namespace_url: String,
-    fallback: dataset::FallbackOptions,
+    storage: dataset::Storage,
+    signing_key: Option<SigningKey>,
     metrics: Option<crate::metrics::LanceMetrics>,
 }
 
@@ -39,7 +40,8 @@ impl CleanupVersionsHandler {
     pub fn new(namespace_url: String) -> Self {
         Self {
             namespace_url,
-            fallback: dataset::FallbackOptions::new(),
+            storage: dataset::Storage::default(),
+            signing_key: None,
             metrics: None,
         }
     }
@@ -49,13 +51,18 @@ impl CleanupVersionsHandler {
         self
     }
 
-    pub fn with_fallback(mut self, fallback: dataset::FallbackOptions) -> Self {
-        self.fallback = fallback;
+    pub fn with_storage(mut self, storage: dataset::Storage) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    pub fn with_signing_key(mut self, signing_key: Option<SigningKey>) -> Self {
+        self.signing_key = signing_key;
         self
     }
 
     fn client(&self) -> NamespaceClient {
-        NamespaceClient::new(self.namespace_url.clone()).with_fallback(&self.fallback)
+        NamespaceClient::new(self.namespace_url.clone()).with_signing_key(self.signing_key.as_ref())
     }
 }
 
@@ -151,7 +158,7 @@ impl JobHandler for CleanupVersionsHandler {
         let mut proposals = Vec::new();
         for encoded in &tables {
             let id = parse_id(encoded);
-            let table = match dataset::open(&client, &id, &self.fallback).await {
+            let table = match dataset::open(&client, &id, &self.storage).await {
                 Ok(table) => table,
                 Err(err) => {
                     if let Some(counters) = &self.metrics {
@@ -210,6 +217,8 @@ impl JobHandler for CleanupVersionsHandler {
             success: true,
             error_message: String::new(),
             total_proposals: total,
+            skipped_reason: String::new(),
+            eligible_after: None,
         })?;
         Ok(())
     }
@@ -245,7 +254,7 @@ impl JobHandler for CleanupVersionsHandler {
         ) as usize;
 
         let client = self.client();
-        let table = dataset::open(&client, &id, &self.fallback).await?;
+        let table = dataset::open(&client, &id, &self.storage).await?;
         let before = table.stats().await?;
 
         // The floor is a promise about how much history survives, so it has to

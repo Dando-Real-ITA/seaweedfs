@@ -104,6 +104,7 @@ type S3Options struct {
 	// whatever process may hold the configured port.
 	icebergBound atomic.Bool
 	lanceBound   atomic.Bool
+	lanceServer  *lance.Server
 }
 
 func init() {
@@ -142,7 +143,7 @@ func init() {
 	s3StandaloneOptions.iamReadOnly = cmdS3.Flag.Bool("iam.readOnly", true, "disable IAM write operations on this server")
 	s3StandaloneOptions.debug = cmdS3.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	s3StandaloneOptions.debugPort = cmdS3.Flag.Int("debug.port", 6060, "http port for debugging")
-	s3StandaloneOptions.cipher = cmdS3.Flag.Bool("encryptVolumeData", false, "encrypt data on volume servers")
+	s3StandaloneOptions.cipher = cmdS3.Flag.Bool("encryptVolumeData", false, "encrypt data on volume servers; on whenever the filer's -encryptVolumeData is")
 	s3StandaloneOptions.externalUrl = cmdS3.Flag.String("externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	s3StandaloneOptions.defaultFileMode = cmdS3.Flag.String("defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
 	s3StandaloneOptions.cacheSizeMB = cmdS3.Flag.Int64("cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
@@ -314,6 +315,8 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	// chunk size for S3 uploads, read from the filer's -maxMB
 	var filerMaxMB int32
+	// the filer's -encryptVolumeData, which turns on chunk encryption here too
+	var filerCipher bool
 
 	for {
 		err := pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
@@ -327,6 +330,7 @@ func (s3opt *S3Options) startS3Server() bool {
 			masterAddresses = pb.ServerAddresses(strings.Join(resp.Masters, ",")).ToAddresses()
 			metricsAddress, metricsIntervalSec = resp.MetricsAddress, int(resp.MetricsIntervalSec)
 			filerMaxMB = int32(resp.MaxMb)
+			filerCipher = resp.Cipher
 			glog.V(0).Infof("S3 read filer buckets dir: %s", filerBucketsPath)
 			glog.V(0).Infof("S3 read filer maxMB: %d", filerMaxMB)
 			if len(masterAddresses) > 0 {
@@ -405,7 +409,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		ConcurrentFileUploadLimit: int64(*s3opt.concurrentFileUploadLimit),
 		EnableIam:                 *s3opt.enableIam, // Embedded IAM API (enabled by default)
 		IamReadOnly:               *s3opt.iamReadOnly,
-		Cipher:                    *s3opt.cipher, // encrypt data on volume servers
+		Cipher:                    *s3opt.cipher || filerCipher, // encrypt data on volume servers
 		Ip:                        *s3opt.ip,
 		BindIp:                    *s3opt.bindIp,
 		GrpcPort:                  *s3opt.portGrpc,
@@ -425,6 +429,9 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	var httpServers []*http.Server
 
+	// Once, before either catalog serves a request that reads it.
+	s3opt.setCredentialRole(s3ApiServer)
+
 	// Start Iceberg REST Catalog server if enabled
 	if *s3opt.portIceberg > 0 {
 		if httpS := s3opt.startIcebergServer(s3ApiServer, listenOnLocalhost); httpS != nil {
@@ -432,9 +439,11 @@ func (s3opt *S3Options) startS3Server() bool {
 		}
 	}
 
-	// Start Lance Namespace server if enabled
+	// The S3 Vectors API resolves its tables through the catalog in process,
+	// whether or not the catalog's own port is served.
+	s3opt.lanceServer = s3opt.newLanceServer(s3ApiServer)
 	if s3opt.portLance != nil && *s3opt.portLance > 0 {
-		if httpS := s3opt.startLanceServer(s3ApiServer, listenOnLocalhost); httpS != nil {
+		if httpS := s3opt.startLanceServer(listenOnLocalhost); httpS != nil {
 			httpServers = append(httpServers, httpS)
 		}
 	}
@@ -615,6 +624,24 @@ func (s3opt *S3Options) newShutdown(stopGrpc func(), s3ApiServer *s3api.S3ApiSer
 	return shutdown
 }
 
+// vendsCredentials reports whether -iceberg.credentialRole is set, which
+// both catalogs vend through, whichever of them runs.
+func (s3opt *S3Options) vendsCredentials() bool {
+	return s3opt.icebergCredentialRole != nil && *s3opt.icebergCredentialRole != ""
+}
+
+// setCredentialRole hands -iceberg.credentialRole to the S3 server.
+func (s3opt *S3Options) setCredentialRole(s3ApiServer *s3api.S3ApiServer) {
+	if !s3opt.vendsCredentials() {
+		return
+	}
+	duration := int64(0)
+	if s3opt.icebergCredentialDuration != nil {
+		duration = int64(*s3opt.icebergCredentialDuration)
+	}
+	s3ApiServer.SetIcebergCredentialRole(*s3opt.icebergCredentialRole, duration)
+}
+
 // startIcebergServer starts the Iceberg REST Catalog server on a separate port.
 func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer, listenOnLocalhost bool) *http.Server {
 	icebergRouter := mux.NewRouter().SkipClean(true)
@@ -625,12 +652,7 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer, liste
 	// Create Iceberg server using the S3ApiServer as filer client
 	icebergServer := iceberg.NewServer(s3ApiServer, s3ApiServer)
 	icebergServer.SetCredentialValidator(s3ApiServer)
-	if s3opt.icebergCredentialRole != nil && *s3opt.icebergCredentialRole != "" {
-		duration := int64(0)
-		if s3opt.icebergCredentialDuration != nil {
-			duration = int64(*s3opt.icebergCredentialDuration)
-		}
-		s3ApiServer.SetIcebergCredentialRole(*s3opt.icebergCredentialRole, duration)
+	if s3opt.vendsCredentials() {
 		icebergServer.SetCredentialVendor(icebergCredentialVendor{s3ApiServer})
 	}
 	icebergServer.SetS3Endpoint(s3opt.deriveS3AdvertisedEndpoint())
@@ -666,21 +688,26 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer, liste
 	return httpS
 }
 
-// startLanceServer starts the Lance Namespace server on a separate port. It
-// shares the Iceberg catalog's credential role: one deployment vends table
-// credentials one way, whichever catalog the client speaks to.
-func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer, listenOnLocalhost bool) *http.Server {
-	lanceRouter := mux.NewRouter().SkipClean(true)
-	lanceRouter.Use(util_http.EscapeSemicolonsInQuery)
-
+// newLanceServer builds the Lance Namespace catalog. It shares the Iceberg
+// catalog's credential role: one deployment vends table credentials one way,
+// whichever catalog the client speaks to.
+func (s3opt *S3Options) newLanceServer(s3ApiServer *s3api.S3ApiServer) *lance.Server {
 	lanceServer := lance.NewServer(s3ApiServer, s3ApiServer)
 	lanceServer.SetCredentialValidator(s3ApiServer)
-	if s3opt.icebergCredentialRole != nil && *s3opt.icebergCredentialRole != "" {
+	lanceServer.SetSigningKey(s3ApiServer.FilerSigningKey)
+	if s3opt.vendsCredentials() {
 		lanceServer.SetCredentialVendor(lanceCredentialVendor{s3ApiServer})
 	}
 	lanceServer.SetS3Endpoint(s3opt.deriveLanceStorageEndpoint())
 	lanceServer.SetS3Region(s3tables.DefaultRegion)
-	lanceServer.RegisterRoutes(lanceRouter)
+	return lanceServer
+}
+
+// startLanceServer serves the Lance Namespace catalog on its own port.
+func (s3opt *S3Options) startLanceServer(listenOnLocalhost bool) *http.Server {
+	lanceRouter := mux.NewRouter().SkipClean(true)
+	lanceRouter.Use(util_http.EscapeSemicolonsInQuery)
+	s3opt.lanceServer.RegisterRoutes(lanceRouter)
 
 	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portLance)
 	lanceListener, lanceLocalListener, err := util.NewIpAndLocalListeners(
@@ -717,12 +744,27 @@ func (s3opt *S3Options) vectorsRouter(s3ApiServer *s3api.S3ApiServer, grpcDialOp
 		glog.Warningf("S3 Vectors API disabled: no weed-vector registered on master")
 		return nil
 	}
-	backend := &vectorDiscovery{masters: masterAddresses, grpcDialOption: grpcDialOption}
+	backend := &vectorDiscovery{masters: masterAddresses, grpcDialOption: grpcDialOption, discover: discoverVectorWorkers}
+	// In-process describe — the router resolves locations and vended
+	// storage options through the catalog directly, never over HTTP. The
+	// lookup itself runs under the trusted identity: the caller's vector
+	// permission already authorized the query, and catalog grants must not
+	// gate an internal resolution.
+	describe := func(ctx context.Context, id []string) (string, map[string]string, error) {
+		if s3opt.lanceServer == nil {
+			return "", nil, fmt.Errorf("lance catalog is not running")
+		}
+		r := (&http.Request{Method: http.MethodPost, Header: make(http.Header)}).WithContext(ctx)
+		return s3opt.lanceServer.DescribeTableInternal(r, id)
+	}
 	vectorsRouter := mux.NewRouter().SkipClean(true)
 
 	vectorsServer := s3vectors.NewServer(s3ApiServer, s3ApiServer, backend)
 	vectorsServer.SetRegion(s3tables.DefaultRegion)
 	vectorsServer.SetAccountID(s3tables.DefaultAccountID)
+	vectorsServer.SetEncryptionChecker(s3api.GetSSES3KeyManager().IsConfigured)
+	vectorsServer.SetDescribe(describe)
+	vectorsServer.SetLimiter(s3ApiServer.Limit)
 	vectorsServer.RegisterRoutes(vectorsRouter)
 	return vectorsRouter
 }
@@ -733,11 +775,13 @@ func (s3opt *S3Options) vectorsRouter(s3ApiServer *s3api.S3ApiServer, grpcDialOp
 type vectorDiscovery struct {
 	masters        []pb.ServerAddress
 	grpcDialOption grpc.DialOption
+	discover       func([]pb.ServerAddress, grpc.DialOption) []string
 	mu             sync.Mutex
 	worker         string
 	conn           *grpc.ClientConn
 	client         vector_pb.VectorServiceClient
 	nextResolve    time.Time
+	resolving      chan struct{} // closed when the in-flight resolve lands
 }
 
 // reset drops the cached worker so the next call rediscovers — invoked on
@@ -762,12 +806,23 @@ func isTransportError(err error) bool {
 	return status.Code(err) == codes.Unavailable
 }
 
-func (d *vectorDiscovery) resolve() (vector_pb.VectorServiceClient, error) {
+// resolve runs without d.mu held so a slow master cannot stall cached-client callers.
+func (d *vectorDiscovery) resolve() {
+	workers := d.discover(d.masters, d.grpcDialOption)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	workers := discoverVectorWorkers(d.masters, d.grpcDialOption)
+	// Measured from lookup end so a slow lookup cannot leave the next one already due.
+	defer func() {
+		interval := vectorRecheckInterval
+		if d.client != nil {
+			interval = vectorResolveInterval
+		}
+		d.nextResolve = time.Now().Add(interval)
+		close(d.resolving)
+		d.resolving = nil
+	}()
 	if len(workers) == 0 {
-		return nil, fmt.Errorf("no weed-vector registered on master")
+		return
 	}
 	worker := workers[0]
 	for _, w := range workers {
@@ -777,36 +832,52 @@ func (d *vectorDiscovery) resolve() (vector_pb.VectorServiceClient, error) {
 		}
 	}
 	if worker != d.worker {
-		if d.conn != nil {
-			d.conn.Close()
-		}
 		conn, err := pb.GrpcDial(context.Background(), worker, false, d.grpcDialOption)
 		if err != nil {
-			return nil, err
+			glog.Warningf("S3 Vectors: dial weed-vector %s: %v", worker, err)
+			return
+		}
+		if d.conn != nil {
+			d.conn.Close()
 		}
 		d.worker, d.conn = worker, conn
 		d.client = vector_pb.NewVectorServiceClient(conn)
 	}
-	return d.client, nil
 }
 
-const vectorResolveInterval = 5 * time.Second
+// A live client refreshes membership at most every vectorResolveInterval.
+// With no usable backend the recheck is much more frequent: a worker that
+// registers a moment after a lookup must surface inside a caller's retry
+// budget, while an absent one still cannot flood the master with lookups.
+const (
+	vectorResolveInterval = 5 * time.Second
+	vectorRecheckInterval = 500 * time.Millisecond
+)
+
+var errNoVectorWorker = status.Error(codes.Unavailable, "no weed-vector registered on master")
 
 func (d *vectorDiscovery) cli() (vector_pb.VectorServiceClient, error) {
 	d.mu.Lock()
-	cli := d.client
-	past := !time.Now().Before(d.nextResolve)
-	if cli != nil && !past {
-		d.mu.Unlock()
+	if d.resolving == nil && !time.Now().Before(d.nextResolve) {
+		d.resolving = make(chan struct{})
+		go d.resolve()
+	}
+	cli, resolving := d.client, d.resolving
+	d.mu.Unlock()
+	if cli != nil {
 		return cli, nil
 	}
-	if !past && cli == nil {
+	// No cached client: wait for the in-flight lookup instead of failing.
+	if resolving != nil {
+		<-resolving
+		d.mu.Lock()
+		cli = d.client
 		d.mu.Unlock()
-		return nil, fmt.Errorf("no weed-vector registered on master")
+		if cli != nil {
+			return cli, nil
+		}
 	}
-	d.nextResolve = time.Now().Add(vectorResolveInterval)
-	d.mu.Unlock()
-	return d.resolve()
+	return nil, errNoVectorWorker
 }
 
 func (d *vectorDiscovery) CreateIndex(ctx context.Context, in *vector_pb.CreateIndexRequest, opts ...grpc.CallOption) (resp *vector_pb.CreateIndexResponse, err error) {

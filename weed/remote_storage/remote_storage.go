@@ -7,12 +7,10 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
-	"google.golang.org/protobuf/proto"
 )
 
 const slash = "/"
@@ -121,6 +119,7 @@ type RemoteStorageClient interface {
 	DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error)
 	ListBuckets() ([]*Bucket, error)
 	CreateBucket(name string) (err error)
+	// DeleteBucket succeeds when the bucket is already gone.
 	DeleteBucket(name string) (err error)
 }
 
@@ -176,16 +175,7 @@ type RemoteStorageClientMaker interface {
 	HasBucket() bool
 }
 
-type CachedRemoteStorageClient struct {
-	*remote_pb.RemoteConf
-	RemoteStorageClient
-}
-
-var (
-	RemoteStorageClientMakers = make(map[string]RemoteStorageClientMaker)
-	remoteStorageClients      = make(map[string]CachedRemoteStorageClient)
-	remoteStorageClientsLock  sync.Mutex
-)
+var RemoteStorageClientMakers = make(map[string]RemoteStorageClientMaker)
 
 func GetAllRemoteStorageNames() string {
 	var storageNames []string
@@ -214,26 +204,4 @@ func makeRemoteStorageClient(remoteConf *remote_pb.RemoteConf) (RemoteStorageCli
 		return nil, fmt.Errorf("remote storage type %s not found", remoteConf.Type)
 	}
 	return maker.Make(remoteConf)
-}
-
-func GetRemoteStorage(remoteConf *remote_pb.RemoteConf) (RemoteStorageClient, error) {
-	remoteStorageClientsLock.Lock()
-	defer remoteStorageClientsLock.Unlock()
-
-	existingRemoteStorageClient, found := remoteStorageClients[remoteConf.Name]
-	if found && proto.Equal(existingRemoteStorageClient.RemoteConf, remoteConf) {
-		return existingRemoteStorageClient.RemoteStorageClient, nil
-	}
-
-	newRemoteStorageClient, err := makeRemoteStorageClient(remoteConf)
-	if err != nil {
-		return nil, fmt.Errorf("make remote storage client %s: %v", remoteConf.Name, err)
-	}
-
-	remoteStorageClients[remoteConf.Name] = CachedRemoteStorageClient{
-		RemoteConf:          remoteConf,
-		RemoteStorageClient: newRemoteStorageClient,
-	}
-
-	return newRemoteStorageClient, nil
 }

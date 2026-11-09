@@ -2,6 +2,8 @@ package dash
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/admin/maintenance"
@@ -16,9 +18,14 @@ type ClusterTopology struct {
 	TotalVolumes  int            `json:"total_volumes"`
 	// TotalChunks counts chunks stored in volumes, not filer entries: a file
 	// is split into one or more chunks.
-	TotalChunks int64     `json:"total_chunks"`
-	TotalSize   int64     `json:"total_size"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	TotalChunks int64 `json:"total_chunks"`
+	TotalSize   int64 `json:"total_size"`
+	// DiskUsage and DiskCapacity sum the volume servers' DiskUsage and
+	// DiskCapacity: the bytes in use on their disks, parity, deleted needles
+	// and retained EC generations included, and the disks' size.
+	DiskUsage    int64     `json:"disk_usage"`
+	DiskCapacity int64     `json:"disk_capacity"`
+	UpdatedAt    time.Time `json:"updated_at"`
 	// TierStats breaks volumes and EC shards down by storage tier: local
 	// disk types plus one entry per remote storage holding tiered volumes.
 	TierStats []TierStats `json:"tier_stats"`
@@ -45,10 +52,11 @@ type VolumeServer struct {
 	DataCenter    string    `json:"datacenter"`
 	Rack          string    `json:"rack"`
 	PublicURL     string    `json:"public_url"`
+	Version       string    `json:"version"`
 	Volumes       int       `json:"volumes"`
 	MaxVolumes    int       `json:"max_volumes"`
-	DiskUsage     int64     `json:"disk_usage"`
-	DiskCapacity  int64     `json:"disk_capacity"`
+	DiskUsage     int64     `json:"disk_usage"`    // statfs bytes in use, comparable with DiskCapacity
+	DiskCapacity  int64     `json:"disk_capacity"` // statfs capacity, or the slot-based estimate without statfs
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 
 	// EC shard information
@@ -788,4 +796,40 @@ type IcebergTableDetailsData struct {
 	// this server can read, so the page can say whose account it is and when.
 	ObservedBy string    `json:"observed_by,omitempty"`
 	ObservedAt time.Time `json:"observed_at,omitempty"`
+}
+
+// VersionCount tallies the nodes of one type running the same binary version.
+type VersionCount struct {
+	Version string `json:"version"`
+	Count   int    `json:"count"`
+}
+
+// NodeTypeVersions is the version spread of one kind of cluster node.
+type NodeTypeVersions struct {
+	Type     string         `json:"type"`
+	Total    int            `json:"total"`
+	Versions []VersionCount `json:"versions"` // sorted by count desc, then version
+}
+
+// Spread renders the per-version counts, e.g. "24× 4.44 abc123, 31× 4.39 def456".
+func (n NodeTypeVersions) Spread() string {
+	parts := make([]string, 0, len(n.Versions))
+	for _, vc := range n.Versions {
+		parts = append(parts, fmt.Sprintf("%d× %s", vc.Count, vc.Version))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ClusterVersionSummary reports whether every cluster node runs the same
+// binary version, and the per-type spread when they do not.
+type ClusterVersionSummary struct {
+	Uniform   bool               `json:"uniform"`
+	Version   string             `json:"version,omitempty"` // set when Uniform
+	NodeTypes []NodeTypeVersions `json:"node_types"`
+}
+
+// Mixed reports a real version split: non-uniform with nodes on record,
+// unlike an empty cluster that reports no versions at all.
+func (v ClusterVersionSummary) Mixed() bool {
+	return !v.Uniform && len(v.NodeTypes) > 0
 }

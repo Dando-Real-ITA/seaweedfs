@@ -33,7 +33,10 @@ func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSo
 		return err
 	}
 
-	lastOffsetTs := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, *option.timeAgo)
+	lastOffsetTs, err := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, *option.timeAgo, option.resumeTsNs)
+	if err != nil {
+		return err
+	}
 	processor := NewMetadataProcessor(eachEntryFunc, 128, lastOffsetTs.UnixNano())
 
 	var lastLogTsNs = time.Now().UnixNano()
@@ -70,7 +73,9 @@ func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSo
 		Resubscribe: processor.ResubscribeCh(),
 	}
 
-	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
+	err = pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
+	option.resumeTsNs = saveResumeOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, processor)
+	return err
 }
 
 // makeBucketedEventProcessor is the gateway half of the sync protocol
@@ -158,6 +163,11 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 
 		client, remoteStorageMountLocation, err := option.findRemoteStorageClient(entry.Name)
 		if err != nil {
+			bucket := util.FullPath(option.bucketsDir).Child(entry.Name)
+			if _, isMounted := option.mappings.Mappings[string(bucket)]; !isMounted {
+				glog.V(0).Infof("remote bucket %s is not mounted, skipping delete", entry.Name)
+				return nil
+			}
 			return fmt.Errorf("findRemoteStorageClient %s: %v", entry.Name, err)
 		}
 
@@ -180,6 +190,9 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 				if readErr != nil {
 					return fmt.Errorf("unmarshal mappings: %w", readErr)
 				}
+				if newMappings.PrimaryBucketStorageName == "" {
+					newMappings.PrimaryBucketStorageName = option.mappings.PrimaryBucketStorageName
+				}
 				option.mappings = newMappings
 			}
 			if strings.HasSuffix(message.NewEntry.Name, filer.REMOTE_STORAGE_CONF_SUFFIX) {
@@ -192,7 +205,10 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 		} else if metadataEventRemovesFromDirectory(resp, filer.DirectoryEtcRemote) {
 			// deletion
 			if message.OldEntry.Name == filer.REMOTE_STORAGE_MOUNT_FILE {
-				option.mappings = &remote_pb.RemoteStorageMapping{}
+				option.mappings = &remote_pb.RemoteStorageMapping{
+					PrimaryBucketStorageName: option.mappings.PrimaryBucketStorageName,
+					Mappings:                 map[string]*remote_pb.RemoteStorageLocation{},
+				}
 			}
 			if strings.HasSuffix(message.OldEntry.Name, filer.REMOTE_STORAGE_CONF_SUFFIX) {
 				conf := &remote_pb.RemoteConf{}
@@ -310,6 +326,9 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			// Skip deletion of internal version files; individual version
 			// deletes should not propagate to the remote object
 			if isVersionedPath(resp.Directory, message.OldEntry.Name, message.OldEntry.IsDirectory) {
+				if releasesVersionLock(message.OldEntry, nil) {
+					return syncGatewayKeptDeleteMarker(option, option, resp.Directory, message.OldEntry.Name)
+				}
 				glog.V(2).Infof("skipping delete of internal version path: %s/%s", resp.Directory, message.OldEntry.Name)
 				return nil
 			}
@@ -331,7 +350,7 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 				return client.RemoveDirectory(dest)
 			}
 			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(dest))
-			return client.DeleteFile(dest)
+			return deleteRemoteFile(client, dest)
 		}
 		if message.OldEntry != nil && message.NewEntry != nil {
 			if resp.Directory == option.bucketsDir {
@@ -355,6 +374,9 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			}
 			// Skip updates to internal version paths
 			if isVersionedPath(message.NewParentPath, message.NewEntry.Name, message.NewEntry.IsDirectory) {
+				if releasesVersionLock(message.OldEntry, message.NewEntry) {
+					return syncGatewayKeptDeleteMarker(option, option, message.NewParentPath, message.NewEntry.Name)
+				}
 				glog.V(2).Infof("skipping update of internal version path: %s/%s", message.NewParentPath, message.NewEntry.Name)
 				return nil
 			}
@@ -579,6 +601,25 @@ func gatewayRemoteOnlyRename(filerClient filer_pb.FilerClient, option *RemoteGat
 		return err
 	}
 	return deleteRenameSource(filerClient, srcClient, message.NewParentPath, current.Name, source, stamp)
+}
+
+// syncGatewayKeptDeleteMarker runs syncKeptDeleteMarker against the object
+// key that the version file's bucket mount maps to.
+func syncGatewayKeptDeleteMarker(filerClient filer_pb.FilerClient, option *RemoteGatewayOptions, versionsDir, versionName string) error {
+	newParent, newName, ok := rewriteVersionedSourcePath(versionsDir, versionName)
+	if !ok {
+		return nil
+	}
+	bucket, remoteStorageMountLocation, remoteStorage, ok := option.detectBucketInfo(newParent)
+	if !ok {
+		return nil
+	}
+	client, err := remote_storage.GetRemoteStorage(remoteStorage)
+	if err != nil {
+		return err
+	}
+	dest := toRemoteStorageLocation(bucket, util.NewFullPath(newParent, newName), remoteStorageMountLocation)
+	return syncKeptDeleteMarker(client, filerClient, versionsDir, dest)
 }
 
 // releaseGatewayRenamedSource releases the pending source a rename's old

@@ -140,18 +140,12 @@ func (h *Handler) compactDataFiles(
 			if entry.DataFile().FileFormat() == iceberg.PuffinFile {
 				continue
 			}
-			if predicate != nil {
-				spec, ok := specsByID[int(entry.DataFile().SpecID())]
-				if !ok {
-					continue
-				}
-				match, err := predicate.Matches(spec, entry.DataFile().Partition())
-				if err != nil {
-					return "", nil, err
-				}
-				if !match {
-					continue
-				}
+			inScope, err := deleteInPredicateScope(entry, predicate, specsByID, schema)
+			if err != nil {
+				return "", nil, err
+			}
+			if !inScope {
+				continue
 			}
 			switch entry.DataFile().ContentType() {
 			case iceberg.EntryContentPosDeletes:
@@ -169,7 +163,7 @@ func (h *Handler) compactDataFiles(
 		}
 
 		if len(eqDeleteEntries) > 0 {
-			eqDeleteGroups, err = collectEqualityDeletes(ctx, filerClient, bucketName, dataPath, eqDeleteEntries, schema)
+			eqDeleteGroups, err = collectEqualityDeletes(ctx, filerClient, bucketName, dataPath, eqDeleteEntries, schema, specsByID)
 			if err != nil {
 				return "", nil, fmt.Errorf("collect equality deletes: %w", err)
 			}
@@ -291,10 +285,18 @@ func (h *Handler) compactDataFiles(
 		var mergedData []byte
 		var recordCount int64
 		rowGroupRows := rowsPerRowGroup(bin, config)
+		// Only the equality deletes of the bin's partition (or unpartitioned
+		// ones) apply to it. When that cannot be told, the bin is left as it
+		// is rather than merged without deletes that may apply.
+		binEqDeleteGroups, scopeErr := eqDeleteGroupsForBin(eqDeleteGroups, bin, specsByID, schema)
+		if scopeErr != nil {
+			glog.Warningf("iceberg compact: bin %d (%d files) not compacted: %v", binIdx, len(bin.Entries), scopeErr)
+			goto binDone
+		}
 		if rewritePlan != nil && rewritePlan.strategy == "sort" {
-			mergedData, recordCount, err = mergeParquetFilesSorted(ctx, filerClient, bucketName, dataPath, bin.Entries, positionDeletes, eqDeleteGroups, schema, rewritePlan, rowGroupRows, lineage)
+			mergedData, recordCount, err = mergeParquetFilesSorted(ctx, filerClient, bucketName, dataPath, bin.Entries, positionDeletes, binEqDeleteGroups, schema, rewritePlan, rowGroupRows, lineage)
 		} else {
-			mergedData, recordCount, err = mergeParquetFiles(ctx, filerClient, bucketName, dataPath, bin.Entries, positionDeletes, eqDeleteGroups, schema, rowGroupRows, lineage)
+			mergedData, recordCount, err = mergeParquetFiles(ctx, filerClient, bucketName, dataPath, bin.Entries, positionDeletes, binEqDeleteGroups, schema, rowGroupRows, lineage)
 		}
 		if err != nil {
 			glog.Warningf("iceberg compact: failed to merge bin %d (%d files): %v", binIdx, len(bin.Entries), err)
@@ -849,12 +851,16 @@ func readPositionDeleteFile(
 	ctx context.Context,
 	filerClient filer_pb.SeaweedFilerClient,
 	bucketName, dataPath, filePath string,
-) (map[string][]int64, error) {
+) (_ map[string][]int64, err error) {
+	defer recoverRead(&err, filePath)
 	data, err := loadFileByIcebergPath(ctx, filerClient, bucketName, dataPath, filePath)
 	if err != nil {
 		return nil, err
 	}
-	reader := parquet.NewReader(bytes.NewReader(data))
+	reader, err := newParquetReader(data, filePath)
+	if err != nil {
+		return nil, err
+	}
 	defer reader.Close()
 
 	pqSchema := reader.Schema()
@@ -898,28 +904,52 @@ func readPositionDeleteFile(
 	return result, nil
 }
 
-// equalityDeleteGroup holds a set of delete keys for a specific set of equality field IDs.
-// Different equality delete files may use different field IDs, so deletes are grouped.
+// equalityDeleteGroup holds the delete keys of the equality delete files that
+// share one set of equality field IDs and one scope. An equality delete file
+// applies only to data files with a lower data sequence number, and only in
+// its own partition unless its spec is unpartitioned (Iceberg spec, "Scan
+// Planning"): each key keeps the highest data sequence number of the delete
+// files carrying it, and the group the partition it applies to.
 type equalityDeleteGroup struct {
 	FieldIDs []int
-	Keys     map[string]struct{}
+	Keys     map[string]int64 // key -> highest data sequence number of a delete file carrying it
+	Scope    deleteScope      // where the group applies
+}
+
+// deleteInPredicateScope reports whether a delete file may apply to a bin a
+// where filter keeps: an unpartitioned one always (it has no field a clause
+// could match, and applies to every partition), one whose scope cannot be
+// decided always (collectEqualityDeletes then refuses it rather than drop it),
+// a partitioned one when its partition matches.
+func deleteInPredicateScope(entry iceberg.ManifestEntry, predicate *partitionPredicate, specs map[int]iceberg.PartitionSpec, schema *iceberg.Schema) (bool, error) {
+	if predicate == nil {
+		return true, nil
+	}
+	scope, err := deleteFileScope(entry.DataFile(), specs, schema)
+	if err != nil {
+		return true, nil
+	}
+	if scope.global {
+		return true, nil
+	}
+	return predicate.Matches(specs[int(entry.DataFile().SpecID())], entry.DataFile().Partition())
 }
 
 // collectEqualityDeletes reads equality delete Parquet files and returns groups
-// of delete keys, one per distinct set of equality field IDs. This correctly
-// handles the case where different delete files use different equality columns.
+// of delete keys, one per distinct set of equality field IDs and scope. This
+// correctly handles the case where different delete files use different
+// equality columns. A delete file without a data sequence number cannot be
+// ordered against the rows it may delete, and is an error.
 func collectEqualityDeletes(
 	ctx context.Context,
 	filerClient filer_pb.SeaweedFilerClient,
 	bucketName, dataPath string,
 	deleteEntries []iceberg.ManifestEntry,
 	schema *iceberg.Schema,
+	specs map[int]iceberg.PartitionSpec,
 ) ([]equalityDeleteGroup, error) {
-	type groupState struct {
-		fieldIDs []int
-		keys     map[string]struct{}
-	}
-	groups := make(map[string]*groupState)
+	groups := make(map[string]*equalityDeleteGroup)
+	var order []string
 
 	for _, entry := range deleteEntries {
 		if entry.DataFile().ContentType() != iceberg.EntryContentEqDeletes {
@@ -930,11 +960,21 @@ func collectEqualityDeletes(
 			continue
 		}
 
-		groupKey := fmt.Sprint(eqFieldIDs)
+		seq := entry.SequenceNum()
+		if seq < 0 {
+			return nil, fmt.Errorf("equality delete file %s has no data sequence number", entry.DataFile().FilePath())
+		}
+		scope, err := deleteFileScope(entry.DataFile(), specs, schema)
+		if err != nil {
+			return nil, err
+		}
+
+		groupKey := fmt.Sprintf("%v\x00%s", eqFieldIDs, scope.key())
 		gs, ok := groups[groupKey]
 		if !ok {
-			gs = &groupState{fieldIDs: eqFieldIDs, keys: make(map[string]struct{})}
+			gs = &equalityDeleteGroup{FieldIDs: eqFieldIDs, Keys: make(map[string]int64), Scope: scope}
 			groups[groupKey] = gs
+			order = append(order, groupKey)
 		}
 
 		keys, err := readEqualityDeleteFile(ctx, filerClient, bucketName, dataPath, entry.DataFile().FilePath(), eqFieldIDs, schema)
@@ -942,13 +982,15 @@ func collectEqualityDeletes(
 			return nil, fmt.Errorf("read equality delete file %s: %w", entry.DataFile().FilePath(), err)
 		}
 		for k := range keys {
-			gs.keys[k] = struct{}{}
+			if cur, seen := gs.Keys[k]; !seen || seq > cur {
+				gs.Keys[k] = seq
+			}
 		}
 	}
 
 	result := make([]equalityDeleteGroup, 0, len(groups))
-	for _, gs := range groups {
-		result = append(result, equalityDeleteGroup{FieldIDs: gs.fieldIDs, Keys: gs.keys})
+	for _, k := range order {
+		result = append(result, *groups[k])
 	}
 	return result, nil
 }
@@ -962,12 +1004,16 @@ func readEqualityDeleteFile(
 	bucketName, dataPath, filePath string,
 	fieldIDs []int,
 	icebergSchema *iceberg.Schema,
-) (map[string]struct{}, error) {
+) (_ map[string]struct{}, err error) {
+	defer recoverRead(&err, filePath)
 	data, err := loadFileByIcebergPath(ctx, filerClient, bucketName, dataPath, filePath)
 	if err != nil {
 		return nil, err
 	}
-	reader := parquet.NewReader(bytes.NewReader(data))
+	reader, err := newParquetReader(data, filePath)
+	if err != nil {
+		return nil, err
+	}
 	defer reader.Close()
 
 	colIndices, err := resolveEqualityColIndices(reader.Schema(), fieldIDs, icebergSchema, false)
@@ -1217,7 +1263,10 @@ func mergeParquetFilesInto(
 	if err != nil {
 		return nil, 0, fmt.Errorf("read parquet file %s: %w", entries[0].DataFile().FilePath(), err)
 	}
-	firstReader := parquet.NewReader(bytes.NewReader(firstData))
+	firstReader, err := newParquetReader(firstData, entries[0].DataFile().FilePath())
+	if err != nil {
+		return nil, 0, err
+	}
 	parquetSchema := firstReader.Schema()
 	if parquetSchema == nil {
 		firstReader.Close()
@@ -1269,8 +1318,9 @@ func mergeParquetFilesInto(
 	var outputBuf bytes.Buffer
 	writer := parquet.NewWriter(&outputBuf, outputSchema, parquet.MaxRowsPerRowGroup(rowGroupRows))
 
-	drainReader := func(reader *parquet.Reader, entry iceberg.ManifestEntry) (int64, error) {
+	drainReader := func(reader *parquet.Reader, entry iceberg.ManifestEntry) (_ int64, err error) {
 		source := entry.DataFile().FilePath()
+		defer recoverRead(&err, source)
 		conv, groups, err := joins(reader, entry)
 		if err != nil {
 			reader.Close()
@@ -1312,7 +1362,11 @@ func mergeParquetFilesInto(
 			return nil, 0, fmt.Errorf("read parquet file %s: %w", entry.DataFile().FilePath(), err)
 		}
 
-		reader := parquet.NewReader(bytes.NewReader(data))
+		reader, err := newParquetReader(data, entry.DataFile().FilePath())
+		if err != nil {
+			writer.Close()
+			return nil, 0, err
+		}
 		rowsWritten, err := drainReader(reader, entry)
 		if err != nil {
 			writer.Close()
@@ -1331,7 +1385,19 @@ func mergeParquetFilesInto(
 
 type resolvedEqDeleteGroup struct {
 	colIndices []int
-	keys       map[string]struct{}
+	keys       map[string]int64 // key -> highest data sequence number of a delete carrying it
+}
+
+// equalityDeletesFor returns the data sequence number of entry's data file: a
+// row is deleted only by a key whose delete files' sequence number is higher.
+// The groups are already the bin's (eqDeleteGroupsForBin). A data file without
+// one, when deletes may apply to it, is an error rather than a guess.
+func equalityDeletesFor(groups []resolvedEqDeleteGroup, entry iceberg.ManifestEntry) ([]resolvedEqDeleteGroup, int64, error) {
+	dataSeq := entry.SequenceNum()
+	if len(groups) > 0 && dataSeq < 0 {
+		return nil, 0, fmt.Errorf("data file %s has no data sequence number to order its equality deletes against", entry.DataFile().FilePath())
+	}
+	return groups, dataSeq, nil
 }
 
 func resolveEqualityDeleteGroupsForSchema(
@@ -1360,6 +1426,7 @@ func visitFilteredParquetRows(
 	source, bucketName, dataPath string,
 	positionDeletes map[string][]int64,
 	resolvedEqGroups []resolvedEqDeleteGroup,
+	dataSeq int64, // the file's data sequence number: only later deletes apply to it
 	onRows func(rows []parquet.Row, positions []int64) error,
 ) (int64, error) {
 	defer reader.Close()
@@ -1402,7 +1469,7 @@ func visitFilteredParquetRows(
 				deleted := false
 				for _, g := range resolvedEqGroups {
 					key := buildEqualityKey(rows[i], g.colIndices)
-					if _, ok := g.keys[key]; ok {
+					if deleteSeq, ok := g.keys[key]; ok && deleteSeq > dataSeq {
 						deleted = true
 						break
 					}
@@ -1455,7 +1522,10 @@ func mergeParquetFilesSorted(
 	if err != nil {
 		return nil, 0, fmt.Errorf("read parquet file %s: %w", entries[0].DataFile().FilePath(), err)
 	}
-	firstReader := parquet.NewReader(bytes.NewReader(firstData))
+	firstReader, err := newParquetReader(firstData, entries[0].DataFile().FilePath())
+	if err != nil {
+		return nil, 0, err
+	}
 	parquetSchema := firstReader.Schema()
 	if parquetSchema == nil {
 		firstReader.Close()
@@ -1517,7 +1587,8 @@ func mergeParquetFilesSorted(
 		}
 	}()
 
-	writeRows := func(reader *parquet.Reader, entry iceberg.ManifestEntry) (int64, error) {
+	writeRows := func(reader *parquet.Reader, entry iceberg.ManifestEntry) (_ int64, err error) {
+		defer recoverRead(&err, entry.DataFile().FilePath())
 		return copyFileRows(ctx, reader, entry, layout, bucketName, dataPath, positionDeletes, resolvedEqGroups, eqDeleteGroups, icebergSchema, func(filtered []parquet.Row) error {
 			// The writer's row buffer copies the values it is handed, so these
 			// rows need no cloning out of the reader's own buffer first.
@@ -1543,7 +1614,10 @@ func mergeParquetFilesSorted(
 			return nil, 0, fmt.Errorf("read parquet file %s: %w", entry.DataFile().FilePath(), err)
 		}
 
-		reader := parquet.NewReader(bytes.NewReader(data))
+		reader, err := newParquetReader(data, entry.DataFile().FilePath())
+		if err != nil {
+			return nil, 0, err
+		}
 		if layout == nil && !schemasEqual(parquetSchema, reader.Schema()) {
 			reader.Close()
 			return nil, 0, fmt.Errorf("schema mismatch in %s: cannot merge files with different schemas", entry.DataFile().FilePath())

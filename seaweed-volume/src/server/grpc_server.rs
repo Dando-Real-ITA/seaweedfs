@@ -16,6 +16,7 @@ use crate::pb::filer_pb;
 use crate::pb::master_pb;
 use crate::pb::volume_server_pb;
 use crate::pb::volume_server_pb::volume_server_server::VolumeServer;
+use crate::storage::erasure_coding::ec_bitrot;
 use crate::storage::erasure_coding::ec_shard::{ShardId, shard_id_try_from};
 use crate::storage::erasure_coding::ecj_merge::EcjIdDecoder;
 use crate::storage::needle::needle::{self, Needle};
@@ -55,10 +56,64 @@ fn needle_not_found(needle_id: NeedleId) -> Status {
     Status::not_found(format!("needle not found {}", needle_id.0))
 }
 
+/// The disks holding `shard_id` of `vid`.
+fn ec_shard_disks(
+    store: &crate::storage::store::Store,
+    vid: VolumeId,
+    shard_id: ShardId,
+) -> Vec<usize> {
+    store
+        .locations
+        .iter()
+        .enumerate()
+        .filter(|(_, loc)| {
+            loc.find_ec_volume(vid)
+                .is_some_and(|ecv| ecv.has_shard(shard_id))
+        })
+        .map(|(disk, _)| disk)
+        .collect()
+}
+
 /// Mirrors Go's `isNotLeaderErr`: the master returns raft's NotLeaderError,
 /// which arrives as an Unknown-status message.
 fn is_not_leader_status(e: &Status) -> bool {
     e.message().contains("Not current leader")
+}
+
+/// A gRPC error that still carries the ids of shards the rebuild wrote before
+/// failing. The Go shell pulls VolumeEcShardsRebuildResponse out of the status
+/// details so its deferred cleanup keeps the copies the rebuild regenerated
+/// in place instead of deleting them as orphans — a plain error drops the
+/// response holding them. `details` is the serialized google.rpc.Status that
+/// the grpc-status-details-bin trailer carries.
+fn status_internal_with_rebuild_ids(message: String, rebuilt_shard_ids: &[u32]) -> Status {
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct RpcStatus {
+        #[prost(int32, tag = "1")]
+        code: i32,
+        #[prost(string, tag = "2")]
+        message: String,
+        #[prost(message, repeated, tag = "3")]
+        details: Vec<prost_types::Any>,
+    }
+    use prost::Message;
+    let resp = volume_server_pb::VolumeEcShardsRebuildResponse {
+        rebuilt_shard_ids: rebuilt_shard_ids.to_vec(),
+    };
+    let status = RpcStatus {
+        code: tonic::Code::Internal as i32,
+        message: message.clone(),
+        details: vec![prost_types::Any {
+            type_url: "type.googleapis.com/volume_server_pb.VolumeEcShardsRebuildResponse"
+                .to_string(),
+            value: resp.encode_to_vec(),
+        }],
+    };
+    Status::with_details(
+        tonic::Code::Internal,
+        message,
+        status.encode_to_vec().into(),
+    )
 }
 
 /// Deadline from the caller's `grpc-timeout` header (TimeoutValue +
@@ -955,6 +1010,58 @@ impl Drop for EcDecodeTailGuard<'_> {
     }
 }
 
+/// Keeps `vid` in `volume_copies_in_flight` for the life of one VolumeCopy,
+/// including the spawned transfer the handler hands off. A second copy of
+/// the same volume can pass the existing-volume snapshot before this one
+/// mounts and then clear or overwrite files this copy still owns, so it
+/// fails fast instead. Dropping — including on panic — releases the claim.
+struct VolumeCopyClaim {
+    state: Arc<VolumeServerState>,
+    vid: VolumeId,
+}
+
+impl VolumeCopyClaim {
+    fn try_new(state: &Arc<VolumeServerState>, vid: VolumeId) -> Result<Self, Status> {
+        if state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(vid)
+        {
+            Ok(Self {
+                state: state.clone(),
+                vid,
+            })
+        } else {
+            Err(Status::unavailable(format!(
+                "volume {} copy already in progress",
+                vid
+            )))
+        }
+    }
+}
+
+impl Drop for VolumeCopyClaim {
+    fn drop(&mut self) {
+        self.state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.vid);
+    }
+}
+
+/// Claims `vid` for a handler that registers or remounts a volume, refusing
+/// while a copy holds the destination files (Go's "volume %d is being
+/// copied" on AllocateVolume and adoptStagedVolume).
+fn claim_volume_against_copy(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+) -> Result<VolumeCopyClaim, Status> {
+    VolumeCopyClaim::try_new(state, vid)
+        .map_err(|_| Status::unavailable(format!("volume {} is being copied", vid)))
+}
+
 /// Whether `vid`'s .ecj appends must wait for the decode publishing tail.
 /// Only meaningful read under the store write lock: a decode can claim the
 /// tail while a caller waits for the decoder's read lock, so membership
@@ -1478,6 +1585,10 @@ impl VolumeServer for VolumeGrpcService {
             crate::storage::types::Version::current()
         };
 
+        // Same window as volume_mount: add_volume registers the volume, and a
+        // copy in flight clears or rewrites the files it would open.
+        let _copy_claim = claim_volume_against_copy(&self.state, vid)?;
+
         let mut store = self.state.store.write().unwrap();
         store
             .add_volume(
@@ -1547,19 +1658,66 @@ impl VolumeServer for VolumeGrpcService {
             return Err(Status::unavailable(e.to_string()));
         }
 
-        let dat_size = v.dat_file_size().unwrap_or(0);
         let super_block_size = v.super_block().block_size() as u64;
 
-        // If since_ns is very large (after all data), return empty
-        if req.since_ns == u64::MAX || dat_size <= super_block_size {
+        // Capture the revision and the .dat/.idx bounds before the resume
+        // reads, so the resume scans only rows the streams can actually carry:
+        // a row inside the index bound always has its record inside the data
+        // bound (a row publishes only after its bytes).
+        let revision = v.super_block().compaction_revision;
+        let (dat_size, idx_size) = v
+            .file_stat()
+            .map_err(|e| Status::internal(format!("stat volume {}: {}", vid, e)))?;
+
+        // If since_ns is very large (after all data), return empty. A
+        // positional resume must still reach resume_by_last_entry so an empty
+        // replica reports divergence instead of a clean empty stream.
+        if req.entry_count == 0 && (req.since_ns == u64::MAX || dat_size <= super_block_size) {
             drop(store);
             let stream = tokio_stream::iter(Vec::new());
             return Ok(Response::new(Box::pin(stream)));
         }
 
-        // Use binary search to find the starting offset
-        let start_offset = if req.since_ns == 0 {
-            super_block_size
+        // Resume by index position when the backup identified its last entry;
+        // append_at_ns stamps differ across replicas, so a since_ns resume can
+        // duplicate or skip needles after the source replica changes.
+        let start_offset: Option<u64> = if req.entry_count > 0 {
+            match v.resume_by_last_entry(
+                req.entry_count,
+                NeedleId(req.last_needle_key),
+                Cookie(req.last_needle_cookie),
+                Size(req.last_needle_size),
+                req.entries_hash,
+                idx_size,
+            ) {
+                Ok((_offset, true)) => {
+                    drop(store);
+                    let stream = tokio_stream::iter(Vec::new());
+                    return Ok(Response::new(Box::pin(stream)));
+                }
+                Ok((offset, false)) => {
+                    // index-only rows like remote-tier tombstones have no .dat
+                    // record; they ride the index stream instead
+                    if offset.is_zero() {
+                        None
+                    } else {
+                        Some(offset.to_actual_offset() as u64)
+                    }
+                }
+                Err(crate::storage::volume::VolumeError::IncrementalCopyDiverged) => {
+                    return Err(Status::failed_precondition(
+                        crate::storage::volume::VolumeError::IncrementalCopyDiverged.to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "fail to locate by entry {}: {}",
+                        req.entry_count, e
+                    )));
+                }
+            }
+        } else if req.since_ns == 0 {
+            Some(super_block_size)
         } else {
             match v.binary_search_by_append_at_ns(req.since_ns) {
                 Ok((_offset, true)) => {
@@ -1570,11 +1728,11 @@ impl VolumeServer for VolumeGrpcService {
                 }
                 Ok((offset, false)) => {
                     let actual = offset.to_actual_offset();
-                    if actual <= 0 {
+                    Some(if actual <= 0 {
                         super_block_size
                     } else {
                         actual as u64
-                    }
+                    })
                 }
                 Err(e) => {
                     return Err(Status::internal(format!(
@@ -1584,9 +1742,37 @@ impl VolumeServer for VolumeGrpcService {
                 }
             }
         };
+        let idx_start = req.entry_count * NEEDLE_MAP_ENTRY_SIZE as u64;
+        let idx_end = if req.entry_count > 0 || req.since_ns == 0 {
+            idx_size
+        } else {
+            idx_start
+        };
+        // Bound the .dat tail by the records the streamed rows cover: a
+        // record staged but not yet indexed would reach the backup without
+        // its row and be appended again on the next run.
+        let dat_size = if req.entry_count > 0 || req.since_ns == 0 {
+            let covered = match v.dat_size_covered_by_index(idx_size) {
+                Ok(covered) => covered,
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "fail to bound data by covered index: {}",
+                        e
+                    )));
+                }
+            };
+            if covered > 0 && covered < dat_size {
+                covered
+            } else {
+                dat_size
+            }
+        } else {
+            dat_size
+        };
         // A corrupt index could place the located offset past the captured
         // `.dat` size; nothing to send, and it would underflow `total` below.
-        if start_offset >= dat_size {
+        let has_data = start_offset.is_some_and(|s| s < dat_size);
+        if !has_data && idx_end <= idx_start {
             drop(store);
             let stream = tokio_stream::iter(Vec::new());
             return Ok(Response::new(Box::pin(stream)));
@@ -1603,26 +1789,46 @@ impl VolumeServer for VolumeGrpcService {
             Local(std::fs::File),
             Remote(crate::storage::volume::RemoteDatFile),
         }
-        let reader = if v.has_remote_file() {
-            match v.remote_dat_file() {
-                Some(r) => DatReader::Remote(r),
-                None => {
-                    return Err(Status::not_found(format!(
-                        "remote dat not loaded for volume id {}",
-                        vid
-                    )));
+        let reader = if has_data {
+            if v.has_remote_file() {
+                match v.remote_dat_file() {
+                    Some(r) => Some(DatReader::Remote(r)),
+                    None => {
+                        return Err(Status::not_found(format!(
+                            "remote dat not loaded for volume id {}",
+                            vid
+                        )));
+                    }
                 }
+            } else {
+                let path = v.file_name(".dat");
+                let file = std::fs::File::open(&path)
+                    .map_err(|e| Status::internal(format!("open {}: {}", path, e)))?;
+                Some(DatReader::Local(file))
             }
         } else {
-            let path = v.file_name(".dat");
+            None
+        };
+        let idx_file = if idx_end > idx_start {
+            let path = v.file_name(".idx");
             let file = std::fs::File::open(&path)
                 .map_err(|e| Status::internal(format!("open {}: {}", path, e)))?;
-            DatReader::Local(file)
+            Some(file)
+        } else {
+            None
         };
+        // A compaction swap between the bound capture and these opens would
+        // mix a new file with bounds from the old revision; the backup must
+        // rebuild instead of copying a mismatched pair.
+        if v.super_block().compaction_revision != revision {
+            return Err(Status::failed_precondition(
+                crate::storage::volume::VolumeError::IncrementalCopyDiverged.to_string(),
+            ));
+        }
         let state = self.state.clone();
         drop(store);
 
-        let total = dat_size - start_offset;
+        let total = start_offset.map_or(0, |s| dat_size.saturating_sub(s));
         let (tx, rx) = tokio::sync::mpsc::channel::<
             Result<volume_server_pb::VolumeIncrementalCopyResponse, Status>,
         >(8);
@@ -1643,10 +1849,10 @@ impl VolumeServer for VolumeGrpcService {
             }
             let buffer_size = 2 * 1024 * 1024u64; // 2MB chunks
             let mut bytes_to_read = total;
-            let mut offset = start_offset;
+            let mut offset = start_offset.unwrap_or(0);
 
             match reader {
-                DatReader::Local(file) => {
+                Some(DatReader::Local(file)) => {
                     // Local volume: stream directly from the .dat, no lock held.
                     use std::io::{Read, Seek, SeekFrom};
                     let mut reader = std::io::BufReader::new(file);
@@ -1664,6 +1870,7 @@ impl VolumeServer for VolumeGrpcService {
                                 buf.truncate(n);
                                 let msg = volume_server_pb::VolumeIncrementalCopyResponse {
                                     file_content: buf,
+                                    ..Default::default()
                                 };
                                 if tx.blocking_send(Ok(msg)).is_err() {
                                     return; // receiver dropped
@@ -1677,7 +1884,7 @@ impl VolumeServer for VolumeGrpcService {
                         }
                     }
                 }
-                DatReader::Remote(remote) => {
+                Some(DatReader::Remote(remote)) => {
                     // Remote/tiered volume: read through the cloned backend
                     // handle. No store lock is held while the (potentially slow)
                     // S3 fetch runs, so it never blocks store writers.
@@ -1690,6 +1897,7 @@ impl VolumeServer for VolumeGrpcService {
                                 let read_len = buf.len() as u64;
                                 let msg = volume_server_pb::VolumeIncrementalCopyResponse {
                                     file_content: buf,
+                                    ..Default::default()
                                 };
                                 if tx.blocking_send(Ok(msg)).is_err() {
                                     return; // receiver dropped
@@ -1701,6 +1909,50 @@ impl VolumeServer for VolumeGrpcService {
                                 let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
                                 return;
                             }
+                        }
+                    }
+                }
+                None => {}
+            }
+
+            // the .idx tail after the .dat: index-only rows like remote-tier
+            // tombstones have no .dat record and reach the copy only here
+            if let Some(file) = idx_file {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut reader = std::io::BufReader::new(file);
+                if let Err(e) = reader.seek(SeekFrom::Start(idx_start)) {
+                    let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                    return;
+                }
+                let mut bytes_to_read = idx_end - idx_start;
+                while bytes_to_read > 0 {
+                    bail_if_unavailable!();
+                    let chunk = std::cmp::min(bytes_to_read, buffer_size) as usize;
+                    let mut buf = vec![0u8; chunk];
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            // a shortened .idx cannot deliver the captured
+                            // tail; the copy must restart rather than install
+                            // a partial index
+                            let _ = tx.blocking_send(Err(Status::internal(
+                                "index file ended before the captured tail",
+                            )));
+                            return;
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            let msg = volume_server_pb::VolumeIncrementalCopyResponse {
+                                idx_content: buf,
+                                ..Default::default()
+                            };
+                            if tx.blocking_send(Ok(msg)).is_err() {
+                                return; // receiver dropped
+                            }
+                            bytes_to_read -= n as u64;
+                        }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(Status::internal(e.to_string())));
+                            return;
                         }
                     }
                 }
@@ -1740,6 +1992,22 @@ impl VolumeServer for VolumeGrpcService {
         let _claim = EcDecodeClaim(&self.state, vid);
 
         let mut store = self.state.store.write().unwrap();
+        // The copy claims the vid, snapshots the store, then waits on the
+        // source. A mount in that window loads files the copy is about to
+        // delete. The check has to sit under this write lock: one taken
+        // earlier still loses to the claim and the snapshot.
+        if self
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&vid)
+        {
+            return Err(Status::unavailable(format!(
+                "volume {} is being copied",
+                req.volume_id
+            )));
+        }
         store
             .mount_volume_by_id(vid, req.collection.as_deref())
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -1905,6 +2173,24 @@ impl VolumeServer for VolumeGrpcService {
 
         let mut store = self.state.store.write().unwrap();
 
+        // Same window as volume_mount: the copy has snapshotted "no volume"
+        // and is waiting on the source. Configure unmounts and remounts, so
+        // it can load the replica whose files the copy is about to delete.
+        // The check sits under this write lock so it cannot lose to the
+        // claim and the snapshot.
+        if self
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&vid)
+        {
+            return Err(Status::unavailable(format!(
+                "volume {} is being copied",
+                req.volume_id
+            )));
+        }
+
         // Unmount the volume (Go propagates unmount errors via resp.Error;
         // not-found falls through to configure_volume)
         if let Err(e) = store.unmount_volume(vid) {
@@ -2056,6 +2342,11 @@ impl VolumeServer for VolumeGrpcService {
                 })?;
         }
 
+        // One copy of a volume at a time: the claim outlives the handler,
+        // so a racing second copy cannot reach remove_partial_files or the
+        // mount while this copy still owns the destination files.
+        let copy_claim = VolumeCopyClaim::try_new(&self.state, vid)?;
+
         // A pre-existing local replica is NOT deleted up front; see
         // delete_existing_replica for why and when.
         let had_existing_volume = {
@@ -2070,9 +2361,38 @@ impl VolumeServer for VolumeGrpcService {
             fetch_source_status_before(&mut client, req.volume_id, vid).await;
         let source = SourceVolumeStatus::fetch(&mut client, req.volume_id).await?;
         let preallocate_size = self.copy_preallocate_size(&source).await;
-        let dest =
+        let mut dest =
             self.plan_copy_destination(&req, vid, &source, had_existing_volume, preallocate_size)?;
+        // Files of a replica the store never mounted get no delete to
+        // displace them, and a crashed copy's leftovers have no owner —
+        // move both aside first so a failed copy can restore the state it
+        // found, the same preserve-before-clear the Go swap does.
+        if let Err(e) = dest.displace_existing_files() {
+            dest.restore_displaced_files();
+            dest.release_reservation(&self.state.store.read().unwrap());
+            return Err(Status::internal(format!(
+                "preserve existing files before copying volume {}: {}",
+                vid, e
+            )));
+        }
+        // A crashed copy, or one whose cleanup failed, can leave a stale
+        // index next to the .idx that this mount would trust. Clear leftovers
+        // before writing anything; a removal failure must abort rather than
+        // risk a mount reusing a poisoned .rdb.
+        if let Err(e) = dest.remove_partial_files() {
+            dest.restore_displaced_files();
+            dest.release_reservation(&self.state.store.read().unwrap());
+            return Err(Status::internal(format!(
+                "clear leftover files before copying volume {}: {}",
+                vid, e
+            )));
+        }
         if let Err(e) = dest.write_note(vid, &req.source_data_node) {
+            // A partially written marker must not outlive the restore: the
+            // load scan would take the restored replica for an unfinished
+            // copy and delete it.
+            let _ = std::fs::remove_file(dest.note_path());
+            dest.restore_displaced_files();
             dest.release_reservation(&self.state.store.read().unwrap());
             return Err(e);
         }
@@ -2088,18 +2408,22 @@ impl VolumeServer for VolumeGrpcService {
             dest,
             preallocate_size,
             tx,
+            _copy_claim: copy_claim,
         };
 
         tokio::spawn(async move {
+            let mut job = job;
             // Tracks whether mount_volume succeeded so the error branch can
             // unmount (not just unlink) an orphaned replica. A mount that
             // races a departing caller is the one case where the existing
             // file-only cleanup leaves the volume loaded in memory.
             let mut mounted = false;
             match job.run(&mut client, &mut mounted).await {
-                Ok(()) => job
-                    .dest
-                    .commit_reservation(&job.state.store.read().unwrap()),
+                Ok(()) => {
+                    job.dest.drop_displaced_files();
+                    job.dest
+                        .commit_reservation(&job.state.store.read().unwrap());
+                }
                 Err(e) => job.cleanup_failed_copy(e, mounted).await,
             }
         });
@@ -3197,63 +3521,215 @@ impl VolumeServer for VolumeGrpcService {
             })?;
         let total_shards = data_shards + parity_shards;
 
-        // Check which shards are missing (check rebuild dir and all other dirs)
-        let mut missing: Vec<u32> = Vec::new();
-        for shard_id in 0..total_shards as u8 {
-            let shard = crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
-                &rebuild_dir,
-                collection,
-                vid,
-                shard_id,
-            );
-            let mut found = std::path::Path::new(&shard.file_name()).exists();
-            if !found {
-                for other_dir in &other_dirs {
-                    let other_shard = crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
-                        other_dir, collection, vid, shard_id,
-                    );
-                    if std::path::Path::new(&other_shard.file_name()).exists() {
-                        found = true;
-                        break;
+        // Discover shard files like Go's findShardFile: the rebuild's own data
+        // and index directories first, then every sibling directory. Track
+        // each present shard's path — a shard the sidecar reclassifies as
+        // corrupt is replaced at ITS discovered path, not at the rebuild dir.
+        let shard_file_path = |dir: &str, shard_id: ShardId| -> String {
+            crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
+                dir, collection, vid, shard_id,
+            )
+            .file_name()
+        };
+        let mut shard_dirs: Vec<String> = vec![rebuild_dir.clone()];
+        if !rebuild_idx_dir.is_empty() && rebuild_idx_dir != rebuild_dir {
+            shard_dirs.push(rebuild_idx_dir.clone());
+        }
+        shard_dirs.extend(other_dirs.iter().cloned());
+
+        let mut found: Vec<Option<String>> = vec![None; total_shards as usize];
+        for shard_id in 0..total_shards as ShardId {
+            found[shard_id as usize] = shard_dirs
+                .iter()
+                .map(|d| shard_file_path(d, shard_id))
+                .find(|p| std::path::Path::new(p).exists());
+        }
+
+        // Load the generation-0 checksum sidecar the way Go's
+        // loadRebuildSidecar does: absent, wrong-generation, or recording no
+        // geometry => Off; a self-integrity, geometry, or manifest failure =>
+        // Invalid; otherwise On.
+        let data_base = crate::storage::volume::volume_file_name(&rebuild_dir, collection, vid);
+        let idx_base = crate::storage::volume::volume_file_name(&rebuild_idx_dir, collection, vid);
+        let sidecar_dir_refs: Vec<&str> = other_dirs.iter().map(|s| s.as_str()).collect();
+        let sidecar_path =
+            ec_bitrot::find_bitrot_sidecar(0, &data_base, &idx_base, &sidecar_dir_refs);
+        let (prot, bitrot_status) = if sidecar_path.is_empty() {
+            (None, ec_bitrot::BitrotStatus::Off)
+        } else {
+            match ec_bitrot::load_bitrot_sidecar(&sidecar_path) {
+                Err(e) => {
+                    tracing::warn!(path = %sidecar_path, error = %e, "bitrot: sidecar self-integrity failed");
+                    (None, ec_bitrot::BitrotStatus::Invalid)
+                }
+                Ok(prot) => {
+                    if prot.generation != 0 || prot.ec_shard_config.is_none() {
+                        (None, ec_bitrot::BitrotStatus::Off)
+                    } else if !ec_bitrot::geometry_matches(
+                        &prot,
+                        data_shards as usize,
+                        parity_shards as usize,
+                        block_size,
+                    ) {
+                        tracing::warn!(path = %sidecar_path, "bitrot: sidecar records a different layout than the rebuild uses");
+                        (None, ec_bitrot::BitrotStatus::Invalid)
+                    } else if let Err(e) = ec_bitrot::validate_manifest(
+                        &prot,
+                        data_shards as usize,
+                        parity_shards as usize,
+                    ) {
+                        tracing::warn!(path = %sidecar_path, error = %e, "bitrot: sidecar manifest invalid");
+                        (None, ec_bitrot::BitrotStatus::Invalid)
+                    } else {
+                        (Some(prot), ec_bitrot::BitrotStatus::On)
                     }
                 }
             }
-            if !found {
-                missing.push(shard_id as u32);
+        };
+        let unsafe_ignore_sidecar = req.unsafe_ignore_sidecar;
+
+        // Present/missing/corrupt classification — mirrors pass 1 of Go's
+        // generateMissingEcFiles plus its bitrot verify-and-exclude.
+        let mut missing: Vec<u32> = Vec::new();
+        let mut corrupt_owned: Vec<(u32, String)> = Vec::new();
+        let mut present = vec![false; total_shards as usize];
+        let mut present_count = 0usize;
+        for shard_id in 0..total_shards as usize {
+            match &found[shard_id] {
+                None => missing.push(shard_id as u32),
+                Some(p) => {
+                    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                    if size == 0 {
+                        // Zero-sized residue is a failed operation's leftover,
+                        // not a shard: exclude it from inputs and regenerate
+                        // over it in place, like a reclassified-corrupt shard.
+                        tracing::warn!(shard = shard_id, path = %p, "zero-sized shard; excluding from rebuild inputs and regenerating");
+                        corrupt_owned.push((shard_id as u32, p.clone()));
+                    } else {
+                        present[shard_id] = true;
+                        present_count += 1;
+                    }
+                }
             }
         }
 
-        if missing.is_empty() {
-            return Ok(Response::new(
-                volume_server_pb::VolumeEcShardsRebuildResponse {
-                    rebuilt_shard_ids: vec![],
-                },
-            ));
+        match bitrot_status {
+            ec_bitrot::BitrotStatus::Invalid => {
+                if !unsafe_ignore_sidecar {
+                    return Err(Status::internal(format!(
+                        "bitrot sidecar for {} is malformed/unverifiable; refusing to rebuild (pass unsafe_ignore_sidecar to override)",
+                        base_name
+                    )));
+                }
+                tracing::warn!(base = %base_name, "bitrot sidecar is malformed/unverifiable; proceeding because unsafe_ignore_sidecar is set");
+            }
+            ec_bitrot::BitrotStatus::On if !unsafe_ignore_sidecar => {
+                let prot = prot.as_ref().unwrap();
+                let mut corrupt: Vec<u32> = Vec::new();
+                for shard_id in 0..total_shards as usize {
+                    if !present[shard_id] {
+                        continue;
+                    }
+                    let Some(entry) = ec_bitrot::shard_checksums(prot, shard_id as u32) else {
+                        continue;
+                    };
+                    let p = found[shard_id].as_ref().unwrap();
+                    match ec_bitrot::verify_shard_file_blocks(p, entry, prot.block_size as i64) {
+                        Err(e) => {
+                            // A read error means we cannot trust this shard as
+                            // a Reed-Solomon input: exclude it rather than
+                            // silently feeding possibly-corrupt bytes into
+                            // reconstruction.
+                            tracing::warn!(shard = shard_id, error = %e, "bitrot: failed to verify present shard; excluding it");
+                            corrupt.push(shard_id as u32);
+                        }
+                        Ok(mismatched) if !mismatched.is_empty() => {
+                            corrupt.push(shard_id as u32);
+                        }
+                        _ => {}
+                    }
+                }
+                if !corrupt.is_empty() {
+                    // Wholesale-mismatch guard (RS-arbiter conservative form):
+                    // localized bitrot touches a few shards; a stale/wrong
+                    // sidecar mismatches more than parity_shards.
+                    if corrupt.len() > parity_shards as usize {
+                        return Err(Status::internal(format!(
+                            "bitrot sidecar suspect for {}: {}/{} present shards mismatch (> parity {}); refusing to rebuild (pass unsafe_ignore_sidecar to override)",
+                            base_name,
+                            corrupt.len(),
+                            present_count,
+                            parity_shards
+                        )));
+                    }
+                    if present_count - corrupt.len() < data_shards as usize {
+                        return Err(Status::internal(format!(
+                            "bitrot: only {} verified-good shards for {}, need {} data shards; sidecar may be stale (pass unsafe_ignore_sidecar to override)",
+                            present_count - corrupt.len(),
+                            base_name,
+                            data_shards
+                        )));
+                    }
+                    for shard_id in corrupt {
+                        tracing::warn!(
+                            shard = shard_id,
+                            "bitrot: present shard fails checksum; excluding from rebuild inputs and regenerating"
+                        );
+                        let p = found[shard_id as usize].take().unwrap();
+                        present[shard_id as usize] = false;
+                        present_count -= 1;
+                        corrupt_owned.push((shard_id, p));
+                    }
+                }
+            }
+            _ => {}
         }
 
-        // Rebuild missing shards, searching all locations for input shards.
-        // Pass other_dirs so shards on sibling disks are found even when the
-        // primary rebuild dir doesn't hold them. This one takes a single flat
-        // list — the shape Go's RebuildEcFiles uses — so unlike the resolvers
-        // above it cannot be handed the rebuild's own index directory
-        // separately, and a split -dir/-dir.idx location keeps its .ecx and
-        // .vif there. Go's additionalDirs carries that directory for the same
-        // reason.
+        // Everything the rebuild (re)writes: genuinely missing plus
+        // reclassified-corrupt. The response — and any failure after this
+        // point — must report the whole set, since the caller keeps copies
+        // the rebuild regenerated in place.
+        let mut rebuilt: Vec<u32> = missing.clone();
+        rebuilt.extend(corrupt_owned.iter().map(|(id, _)| *id));
+        rebuilt.sort_unstable();
+
+        if !rebuilt.is_empty() && present_count < data_shards as usize {
+            return Err(Status::internal(format!(
+                "not enough shards to rebuild {}: found {} shards, need at least {} (data shards), missing shards: {:?}",
+                base_name, present_count, data_shards, rebuilt
+            )));
+        }
+
+        // Rebuild missing and corrupt shards, searching all locations for
+        // input shards. This takes a single flat list — the shape Go's
+        // RebuildEcFiles uses — so unlike the resolvers above it cannot be
+        // handed the rebuild's own index directory separately, and a split
+        // -dir/-dir.idx location keeps its .ecx and .vif there. Go's
+        // additionalDirs carries that directory for the same reason. Nothing
+        // missing skips only the regeneration: a retry after a failed earlier
+        // attempt still owes the .ecx rebuild and the mounted-handle repoint
+        // below.
         let mut rebuild_search_dirs: Vec<String> = other_dirs.clone();
         if !rebuild_idx_dir.is_empty() && rebuild_idx_dir != rebuild_dir {
             rebuild_search_dirs.push(rebuild_idx_dir.clone());
         }
         let other_dir_refs: Vec<&str> = rebuild_search_dirs.iter().map(|s| s.as_str()).collect();
-        crate::storage::erasure_coding::ec_encoder::rebuild_ec_files(
-            &rebuild_dir,
-            collection,
-            vid,
-            &missing,
-            data_shards as usize,
-            parity_shards as usize,
-            &other_dir_refs,
-        )
-        .map_err(|e| Status::internal(format!("RebuildEcFiles: {}", e)))?;
+        if !rebuilt.is_empty() {
+            crate::storage::erasure_coding::ec_encoder::rebuild_ec_files(
+                &rebuild_dir,
+                collection,
+                vid,
+                &missing,
+                &corrupt_owned,
+                data_shards as usize,
+                parity_shards as usize,
+                &other_dir_refs,
+                prot.as_ref().filter(|_| {
+                    bitrot_status == ec_bitrot::BitrotStatus::On && !unsafe_ignore_sidecar
+                }),
+            )
+            .map_err(|e| Status::internal(format!("RebuildEcFiles: {}", e)))?;
+        }
 
         // Rebuild .ecx; use idx_directory with fallback to data directory
         let ecx_base = format!("{}/{}", rebuild_idx_dir, base_name);
@@ -3276,20 +3752,113 @@ impl VolumeServer for VolumeGrpcService {
         }
         ecx_dir_refs.extend(other_dir_refs.iter().copied());
 
-        crate::storage::erasure_coding::ec_encoder::rebuild_ecx_file(
-            &ecx_rebuild_dir,
-            collection,
-            vid,
-            data_shards as usize,
-            block_size,
-            dat_file_size,
-            &ecx_dir_refs,
-        )
-        .map_err(|e| Status::internal(format!("RebuildEcxFile: {}", e)))?;
+        // A mounted volume folds its .ecj into the live .ecx in place —
+        // the same path Go takes under LockDeletionJournal — so readers
+        // searching the open index never watch it get truncated. Only an
+        // unmounted index takes the full regen; nothing holds it open to
+        // interrupt. Either failure still owes the caller the regenerated
+        // ids — the shards are already written and its deferred cleanup
+        // would delete the copies as strays without them.
+        let mut folded = false;
+        {
+            let mut store = self.state.store.write().unwrap_or_else(|e| e.into_inner());
+            let loc_idx = store
+                .locations
+                .iter()
+                .position(|loc| loc.directory == rebuild_dir);
+            if let Some(loc_idx) = loc_idx {
+                if let Some(ev) = store.locations[loc_idx].find_ec_volume_mut(vid) {
+                    let journal_path = ev.ecj_file_name();
+                    ev.rebuild_ecx_from_journal().map_err(|e| {
+                        status_internal_with_rebuild_ids(
+                            format!("RebuildEcxFile: {}", e),
+                            &rebuilt,
+                        )
+                    })?;
+                    folded = true;
+                    // The fold replaced a journal other disks may share:
+                    // repoint their handles before dropping the store lock,
+                    // or their next delete lands on the detached inode.
+                    for (i, loc) in store.locations.iter_mut().enumerate() {
+                        if i == loc_idx {
+                            continue;
+                        }
+                        if let Some(other) = loc.find_ec_volume_mut(vid) {
+                            if std::path::Path::new(&other.ecj_file_name())
+                                == std::path::Path::new(&journal_path)
+                            {
+                                other.adopt_folded_journal().map_err(|e| {
+                                    status_internal_with_rebuild_ids(
+                                        format!("RebuildEcxFile: {}", e),
+                                        &rebuilt,
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !folded {
+            crate::storage::erasure_coding::ec_encoder::rebuild_ecx_file(
+                &ecx_rebuild_dir,
+                collection,
+                vid,
+                data_shards as usize,
+                block_size,
+                dat_file_size,
+                &ecx_dir_refs,
+            )
+            .map_err(|e| {
+                status_internal_with_rebuild_ids(format!("RebuildEcxFile: {}", e), &rebuilt)
+            })?;
+        }
+
+        // Repoint every mounted handle of this volume at the file now on
+        // disk, not just this run's outputs — mirrors Go's repoint loop in
+        // VolumeEcShardsRebuild: a shard an earlier rebuild wrote on another
+        // disk is "present" this run and never re-enters `missing`, yet its
+        // mounted handle still serves the detached inode.
+        {
+            let mut store = self.state.store.write().unwrap_or_else(|e| e.into_inner());
+            for loc_idx in 0..store.locations.len() {
+                let mounted: Vec<ShardId> = match store.locations[loc_idx].find_ec_volume(vid) {
+                    Some(ev) => ev
+                        .shards
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| s.as_ref().map(|_| i as ShardId))
+                        .collect(),
+                    None => continue,
+                };
+                for shard_id in mounted {
+                    if store.locations[loc_idx]
+                        .reopen_ec_shard(vid, shard_id)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    // The mounted disk lost the file and the rebuild wrote it
+                    // elsewhere — or it is unreadable in place. Drop the stale
+                    // handle and remount from whichever local disk holds the
+                    // rebuilt file; a shard that cannot be remounted stays
+                    // unmounted rather than serving replaced bytes.
+                    store.locations[loc_idx].unmount_ec_shards(vid, &[shard_id]);
+                    if let Err(e) = store.mount_ec_shard(vid, collection, shard_id, "") {
+                        tracing::warn!(
+                            "rebuilt ec shard {}.{} left unmounted: {}",
+                            vid.0,
+                            shard_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(Response::new(
             volume_server_pb::VolumeEcShardsRebuildResponse {
-                rebuilt_shard_ids: missing,
+                rebuilt_shard_ids: rebuilt,
             },
         ))
     }
@@ -3563,10 +4132,7 @@ impl VolumeServer for VolumeGrpcService {
                     crate::storage::volume::volume_file_name(&dest_dir, &req.collection, vid);
                 format!("{}.vif", base)
             };
-            let file = tokio::fs::File::create(&file_path)
-                .await
-                .map_err(|e| Status::internal(format!("create {}: {}", file_path, e)))?;
-            drain_copy_stream_to_file(&mut stream, file, &file_path, ".vif").await?;
+            drain_optional_copy_to_file(&mut stream, &file_path, ".vif").await?;
         }
 
         // Copy the generation-0 bitrot checksum sidecar (.ecsum) when requested, so
@@ -3600,17 +4166,7 @@ impl VolumeServer for VolumeGrpcService {
                     crate::storage::volume::volume_file_name(&dest_dir, &req.collection, vid);
                 format!("{}.ecsum", base)
             };
-            let file = tokio::fs::File::create(&file_path)
-                .await
-                .map_err(|e| Status::internal(format!("create {}: {}", file_path, e)))?;
-            let written =
-                drain_copy_stream_to_file(&mut stream, file, &file_path, ".ecsum").await?;
-            // A missing source yields an empty stream; drop the 0-byte file so mount
-            // sees no sidecar (protection Off) rather than a truncated/invalid one.
-            // (drain_copy_stream_to_file has already closed the file on return.)
-            if written == 0 {
-                let _ = tokio::fs::remove_file(&file_path).await;
-            }
+            drain_optional_copy_to_file(&mut stream, &file_path, ".ecsum").await?;
         }
 
         Ok(Response::new(
@@ -3788,13 +4344,40 @@ impl VolumeServer for VolumeGrpcService {
 
         // Mount one shard at a time, returning error on first failure.
         // Matches Go: for _, shardId := range req.ShardIds { err = vs.store.MountEcShards(...) }
+        // A failed shard stops the batch, but the shards mounted before it still
+        // get the sidecar reload and the heartbeat notify below.
         let mut store = self.state.store.write().unwrap();
+        let mut mount_err = None;
         for &shard_id in &validated {
-            store
-                .mount_ec_shard(vid, &req.collection, shard_id, &req.source_disk_type)
-                .map_err(|e| {
-                    Status::internal(format!("mount {}.{}: {}", req.volume_id, shard_id, e))
-                })?;
+            let held_before = ec_shard_disks(&store, vid, shard_id);
+            let disk =
+                match store.mount_ec_shard(vid, &req.collection, shard_id, &req.source_disk_type) {
+                    Ok(disk) => disk,
+                    Err(e) => {
+                        mount_err = Some(Status::internal(format!(
+                            "mount {}.{}: {}",
+                            req.volume_id, shard_id, e
+                        )));
+                        break;
+                    }
+                };
+            // Mirrors Go's MountEcShards: a caller moving the shard here keeps
+            // its source copy, and the heartbeat never announces it. A shard
+            // this call mounted is dropped again, so it does not draw later
+            // copies to the same disk.
+            if store.locations[disk]
+                .find_ec_volume(vid)
+                .is_some_and(|ecv| ecv.get_io_error_state().2)
+            {
+                if !held_before.contains(&disk) {
+                    store.locations[disk].unmount_ec_shards(vid, &[shard_id]);
+                }
+                mount_err = Some(Status::internal(format!(
+                    "mount {}.{}: ec volume is quarantined after IO errors, shard not announced",
+                    req.volume_id, shard_id
+                )));
+                break;
+            }
         }
         // A delivery can bring the checksum manifest alongside the shards, but
         // the receive path only writes the file. When this server already had
@@ -3815,10 +4398,13 @@ impl VolumeServer for VolumeGrpcService {
         // however often it reloaded. One delivered copy, reachable from all.
         let ec_metadata_dirs = store.ec_metadata_dirs();
         for ec_vol in store.find_all_ec_volumes_mut(vid) {
-            ec_vol.reload_bitrot_sidecar(&ec_metadata_dirs);
+            let _ = ec_vol.reload_bitrot_sidecar(&ec_metadata_dirs);
         }
         drop(store);
         self.state.volume_state_notify.notify_one();
+        if let Some(status) = mount_err {
+            return Err(status);
+        }
 
         Ok(Response::new(
             volume_server_pb::VolumeEcShardsMountResponse {},
@@ -3891,6 +4477,12 @@ impl VolumeServer for VolumeGrpcService {
         if req.encode_ts_ns != 0 && req.encode_ts_ns != ec_vol.encode_ts_ns {
             return Err(Status::failed_precondition(format!(
                 "ec shard {}.{} belongs to a different encode run",
+                req.volume_id, req.shard_id
+            )));
+        }
+        if ec_vol.get_io_error_state().2 {
+            return Err(Status::unavailable(format!(
+                "ec shard {}.{} is on a disk quarantined after IO errors",
                 req.volume_id, req.shard_id
             )));
         }
@@ -4057,6 +4649,10 @@ impl VolumeServer for VolumeGrpcService {
                 )));
             }
             let _claim = EcDecodeClaim(&self.state, vid);
+            // Same window as volume_mount: the renames and the mount below
+            // register the volume, and an in-flight copy of it rewrites the
+            // destination files. The claim covers the whole adoption.
+            let _copy_claim = claim_volume_against_copy(&self.state, vid)?;
             let want = DiskType::from_string(&req.disk_type);
             let base = {
                 let store = self.state.store.read().unwrap();
@@ -4988,9 +5584,11 @@ impl VolumeServer for VolumeGrpcService {
                 .map_err(|e| Status::invalid_argument(format!("reject remote endpoint: {}", e)))?;
         }
 
-        // Create remote storage client
+        // One client per configuration: a client built per request kept its
+        // connector's idle connections and never reused them. Mirrors the Go
+        // volume server.
         let client =
-            crate::remote_storage::make_remote_storage_client(remote_conf).map_err(|e| {
+            crate::remote_storage::get_remote_storage_client(remote_conf).map_err(|e| {
                 Status::internal(format!(
                     "get remote client: make remote storage client {}: {}",
                     remote_conf.name, e,
@@ -5074,27 +5672,7 @@ impl VolumeServer for VolumeGrpcService {
                 let needle_id = req.needle_id;
                 let size = req.size;
                 handles.push(tokio::spawn(async move {
-                    let form = reqwest::multipart::Form::new()
-                        .part("file", reqwest::multipart::Part::bytes(data_clone));
-                    let resp = client_clone
-                        .post(&url)
-                        .multipart(form)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            format!("remote write needle {} size {}: {}", needle_id, size, e)
-                        })?;
-                    if resp.status().is_success() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "remote write needle {} size {}: {} returned status {}",
-                            needle_id,
-                            size,
-                            url,
-                            resp.status()
-                        ))
-                    }
+                    fetch_and_write_replica(&client_clone, &url, data_clone, needle_id, size).await
                 }));
             }
         }
@@ -5651,11 +6229,163 @@ struct CopyDestination {
     /// what is still promised.
     loc_idx: usize,
     reserved_space: std::sync::atomic::AtomicU64,
+    /// Files the copy displaced from the final basenames, kept as
+    /// `copying/replaced_<name>` siblings so a failed copy can put an
+    /// unmounted replica back the way it found it (Go's swap rollback).
+    displaced_files: Vec<(String, String)>,
 }
 
 impl CopyDestination {
     fn note_path(&self) -> String {
         format!("{}.note", self.data_base_name)
+    }
+
+    /// Remove everything a failed copy may have put on disk. The .rdb is the
+    /// redb needle map that mount_volume builds next to the .idx: a copy that
+    /// mounts and then fails validation is unmounted, not deleted, so without
+    /// this the index database outlives the copy. A later copy of the same
+    /// volume to this server then reuses it (RedbNeedleMap::try_reuse_rdb
+    /// keeps an .rdb whose recorded idx size is not larger than the new .idx),
+    /// which is wrong once the source has been compacted in between.
+    ///
+    /// When the index directory differs from the data directory, a leftover
+    /// `.idx` beside the `.dat` makes load switch to that directory and trust
+    /// the `.rdb` next to it, so those index artifacts are cleared on both
+    /// bases. `.dat` and `.note` come off the data base only: another
+    /// location can use this index directory as its data directory, and
+    /// deleting `<idx base>.dat` would destroy that replica.
+    ///
+    /// A regular volume and an EC volume for the same id share `<base>.vif`.
+    /// `Volume::destroy` keeps that file while a non-empty `.ecx` is present;
+    /// this does the same, or the pre-copy clear would undo that.
+    ///
+    /// The first error other than NotFound is returned: a surviving index is
+    /// trusted by the next mount, so a caller that can still abort must know
+    /// the removal failed. Missing files are fine — they were never written.
+    fn partial_file_paths(&self) -> Vec<String> {
+        let mut paths = vec![
+            format!("{}.dat", self.data_base_name),
+            format!("{}.note", self.data_base_name),
+        ];
+        if !self.shares_vif_with_ec() {
+            paths.push(format!("{}.vif", self.data_base_name));
+        }
+        let index_bases = if self.data_base_name == self.idx_base_name {
+            vec![self.data_base_name.as_str()]
+        } else {
+            vec![self.data_base_name.as_str(), self.idx_base_name.as_str()]
+        };
+        for base in index_bases {
+            for ext in [".idx", ".rdb", ".sdx"] {
+                paths.push(format!("{base}{ext}"));
+            }
+        }
+        paths
+    }
+
+    /// Move whatever sits at the final basenames into `copying/replaced_`
+    /// siblings before the copy clears them. The store delete only covers a
+    /// mounted replica, so files of an unmounted one (or a crashed copy's
+    /// leftovers) would otherwise be unlinked with no way back. The `.note`
+    /// comes along so a restored crashed copy keeps the marker the load scan
+    /// rejects it by. A failure refuses the copy: removing what could not be
+    /// displaced risks losing the replica.
+    fn displace_existing_files(&mut self) -> std::io::Result<()> {
+        // A sealed .ecx keeps the .vif where it is, but the incoming copy
+        // truncates that shared file in place — a hard link would not save
+        // it. Back its content up so a failed copy can restore it.
+        let shared_vif = self
+            .shares_vif_with_ec()
+            .then(|| format!("{}.vif", self.data_base_name));
+        let mut paths = self.partial_file_paths();
+        if let Some(vif) = &shared_vif {
+            paths.push(vif.clone());
+        }
+        for path in paths {
+            let p = std::path::Path::new(&path);
+            if !p.exists() {
+                continue;
+            }
+            let dir = p.parent().unwrap_or_else(|| std::path::Path::new(".")).join("copying");
+            std::fs::create_dir_all(&dir)?;
+            let backup = dir.join(format!(
+                "replaced_{}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            if backup.exists() {
+                std::fs::remove_file(&backup)?;
+            }
+            if shared_vif.as_deref() == Some(path.as_str()) {
+                std::fs::copy(p, &backup)?;
+            } else {
+                std::fs::rename(p, &backup)?;
+            }
+            self.displaced_files
+                .push((backup.to_string_lossy().into_owned(), path));
+        }
+        Ok(())
+    }
+
+    /// Put displaced files back after a failed copy. A leftover at the
+    /// basename is a surviving partial of this copy — it comes off first so
+    /// the restored set stays one generation. The backup is kept whenever it
+    /// cannot go back: an existing path does not mean the copy's write
+    /// succeeded, and dropping the old file under it would mix generations
+    /// into a corrupt replica.
+    fn restore_displaced_files(&mut self) {
+        for (backup, base) in std::mem::take(&mut self.displaced_files) {
+            if std::path::Path::new(&base).exists()
+                && let Err(e) = std::fs::remove_file(&base)
+            {
+                tracing::warn!(
+                    "restore displaced file {}: cannot remove leftover {}: {}",
+                    backup,
+                    base,
+                    e
+                );
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&backup, &base) {
+                tracing::warn!("restore displaced file {}: {}", backup, e);
+            }
+        }
+    }
+
+    /// The copy landed: the displaced files it replaced are gone for good.
+    fn drop_displaced_files(&mut self) {
+        for (backup, _) in std::mem::take(&mut self.displaced_files) {
+            let _ = std::fs::remove_file(&backup);
+        }
+    }
+
+    fn remove_partial_files(&self) -> std::io::Result<()> {
+        let paths = self.partial_file_paths();
+        let mut first_err = None;
+        for path in paths {
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// True when a sealed `.ecx` for this id sits on the data or index base,
+    /// matching `Volume::shares_vif_with_ec_volume`: the shared `.vif` must
+    /// outlive the regular volume's files.
+    fn shares_vif_with_ec(&self) -> bool {
+        let sealed_ecx = |base: &str| {
+            std::fs::metadata(format!("{base}.ecx"))
+                .map(|m| !m.is_dir() && m.len() > 0)
+                .unwrap_or(false)
+        };
+        sealed_ecx(&self.idx_base_name)
+            || (self.data_base_name != self.idx_base_name && sealed_ecx(&self.data_base_name))
     }
 
     /// Write a .note file to indicate copy in progress. A leftover note
@@ -5831,6 +6561,7 @@ impl VolumeGrpcService {
             has_remote_dat,
             loc_idx,
             reserved_space: std::sync::atomic::AtomicU64::new(needed_space),
+            displaced_files: Vec::new(),
         })
     }
 }
@@ -5845,6 +6576,7 @@ struct VolumeCopyJob {
     dest: CopyDestination,
     preallocate_size: i64,
     tx: tokio::sync::mpsc::Sender<Result<volume_server_pb::VolumeCopyResponse, Status>>,
+    _copy_claim: VolumeCopyClaim,
 }
 
 impl VolumeCopyJob {
@@ -6098,6 +6830,7 @@ impl VolumeCopyJob {
             if validate_counts
                 && let Some((_, v)) = store.find_volume(vid)
                 && let Err(e) = check_copy_counts(
+                    vid,
                     source_status_after,
                     v.file_count() as u64,
                     v.deleted_count() as u64,
@@ -6137,13 +6870,8 @@ impl VolumeCopyJob {
         Ok(())
     }
 
-    async fn cleanup_failed_copy(&self, e: Status, mounted: bool) {
+    async fn cleanup_failed_copy(&mut self, e: Status, mounted: bool) {
         let (state, req, vid, tx) = (&self.state, &self.req, self.vid, &self.tx);
-        let (data_base_name, idx_base_name, note_path) = (
-            &self.dest.data_base_name,
-            &self.dest.idx_base_name,
-            self.dest.note_path(),
-        );
         // An abandoned copy is otherwise invisible here: the error goes
         // to a channel nobody is reading. Logging it gives the operator
         // the cause behind the balancer's "delete that copy, then re-run
@@ -6164,18 +6892,43 @@ impl VolumeCopyJob {
         }
         // Clean up on error. If the volume was mounted (the after-mount
         // race), delete_volume unmounts it from the store AND removes
-        // the .dat/.idx/.vif in one step; the remove_file calls below
-        // cover the never-mounted partial-file case and are harmless
-        // no-ops when delete_volume already removed the files.
+        // its files in one step; remove_partial_files covers the
+        // never-mounted and mounted-then-unmounted cases and is a
+        // harmless no-op when delete_volume already removed the files.
+        let mut keep_files = false;
         if mounted {
             let mut store = state.store.write().unwrap();
-            let _ = delete_replica_keep_remote(&mut store, vid);
-            state.volume_state_notify.notify_one();
+            match delete_replica_keep_remote(&mut store, vid) {
+                Ok(()) => {
+                    state.volume_state_notify.notify_one();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "volume {} copy cleanup could not delete the mounted replica: {}",
+                        vid,
+                        e
+                    );
+                    // A refused delete (e.g. the volume is compacting)
+                    // leaves it registered; unlinking its files now would
+                    // strand a live replica.
+                    keep_files = store.find_volume(vid).is_some();
+                }
+            }
         }
-        let _ = std::fs::remove_file(format!("{}.dat", data_base_name));
-        let _ = std::fs::remove_file(format!("{}.idx", idx_base_name));
-        let _ = std::fs::remove_file(format!("{}.vif", data_base_name));
-        let _ = std::fs::remove_file(&note_path);
+        if keep_files {
+            // The mounted copy's files stay; the replica it displaced is
+            // replaced for good.
+            self.dest.drop_displaced_files();
+        } else {
+            if let Err(e) = self.dest.remove_partial_files() {
+                tracing::warn!(
+                    "volume {} copy cleanup could not remove all partial files: {} (a surviving index may poison the next copy)",
+                    vid,
+                    e
+                );
+            }
+            self.dest.restore_displaced_files();
+        }
         self.dest
             .release_reservation(&state.store.read().unwrap());
         let _ = tx.send(Err(e)).await;
@@ -6267,6 +7020,30 @@ fn set_file_mtime(path: &str, modified_ts_ns: i64) -> std::io::Result<()> {
     let file = std::fs::File::open(path)?;
     let ft = std::fs::FileTimes::new().set_accessed(ts).set_modified(ts);
     file.set_times(ft)
+}
+
+/// An optional copy (the source may lack the file) streams into
+/// `<file_path>.copying` and is renamed into place only once the source sent
+/// bytes, so a missing source or a failed stream leaves an existing destination
+/// untouched, as Go's writeToFile does for ignore_source_file_not_found.
+async fn drain_optional_copy_to_file(
+    stream: &mut tonic::Streaming<volume_server_pb::CopyFileResponse>,
+    file_path: &str,
+    what: &str,
+) -> Result<u64, Status> {
+    let staging = format!("{}.copying", file_path);
+    let mut incomplete = crate::server::store_ec::RemoveIncomplete::new(&staging);
+    let file = tokio::fs::File::create(&staging)
+        .await
+        .map_err(|e| Status::internal(format!("create {}: {}", staging, e)))?;
+    let written = drain_copy_stream_to_file(stream, file, &staging, what).await?;
+    if written > 0 {
+        tokio::fs::rename(&staging, file_path)
+            .await
+            .map_err(|e| Status::internal(format!("commit {}: {}", file_path, e)))?;
+        incomplete.committed();
+    }
+    Ok(written)
 }
 
 /// Drain a CopyFile stream into `file`, returning the number of bytes written.
@@ -6574,7 +7351,18 @@ where
 }
 
 /// Compare a copied replica's record counts with the source's.
+///
+/// The file count is exact on both sides (every non-tombstone .idx row is one
+/// file, at load and at runtime), so a mismatch rejects the copy. The deleted
+/// count is not: a redb needle map rebuilds it at load from the .idx through
+/// a bloom filter (`metrics_from_idx`, 0.1% false positives per entry, each
+/// one counted as an overwrite), and the source's figure is that estimate from
+/// its own last load plus exact runtime updates. A source written since its
+/// load and the target's fresh load of the same files therefore disagree by a
+/// few for identical data. Go warns instead of rejecting on this drift since
+/// #11701 (issue #11678); the .dat/.idx size checks already gate integrity.
 fn check_copy_counts(
+    vid: VolumeId,
     origin: &volume_server_pb::VolumeStatusResponse,
     target_file_count: u64,
     target_deleted_count: u64,
@@ -6586,25 +7374,26 @@ fn check_copy_counts(
         ));
     }
     if origin.file_deleted_count != target_deleted_count {
-        return Err(format!(
-            "target deleted count [{}] is not same as origin deleted count [{}]",
-            target_deleted_count, origin.file_deleted_count
-        ));
+        tracing::warn!(
+            "copied volume {} deleted count [{}] differs from origin deleted count [{}] (counter drift, copy kept)",
+            vid,
+            target_deleted_count,
+            origin.file_deleted_count
+        );
     }
     Ok(())
 }
 
-/// A writable source may take writes or deletes while its files are copied;
-/// then the before/after counts do not describe one snapshot and a strict
-/// count check would report a false mismatch.
+/// A writable source may take writes while its files are copied; then the
+/// before/after file counts do not describe one snapshot and a strict count
+/// check would report a false mismatch. Deletes do not move the file count —
+/// they append tombstone rows the deleted counter records — so drift there
+/// leaves the strict check exact, and check_copy_counts warns on it instead.
 fn copy_counts_stable(
     before: Option<&volume_server_pb::VolumeStatusResponse>,
     after: &volume_server_pb::VolumeStatusResponse,
 ) -> bool {
-    before.is_some_and(|before| {
-        before.file_count == after.file_count
-            && before.file_deleted_count == after.file_deleted_count
-    })
+    before.is_some_and(|before| before.file_count == after.file_count)
 }
 
 /// Verify that a copied file has the expected size.
@@ -7031,6 +7820,45 @@ impl EcDecodeJob {
             )));
         }
 
+        let shard_paths: Vec<String> = shard_dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| {
+                crate::storage::erasure_coding::ec_shard::EcVolumeShard::new(
+                    dir,
+                    &collection,
+                    vid,
+                    i as ShardId,
+                )
+                .file_name()
+            })
+            .collect();
+        // A rebuild's backfill writes the sidecar without reloading the
+        // mounted runtimes, so resolve it again the way a shard mount does.
+        // Any runtime left finds it on every disk; with none left (an unmount
+        // raced the decode) the protection would read as Off.
+        let (bitrot, bitrot_status) = {
+            let mut store = state.store.write().unwrap();
+            let ec_metadata_dirs = store.ec_metadata_dirs();
+            let runtimes = store.find_all_ec_volumes_mut(vid);
+            if runtimes.is_empty() {
+                return Err(Status::internal(format!(
+                    "ec volume {} was unmounted during the decode",
+                    vid
+                )));
+            }
+            for ec_vol in runtimes {
+                ec_vol
+                    .reload_bitrot_sidecar(&ec_metadata_dirs)
+                    .map_err(|e| Status::internal(format!("ec volume {}: {}", vid, e)))?;
+            }
+            crate::storage::erasure_coding::ec_volume::EcVolume::select_bitrot_protection(
+                &store.find_all_ec_volumes(vid),
+            )
+        };
+        ec_bitrot::verify_ec_volume_data_shards(bitrot.as_ref(), bitrot_status, &shard_paths)
+            .map_err(|e| Status::internal(format!("ec volume {}: {}", vid, e)))?;
+
         // Calculate .dat file size from .ecx entries (.ec00 lives on
         // its own disk, .ecx on the index disk).
         let dat_file_size = ec_decoder::find_dat_file_size_with_dirs(
@@ -7148,6 +7976,51 @@ impl EcDecodeJob {
             tracing::error!(volume_id = vid.0, error = %e, "compact decoded volume");
         }
         Ok(())
+    }
+}
+
+/// The base bound on one `fetch_and_write_needle` replica write, from connect to
+/// the response status. Mirrors the Go volume server's fetchAndWriteReplicaTimeout.
+const FETCH_AND_WRITE_REPLICA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The slowest link a replica write's chunk may cross within its bound. The
+/// reqwest timeout includes sending the body, and a remote-cache chunk can be
+/// a thousandth of a very large object.
+const REPLICA_MIN_BYTES_PER_SEC: u64 = 1 << 20;
+
+fn fetch_and_write_replica_timeout(body_len: usize) -> std::time::Duration {
+    FETCH_AND_WRITE_REPLICA_TIMEOUT
+        + std::time::Duration::from_millis(
+            (body_len as u64).saturating_mul(1000) / REPLICA_MIN_BYTES_PER_SEC,
+        )
+}
+
+async fn fetch_and_write_replica(
+    client: &reqwest::Client,
+    url: &str,
+    data: Vec<u8>,
+    needle_id: u64,
+    size: i64,
+) -> Result<(), String> {
+    let timeout = fetch_and_write_replica_timeout(data.len());
+    let form = reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(data));
+    let resp = client
+        .post(url)
+        .multipart(form)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("remote write needle {} size {}: {}", needle_id, size, e))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote write needle {} size {}: {} returned status {}",
+            needle_id,
+            size,
+            url,
+            resp.status()
+        ))
     }
 }
 
@@ -7629,6 +8502,7 @@ mod tests {
             cli_white_list: vec![],
             state_file_path: String::new(),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
             ec_decode_tail_notify: tokio::sync::Notify::new(),
         });
@@ -7647,18 +8521,19 @@ mod tests {
         collection: &str,
         ttl: Option<crate::storage::needle::ttl::TTL>,
     ) -> (VolumeGrpcService, TempDir) {
-        make_local_service_with_volume_and_trust(collection, ttl, true)
+        make_local_service_with_volume_and_trust(collection, ttl, true, NeedleMapKind::InMemory)
     }
 
     fn make_local_service_with_volume_and_trust(
         collection: &str,
         ttl: Option<crate::storage::needle::ttl::TTL>,
         allow_untrusted: bool,
+        needle_map_kind: NeedleMapKind,
     ) -> (VolumeGrpcService, TempDir) {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
 
-        let mut store = Store::new(NeedleMapKind::InMemory);
+        let mut store = Store::new(needle_map_kind);
         store
             .add_location(
                 dir,
@@ -7745,6 +8620,7 @@ mod tests {
             cli_white_list: vec![],
             state_file_path: String::new(),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
             ec_decode_tail_notify: tokio::sync::Notify::new(),
         });
@@ -7754,7 +8630,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_copy_and_tail_handlers_reject_blocked_sources() {
-        let (service, _tmp) = make_local_service_with_volume_and_trust("guard_rpc", None, false);
+        let (service, _tmp) = make_local_service_with_volume_and_trust(
+            "guard_rpc",
+            None,
+            false,
+            NeedleMapKind::InMemory,
+        );
 
         let copy_req = Request::new(volume_server_pb::VolumeCopyRequest {
             volume_id: 1,
@@ -8105,6 +8986,7 @@ mod tests {
                 volume_server_pb::VolumeIncrementalCopyRequest {
                     volume_id: 1,
                     since_ns: 0,
+                    ..Default::default()
                 },
             ))
             .await
@@ -8123,6 +9005,51 @@ mod tests {
             .write()
             .unwrap()
             .remove("s3.incr_copy_test");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_volume_incremental_copy_streams_index_tail_with_tombstones() {
+        let (service, tmp, shutdown_tx, _dat_bytes, _super_block_size, _delete_count) =
+            make_remote_only_service("incr_copy_idx");
+
+        // a delete on a tiered volume leaves an index-only tombstone row
+        {
+            let store = service.state.store.read().unwrap();
+            store
+                .delete_volume_needle(
+                    VolumeId(1),
+                    &mut Needle {
+                        id: NeedleId(7),
+                        ..Needle::default()
+                    },
+                )
+                .unwrap();
+        }
+        let idx_bytes = std::fs::read(format!("{}/1.idx", tmp.path().to_str().unwrap())).unwrap();
+
+        let response = service
+            .volume_incremental_copy(Request::new(
+                volume_server_pb::VolumeIncrementalCopyRequest {
+                    volume_id: 1,
+                    since_ns: 0,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+
+        let mut stream = response.into_inner();
+        let mut copied_idx = Vec::new();
+        while let Some(message) = stream.next().await {
+            copied_idx.extend_from_slice(&message.unwrap().idx_content);
+        }
+        assert_eq!(copied_idx, idx_bytes);
+
+        let _ = shutdown_tx.send(());
+        global_s3_tier_registry()
+            .write()
+            .unwrap()
+            .remove("s3.incr_copy_idx");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9062,6 +9989,608 @@ mod tests {
         );
     }
 
+    // An optional sidecar copy from a peer that lacks the file must leave the
+    // destination's own copy in place; one from a peer that has it replaces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_optional_copy_keeps_destination_when_source_lacks_file() {
+        let (source_service, source_tmp) = make_local_service_with_volume("optional_copy", None);
+        let (port, _shutdown) = serve_source(source_service).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", port))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = volume_server_pb::volume_server_client::VolumeServerClient::new(channel);
+        let request = |ext: &str| volume_server_pb::CopyFileRequest {
+            volume_id: 1,
+            ext: ext.to_string(),
+            is_ec_volume: true,
+            compaction_revision: u32::MAX,
+            stop_offset: i64::MAX as u64,
+            ignore_source_file_not_found: true,
+            ..Default::default()
+        };
+
+        let dest_tmp = TempDir::new().unwrap();
+        let dest = format!("{}/1.ecsum", dest_tmp.path().to_str().unwrap());
+        std::fs::write(&dest, b"local sidecar").unwrap();
+
+        let mut missing = client
+            .copy_file(request(".ecsum"))
+            .await
+            .unwrap()
+            .into_inner();
+        let written = drain_optional_copy_to_file(&mut missing, &dest, ".ecsum")
+            .await
+            .unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"local sidecar");
+        assert!(!std::path::Path::new(&format!("{}.copying", dest)).exists());
+
+        std::fs::write(
+            format!("{}/1.ecsum", source_tmp.path().to_str().unwrap()),
+            b"peer sidecar",
+        )
+        .unwrap();
+        let mut present = client
+            .copy_file(request(".ecsum"))
+            .await
+            .unwrap()
+            .into_inner();
+        drain_optional_copy_to_file(&mut present, &dest, ".ecsum")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"peer sidecar");
+    }
+
+    // Missing-index recovery copies the peer's .vif the same way, so a peer
+    // without one cannot truncate the local .vif that carries the EC ratio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_index_recovery_vif_copy_keeps_local_vif_when_peer_lacks_it() {
+        let (source_service, source_tmp) = make_local_service_with_volume("optional_vif", None);
+        let source_vif = format!("{}/1.vif", source_tmp.path().to_str().unwrap());
+        let _ = std::fs::remove_file(&source_vif);
+        let (port, _shutdown) = serve_source(source_service).await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", port))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = volume_server_pb::volume_server_client::VolumeServerClient::new(channel);
+        let request = volume_server_pb::CopyFileRequest {
+            volume_id: 1,
+            ext: ".vif".to_string(),
+            is_ec_volume: true,
+            compaction_revision: u32::MAX,
+            stop_offset: i64::MAX as u64,
+            ignore_source_file_not_found: true,
+            ..Default::default()
+        };
+
+        let dest_tmp = TempDir::new().unwrap();
+        let dest = format!("{}/1.vif", dest_tmp.path().to_str().unwrap());
+        std::fs::write(&dest, b"local vif").unwrap();
+
+        let missing = client
+            .copy_file(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        crate::server::store_ec::drain_optional_copy_stream(missing, &dest)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"local vif");
+        assert!(!std::path::Path::new(&format!("{}.copying", dest)).exists());
+
+        std::fs::write(&source_vif, b"peer vif").unwrap();
+        let present = client.copy_file(request).await.unwrap().into_inner();
+        crate::server::store_ec::drain_optional_copy_stream(present, &dest)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"peer vif");
+    }
+
+    /// A CopyFile stream that delivers `frame` and then fails, or stalls
+    /// forever when the second field is set.
+    struct FailAfterFrame(Option<bytes::Bytes>, bool);
+
+    impl http_body::Body for FailAfterFrame {
+        type Data = bytes::Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Status>>> {
+            match self.0.take() {
+                Some(frame) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(frame)))),
+                None if self.1 => std::task::Poll::Pending,
+                None => std::task::Poll::Ready(Some(Err(Status::unavailable("source went away")))),
+            }
+        }
+    }
+
+    fn copy_stream_after_bytes(
+        stall: bool,
+    ) -> tonic::Streaming<volume_server_pb::CopyFileResponse> {
+        let message = prost::Message::encode_to_vec(&volume_server_pb::CopyFileResponse {
+            file_content: b"partial".to_vec(),
+            modified_ts_ns: 1,
+            ..Default::default()
+        });
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&message);
+        tonic::Streaming::new_response(
+            tonic_prost::ProstDecoder::<volume_server_pb::CopyFileResponse>::default(),
+            FailAfterFrame(Some(frame.into()), stall),
+            tonic::codegen::http::StatusCode::OK,
+            None,
+            None,
+        )
+    }
+
+    // A stream that fails after sending bytes leaves the destination as it was
+    // and removes the staged copy, on both optional-copy paths.
+    #[tokio::test]
+    async fn test_optional_copy_keeps_destination_when_stream_fails() {
+        let dest_tmp = TempDir::new().unwrap();
+        let dir = dest_tmp.path().to_str().unwrap();
+
+        let ecsum = format!("{}/1.ecsum", dir);
+        std::fs::write(&ecsum, b"local sidecar").unwrap();
+        let mut stream = copy_stream_after_bytes(false);
+        assert!(
+            drain_optional_copy_to_file(&mut stream, &ecsum, ".ecsum")
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&ecsum).unwrap(), b"local sidecar");
+        assert!(!std::path::Path::new(&format!("{}.copying", ecsum)).exists());
+
+        let vif = format!("{}/1.vif", dir);
+        std::fs::write(&vif, b"local vif").unwrap();
+        assert!(
+            crate::server::store_ec::drain_optional_copy_stream(
+                copy_stream_after_bytes(false),
+                &vif
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&vif).unwrap(), b"local vif");
+        assert!(!std::path::Path::new(&format!("{}.copying", vif)).exists());
+    }
+
+    /// Polls `copy` until `staging` exists, then drops it as a cancelled RPC
+    /// would.
+    async fn cancel_once_staged(copy: impl std::future::Future, staging: &str) {
+        let staged = async {
+            while !std::path::Path::new(staging).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            _ = copy => panic!("a stalled copy must not complete"),
+            r = tokio::time::timeout(std::time::Duration::from_secs(5), staged) => {
+                r.expect("staging file was not created")
+            }
+        }
+    }
+
+    // A copy dropped mid-stream, as when its RPC is cancelled, still removes
+    // the staged copy and leaves the destination as it was.
+    #[tokio::test]
+    async fn test_optional_copy_removes_staging_when_cancelled() {
+        let dest_tmp = TempDir::new().unwrap();
+        let dir = dest_tmp.path().to_str().unwrap();
+
+        let ecsum = format!("{}/1.ecsum", dir);
+        let staging = format!("{}.copying", ecsum);
+        std::fs::write(&ecsum, b"local sidecar").unwrap();
+        let mut stream = copy_stream_after_bytes(true);
+        cancel_once_staged(
+            drain_optional_copy_to_file(&mut stream, &ecsum, ".ecsum"),
+            &staging,
+        )
+        .await;
+        assert_eq!(std::fs::read(&ecsum).unwrap(), b"local sidecar");
+        assert!(!std::path::Path::new(&staging).exists());
+
+        let vif = format!("{}/1.vif", dir);
+        let staging = format!("{}.copying", vif);
+        std::fs::write(&vif, b"local vif").unwrap();
+        cancel_once_staged(
+            crate::server::store_ec::drain_optional_copy_stream(
+                copy_stream_after_bytes(true),
+                &vif,
+            ),
+            &staging,
+        )
+        .await;
+        assert_eq!(std::fs::read(&vif).unwrap(), b"local vif");
+        assert!(!std::path::Path::new(&staging).exists());
+    }
+
+    // A copy that mounts and then fails validation (check_copy_counts) is
+    // unmounted, not deleted. With a redb needle map the mount has already
+    // built <idx base>.rdb; the failure cleanup must remove it with the other
+    // partial files, or the next copy of the same volume to this server reuses
+    // that stale index database.
+    #[test]
+    fn test_failed_copy_cleanup_removes_redb_index_left_by_mount() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let mut store = Store::new(NeedleMapKind::Redb);
+        store
+            .add_location(
+                dir,
+                dir,
+                10,
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                Vec::new(),
+            )
+            .unwrap();
+        store
+            .add_volume(VolumeId(1), DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+        // What the validation-failure branch does after mount_volume.
+        store.unmount_volume(VolumeId(1)).unwrap();
+
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(1));
+        assert!(
+            std::path::Path::new(&format!("{}.rdb", base)).exists(),
+            "a redb mount must have created {}.rdb for this test to mean anything",
+            base
+        );
+        std::fs::write(format!("{}.note", base), "copying from test").unwrap();
+
+        let dest = CopyDestination {
+            data_base_name: base.clone(),
+            idx_base_name: base.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.remove_partial_files().unwrap();
+
+        for ext in [".dat", ".idx", ".rdb", ".sdx", ".vif", ".note"] {
+            assert!(
+                !std::path::Path::new(&format!("{}{}", base, ext)).exists(),
+                "failed copy cleanup left {}{} behind",
+                base,
+                ext
+            );
+        }
+    }
+
+    // destroy() keeps <base>.vif while a sealed .ecx shares it. The copy
+    // cleanup runs after that delete and must not take the file back.
+    #[test]
+    fn test_copy_cleanup_keeps_vif_shared_with_ec_shards() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("1").to_str().unwrap().to_string();
+        std::fs::write(format!("{base}.vif"), b"volume-info").unwrap();
+        std::fs::write(format!("{base}.ecx"), b"ec-index").unwrap();
+        std::fs::write(format!("{base}.rdb"), b"stale").unwrap();
+
+        let dest = CopyDestination {
+            data_base_name: base.clone(),
+            idx_base_name: base.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.remove_partial_files().unwrap();
+
+        assert!(
+            std::path::Path::new(&format!("{base}.vif")).exists(),
+            "a sealed .ecx still needs the shared .vif"
+        );
+        assert!(std::path::Path::new(&format!("{base}.ecx")).exists());
+        assert!(
+            !std::path::Path::new(&format!("{base}.rdb")).exists(),
+            "the stale index is still removed"
+        );
+    }
+
+    // load() switches to an .idx that still sits beside the .dat, even when
+    // --dir.idx names another directory, and then trusts the .rdb next to it.
+    #[test]
+    fn test_copy_cleanup_removes_index_left_beside_the_dat() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let idx_dir = tmp.path().join("idx");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::create_dir(&idx_dir).unwrap();
+        let data = data_dir.join("1").to_str().unwrap().to_string();
+        let idx = idx_dir.join("1").to_str().unwrap().to_string();
+        for base in [&data, &idx] {
+            for ext in [".idx", ".rdb", ".sdx"] {
+                std::fs::write(format!("{base}{ext}"), b"stale").unwrap();
+            }
+        }
+        // The index directory may be another location's data directory.
+        std::fs::write(format!("{data}.dat"), b"this-copy").unwrap();
+        std::fs::write(format!("{data}.note"), b"copying").unwrap();
+        std::fs::write(format!("{idx}.dat"), b"other-location").unwrap();
+        std::fs::write(format!("{idx}.note"), b"other-note").unwrap();
+
+        let dest = CopyDestination {
+            data_base_name: data.clone(),
+            idx_base_name: idx.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.remove_partial_files().unwrap();
+
+        for base in [&data, &idx] {
+            for ext in [".idx", ".rdb", ".sdx"] {
+                assert!(
+                    !std::path::Path::new(&format!("{base}{ext}")).exists(),
+                    "cleanup left {base}{ext} behind"
+                );
+            }
+        }
+        assert!(
+            !std::path::Path::new(&format!("{data}.dat")).exists(),
+            "the copy's own .dat must be removed"
+        );
+        assert!(!std::path::Path::new(&format!("{data}.note")).exists());
+        assert!(
+            std::path::Path::new(&format!("{idx}.dat")).exists(),
+            "a .dat in the index directory belongs to another location"
+        );
+        assert!(std::path::Path::new(&format!("{idx}.note")).exists());
+    }
+
+    // The store delete only covers a mounted replica, so files of an
+    // unmounted one at the destination basenames are displaced before the
+    // pre-copy clear; a failed copy must put them back.
+    #[test]
+    fn test_failed_copy_restores_displaced_files() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("1").to_str().unwrap().to_string();
+        for ext in [".dat", ".idx", ".vif", ".rdb", ".sdx"] {
+            std::fs::write(format!("{base}{ext}"), b"replica").unwrap();
+        }
+        std::fs::write(format!("{base}.note"), b"stale marker").unwrap();
+
+        let mut dest = CopyDestination {
+            data_base_name: base.clone(),
+            idx_base_name: base.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.displace_existing_files().unwrap();
+
+        for ext in [".dat", ".idx", ".vif", ".rdb", ".sdx", ".note"] {
+            assert!(
+                !std::path::Path::new(&format!("{base}{ext}")).exists(),
+                "displacement left {base}{ext} behind"
+            );
+        }
+        // The copy lands its own file, then fails before the swap.
+        std::fs::write(format!("{base}.dat"), b"copy").unwrap();
+        dest.remove_partial_files().unwrap();
+        dest.restore_displaced_files();
+
+        for ext in [".dat", ".idx", ".vif", ".rdb", ".sdx"] {
+            let path = format!("{base}{ext}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"replica",
+                "the displaced {ext} was not restored"
+            );
+        }
+        assert_eq!(
+            std::fs::read(format!("{base}.note")).unwrap(),
+            b"stale marker",
+            "the .note the restored set arrived with goes back with it"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path().join("copying"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "no backups may survive the restore"
+        );
+    }
+
+    // When the partial cleanup cannot take every file the copy landed, the
+    // restore still puts the displaced set back whole: a surviving partial is
+    // removed for the backup, not the other way around.
+    #[test]
+    fn test_failed_copy_restore_replaces_a_surviving_partial() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("1").to_str().unwrap().to_string();
+        for ext in [".dat", ".idx"] {
+            std::fs::write(format!("{base}{ext}"), b"replica").unwrap();
+        }
+
+        let mut dest = CopyDestination {
+            data_base_name: base.clone(),
+            idx_base_name: base.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.displace_existing_files().unwrap();
+
+        std::fs::write(format!("{base}.idx"), b"copy").unwrap();
+        dest.restore_displaced_files();
+
+        for ext in [".dat", ".idx"] {
+            assert_eq!(
+                std::fs::read(format!("{base}{ext}")).unwrap(),
+                b"replica",
+                "a surviving partial {ext} replaced the restored file"
+            );
+        }
+        assert!(
+            std::fs::read_dir(tmp.path().join("copying"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "no backups may survive the restore"
+        );
+    }
+
+    // A write_note that dies mid-write leaves a marker behind; the restore
+    // must take it off or the load scan deletes the restored replica as an
+    // unfinished copy.
+    #[test]
+    fn test_failed_note_write_leaves_no_marker_on_restore() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("1").to_str().unwrap().to_string();
+        for ext in [".dat", ".idx"] {
+            std::fs::write(format!("{base}{ext}"), b"replica").unwrap();
+        }
+
+        let mut dest = CopyDestination {
+            data_base_name: base.clone(),
+            idx_base_name: base.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.displace_existing_files().unwrap();
+
+        std::fs::write(dest.note_path(), b"").unwrap();
+        let _ = std::fs::remove_file(dest.note_path());
+        dest.restore_displaced_files();
+
+        assert!(
+            !std::path::Path::new(&format!("{base}.note")).exists(),
+            "the failed copy's .note must not outlive the restore"
+        );
+        for ext in [".dat", ".idx"] {
+            assert_eq!(
+                std::fs::read(format!("{base}{ext}")).unwrap(),
+                b"replica",
+                "the displaced {ext} was not restored"
+            );
+        }
+    }
+
+    // A .vif shared with a sealed .ecx stays in place for the EC volume, but
+    // the copy truncates it in place — so its content is still backed up and
+    // a failed copy puts the original back.
+    #[test]
+    fn test_failed_copy_restores_vif_shared_with_ec_shards() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("1").to_str().unwrap().to_string();
+        std::fs::write(format!("{base}.vif"), b"shared-settings").unwrap();
+        std::fs::write(format!("{base}.ecx"), b"ec-index").unwrap();
+
+        let mut dest = CopyDestination {
+            data_base_name: base.clone(),
+            idx_base_name: base.clone(),
+            disk_type: DiskType::HardDrive,
+            has_remote_dat: false,
+            loc_idx: 0,
+            reserved_space: std::sync::atomic::AtomicU64::new(0),
+            displaced_files: Vec::new(),
+        };
+        dest.displace_existing_files().unwrap();
+
+        assert_eq!(
+            std::fs::read(format!("{base}.vif")).unwrap(),
+            b"shared-settings",
+            "the EC volume keeps its .vif during the copy"
+        );
+        // The incoming copy truncates the shared .vif, then fails.
+        std::fs::write(format!("{base}.vif"), b"incoming").unwrap();
+        dest.remove_partial_files().unwrap();
+        dest.restore_displaced_files();
+
+        assert_eq!(
+            std::fs::read(format!("{base}.vif")).unwrap(),
+            b"shared-settings",
+            "the shared .vif must come back with its original content"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path().join("copying"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "no backups may survive the restore"
+        );
+    }
+
+    // A .rdb that survives an earlier copy attempt was built against a
+    // different .idx generation: after a compaction on the source its recorded
+    // offsets no longer fit the .idx this copy writes. The destination's
+    // pre-write cleanup must clear it, so the mount rebuilds the index instead
+    // of replaying stale entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_volume_copy_rebuilds_a_stale_redb_index() {
+        let (source_service, _source_tmp, _dat_bytes) = make_local_service_with_large_volume();
+        let (port, _shutdown) = serve_source(source_service).await;
+
+        let (dest_service, dest_tmp) =
+            make_local_service_with_volume_and_trust("", None, true, NeedleMapKind::Redb);
+        {
+            let mut store = dest_service.state.store.write().unwrap();
+            store
+                .delete_volume(VolumeId(1), false, false, false)
+                .unwrap();
+            for loc in &store.locations {
+                loc.check_disk_space();
+            }
+        }
+
+        // Stand in for an orphaned index database: a valid .rdb that maps
+        // needle 11 to an offset past the end of the copied .dat.
+        let dir = dest_tmp.path().to_str().unwrap();
+        let base = crate::storage::volume::volume_file_name(dir, "", VolumeId(1));
+        let mut stale_idx = Vec::new();
+        let mut entry = [0u8; NEEDLE_MAP_ENTRY_SIZE];
+        idx_entry_to_bytes(
+            &mut entry,
+            NeedleId(11),
+            Offset::from_actual_offset(64 * 1024 * 1024),
+            Size(4),
+        );
+        stale_idx.extend_from_slice(&entry);
+        let stale = crate::storage::needle_map::RedbNeedleMap::load_from_idx(
+            &format!("{}.rdb", base),
+            &mut std::io::Cursor::new(&stale_idx),
+            Version(3),
+            NeedleMapKind::Redb.redb_cache_bytes(),
+        )
+        .unwrap();
+        drop(stale);
+
+        run_volume_copy(&dest_service, port)
+            .await
+            .expect("a leftover .rdb must not fail the copy");
+
+        let store = dest_service.state.store.read().unwrap();
+        let (_, vol) = store
+            .find_volume(VolumeId(1))
+            .expect("the copied replica must stay mounted");
+        let mut n = Needle {
+            id: NeedleId(11),
+            ..Needle::default()
+        };
+        vol.read_needle(&mut n)
+            .expect("a reused stale .rdb resolves needle 11 to a dead offset");
+        assert_eq!(n.data, b"ec-generate");
+    }
+
     // An abandoned VolumeCopy must leave nothing behind: no mounted volume (its
     // index cache would be held for the life of the process, and under
     // replication=000 the cluster would carry one volume id on two writable
@@ -9461,6 +10990,75 @@ mod tests {
             2,
             "the replica must hold the source's needles"
         );
+    }
+
+    // A deleted-count difference alone is counter drift, not a bad copy: the
+    // count is a bloom-filter estimate on redb needle maps, so a source written
+    // since its last load and a fresh load of the same files can disagree.
+    // The copy must be kept and mounted, as Go does since #11701.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_volume_copy_keeps_replica_on_deleted_count_drift() {
+        let (source_service, _source_tmp, _dat_bytes) = make_local_service_with_large_volume();
+        {
+            let store = source_service.state.store.read().unwrap();
+            let (_, vol) = store.find_volume(VolumeId(1)).unwrap();
+            vol.add_deletion_count_for_test(1);
+        }
+        let (port, _shutdown) = serve_source(source_service).await;
+
+        let (dest_service, _dest_tmp) = make_local_service_with_volume("", None);
+        {
+            let mut store = dest_service.state.store.write().unwrap();
+            store
+                .delete_volume(VolumeId(1), false, false, false)
+                .unwrap();
+            for loc in &store.locations {
+                loc.check_disk_space();
+            }
+        }
+
+        run_volume_copy(&dest_service, port)
+            .await
+            .expect("a deleted-count difference alone must not fail the copy");
+
+        let store = dest_service.state.store.read().unwrap();
+        let (_, vol) = store
+            .find_volume(VolumeId(1))
+            .expect("the copied replica must stay mounted");
+        assert_eq!(
+            vol.file_count(),
+            2,
+            "the replica must hold the source's needles"
+        );
+        assert_eq!(
+            vol.deleted_count(),
+            0,
+            "the target's own count is kept; the drift is only logged"
+        );
+    }
+
+    // Writes move the file count; deletes move only the deleted count. The
+    // strict check still applies when only the latter drifts: the copied
+    // file count remains exact, and check_copy_counts warns on the drift.
+    #[test]
+    fn test_copy_counts_stable_gates_on_file_count() {
+        let before = volume_server_pb::VolumeStatusResponse {
+            file_count: 10,
+            file_deleted_count: 3,
+            ..Default::default()
+        };
+        let mut after = before.clone();
+        assert!(copy_counts_stable(Some(&before), &after));
+
+        after.file_deleted_count = 5;
+        assert!(
+            copy_counts_stable(Some(&before), &after),
+            "deleted-count drift alone must not disable the strict check"
+        );
+
+        after.file_count = 9;
+        assert!(!copy_counts_stable(Some(&before), &after));
+        assert!(!copy_counts_stable(None, &after));
     }
 
     // A copy whose record counts disagree with a stable source must be
@@ -10083,6 +11681,7 @@ mod tests {
                 volume_server_pb::VolumeIncrementalCopyRequest {
                     volume_id: 1,
                     since_ns: 0,
+                    ..Default::default()
                 },
             ))
             .await
@@ -10181,6 +11780,7 @@ mod tests {
             cli_white_list: vec![],
             state_file_path: String::new(),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
             ec_decode_tail_notify: tokio::sync::Notify::new(),
         });
@@ -10505,6 +12105,101 @@ mod tests {
         let store = service.state.store.read().unwrap();
         let (_, v) = store.find_volume(vid).unwrap();
         assert_eq!(v.super_block().replica_placement.to_string(), "001");
+    }
+
+    /// Configure remounts an on-disk replica. During a copy that already
+    /// snapshotted the volume as absent, that remount loads files the copy
+    /// then unlinks.
+    #[tokio::test]
+    async fn test_volume_configure_refuses_a_volume_being_copied() {
+        let (service, _tmp) = make_local_service_with_volume("configure_during_copy", None);
+        let vid = VolumeId(1);
+        service
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap()
+            .insert(vid);
+
+        let err = service
+            .volume_configure(Request::new(volume_server_pb::VolumeConfigureRequest {
+                volume_id: vid.0,
+                replication: "001".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("is being copied"), "{}", err.message());
+        {
+            let store = service.state.store.read().unwrap();
+            let (_, v) = store.find_volume(vid).expect("still mounted");
+            assert_eq!(v.super_block().replica_placement.to_string(), "000");
+        }
+
+        service
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap()
+            .remove(&vid);
+        let resp = service
+            .volume_configure(Request::new(volume_server_pb::VolumeConfigureRequest {
+                volume_id: vid.0,
+                replication: "001".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.error, "");
+        let store = service.state.store.read().unwrap();
+        let (_, v) = store.find_volume(vid).unwrap();
+        assert_eq!(v.super_block().replica_placement.to_string(), "001");
+    }
+
+    /// Allocate registers the volume under the same claim a mount takes: a
+    /// copy in flight owns the destination files the new replica would open.
+    #[tokio::test]
+    async fn test_allocate_volume_refuses_a_volume_being_copied() {
+        let (service, _tmp) = make_local_service_with_volume("allocate_during_copy", None);
+        let vid = VolumeId(7);
+        service
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap()
+            .insert(vid);
+
+        let err = service
+            .allocate_volume(Request::new(volume_server_pb::AllocateVolumeRequest {
+                volume_id: vid.0,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("is being copied"), "{}", err.message());
+    }
+
+    /// The staged adoption renames .copying files into place and mounts, so
+    /// it holds the copy claim for the whole span — Go's adoptStagedVolume.
+    #[tokio::test]
+    async fn test_staged_adoption_refuses_a_volume_being_copied() {
+        let (service, _tmp) = make_local_service_with_volume("adopt_during_copy", None);
+        service
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap()
+            .insert(VolumeId(1));
+
+        let mut request = ec_shards_to_volume_request();
+        request.get_mut().from_staged = true;
+        let err = service
+            .volume_ec_shards_to_volume(request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("is being copied"), "{}", err.message());
     }
 
     // Regression test for comparing the wrong compaction-revision field.
@@ -11364,16 +13059,16 @@ mod tests {
             .unwrap();
     }
 
-    /// Leaves `service` holding only EC shard 1 of volume 1, with shard 0 (the
-    /// one with needle 11's bytes) served by a peer; `peer_deletes` journals
-    /// the needle's delete on the peer alone.
+    /// Leaves `service` holding `local_shards` of EC volume 1, with shard 0 (the
+    /// one with needle 11's bytes) also served by a peer; `peer_deletes`
+    /// journals the needle's delete on the peer alone.
     async fn put_ec_1_needle_shard_on_a_peer(
         service: &VolumeGrpcService,
         tmp: &TempDir,
+        local_shards: Vec<u32>,
         peer_deletes: bool,
     ) -> (TempDir, tokio::sync::oneshot::Sender<()>) {
-        // One local shard, not the needle's: only a peer read can answer.
-        generate_and_mount_ec_1(service, vec![1]).await;
+        generate_and_mount_ec_1(service, local_shards).await;
 
         let (peer, peer_tmp) = make_local_service_with_volume("", None);
         peer.state
@@ -11429,7 +13124,7 @@ mod tests {
     async fn test_volume_needle_status_reads_an_ec_needle_from_a_peer_shard() {
         let (service, tmp) = make_local_service_with_volume("", None);
         let want = needle_status(&service, 11).await.unwrap();
-        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, false).await;
+        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, vec![1], false).await;
 
         let got = needle_status(&service, 11)
             .await
@@ -11442,11 +13137,256 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_volume_needle_status_reports_a_peer_reported_ec_deletion() {
         let (service, tmp) = make_local_service_with_volume("", None);
-        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, true).await;
+        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, vec![1], true).await;
 
         let err = needle_status(&service, 11).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unknown, "{err}");
         assert_eq!(err.message(), "already deleted");
+    }
+
+    fn quarantine_ec_1(service: &VolumeGrpcService) {
+        service
+            .state
+            .store
+            .read()
+            .unwrap()
+            .find_ec_volume(VolumeId(1))
+            .unwrap()
+            .mark_io_quarantined();
+    }
+
+    /// A quarantined disk is not read while a peer holds the shard: the peer's
+    /// answer, here that the needle is deleted, replaces the local copy's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_ec_read_skips_quarantined_local_shards() {
+        let (service, tmp) = make_local_service_with_volume("", None);
+        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, (0..14).collect(), true).await;
+        needle_status(&service, 11)
+            .await
+            .expect("healthy local shards answer first");
+
+        quarantine_ec_1(&service);
+        let miss = crate::server::store_ec::read_ec_shard_needle_or_miss(
+            &service.state,
+            VolumeId(1),
+            NeedleId(11),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(miss, crate::server::store_ec::EcMiss::Deleted);
+    }
+
+    /// Leaves `service` holding `local_shards` of EC volume 1 on a quarantined
+    /// disk, with every shard's other holder unreachable.
+    async fn quarantine_ec_1_without_peers(service: &VolumeGrpcService, local_shards: Vec<u32>) {
+        generate_and_mount_ec_1(service, local_shards).await;
+        {
+            let mut store = service.state.store.write().unwrap();
+            store.unmount_volume(VolumeId(1)).unwrap();
+            store
+                .find_ec_volume(VolumeId(1))
+                .unwrap()
+                .merge_shard_locations(
+                    (0u8..14)
+                        .map(|sid| (sid, vec!["127.0.0.1:255.1".to_string()]))
+                        .collect(),
+                );
+        }
+        quarantine_ec_1(service);
+    }
+
+    /// When no healthy copy answers, the quarantined shards still serve the read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_ec_read_falls_back_to_quarantined_shards() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        let want = needle_status(&service, 11).await.unwrap();
+        quarantine_ec_1_without_peers(&service, (0..14).collect()).await;
+
+        let got = needle_status(&service, 11)
+            .await
+            .expect("only the quarantined disk holds the shards");
+        assert_eq!(got, want);
+    }
+
+    /// Reconstruction falls back to quarantined local shards when the healthy
+    /// sources cannot supply enough of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_ec_read_reconstructs_from_quarantined_shards() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        let want = needle_status(&service, 11).await.unwrap();
+        quarantine_ec_1_without_peers(&service, (4..14).collect()).await;
+
+        let got = needle_status(&service, 11)
+            .await
+            .expect("the needle's shard is gone and only quarantined shards can rebuild it");
+        assert_eq!(got, want);
+    }
+
+    /// Peers move on to the next holder or reconstruct when a shard sits on a
+    /// quarantined disk.
+    #[tokio::test]
+    async fn test_volume_ec_shard_read_refuses_a_quarantined_shard() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        generate_and_mount_ec_1(&service, vec![0]).await;
+        let read = || {
+            service.volume_ec_shard_read(Request::new(
+                volume_server_pb::VolumeEcShardReadRequest {
+                    volume_id: 1,
+                    shard_id: 0,
+                    offset: 0,
+                    size: 8,
+                    ..Default::default()
+                },
+            ))
+        };
+        assert!(read().await.is_ok());
+
+        quarantine_ec_1(&service);
+        match read().await {
+            Ok(_) => panic!("a quarantined shard was served"),
+            Err(status) => assert_eq!(status.code(), tonic::Code::Unavailable, "{status}"),
+        }
+    }
+
+    /// A shard mounted onto a quarantined EC volume fails the mount, so a
+    /// caller moving it here keeps its source copy.
+    #[tokio::test]
+    async fn test_volume_ec_shards_mount_refuses_a_quarantined_volume() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        generate_and_mount_ec_1(&service, vec![0]).await;
+        quarantine_ec_1(&service);
+
+        let mount = |shard_id: u32| {
+            service.volume_ec_shards_mount(Request::new(
+                volume_server_pb::VolumeEcShardsMountRequest {
+                    volume_id: 1,
+                    shard_ids: vec![shard_id],
+                    ..Default::default()
+                },
+            ))
+        };
+        let shard_mounted = |shard_id: ShardId| {
+            service
+                .state
+                .store
+                .read()
+                .unwrap()
+                .find_ec_volume_with_shard(VolumeId(1), shard_id)
+                .is_some()
+        };
+
+        let err = mount(1).await.unwrap_err();
+        assert!(err.message().contains("quarantined"), "{err}");
+        assert!(!shard_mounted(1), "the refused shard stayed mounted");
+
+        let err = mount(0).await.unwrap_err();
+        assert!(err.message().contains("quarantined"), "{err}");
+        assert!(
+            shard_mounted(0),
+            "a refused remount unmounted a shard that was already mounted"
+        );
+    }
+
+    /// While a quarantined sibling holds the same shard, the result follows
+    /// the disk the store picks for the shard: the healthy disk mounts it,
+    /// the quarantined one refuses and leaves no copy on the healthy disk.
+    #[tokio::test]
+    async fn test_volume_ec_shards_mount_beside_a_quarantined_sibling() {
+        let (service, tmp) = make_local_service_with_volume("", None);
+        generate_and_mount_ec_1(&service, vec![]).await;
+        let sibling = TempDir::new().unwrap();
+        let dir = sibling.path().to_str().unwrap();
+        let picked = {
+            let mut store = service.state.store.write().unwrap();
+            store
+                .add_location(
+                    dir,
+                    dir,
+                    10,
+                    DiskType::HardDrive,
+                    MinFreeSpace::Percent(1.0),
+                    Vec::new(),
+                )
+                .unwrap();
+            store.locations[0].unmount_ec_shards(VolumeId(1), &[1]);
+            for name in ["1.ec01", "1.ecx", "1.ecj", "1.vif"] {
+                let src = tmp.path().join(name);
+                if src.exists() {
+                    std::fs::copy(&src, sibling.path().join(name)).unwrap();
+                }
+            }
+            store.locations[1]
+                .mount_ec_shards_with_idx_dir(VolumeId(1), "", &[1], dir, "")
+                .unwrap();
+            store.locations[1]
+                .find_ec_volume(VolumeId(1))
+                .unwrap()
+                .mark_io_quarantined();
+            let picked = store.mount_ec_shard(VolumeId(1), "", 1, "").unwrap();
+            if picked == 0 {
+                store.locations[0].unmount_ec_shards(VolumeId(1), &[1]);
+            }
+            picked
+        };
+
+        let mounted = service
+            .volume_ec_shards_mount(Request::new(volume_server_pb::VolumeEcShardsMountRequest {
+                volume_id: 1,
+                shard_ids: vec![1],
+                ..Default::default()
+            }))
+            .await;
+        let healthy_holds = service.state.store.read().unwrap().locations[0]
+            .find_ec_volume(VolumeId(1))
+            .is_some_and(|ecv| ecv.has_shard(1));
+        assert_eq!(
+            mounted.is_ok(),
+            picked == 0,
+            "mount returned {:?} with disk {picked} picked",
+            mounted.err()
+        );
+        assert_eq!(mounted.is_ok(), healthy_holds);
+    }
+
+    /// A shard that fails to mount stops the batch, but the shards mounted
+    /// before it are still announced.
+    #[tokio::test]
+    async fn test_volume_ec_shards_mount_failure_still_announces_earlier_shards() {
+        use futures::FutureExt;
+        let (service, tmp) = make_local_service_with_volume("", None);
+        generate_and_mount_ec_1(&service, vec![0]).await;
+        let _ = service.state.volume_state_notify.notified().now_or_never();
+        std::fs::remove_file(tmp.path().join("1.ec02")).unwrap();
+
+        service
+            .volume_ec_shards_mount(Request::new(
+                volume_server_pb::VolumeEcShardsMountRequest {
+                    volume_id: 1,
+                    shard_ids: vec![1, 2],
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            service
+                .state
+                .store
+                .read()
+                .unwrap()
+                .find_ec_volume_with_shard(VolumeId(1), 1)
+                .is_some()
+        );
+        assert!(
+            service
+                .state
+                .volume_state_notify
+                .notified()
+                .now_or_never()
+                .is_some(),
+            "shard 1 was mounted but the heartbeat was never told"
+        );
     }
 
     /// A volume unmounted before the EC read resolves it is "volume not found",
@@ -11654,7 +13594,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_batch_delete_peer_reported_ec_deletion_is_not_an_error() {
         let (service, tmp) = make_local_service_with_volume("", None);
-        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, true).await;
+        let _peer = put_ec_1_needle_shard_on_a_peer(&service, &tmp, vec![1], true).await;
 
         assert_eq!(
             batch_delete_1(&service, 11, 0x3344, true).await,
@@ -12066,6 +14006,7 @@ mod tests {
             cli_white_list: vec![],
             state_file_path: String::new(),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
             ec_decode_tail_notify: tokio::sync::Notify::new(),
         });
@@ -13202,6 +15143,149 @@ mod tests {
         assert!(std::path::Path::new(&idx_sidecar).exists());
     }
 
+    /// A data shard that fails its .ecsum checksum must fail the decode and
+    /// leave every shard and the sidecar in place for a repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_volume_ec_shards_to_volume_rejects_a_corrupt_data_shard() {
+        let (service, _tmp, data, _idx, _) = make_split_idx_ec_decode_service(&[], false).await;
+        assert_corrupt_data_shard_rejected(&service, &data).await;
+    }
+
+    /// A rebuild's backfill writes the sidecar after the shards are mounted,
+    /// without reloading the runtimes: the decode must still find it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_volume_ec_shards_to_volume_rejects_a_corrupt_shard_with_a_late_sidecar() {
+        let (service, _tmp, data, _idx, _) = make_split_idx_ec_decode_service(&[], false).await;
+        let sidecar = format!("{data}/1.ecsum");
+        let hidden = format!("{data}/1.ecsum.hidden");
+        std::fs::rename(&sidecar, &hidden).unwrap();
+        {
+            let mut store = service.state.store.write().unwrap();
+            for ec_vol in store.find_all_ec_volumes_mut(VolumeId(1)) {
+                ec_vol.reload_bitrot_sidecar(&[]).unwrap();
+                assert_eq!(
+                    ec_vol.bitrot_protection().1,
+                    crate::storage::erasure_coding::ec_bitrot::BitrotStatus::Off,
+                    "precondition: the mounted runtime holds no protection"
+                );
+            }
+        }
+        std::fs::rename(&hidden, &sidecar).unwrap();
+        assert_corrupt_data_shard_rejected(&service, &data).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_volume_ec_shards_to_volume_refuses_a_late_sidecar_with_another_layout() {
+        use crate::storage::erasure_coding::ec_bitrot;
+        let (service, _tmp, data, _idx, _) = make_split_idx_ec_decode_service(&[], false).await;
+        let sidecar = format!("{data}/1.ecsum");
+        let hidden = format!("{data}/1.ecsum.hidden");
+        std::fs::rename(&sidecar, &hidden).unwrap();
+        {
+            let mut store = service.state.store.write().unwrap();
+            for ec_vol in store.find_all_ec_volumes_mut(VolumeId(1)) {
+                ec_vol.reload_bitrot_sidecar(&[]).unwrap();
+            }
+        }
+        let mut prot = ec_bitrot::load_bitrot_sidecar(&hidden).unwrap();
+        prot.ec_shard_config.as_mut().unwrap().parity_shards = 2;
+        ec_bitrot::save_bitrot_sidecar(&sidecar, &prot).unwrap();
+        std::fs::remove_file(&hidden).unwrap();
+
+        let err = service
+            .volume_ec_shards_to_volume(ec_shards_to_volume_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.message().contains("refusing to serve"),
+            "unexpected error: {}",
+            err.message()
+        );
+        assert!(!std::path::Path::new(&format!("{data}/1.dat")).exists());
+        for shard_id in 0..14 {
+            assert!(std::path::Path::new(&format!("{data}/1.ec{shard_id:02}")).exists());
+        }
+    }
+
+    /// An unmount between the job snapshot and the verification leaves no
+    /// runtime to resolve the sidecar: the job must refuse, not verify as Off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ec_decode_job_refuses_when_every_runtime_was_unmounted() {
+        let (service, _tmp, data, _idx, _) = make_split_idx_ec_decode_service(&[], false).await;
+        let job = {
+            let store = service.state.store.read().unwrap();
+            let (ec_vol, shard_dirs) = store
+                .collect_ec_shard_dirs(
+                    VolumeId(1),
+                    crate::storage::erasure_coding::ec_shard::MAX_SHARD_COUNT,
+                )
+                .unwrap();
+            let data_shards = ec_vol.data_shards as usize;
+            EcDecodeJob {
+                vid: VolumeId(1),
+                dat_dir: ec_vol.dir.clone(),
+                ecx_dir: ec_vol.ecx_actual_dir().to_string(),
+                idx_dir: ec_vol.dir_idx.clone(),
+                collection: ec_vol.collection.clone(),
+                vif_dat_file_size: ec_vol.dat_file_size,
+                large_block_size: ec_vol.large_block_size() as usize,
+                small_block_size: ec_vol.small_block_size() as usize,
+                shard_dirs: shard_dirs[..data_shards]
+                    .iter()
+                    .map(|d| d.clone().unwrap())
+                    .collect(),
+                needle_map_kind: store.needle_map_kind,
+            }
+        };
+        service
+            .volume_ec_shards_unmount(Request::new(
+                volume_server_pb::VolumeEcShardsUnmountRequest {
+                    volume_id: 1,
+                    shard_ids: (0..14).collect(),
+                    encode_ts_ns: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        let shard = format!("{data}/1.ec03");
+        let mut bytes = std::fs::read(&shard).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&shard, bytes).unwrap();
+
+        let err = job.run(&service.state).unwrap_err();
+
+        assert!(
+            err.message().contains("unmounted during the decode"),
+            "unexpected error: {}",
+            err.message()
+        );
+        assert!(!std::path::Path::new(&format!("{data}/1.dat")).exists());
+    }
+
+    async fn assert_corrupt_data_shard_rejected(service: &VolumeGrpcService, data: &str) {
+        let shard = format!("{data}/1.ec03");
+        let mut bytes = std::fs::read(&shard).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&shard, bytes).unwrap();
+
+        let err = service
+            .volume_ec_shards_to_volume(ec_shards_to_volume_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.message().contains("data shard 3"),
+            "unexpected error: {}",
+            err.message()
+        );
+        assert!(!std::path::Path::new(&format!("{data}/1.dat")).exists());
+        assert!(std::path::Path::new(&format!("{data}/1.ecsum")).exists());
+        for shard_id in 0..14 {
+            assert!(std::path::Path::new(&format!("{data}/1.ec{shard_id:02}")).exists());
+        }
+    }
+
     /// Replaces the idx-dir .ecj with a FIFO: the decode's open of it blocks
     /// until [`release_ecj_fifo`] opens the write end.
     #[cfg(unix)]
@@ -13454,6 +15538,52 @@ mod tests {
         );
     }
 
+    /// A copy claims the vid before it snapshots the store. A mount that
+    /// gets in afterwards would load files the copy's cleanup then unlinks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_volume_mount_refuses_a_volume_being_copied() {
+        let (service, _tmp) = make_local_service_with_volume("mount_during_copy", None);
+        service
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap()
+            .insert(VolumeId(2));
+
+        let err = service
+            .volume_mount(Request::new(volume_server_pb::VolumeMountRequest {
+                volume_id: 2,
+                collection: Some(String::new()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            err.message().contains("is being copied"),
+            "{}",
+            err.message()
+        );
+
+        service
+            .state
+            .volume_copies_in_flight
+            .lock()
+            .unwrap()
+            .remove(&VolumeId(2));
+        let err = service
+            .volume_mount(Request::new(volume_server_pb::VolumeMountRequest {
+                volume_id: 2,
+                collection: Some(String::new()),
+            }))
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "a released claim must not keep refusing the mount: {err}"
+        );
+    }
+
     // Among storage errors, the filer requeues a delete only on "is read only"
     // (Go's DeleteVolumeNeedle text).
     #[tokio::test]
@@ -13517,6 +15647,84 @@ mod tests {
                 .into_inner();
             assert_eq!(resp.results[0].status, status, "skip={skip_cookie_check}");
             assert_eq!(resp.results[0].error, "not found");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_and_write_replica_fails_when_the_peer_goes_silent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/3,01637037d6?type=replicate",
+            listener.local_addr().unwrap()
+        );
+        let client = reqwest::Client::new();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            fetch_and_write_replica(&client, &url, b"needle".to_vec(), 1, 6),
+        )
+        .await
+        .expect("a replica that never answers must not hold the request");
+        let err = result.expect_err("a silent replica must fail the write");
+        assert!(err.contains("remote write needle 1 size 6"), "{err}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= FETCH_AND_WRITE_REPLICA_TIMEOUT
+                && elapsed < FETCH_AND_WRITE_REPLICA_TIMEOUT + std::time::Duration::from_secs(1),
+            "failed after {elapsed:?}: {err}"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn fetch_and_write_replica_timeout_grows_with_the_chunk() {
+        let mib = REPLICA_MIN_BYTES_PER_SEC as usize;
+        assert_eq!(
+            fetch_and_write_replica_timeout(0),
+            FETCH_AND_WRITE_REPLICA_TIMEOUT
+        );
+        assert_eq!(
+            fetch_and_write_replica_timeout(1024 * mib),
+            FETCH_AND_WRITE_REPLICA_TIMEOUT + std::time::Duration::from_secs(1024)
+        );
+        assert_eq!(
+            fetch_and_write_replica_timeout(mib / 2),
+            FETCH_AND_WRITE_REPLICA_TIMEOUT + std::time::Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_and_write_replica_reports_the_peer_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status_line, ok) in [("201 Created", true), ("500 Internal Server Error", false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/3,01637037d6?type=replicate",
+                listener.local_addr().unwrap()
+            );
+            let peer = tokio::spawn(async move {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.ends_with(b"--\r\n") {
+                    let n = conn.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "request ended early");
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let reply = format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n");
+                conn.write_all(reply.as_bytes()).await.unwrap();
+                String::from_utf8_lossy(&request).into_owned()
+            });
+            let result =
+                fetch_and_write_replica(&reqwest::Client::new(), &url, b"needle".to_vec(), 1, 6)
+                    .await;
+            let request = peer.await.unwrap();
+            assert!(
+                request.starts_with("POST /3,01637037d6?type=replicate "),
+                "{request}"
+            );
+            assert!(request.contains("needle"), "{request}");
+            assert_eq!(result.is_ok(), ok, "{status_line}: {result:?}");
         }
     }
 }

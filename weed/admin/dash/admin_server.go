@@ -43,6 +43,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/scheduler"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3vectors"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks"
 
 	_ "github.com/seaweedfs/seaweedfs/weed/credential/grpc" // Register gRPC credential store
@@ -132,6 +133,13 @@ type AdminServer struct {
 	lastFilerUpdate      time.Time
 	filerCacheExpiration time.Duration
 
+	// Volume server version reporting: the heartbeat topology carries no
+	// version, so versions are collected per server over VolumeServerStatus
+	// and cached briefly (they only change when a server restarts).
+	volumeVersionCache map[string]string
+	lastVersionFetch   time.Time
+	volumeVersionMu    sync.Mutex
+
 	// Credential management
 	credentialManager *credential.CredentialManager
 
@@ -160,13 +168,20 @@ type AdminServer struct {
 	collectionStatsCacheThreshold time.Duration
 
 	s3TablesManager *s3tables.Manager
+	s3VectorsServer *s3vectors.Server
 	icebergPort     int
 	lancePort       int
 
 	// s3PublicEndpoint is the client-facing S3 address from admin.toml
 	// (s3.public_endpoint); discovered S3 servers are the fallback.
 	s3PublicEndpoint string
+
+	// uploadMaxSize caps the total bytes of one file browser upload; 0 means no limit.
+	uploadMaxSize int64
 }
+
+// DefaultUploadMaxSizeMB is the default total size limit of one file browser upload.
+const DefaultUploadMaxSizeMB = 500
 
 // Type definitions moved to types.go
 
@@ -208,10 +223,13 @@ func NewAdminServer(masters string, filerGroup string, templateFS http.FileSyste
 		icebergPort:                   icebergPort,
 		lancePort:                     lancePort,
 		s3PublicEndpoint:              normalizeS3PublicEndpoint(s3PublicEndpoint),
+		uploadMaxSize:                 DefaultUploadMaxSizeMB << 20,
 		pluginLock:                    lockManager,
 		adminPresenceLock:             presenceLock,
 		bgCancel:                      bgCancel,
 	}
+
+	server.s3VectorsServer = newS3VectorsServer(server)
 
 	// Initialize topic retention purger
 	server.topicRetentionPurger = NewTopicRetentionPurger(server)
@@ -362,29 +380,29 @@ func (m *masterVacuumToggler) enableVacuum() error {
 	})
 }
 
-// syncVacuumState performs a single sync step: checks if a vacuum-capable worker
-// is present and calls disable/enable accordingly. Returns the updated state
-// and whether the call failed (for log dedup on retries).
+// syncVacuumState tells the master to disable its automatic vacuum while a
+// vacuum-capable worker is present and to re-enable it otherwise. It re-sends
+// on every tick because the master keeps the flag in memory only, so a leader
+// change or master restart drops it. Only transitions are logged. Returns the
+// state the master was last set to and whether this call failed.
 func syncVacuumState(hasWorker bool, previouslyActive bool, toggler vacuumToggler, retrying bool) (active bool, failed bool) {
-	if hasWorker == previouslyActive {
-		return previouslyActive, false
-	}
+	changed := hasWorker != previouslyActive
 	if hasWorker {
-		if !retrying {
+		if changed && !retrying {
 			glog.V(0).Infof("Vacuum plugin worker connected, disabling master automatic vacuum")
 		}
 		if err := toggler.disableVacuum(); err != nil {
 			glog.Warningf("Failed to disable vacuum on master: %v", err)
-			return false, true // retry next tick
+			return previouslyActive, true // retry next tick
 		}
 		return true, false
 	}
-	if !retrying {
+	if changed && !retrying {
 		glog.V(0).Infof("Vacuum plugin worker disconnected, re-enabling master automatic vacuum")
 	}
 	if err := toggler.enableVacuum(); err != nil {
 		glog.Warningf("Failed to enable vacuum on master: %v", err)
-		return true, true // retry next tick
+		return previouslyActive, true // retry next tick
 	}
 	return false, false
 }
@@ -1563,6 +1581,18 @@ func (s *AdminServer) GetS3Endpoint() string {
 	return s.s3PublicEndpoint
 }
 
+// SetUploadMaxSize sets the total size limit in bytes of one file browser
+// upload; zero or less removes the limit.
+func (s *AdminServer) SetUploadMaxSize(maxBytes int64) {
+	s.uploadMaxSize = max(maxBytes, 0)
+}
+
+// GetUploadMaxSize returns the total size limit in bytes of one file browser
+// upload, or 0 when uploads are unlimited.
+func (s *AdminServer) GetUploadMaxSize() int64 {
+	return s.uploadMaxSize
+}
+
 // normalizeS3PublicEndpoint trims a trailing slash and drops, with a warning,
 // a value that is not a plain absolute http or https URL, so the file browser
 // hides its URL actions instead of copying broken links. Checking the string
@@ -1676,6 +1706,15 @@ func (s *AdminServer) GetWorkerGrpcPort() int {
 // GetPlugin returns the plugin instance when enabled.
 func (s *AdminServer) GetPlugin() *adminplugin.Plugin {
 	return s.plugin
+}
+
+// SetAdminLockFairnessWindow sets the cluster admin lock's fairness window
+// (see AdminLockManager.SetFairnessWindow).
+func (s *AdminServer) SetAdminLockFairnessWindow(window time.Duration) {
+	if s == nil || s.pluginLock == nil {
+		return
+	}
+	s.pluginLock.SetFairnessWindow(window)
 }
 
 func (s *AdminServer) acquirePluginLock(reason string) (func(), error) {
@@ -2279,16 +2318,24 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 
 	// Fold EC per-volume counts into the collection totals. fileCount is
 	// deduped via max across every node reporting shards for the volume;
-	// deleteCount is summed across the same nodes.
+	// deleteCount is summed across the same nodes, and a tombstone recorded
+	// on more than one shard holder can push that sum past fileCount. This
+	// is an expected accounting artefact that recurs on every refresh, so
+	// it is summarized once per pass rather than logged per volume.
+	skipped := 0
 	for vid, agg := range ecVolumeAgg {
 		data := collectionMap[agg.collection]
 		if agg.fileCount >= agg.deleteCount {
 			data.FileCount += int64(agg.fileCount - agg.deleteCount)
 		} else {
-			glog.Warningf("ec volume %d in collection %q: summed delete_count=%d exceeds file_count=%d; skipping object count",
+			skipped++
+			glog.V(2).Infof("ec volume %d in collection %q: summed delete_count=%d exceeds file_count=%d; skipping object count",
 				vid, agg.collection, agg.deleteCount, agg.fileCount)
 		}
 		collectionMap[agg.collection] = data
+	}
+	if skipped > 0 {
+		glog.V(1).Infof("%d ec volumes have summed delete_count above file_count; skipping object count for them", skipped)
 	}
 
 	return collectionMap

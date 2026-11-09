@@ -1412,6 +1412,17 @@ func (iam *IdentityAccessManagement) UpsertIdentity(ident *iam_pb.Identity) erro
 				config.Policies = append(config.Policies, &iam_pb.Policy{Name: runtimeName, Content: string(content)})
 			}
 		}
+		// The proto carries only the user's own keys; the merge replaces the
+		// identity, so its service account keys have to come from the store.
+		serviceAccounts, err := iam.credentialManager.ListServiceAccounts(context.Background())
+		if err != nil {
+			return err
+		}
+		for _, sa := range serviceAccounts {
+			if sa.ParentUser == ident.Name {
+				config.ServiceAccounts = append(config.ServiceAccounts, sa)
+			}
+		}
 	}
 	if err := iam.MergeS3ApiConfiguration(config, false, false); err != nil {
 		return err
@@ -1698,10 +1709,9 @@ func (iam *IdentityAccessManagement) Auth(f http.HandlerFunc, action Action) htt
 
 // AuthPostPolicy is a specialized authentication wrapper for PostPolicy requests.
 // It allows requests with multipart/form-data to proceed even if classified as Anonymous,
-// because the actual authentication (signature verification) for ALL PostPolicy requests is
-// performed unconditionally in PostPolicyBucketHandler.doesPolicySignatureMatch().
-// This delegation only defers the initial authentication classification; it does NOT bypass
-// signature verification, which is mandatory for all PostPolicy uploads.
+// because PostPolicy signature verification happens in PostPolicyBucketHandler when auth
+// is enabled. This delegation only defers the initial authentication classification; it
+// does NOT bypass signature verification for authenticated uploads.
 func (iam *IdentityAccessManagement) AuthPostPolicy(f http.HandlerFunc, action Action) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		scrubInternalHeaders(r)

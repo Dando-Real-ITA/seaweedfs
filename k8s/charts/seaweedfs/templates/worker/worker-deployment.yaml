@@ -7,13 +7,14 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "seaweedfs.fullname" . }}-worker
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "seaweedfs.namespace" . | quote }}
   labels:
     app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: worker
+    {{- with include "seaweedfs.commonLabels" $ }}{{ . | nindent 4 }}{{ end }}
 {{- if .Values.worker.annotations }}
   annotations:
     {{- toYaml .Values.worker.annotations | nindent 4 }}
@@ -130,7 +131,7 @@ spec:
               {{- if .Values.worker.adminServer }}
               -admin={{ .Values.worker.adminServer }} \
               {{- else }}
-              -admin={{ template "seaweedfs.fullname" . }}-admin.{{ .Release.Namespace }}:{{ .Values.admin.port }}{{ if .Values.admin.grpcPort }}.{{ .Values.admin.grpcPort }}{{ end }} \
+              -admin={{ template "seaweedfs.fullname" . }}-admin.{{ include "seaweedfs.namespace" . }}:{{ .Values.admin.port }}{{ if .Values.admin.grpcPort }}.{{ .Values.admin.grpcPort }}{{ end }} \
               {{- end }}
               -jobType={{ .Values.worker.jobType }} \
               -maxDetect={{ .Values.worker.maxDetect }} \
@@ -238,6 +239,22 @@ spec:
             {{- /* the URL crosses a shell line; metacharacters must arrive as data, not syntax */}}
             - name: LANCE_NAMESPACE_URL
               value: {{ include "seaweedfs.worker.lanceNamespaceUrl" . | quote }}
+            {{- $mergedExtraEnvironmentVars := dict }}
+            {{- include "seaweedfs.mergeExtraEnvironmentVars" (dict "global" .Values.global.seaweedfs "component" .Values.worker "target" $mergedExtraEnvironmentVars) }}
+            {{- /* a duplicate would win over the chart's value and change --id or --namespace */}}
+            {{- $mergedExtraEnvironmentVars = omit $mergedExtraEnvironmentVars "POD_NAME" "LANCE_NAMESPACE_URL" }}
+            {{- range $key := keys $mergedExtraEnvironmentVars | sortAlpha }}
+            {{- $value := index $mergedExtraEnvironmentVars $key }}
+            - name: {{ $key }}
+            {{- if kindIs "string" $value }}
+              value: {{ tpl $value $ | quote }}
+            {{- else if kindIs "map" $value }}
+              valueFrom:
+                {{ toYaml $value | nindent 16 | trim }}
+            {{- else if not (kindIs "invalid" $value) }}
+              value: {{ toJson $value | quote }}
+            {{- end -}}
+            {{- end }}
           command:
             - "/bin/sh"
             - "-ec"
@@ -252,9 +269,13 @@ spec:
               {{- if .Values.worker.adminServer }}
               --admin={{ .Values.worker.adminServer }} \
               {{- else }}
-              --admin={{ template "seaweedfs.fullname" . }}-admin.{{ .Release.Namespace }}:{{ .Values.admin.port }}{{ if .Values.admin.grpcPort }}.{{ .Values.admin.grpcPort }}{{ end }} \
+              --admin={{ template "seaweedfs.fullname" . }}-admin.{{ include "seaweedfs.namespace" . }}:{{ .Values.admin.port }}{{ if .Values.admin.grpcPort }}.{{ .Values.admin.grpcPort }}{{ end }} \
               {{- end }}
               --namespace="$LANCE_NAMESPACE_URL" \
+              --masters={{ include "seaweedfs.masterServerArg" . }} \
+              {{- if .Values.filer.filerGroup }}
+              --filer-group={{ .Values.filer.filerGroup }} \
+              {{- end }}
               {{- if .Values.global.seaweedfs.enableSecurity }}
               --tls-ca=/usr/local/share/ca-certificates/ca/tls.crt \
               --tls-cert=/usr/local/share/ca-certificates/worker/tls.crt \
@@ -267,10 +288,20 @@ spec:
               --max-concurrency={{ .Values.worker.maxExecute }}
           volumeMounts:
             {{- include "seaweedfs.tmpDirVolumeMount" (list . .Values.worker.containerSecurityContext "" "") | nindent 12 }}
+            {{- if include "seaweedfs.securityConfigEnabled" . }}
+            - name: security-config
+              readOnly: true
+              mountPath: /etc/seaweedfs/security.toml
+              subPath: security.toml
+            {{- end }}
             {{- if .Values.global.seaweedfs.enableSecurity }}
             - name: ca-cert
               readOnly: true
               mountPath: /usr/local/share/ca-certificates/ca/
+            {{- /* grpc.client, which the worker dials the masters and filers with */}}
+            - name: client-cert
+              readOnly: true
+              mountPath: /usr/local/share/ca-certificates/client/
             - name: worker-cert
               readOnly: true
               mountPath: /usr/local/share/ca-certificates/worker/
@@ -297,6 +328,10 @@ spec:
             successThreshold: 1
             failureThreshold: 3
             timeoutSeconds: 10
+          {{- end }}
+          {{- with (default .Values.worker.resources .Values.worker.lanceResources) }}
+          resources:
+            {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- if .Values.worker.containerSecurityContext.enabled }}
           securityContext: {{- omit .Values.worker.containerSecurityContext "enabled" | toYaml | nindent 12 }}

@@ -37,16 +37,20 @@ type ReadOption struct {
 	// request
 	ReadDeleted bool
 	// AttemptMetaOnly alone skips the payload only for needles larger than
-	// PagedReadLimit. Setting MustMetaOnly as well skips it at any size.
+	// PagedReadLimit. Setting MustMetaOnly or HasRange as well skips it at
+	// any size: MustMetaOnly when the request ends at the metadata, HasRange
+	// when a range of the payload is read next and reports the outcome.
 	// A compressed needle or a chunk manifest is always read in full, because
 	// the caller needs its data. After the read, IsMetaOnly reports whether
 	// the payload was skipped.
 	AttemptMetaOnly bool
 	MustMetaOnly    bool
+	HasRange        bool
 	// response
 	IsMetaOnly     bool // read status
 	VolumeRevision uint16
-	IsOutOfRange   bool // whether read over MaxPossibleVolumeSize
+	metaOffset     Offset // the record a metadata-only read resolved
+	IsOutOfRange   bool   // whether read over MaxPossibleVolumeSize
 
 	// If HasSlowRead is set to true:
 	//  * read requests and write requests compete for the lock.
@@ -166,8 +170,12 @@ func NewStore(
 
 		location.ecShardNotifyHandler = func(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, ecVolume *erasure_coding.EcVolume) {
 			s.UpdateMaxVolumeIdSeen(vid)
+			if _, _, quarantined := ecVolume.GetIoErrorState(); quarantined {
+				return
+			}
 			si := erasure_coding.NewShardsInfo()
 			si.Set(erasure_coding.NewShardInfo(shardId, erasure_coding.ShardSize(ecVolume.ShardSize())))
+			fileCount, deleteCount := ecVolume.FileAndDeleteCount()
 
 			// Use non-blocking send during startup to avoid deadlock
 			// The channel reader only starts after connecting to master, but we're loading during startup
@@ -180,6 +188,8 @@ func NewStore(
 				DiskType:    string(location.DiskType),
 				ExpireAtSec: ecVolume.ExpireAtSec,
 				DiskId:      diskId,
+				FileCount:   fileCount,
+				DeleteCount: deleteCount,
 				EncodeTsNs:  ecVolume.EncodeTsNs,
 			}:
 			default:
@@ -287,14 +297,17 @@ func (s *Store) DeleteCollection(collection string) (e error) {
 		// volume grown and destroyed between two of them was never reported at
 		// all, so nothing else would ever tell the master its slot came free.
 		for _, v := range deleted {
+			readOnly, _, readOnlyCanDelete, _ := v.ReadOnlyReasons()
 			s.DeletedVolumesChan <- &master_pb.VolumeShortInformationMessage{
-				Id:               uint32(v.Id),
-				Collection:       v.Collection,
-				ReplicaPlacement: uint32(v.ReplicaPlacement.Byte()),
-				Version:          uint32(v.Version()),
-				Ttl:              v.Ttl.ToUint32(),
-				DiskType:         string(location.DiskType),
-				DiskId:           v.diskId,
+				Id:                uint32(v.Id),
+				Collection:        v.Collection,
+				ReplicaPlacement:  uint32(v.ReplicaPlacement.Byte()),
+				Version:           uint32(v.Version()),
+				Ttl:               v.Ttl.ToUint32(),
+				DiskType:          string(location.DiskType),
+				DiskId:            v.diskId,
+				ReadOnly:          readOnly,
+				ReadOnlyCanDelete: readOnlyCanDelete,
 			}
 		}
 		if err != nil {
@@ -890,13 +903,16 @@ func (s *Store) deleteExpiredEcVolumes() (ecShards, deleted []*master_pb.VolumeE
 		// Quarantine EC volumes on faulty media: keep them in memory (so
 		// healthz can observe the quarantine state and an operator can
 		// recover) but stop reporting them so the master re-replicates
-		// from healthy peers. Mirrors the regular volume quarantine.
+		// from healthy peers. Mirrors the regular volume quarantine. The
+		// shards go out as deleted once, so the master drops them now rather
+		// than at the next full EC heartbeat.
 		for _, ev := range ioQuarantinedEvs {
 			ioErr, ioCount, quarantined := ev.GetIoErrorState()
 			if !quarantined {
 				ev.MarkIoQuarantined()
 				glog.Warningf("ec volume %d quarantined after %d consecutive IO errors: %v",
 					ev.VolumeId, ioCount, ioErr)
+				deleted = append(deleted, ev.ToVolumeEcShardInformationMessage(uint32(diskId))...)
 			}
 		}
 	}
@@ -945,6 +961,15 @@ func (s *Store) LoadNewVolumes() {
 	}
 }
 
+// SetVolumeLoadGuard installs the server-side hook every location consults
+// before loading a volume from disk, so a reload cannot register or clean
+// files out from under an in-flight VolumeCopy.
+func (s *Store) SetVolumeLoadGuard(guard func(vid needle.VolumeId) (release func(), skip bool)) {
+	for _, location := range s.Locations {
+		location.loadGuard = guard
+	}
+}
+
 func (s *Store) Close() {
 	for _, location := range s.Locations {
 		location.Close()
@@ -954,7 +979,7 @@ func (s *Store) Close() {
 func (s *Store) WriteVolumeNeedle(i needle.VolumeId, n *needle.Needle, checkCookie bool, fsync bool) (isUnchanged bool, err error) {
 	if v := s.findVolume(i); v != nil {
 		if v.IsReadOnly() {
-			err = fmt.Errorf("volume %d is read only", i)
+			err = fmt.Errorf("volume %d is %w", i, ErrorReadOnly)
 			return
 		}
 		_, _, isUnchanged, err = v.writeNeedle2(n, checkCookie, fsync, s.isStopping.Load())
@@ -1109,12 +1134,18 @@ func (s *Store) MarkVolumeWritable(i needle.VolumeId) error {
 // succeed. A validator failure unloads the volume before returning the error,
 // so an invalid newly copied replica is never announced to the master.
 func (s *Store) MountVolume(i needle.VolumeId, collection *string, validators ...func(*Volume) error) error {
-	return s.mountVolume(i, collection, validators...)
+	return s.mountVolume(i, collection, false, validators...)
 }
 
-func (s *Store) mountVolume(i needle.VolumeId, collection *string, validators ...func(*Volume) error) error {
+// MountVolumeClaimed mounts a volume whose copy guard the caller already
+// holds, so the load guard does not skip the owner's own load.
+func (s *Store) MountVolumeClaimed(i needle.VolumeId, collection *string, validators ...func(*Volume) error) error {
+	return s.mountVolume(i, collection, true, validators...)
+}
+
+func (s *Store) mountVolume(i needle.VolumeId, collection *string, ownLoad bool, validators ...func(*Volume) error) error {
 	for diskId, location := range s.Locations {
-		if found := location.LoadVolume(uint32(diskId), i, s.NeedleMapKind, collection); found == true {
+		if found := location.LoadVolume(uint32(diskId), i, s.NeedleMapKind, collection, ownLoad); found == true {
 			glog.V(0).Infof("mount volume %d", i)
 			v := s.findVolume(i)
 			v.diskId = uint32(diskId) // Set disk ID when mounting
@@ -1161,14 +1192,17 @@ func (s *Store) UnmountVolume(i needle.VolumeId) error {
 		if !found {
 			continue
 		}
+		readOnly, _, readOnlyCanDelete, _ := v.ReadOnlyReasons()
 		message := master_pb.VolumeShortInformationMessage{
-			Id:               uint32(v.Id),
-			Collection:       v.Collection,
-			ReplicaPlacement: uint32(v.ReplicaPlacement.Byte()),
-			Version:          uint32(v.Version()),
-			Ttl:              v.Ttl.ToUint32(),
-			DiskType:         string(location.DiskType),
-			DiskId:           v.diskId,
+			Id:                uint32(v.Id),
+			Collection:        v.Collection,
+			ReplicaPlacement:  uint32(v.ReplicaPlacement.Byte()),
+			Version:           uint32(v.Version()),
+			Ttl:               v.Ttl.ToUint32(),
+			DiskType:          string(location.DiskType),
+			DiskId:            v.diskId,
+			ReadOnly:          readOnly,
+			ReadOnlyCanDelete: readOnlyCanDelete,
 		}
 		if err := location.UnloadVolume(i); err != nil {
 			if err == ErrVolumeNotFound {
@@ -1264,14 +1298,17 @@ func (s *Store) DeleteVolume(i needle.VolumeId, onlyEmpty bool, onlyGarbage bool
 		if !found {
 			continue
 		}
+		readOnly, _, readOnlyCanDelete, _ := v.ReadOnlyReasons()
 		message := master_pb.VolumeShortInformationMessage{
-			Id:               uint32(v.Id),
-			Collection:       v.Collection,
-			ReplicaPlacement: uint32(v.ReplicaPlacement.Byte()),
-			Version:          uint32(v.Version()),
-			Ttl:              v.Ttl.ToUint32(),
-			DiskType:         string(location.DiskType),
-			DiskId:           v.diskId,
+			Id:                uint32(v.Id),
+			Collection:        v.Collection,
+			ReplicaPlacement:  uint32(v.ReplicaPlacement.Byte()),
+			Version:           uint32(v.Version()),
+			Ttl:               v.Ttl.ToUint32(),
+			DiskType:          string(location.DiskType),
+			DiskId:            v.diskId,
+			ReadOnly:          readOnly,
+			ReadOnlyCanDelete: readOnlyCanDelete,
 		}
 		err := location.DeleteVolume(i, onlyEmpty, onlyGarbage, keepRemoteData)
 		if err == nil {
@@ -1341,14 +1378,17 @@ func (s *Store) deleteVolumeGuarded(i needle.VolumeId, onlyEmpty bool, onlyGarba
 	var deletedMessages []*master_pb.VolumeShortInformationMessage
 	for _, location := range lockedLocations {
 		v := location.volumes[i]
+		readOnly, _, readOnlyCanDelete, _ := v.ReadOnlyReasons()
 		message := &master_pb.VolumeShortInformationMessage{
-			Id:               uint32(v.Id),
-			Collection:       v.Collection,
-			ReplicaPlacement: uint32(v.ReplicaPlacement.Byte()),
-			Version:          uint32(v.Version()),
-			Ttl:              v.Ttl.ToUint32(),
-			DiskType:         string(location.DiskType),
-			DiskId:           v.diskId,
+			Id:                uint32(v.Id),
+			Collection:        v.Collection,
+			ReplicaPlacement:  uint32(v.ReplicaPlacement.Byte()),
+			Version:           uint32(v.Version()),
+			Ttl:               v.Ttl.ToUint32(),
+			DiskType:          string(location.DiskType),
+			DiskId:            v.diskId,
+			ReadOnly:          readOnly,
+			ReadOnlyCanDelete: readOnlyCanDelete,
 		}
 		if err := v.destroyLocked(onlyEmpty, onlyGarbage, keepRemoteData); err != nil {
 			// A real failure on one disk must not be masked by another copy's

@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"bytes"
+	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -141,5 +145,129 @@ func TestListFolders_RejectsPathOutsideBuckets(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("path %q: expected 400, got %d (body: %s)", path, w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestUploadFile_RejectsOversizedUpload(t *testing.T) {
+	adminServer := &dash.AdminServer{}
+	adminServer.SetUploadMaxSize(1 << 20)
+	h := &FileBrowserHandlers{adminServer: adminServer}
+
+	// 1.5MB and two 600KB files fit the body allowance but exceed the file total;
+	// 3MB trips the body cap.
+	for _, sizes := range [][]int{{3 << 19}, {600 << 10, 600 << 10}, {3 << 20}} {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		for i, size := range sizes {
+			part, err := mw.CreateFormFile("files", fmt.Sprintf("big%d.bin", i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			part.Write(make([]byte, size))
+		}
+		mw.WriteField("path", "/buckets/b")
+		mw.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/api/files/upload", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		w := httptest.NewRecorder()
+
+		h.UploadFile(w, req)
+
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("sizes %v: expected 413, got %d (body: %s)", sizes, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "1 MB limit") {
+			t.Errorf("sizes %v: expected the limit in the error, got %s", sizes, w.Body.String())
+		}
+	}
+}
+
+func TestUploadFile_RemovesSpooledParts(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+
+	adminServer := &dash.AdminServer{}
+	adminServer.SetUploadMaxSize(34 << 20)
+	h := &FileBrowserHandlers{adminServer: adminServer}
+
+	// The 33MB part spills to disk; together the parts exceed the limit, so the upload stops there.
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for i, size := range []int{33 << 20, 3 << 19} {
+		part, err := mw.CreateFormFile("files", fmt.Sprintf("part%d.bin", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		part.Write(make([]byte, size))
+	}
+	mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/files/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	h.UploadFile(w, req.WithContext(req.Context()))
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if left, _ := os.ReadDir(tmpDir); len(left) != 0 {
+		t.Errorf("spooled parts left behind: %v", left)
+	}
+}
+
+func TestIsRelativeUploadPath(t *testing.T) {
+	for name, want := range map[string]bool{
+		"a.txt":         true,
+		"photos/a.jpg":  true,
+		"a/b/c/..x.txt": true,
+		"/etc/a":        false,
+		"a/../../b":     false,
+		"..":            false,
+		"a//b":          false,
+		"./a":           false,
+		"a/":            false,
+	} {
+		if got := isRelativeUploadPath(name); got != want {
+			t.Errorf("isRelativeUploadPath(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestUploadFile_FolderRelativePaths(t *testing.T) {
+	h := &FileBrowserHandlers{adminServer: &dash.AdminServer{}}
+	upload := func(relativePaths string) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		for _, name := range []string{"a.txt", "b.txt"} {
+			part, err := mw.CreateFormFile("files", name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			part.Write([]byte(name))
+		}
+		mw.WriteField("path", "/buckets/b")
+		mw.WriteField("relativePaths", relativePaths)
+		mw.Close()
+		req := httptest.NewRequest(http.MethodPost, "/api/files/upload", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		w := httptest.NewRecorder()
+		h.UploadFile(w, req)
+		return w
+	}
+
+	for _, paths := range []string{`["dir/a.txt"]`, `not json`, ``, `null`} {
+		if w := upload(paths); w.Code != http.StatusBadRequest {
+			t.Errorf("relativePaths %s: expected 400, got %d (body: %s)", paths, w.Code, w.Body.String())
+		}
+	}
+
+	w := upload(`["../a.txt", "dir\\..\\..\\b.txt"]`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected every escaping path to fail, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if strings.Count(w.Body.String(), "invalid relative path") != 2 {
+		t.Errorf("expected both paths rejected before upload, got %s", w.Body.String())
 	}
 }

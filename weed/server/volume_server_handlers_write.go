@@ -56,7 +56,14 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 	isUnchanged, writeError := topology.ReplicatedWrite(context.WithoutCancel(ctx), vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r, contentMd5)
 	if writeError != nil {
 		stats.VolumeServerFileWriteFailures.Inc()
-		writeJsonError(w, r, http.StatusInternalServerError, writeError)
+		status := http.StatusInternalServerError
+		if errors.Is(writeError, storage.ErrorReadOnly) {
+			status = http.StatusConflict
+		}
+		if errors.Is(writeError, topology.ErrorWriteRefused) {
+			w.Header().Set("X-Seaweed-Write-Outcome", "refused-before-append")
+		}
+		writeJsonError(w, r, status, writeError)
 		return
 	}
 
@@ -117,6 +124,13 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, ok := vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
+	if ok != nil && r.FormValue("type") == "replicate" {
+		// the write this delete undoes can still be queued here
+		if v := vs.store.GetVolume(volumeId); v != nil {
+			v.CancelPendingWrites(n.Id, cookie)
+			_, ok = vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
+		}
+	}
 	if ok != nil {
 		m := make(map[string]uint32)
 		m["size"] = 0

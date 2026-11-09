@@ -477,6 +477,7 @@ func (s *AdminServer) GetClusterVolumeServers() (*ClusterVolumeServersData, erro
 	publicUrls := s.fetchPublicUrlMap()
 
 	// Make only ONE VolumeList call and use it for both topology building AND EC shard processing
+	var dataNodes []*master_pb.DataNodeInfo
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
 		resp, err := pb.CollectVolumeList(context.Background(), client, &master_pb.VolumeListRequest{})
 		if err != nil {
@@ -497,6 +498,7 @@ func (s *AdminServer) GetClusterVolumeServers() (*ClusterVolumeServersData, erro
 			for _, dc := range resp.TopologyInfo.DataCenterInfos {
 				for _, rack := range dc.RackInfos {
 					for _, node := range rack.DataNodeInfos {
+						dataNodes = append(dataNodes, node)
 						// Initialize volume server if not exists
 						if volumeServerMap[node.Id] == nil {
 							// Look up PublicUrl from master HTTP API
@@ -531,33 +533,31 @@ func (s *AdminServer) GetClusterVolumeServers() (*ClusterVolumeServersData, erro
 						// Process disk information
 						for _, diskInfo := range node.DiskInfos {
 							vs.MaxVolumes += int(diskInfo.MaxVolumeCount)
-							// Prefer the real physical disk capacity the volume server
-							// reports; the slot-based estimate overstates capacity when
-							// maxVolumeCount is configured higher than the disk holds.
-							if diskInfo.DiskTotalBytes > 0 {
-								vs.DiskCapacity += int64(diskInfo.DiskTotalBytes)
-							} else {
-								vs.DiskCapacity += int64(diskInfo.MaxVolumeCount) * int64(volumeSizeLimitMB) * 1024 * 1024
-							}
 
-							// Count regular volumes and calculate disk usage.
-							// A remote-tiered volume reports its cloud object's
-							// size; keep those bytes out of the local disk usage
-							// that is compared against DiskCapacity.
+							// Count regular volumes. A remote-tiered volume
+							// reports its cloud object's size; keep those bytes
+							// out of the local disk usage that is compared
+							// against DiskCapacity.
+							var diskLocalSize int64
 							for _, volInfo := range diskInfo.VolumeInfos {
 								vs.Volumes++
 								if volInfo.RemoteStorageName != "" {
 									vs.RemoteSize += int64(volInfo.Size)
 								} else {
-									vs.DiskUsage += int64(volInfo.Size)
+									diskLocalSize += int64(volInfo.Size)
 								}
 							}
 
 							// Accumulate EC shard information across all disks for this volume server
 							for _, ecShardInfo := range diskInfo.EcShardInfos {
+								diskLocalSize += erasure_coding.EcShardsTotalSize(ecShardInfo)
 								volumeId := ecShardInfo.Id
 								ecShardAccumulator[volumeId] = append(ecShardAccumulator[volumeId], ecShardInfo)
 							}
+
+							capacity, usage := diskCapacityAndUsage(diskInfo, volumeSizeLimitMB, diskLocalSize)
+							vs.DiskCapacity += capacity
+							vs.DiskUsage += usage
 						}
 
 						// Process accumulated EC shard information per volume
@@ -599,7 +599,6 @@ func (s *AdminServer) GetClusterVolumeServers() (*ClusterVolumeServersData, erro
 								if shardSize, exists := allShardSizes[shardId]; exists {
 									ecInfo.ShardSizes[int(shardId)] = shardSize
 									ecInfo.TotalSize += shardSize
-									vs.DiskUsage += shardSize // Add EC shard size to total disk usage
 								}
 							}
 
@@ -622,6 +621,9 @@ func (s *AdminServer) GetClusterVolumeServers() (*ClusterVolumeServersData, erro
 	if err != nil {
 		return nil, err
 	}
+
+	// Versions are not in the heartbeat topology; ask each server directly.
+	s.fillVolumeServerVersions(volumeServerMap, dataNodes)
 
 	// Convert map back to slice
 	var volumeServers []VolumeServer

@@ -119,6 +119,9 @@ pub struct Store {
     /// field so a test can exercise the guard off Linux. Go:
     /// createVolumeFilePreallocates.
     preallocate_supported: bool,
+    /// The copy-claim set installed on every location by
+    /// set_volume_load_guard, kept here so a later add_location gets it too.
+    load_guard: Option<Arc<Mutex<HashSet<VolumeId>>>>,
 }
 
 impl Store {
@@ -143,6 +146,7 @@ impl Store {
             vid_stamp_lock: Mutex::new(()),
             vid_stamp_dirty: std::sync::atomic::AtomicBool::new(false),
             disk_stats_of: super::disk_location::get_disk_stats,
+            load_guard: None,
             preallocate_supported: PREALLOCATE_SUPPORTED,
         }
     }
@@ -165,6 +169,7 @@ impl Store {
             min_free_space,
             tags,
         )?;
+        loc.load_guard = self.load_guard.clone();
         loc.load_existing_volumes(self.needle_map_kind)?;
 
         // Check for duplicate volume IDs across existing locations
@@ -212,6 +217,17 @@ impl Store {
         self.save_vid_stamps();
 
         Ok(())
+    }
+
+    /// Mirrors Go's `Store.SetVolumeLoadGuard`: installs the copy-claim set
+    /// every location consults before scanning a volume from disk, so a
+    /// reload cannot sweep or register files out from under an in-flight
+    /// VolumeCopy.
+    pub fn set_volume_load_guard(&mut self, claims: Arc<Mutex<HashSet<VolumeId>>>) {
+        self.load_guard = Some(claims);
+        for loc in &mut self.locations {
+            loc.load_guard = self.load_guard.clone();
+        }
     }
 
     /// Scan disk locations for new volume files and load them.
@@ -932,14 +948,39 @@ impl Store {
         vol.read_needle_opt(n, read_deleted)
     }
 
-    /// Resolve a needle read under this guard, to run after it is released.
+    /// Resolve a needle read with the store guard held only for the lookup:
+    /// the plan can wait on a vacuum commit's data-file lease, and waiting
+    /// under the guard would park store writers, and every reader queued
+    /// behind them, on that commit. A handle closed while the plan waited is
+    /// looked up again, a bounded number of times.
     pub(crate) fn needle_read_plan(
-        &self,
+        store: &std::sync::RwLock<Store>,
         vid: VolumeId,
         id: NeedleId,
         read_deleted: bool,
     ) -> Result<crate::storage::volume::NeedleReadPlan, VolumeError> {
-        let (_, vol) = self.find_volume(vid).ok_or(VolumeError::NotFound)?;
+        let find = || {
+            let store = store.read().unwrap();
+            store
+                .find_volume(vid)
+                .map(|(_, vol)| vol)
+                .ok_or(VolumeError::NotFound)
+        };
+        Self::plan_on_open_handle(find, id, read_deleted)
+    }
+
+    fn plan_on_open_handle(
+        mut find: impl FnMut() -> Result<Arc<Volume>, VolumeError>,
+        id: NeedleId,
+        read_deleted: bool,
+    ) -> Result<crate::storage::volume::NeedleReadPlan, VolumeError> {
+        let mut vol = find()?;
+        for _ in 0..3 {
+            match vol.needle_read_plan(id, read_deleted) {
+                Err(_) if vol.is_closed() => vol = find()?,
+                plan => return plan,
+            }
+        }
         vol.needle_read_plan(id, read_deleted)
     }
 
@@ -1141,13 +1182,14 @@ impl Store {
     /// Matches Go's Store.MountEcShards which mounts one shard at a time.
     /// `source_disk_type` is the source volume's disk type from the
     /// `VolumeEcShardsMount` RPC (#9423); pass `""` for non-RPC paths.
+    /// Returns the index of the disk the shard mounted on.
     pub fn mount_ec_shard(
         &mut self,
         vid: VolumeId,
         collection: &str,
         shard_id: ShardId,
         source_disk_type: &str,
-    ) -> Result<(), VolumeError> {
+    ) -> Result<usize, VolumeError> {
         self.stamp_allocated_vid(vid);
         // The .ecx may live on a different disk than the shard being mounted
         // (ec.balance / ec.rebuild can spread shards across sibling disks), so
@@ -1160,7 +1202,7 @@ impl Store {
         // next. Like Go, a NotFound just means "not this disk"; anything else
         // is collected so an all-disks-fail error names every disk tried.
         let mut failures: Vec<(String, VolumeError)> = Vec::new();
-        for loc in &mut self.locations {
+        for (disk, loc) in self.locations.iter_mut().enumerate() {
             // Check if the shard file exists on this location
             let shard = EcVolumeShard::new(&loc.directory, collection, vid, shard_id);
             if !std::path::Path::new(&shard.file_name()).exists() {
@@ -1185,7 +1227,7 @@ impl Store {
                 &idx_dir,
                 source_disk_type,
             ) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(disk),
                 Err(VolumeError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => failures.push((loc.directory.clone(), e)),
             }
@@ -1450,22 +1492,27 @@ impl Store {
         Vec<master_pb::VolumeEcShardInformationMessage>,
         Vec<master_pb::VolumeEcShardInformationMessage>,
     ) {
-        let (mut ec_shards, expired) = self.find_expired_ec_volumes();
-        let (deleted, still_held) = self.remove_expired_ec_volumes(expired);
+        let (mut ec_shards, expired, quarantined) = self.find_expired_ec_volumes();
+        let (mut deleted, still_held) = self.remove_expired_ec_volumes(expired);
         ec_shards.extend(still_held);
+        deleted.extend(quarantined);
         (ec_shards, deleted)
     }
 
-    /// The read half of `delete_expired_ec_volumes`: the shards to report, and
-    /// the expired EC volumes, by disk index, for `remove_expired_ec_volumes`.
+    /// The read half of `delete_expired_ec_volumes`: the shards to report, the
+    /// expired EC volumes, by disk index, for `remove_expired_ec_volumes`, and
+    /// the shards of volumes this pass quarantined, which go out as deleted
+    /// once so the master drops them before the next full EC heartbeat.
     pub fn find_expired_ec_volumes(
         &self,
     ) -> (
         Vec<master_pb::VolumeEcShardInformationMessage>,
         Vec<(usize, VolumeId)>,
+        Vec<master_pb::VolumeEcShardInformationMessage>,
     ) {
         let mut ec_shards = Vec::new();
         let mut expired = Vec::new();
+        let mut quarantined_now = Vec::new();
 
         for (disk_id, loc) in self.locations.iter().enumerate() {
             for (vid, ec_vol) in loc.ec_volumes() {
@@ -1480,6 +1527,8 @@ impl Store {
                             io_count,
                             "ec volume quarantined after consecutive IO errors"
                         );
+                        quarantined_now
+                            .extend(ec_vol.to_volume_ec_shard_information_messages(disk_id as u32));
                     }
                 } else {
                     ec_shards
@@ -1488,7 +1537,7 @@ impl Store {
             }
         }
 
-        (ec_shards, expired)
+        (ec_shards, expired, quarantined_now)
     }
 
     /// The write half of `delete_expired_ec_volumes`: destroys each volume that
@@ -3023,6 +3072,7 @@ mod tests {
 
     #[test]
     fn test_maybe_adjust_volume_max_reserves_plain_volumes_while_preallocating() {
+        let _g = FAKE_DISK_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
 
@@ -3031,7 +3081,7 @@ mod tests {
             .add_location(
                 dir,
                 dir,
-                2,
+                5,
                 DiskType::HardDrive,
                 MinFreeSpace::Percent(1.0),
                 Vec::new(),
@@ -3048,15 +3098,13 @@ mod tests {
             )
             .unwrap();
 
-        // Room for 2.5 volumes: the plain volume claims one, leaving one more slot.
-        let (_, free) = crate::storage::disk_location::get_disk_stats(dir);
-        let volume_size_limit = (free as f64 / 2.5) as u64;
-        if volume_size_limit == 0 {
-            return; // cannot determine free disk space
-        }
-        store
-            .volume_size_limit
-            .store(volume_size_limit, Ordering::Relaxed);
+        // Room for 2.5 volumes above the 1% floor: the plain volume claims one,
+        // leaving one more slot.
+        let limit = 1024 * MIB;
+        FAKE_ALL.store(100 * limit, Ordering::Relaxed);
+        FAKE_FREE.store(limit + limit * 5 / 2, Ordering::Relaxed);
+        store.disk_stats_of = fake_disk_stats;
+        store.volume_size_limit.store(limit, Ordering::Relaxed);
         store.locations[0].original_max_volume_count = 0;
         store.set_preallocate(true);
 
@@ -3367,6 +3415,207 @@ mod tests {
         assert_eq!(v.file_count(), 2);
         assert_eq!(v.deleted_count(), 0);
         assert_eq!(v.dat_file_size().unwrap(), volume_size);
+    }
+
+    /// A volume `vid` holding needle 1, compacted and ready to commit, behind
+    /// the store lock the server's handlers use.
+    fn store_ready_to_commit(
+        dir: &str,
+        vid: VolumeId,
+        kind: NeedleMapKind,
+    ) -> Arc<std::sync::RwLock<Store>> {
+        let mut store = make_test_store(&[dir]);
+        store.needle_map_kind = kind;
+        store
+            .add_volume(vid, DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+        write_test_needle(&mut store, vid, 1, b"live needle");
+        store.compact_volume(vid, 0, 0, |_| true).unwrap();
+        Arc::new(std::sync::RwLock::new(store))
+    }
+
+    /// Commits as the vacuum-commit RPC does: the volume is looked up under
+    /// the store guard, which is dropped before the commit takes its locks.
+    /// The result comes back on a channel, so a deadlock fails a test by
+    /// timing out instead of hanging it.
+    fn commit_like_the_rpc(
+        store: Arc<std::sync::RwLock<Store>>,
+        vid: VolumeId,
+    ) -> std::sync::mpsc::Receiver<Result<(), VolumeError>> {
+        let (committed, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (_, vol) = store.read().unwrap().find_volume(vid).unwrap();
+            let _sync_guard = vol.data_file_sync_lock().lock().unwrap();
+            let _lease = vol.instance().write_lock();
+            let _ = committed.send(vol.commit_compact_held());
+        });
+        result
+    }
+
+    /// Holds the next commit of `vid` inside its swap window, where the needle
+    /// map is closed, until the returned sender is used.
+    fn hold_commit_in_swap_window(
+        vid: VolumeId,
+    ) -> (
+        crate::storage::volume::commit_swap_hook::Registration,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, in_window) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        let entered = std::sync::Mutex::new(entered);
+        let hook = crate::storage::volume::commit_swap_hook::register(vid, move || {
+            entered.lock().unwrap().send(()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+        });
+        (hook, in_window, release)
+    }
+
+    /// Plans and reads needle 1 of `vid` on another thread, and returns once
+    /// the plan holds the volume handle, so a timed check cannot pass on a
+    /// late start.
+    fn plan_in_background(
+        store: &Arc<std::sync::RwLock<Store>>,
+        vid: VolumeId,
+    ) -> std::sync::mpsc::Receiver<Result<Vec<u8>, VolumeError>> {
+        let (_, vol) = store.read().unwrap().find_volume(vid).unwrap();
+        let handles = Arc::strong_count(&vol);
+        let (planned, plan) = std::sync::mpsc::channel();
+        let reader = store.clone();
+        std::thread::spawn(move || {
+            let mut n = Needle {
+                id: NeedleId(1),
+                cookie: Cookie(1),
+                ..Needle::default()
+            };
+            let read = Store::needle_read_plan(&reader, vid, NeedleId(1), false)
+                .and_then(|mut plan| plan.read_full(&mut n))
+                .map(|()| n.data);
+            let _ = planned.send(read);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&vol) == handles {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the plan never looked up the volume"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        plan
+    }
+
+    /// A GET planned while a vacuum commit has the needle map closed waits for
+    /// the commit, as Go's readNeedle does, instead of answering NotFound for a
+    /// live needle.
+    fn check_read_plan_waits_out_a_commit_swap_window(kind: NeedleMapKind, vid: VolumeId) {
+        let tmp = TempDir::new().unwrap();
+        let store = store_ready_to_commit(tmp.path().to_str().unwrap(), vid, kind);
+        let (_hook, in_window, release) = hold_commit_in_swap_window(vid);
+        let commit = commit_like_the_rpc(store.clone(), vid);
+        in_window
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never reached its swap window");
+
+        let plan = plan_in_background(&store, vid);
+        if let Ok(early) = plan.recv_timeout(std::time::Duration::from_millis(300)) {
+            release.send(()).unwrap();
+            panic!("planned during the swap window instead of waiting: {early:?}");
+        }
+
+        release.send(()).unwrap();
+        commit
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never finished")
+            .unwrap();
+        let after = plan
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the plan still waits after the commit finished");
+        assert_eq!(after.unwrap(), b"live needle");
+    }
+
+    #[test]
+    fn test_read_plan_waits_out_a_commit_swap_window_in_memory() {
+        check_read_plan_waits_out_a_commit_swap_window(NeedleMapKind::InMemory, VolumeId(81));
+    }
+
+    #[test]
+    fn test_read_plan_waits_out_a_commit_swap_window_redb() {
+        check_read_plan_waits_out_a_commit_swap_window(NeedleMapKind::Redb, VolumeId(83));
+    }
+
+    /// A plan on a handle an unmount closed looks the volume up again and
+    /// reads the remounted volume.
+    #[test]
+    fn test_read_plan_retries_a_handle_closed_by_a_remount() {
+        let tmp = TempDir::new().unwrap();
+        let vid = VolumeId(1);
+        let mut store = make_test_store(&[tmp.path().to_str().unwrap()]);
+        store
+            .add_volume(vid, DiskType::HardDrive, &VolumeSpec::default())
+            .unwrap();
+        write_test_needle(&mut store, vid, 1, b"live needle");
+        let (_, stale) = store.find_volume(vid).unwrap();
+        assert!(store.unmount_volume(vid).unwrap());
+        store.mount_volume(vid, "", DiskType::HardDrive).unwrap();
+
+        let mut stale = Some(stale);
+        let mut plan = Store::plan_on_open_handle(
+            || match stale.take() {
+                Some(vol) => Ok(vol),
+                None => store
+                    .find_volume(vid)
+                    .map(|(_, vol)| vol)
+                    .ok_or(VolumeError::NotFound),
+            },
+            NeedleId(1),
+            false,
+        )
+        .unwrap();
+        let mut n = Needle {
+            id: NeedleId(1),
+            cookie: Cookie(1),
+            ..Needle::default()
+        };
+        plan.read_full(&mut n).unwrap();
+        assert_eq!(n.data, b"live needle");
+    }
+
+    /// A plan waiting for a commit holds no store guard, so a store writer
+    /// finishes while the commit is still in its swap window.
+    #[test]
+    fn test_read_plan_waiting_on_a_commit_does_not_block_a_store_writer() {
+        let tmp = TempDir::new().unwrap();
+        let vid = VolumeId(82);
+        let store =
+            store_ready_to_commit(tmp.path().to_str().unwrap(), vid, NeedleMapKind::InMemory);
+        let (_hook, in_window, release) = hold_commit_in_swap_window(vid);
+        let commit = commit_like_the_rpc(store.clone(), vid);
+        in_window
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never reached its swap window");
+
+        let plan = plan_in_background(&store, vid);
+        let (wrote, written) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        std::thread::spawn(move || {
+            let _guard = writer.write().unwrap();
+            let _ = wrote.send(());
+        });
+        let writer_done = written.recv_timeout(std::time::Duration::from_secs(10));
+        let planned_early = plan.try_recv().is_ok();
+        release.send(()).unwrap();
+        writer_done.expect("a store writer waited on the commit");
+        assert!(!planned_early, "planned during the swap window");
+
+        let committed = commit
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the commit never finished");
+        assert!(committed.is_ok(), "{committed:?}");
+        let after = plan
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the plan still waits after the commit finished");
+        assert_eq!(after.unwrap(), b"live needle");
     }
 
     fn write_test_needle(store: &mut Store, vid: VolumeId, id: u64, data: &[u8]) {

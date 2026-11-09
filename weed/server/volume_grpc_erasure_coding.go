@@ -186,6 +186,19 @@ func recordEcRebuild(result string, d time.Duration) {
 	stats.VolumeServerECRebuildCounter.WithLabelValues(result).Inc()
 }
 
+// ecRebuildErrorWithIds reports a rebuild failure that happened after shards
+// were regenerated on disk. The error still carries their ids so the caller's
+// deferred cleanup keeps the copies it regenerated in place — to the shell an
+// unreported regenerated copy is just an orphan to delete, and a plain gRPC
+// error would drop the response holding them.
+func ecRebuildErrorWithIds(rebuiltShardIds []uint32, err error) error {
+	st := status.New(codes.Internal, err.Error())
+	if withIds, derr := st.WithDetails(&volume_server_pb.VolumeEcShardsRebuildResponse{RebuiltShardIds: rebuiltShardIds}); derr == nil {
+		st = withIds
+	}
+	return st.Err()
+}
+
 // VolumeEcShardsRebuild generates the any of the missing .ec00 ~ .ec13 files
 func (vs *VolumeServer) VolumeEcShardsRebuild(ctx context.Context, req *volume_server_pb.VolumeEcShardsRebuildRequest) (*volume_server_pb.VolumeEcShardsRebuildResponse, error) {
 	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
@@ -280,13 +293,58 @@ func (vs *VolumeServer) VolumeEcShardsRebuild(ctx context.Context, req *volume_s
 			err = ev.ReopenDeletionJournal()
 		}
 		unlockJournal()
+		if err == nil {
+			// Mounts on sibling disks can journal into the same .ecj — the
+			// fold unlinked it, so repoint their handles too or their next
+			// append lands on the detached inode.
+			for _, location := range vs.store.Locations {
+				if location == rebuildLocation {
+					continue
+				}
+				if sibling, ok := location.FindEcVolume(needle.VolumeId(req.VolumeId)); ok && sibling.EcIndexBaseFileName() == indexBaseFileName {
+					unlockSibling := sibling.LockDeletionJournal()
+					serr := sibling.ReopenDeletionJournal()
+					unlockSibling()
+					if serr != nil {
+						err = fmt.Errorf("reopen shared ec journal on %s: %v", location.Directory, serr)
+						break
+					}
+				}
+			}
+		}
 		if err != nil {
 			recordEcRebuild("failure", time.Since(start))
-			return nil, fmt.Errorf("RebuildEcxFile %s: %v", indexBaseFileName, err)
+			return nil, ecRebuildErrorWithIds(rebuiltShardIds, fmt.Errorf("RebuildEcxFile %s: %v", indexBaseFileName, err))
 		}
 	} else if err := erasure_coding.RebuildEcxFile(indexBaseFileName); err != nil {
 		recordEcRebuild("failure", time.Since(start))
-		return nil, fmt.Errorf("RebuildEcxFile %s: %v", indexBaseFileName, err)
+		return nil, ecRebuildErrorWithIds(rebuiltShardIds, fmt.Errorf("RebuildEcxFile %s: %v", indexBaseFileName, err))
+	}
+
+	// A regenerated shard that was mounted keeps serving its old file through
+	// the open descriptor — the rename left the mounted handle on the detached
+	// inode. Repoint every mounted handle of this volume at the file now on
+	// disk, not just this run's outputs: a shard an earlier rebuild wrote on
+	// another disk is "present" this run and would never re-enter
+	// generatedShardIds, yet its mounted handle is still stale.
+	for _, location := range vs.store.Locations {
+		for _, shardId := range location.MountedEcShardIds(needle.VolumeId(req.VolumeId)) {
+			if _, rerr := location.ReopenEcShard(needle.VolumeId(req.VolumeId), shardId); rerr == nil {
+				continue
+			}
+			// The mounted disk lost the file and the rebuild wrote it
+			// elsewhere — or the file is unreadable in place. Drop the stale
+			// handle and remount from whichever local disk holds the rebuilt
+			// file; both steps emit no heartbeat delta, so the master's
+			// registration never flips. A shard that cannot be remounted is
+			// left unmounted — the honest state — rather than serving
+			// replaced bytes. Reporting the rebuilt ids on this path keeps
+			// the caller's cleanup from deleting them as strays.
+			location.UnloadEcShard(needle.VolumeId(req.VolumeId), shardId)
+			if _, _, lerr := vs.store.LoadEcShardAcrossDisks(req.Collection, needle.VolumeId(req.VolumeId), shardId); lerr != nil {
+				glog.Warningf("rebuilt ec shard %d.%d left unmounted: %v", req.VolumeId, shardId, lerr)
+			}
+		}
 	}
 
 	recordEcRebuild("success", time.Since(start))
@@ -958,6 +1016,9 @@ func (vs *VolumeServer) VolumeEcShardsMount(ctx context.Context, req *volume_ser
 		vs.recoverMissingEcIndexes(req.VolumeId)
 	}
 
+	// A failed shard stops the batch, but the shards mounted before it still
+	// get the sidecar reload below.
+	var mountErr error
 	for _, shardId := range req.ShardIds {
 		err := vs.store.MountEcShards(req.Collection, needle.VolumeId(req.VolumeId), erasure_coding.ShardId(shardId), req.SourceDiskType)
 
@@ -968,7 +1029,8 @@ func (vs *VolumeServer) VolumeEcShardsMount(ctx context.Context, req *volume_ser
 		}
 
 		if err != nil {
-			return nil, fmt.Errorf("mount %d.%d: %v", req.VolumeId, shardId, err)
+			mountErr = fmt.Errorf("mount %d.%d: %v", req.VolumeId, shardId, err)
+			break
 		}
 	}
 
@@ -991,6 +1053,9 @@ func (vs *VolumeServer) VolumeEcShardsMount(ctx context.Context, req *volume_ser
 	ecMetadataDirs := vs.store.EcMetadataDirs()
 	for _, v := range vs.store.FindAllEcVolumes(needle.VolumeId(req.VolumeId)) {
 		v.ReloadBitrotSidecar(ecMetadataDirs...)
+	}
+	if mountErr != nil {
+		return nil, mountErr
 	}
 
 	return &volume_server_pb.VolumeEcShardsMountResponse{}, nil
@@ -1037,10 +1102,16 @@ func (vs *VolumeServer) VolumeEcShardRead(req *volume_server_pb.VolumeEcShardRea
 	if req.EncodeTsNs != 0 && req.EncodeTsNs != ecVolume.EncodeTsNs {
 		return fmt.Errorf("ec shard %d.%d belongs to a different encode run", req.VolumeId, req.ShardId)
 	}
+	if _, _, quarantined := ecVolume.GetIoErrorState(); quarantined {
+		return fmt.Errorf("ec shard %d.%d is on a disk quarantined after IO errors", req.VolumeId, req.ShardId)
+	}
 
 	if req.FileKey != 0 {
-		_, size, _ := ecVolume.FindNeedleFromEcx(types.Uint64ToNeedleId(req.FileKey))
-		if size.IsDeleted() {
+		_, size, err := ecVolume.FindNeedleFromEcx(types.Uint64ToNeedleId(req.FileKey))
+		if err != nil && !errors.Is(err, erasure_coding.NotFoundError) {
+			return fmt.Errorf("ec shard %d.%d locate needle %d: %w", req.VolumeId, req.ShardId, req.FileKey, err)
+		}
+		if err == nil && size.IsDeleted() {
 			return stream.Send(&volume_server_pb.VolumeEcShardReadResponse{
 				IsDeleted:  true,
 				EncodeTsNs: ecVolume.EncodeTsNs,
@@ -1244,6 +1315,25 @@ func (vs *VolumeServer) VolumeEcShardsToVolume(ctx context.Context, req *volume_
 		return nil, status.Errorf(codes.FailedPrecondition, "ec volume %d %s", req.VolumeId, erasure_coding.EcNoLiveEntriesSubstring)
 	}
 
+	// A rebuild's backfill writes the sidecar without reloading the mounted
+	// runtimes, so resolve it again the way a shard mount does. Any runtime
+	// left finds it on every disk; with none left (an unmount raced the
+	// decode) the protection would read as Off.
+	ecVolumes := vs.store.FindAllEcVolumes(needle.VolumeId(req.VolumeId))
+	if len(ecVolumes) == 0 {
+		return nil, fmt.Errorf("ec volume %d was unmounted during the decode", req.VolumeId)
+	}
+	ecMetadataDirs := vs.store.EcMetadataDirs()
+	for _, ecVolume := range ecVolumes {
+		if err := ecVolume.ReloadBitrotSidecar(ecMetadataDirs...); err != nil {
+			return nil, fmt.Errorf("ec volume %d: %w", req.VolumeId, err)
+		}
+	}
+	prot, bitrotStatus := erasure_coding.SelectBitrotProtection(ecVolumes)
+	if err := erasure_coding.VerifyEcVolumeDataShards(prot, bitrotStatus, shardFileNames); err != nil {
+		return nil, fmt.Errorf("ec volume %d: %w", req.VolumeId, err)
+	}
+
 	// calculate .dat file size. Pass shard 0's resolved path: on a multi-disk
 	// server the volume's shards can sit on several disks, so the .ec00 is not
 	// necessarily beside the EcVolume's own base path.
@@ -1331,6 +1421,17 @@ func (vs *VolumeServer) VolumeEcShardsToVolume(ctx context.Context, req *volume_
 // as an EC/normal twin in one directory.
 func (vs *VolumeServer) adoptStagedVolume(req *volume_server_pb.VolumeEcShardsToVolumeRequest) (*volume_server_pb.VolumeEcShardsToVolumeResponse, error) {
 	vid := needle.VolumeId(req.VolumeId)
+
+	// Same window as VolumeMount: the renames and the mount below register
+	// the volume, and an in-flight copy of it rewrites the destination
+	// files. The check shares the copy's guard through the mount.
+	guard := vs.volumeCopyGuard(req.VolumeId)
+	guard.Lock()
+	defer guard.Unlock()
+	if guard.copying {
+		return nil, status.Errorf(codes.Unavailable, "volume %d is being copied", req.VolumeId)
+	}
+
 	if vs.store.GetVolume(vid) != nil {
 		return nil, fmt.Errorf("staged volume %d already exists on this server", req.VolumeId)
 	}
@@ -1375,7 +1476,7 @@ func (vs *VolumeServer) adoptStagedVolume(req *volume_server_pb.VolumeEcShardsTo
 	}
 	os.Remove(noteFile)
 
-	if err := vs.store.MountVolume(vid, &req.Collection); err != nil {
+	if err := vs.store.MountVolumeClaimed(vid, &req.Collection); err != nil {
 		return nil, fmt.Errorf("mount staged volume %d: %w", req.VolumeId, err)
 	}
 	glog.V(0).Infof("VolumeEcShardsToVolume: adopted decoded volume %d from staging (%s)", req.VolumeId, base)

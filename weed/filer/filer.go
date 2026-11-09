@@ -46,6 +46,14 @@ var (
 	OS_GID = uint32(os.Getgid())
 )
 
+// DialOptions selects the outbound dial option per target kind. Empty fields
+// fall back to the filer option, so sharing one option keeps past behavior.
+type DialOptions struct {
+	Filer  grpc.DialOption
+	Master grpc.DialOption
+	Volume grpc.DialOption
+}
+
 type Filer struct {
 	UniqueFilerId       int32
 	UniqueFilerEpoch    int32
@@ -53,6 +61,7 @@ type Filer struct {
 	MasterClient        *wdclient.MasterClient
 	FileIdDeletionQueue *util.UnboundedQueue
 	GrpcDialOption      grpc.DialOption
+	dialOptions         *DialOptions
 	DirBucketsPath      string
 	Cipher              bool
 	LocalMetaLogBuffer  *log_buffer.LogBuffer
@@ -123,11 +132,12 @@ type Filer struct {
 	flushCancel context.CancelFunc
 }
 
-func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerHost pb.ServerAddress, filerGroup string, collection string, replication string, dataCenter string, maxFilenameLength uint32, notifyFn func()) *Filer {
+func NewFiler(masters pb.ServerDiscovery, dialOptions *DialOptions, filerHost pb.ServerAddress, filerGroup string, collection string, replication string, dataCenter string, maxFilenameLength uint32, notifyFn func()) *Filer {
 	f := &Filer{
-		MasterClient:        wdclient.NewMasterClient(grpcDialOption, filerGroup, cluster.FilerType, filerHost, dataCenter, "", masters),
+		MasterClient:        wdclient.NewMasterClient(dialOptions.master(), filerGroup, cluster.FilerType, filerHost, dataCenter, "", masters),
 		FileIdDeletionQueue: util.NewUnboundedQueue(),
-		GrpcDialOption:      grpcDialOption,
+		GrpcDialOption:      dialOptions.filer(),
+		dialOptions:         dialOptions,
 		FilerConf:           NewFilerConf(),
 		RemoteStorage:       NewFilerRemoteStorage(),
 		UniqueFilerId:       util.RandomInt32(),
@@ -175,6 +185,47 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 	go f.loopProcessingDeletion()
 
 	return f
+}
+
+func (o *DialOptions) filer() grpc.DialOption {
+	if o == nil {
+		return nil
+	}
+	return o.Filer
+}
+
+func (o *DialOptions) master() grpc.DialOption {
+	if o == nil {
+		return nil
+	}
+	if o.Master != nil {
+		return o.Master
+	}
+	return o.Filer
+}
+
+func (o *DialOptions) volume() grpc.DialOption {
+	if o == nil {
+		return nil
+	}
+	if o.Volume != nil {
+		return o.Volume
+	}
+	return o.Filer
+}
+
+func (f *Filer) masterGrpcDialOption() grpc.DialOption {
+	if f.dialOptions != nil && f.dialOptions.Master != nil {
+		return f.dialOptions.Master
+	}
+	return f.GrpcDialOption
+}
+
+func (f *Filer) volumeGrpcDialOption() grpc.DialOption {
+	if f.dialOptions != nil && f.dialOptions.Volume != nil {
+		return f.dialOptions.Volume
+	}
+	return f.GrpcDialOption
 }
 
 func (f *Filer) buildRemoteStorageClient(ctx context.Context, remoteConf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
@@ -294,7 +345,7 @@ func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*m
 			break
 		}
 		lookupCtx, cancel := context.WithTimeout(ctx, peerLookupTimeout)
-		l, lookErr := cluster.LookupClusterLeader(lookupCtx, master, f.GrpcDialOption)
+		l, lookErr := cluster.LookupClusterLeader(lookupCtx, master, f.masterGrpcDialOption())
 		cancel()
 		if lookErr != nil {
 			queryErrs = append(queryErrs, lookErr)
@@ -309,7 +360,7 @@ func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*m
 		settleDeadline := time.Now().Add(leaderSettleTimeout)
 		for {
 			lookupCtx, cancel := context.WithTimeout(ctx, peerLookupTimeout)
-			nodes, listErr := cluster.ListExistingPeerUpdates(lookupCtx, leader, f.GrpcDialOption, f.MasterClient.FilerGroup, cluster.FilerType)
+			nodes, listErr := cluster.ListExistingPeerUpdates(lookupCtx, leader, f.masterGrpcDialOption(), f.MasterClient.FilerGroup, cluster.FilerType)
 			cancel()
 			if listErr != nil {
 				queryErrs = append(queryErrs, fmt.Errorf("list peers from leader %s: %w", leader, listErr))
@@ -334,7 +385,7 @@ func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*m
 			break
 		}
 		lookupCtx, cancel := context.WithTimeout(ctx, peerLookupTimeout)
-		nodes, listErr := cluster.ListExistingPeerUpdates(lookupCtx, master, f.GrpcDialOption, f.MasterClient.FilerGroup, cluster.FilerType)
+		nodes, listErr := cluster.ListExistingPeerUpdates(lookupCtx, master, f.masterGrpcDialOption(), f.MasterClient.FilerGroup, cluster.FilerType)
 		cancel()
 		if listErr != nil {
 			queryErrs = append(queryErrs, listErr)
@@ -400,8 +451,16 @@ func (fs *Filer) GetMaster(ctx context.Context) pb.ServerAddress {
 	return fs.MasterClient.GetMaster(ctx)
 }
 
+// storeTransactionKey marks a context inside BeginTransaction, whatever key
+// the store keeps its own transaction under.
+type storeTransactionKey struct{}
+
 func (f *Filer) BeginTransaction(ctx context.Context) (context.Context, error) {
-	return f.Store.BeginTransaction(ctx)
+	txCtx, err := f.Store.BeginTransaction(ctx)
+	if err != nil {
+		return txCtx, err
+	}
+	return context.WithValue(txCtx, storeTransactionKey{}, true), nil
 }
 
 func (f *Filer) CommitTransaction(ctx context.Context) error {
@@ -450,6 +509,10 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 		return filer_pb.ErrEntryNameTooLong
 	}
 
+	if entry.FullPath.HasDotSegment() {
+		return fmt.Errorf("invalid path %s", entry.FullPath)
+	}
+
 	if entry.IsDirectory() {
 		entry.Attr.TtlSec = 0
 	}
@@ -461,7 +524,14 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 	oldEntry := existing
 	if oldEntry == nil {
 		var findErr error
-		oldEntry, findErr = f.FindEntry(ctx, entry.FullPath)
+		// A lazy fetch here would persist outside the transaction and wait on
+		// the lock it holds for a target it just deleted; a non-exclusive
+		// create writes the path either way.
+		findCtx := ctx
+		if ctx.Value(storeTransactionKey{}) != nil && !o_excl {
+			findCtx = context.WithValue(ctx, lazyFetchContextKey{}, true)
+		}
+		oldEntry, findErr = f.FindEntry(findCtx, entry.FullPath)
 		if findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound) {
 			// A create cannot decide whether the path exists when the lookup
 			// itself failed; proceeding would upsert over it.
@@ -521,6 +591,25 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 		if o_excl {
 			glog.V(3).InfofCtx(ctx, "EEXIST: entry %s already exists", entry.FullPath)
 			return fmt.Errorf("%s: %w", entry.FullPath, filer_pb.ErrEntryAlreadyExists)
+		}
+		// An object landing on a directory (prefix object) replaces the object
+		// data only: the directory keeps its own mode, owner and xattrs. Only
+		// xattr- keys merge — FUSE stores them on the directory itself — while a
+		// marker's other fields (encryption, version, etag) belong to the
+		// object it held, not to the directory.
+		if oldEntry.IsDirectory() && entry.IsDirectory() {
+			if _, marked := entry.Extended[s3_constants.SeaweedFSPrefixObject]; marked {
+				entry.Attr.Mode = oldEntry.Attr.Mode
+				entry.Attr.Uid = oldEntry.Attr.Uid
+				entry.Attr.Gid = oldEntry.Attr.Gid
+				entry.Attr.UserName = oldEntry.Attr.UserName
+				entry.Attr.GroupNames = oldEntry.Attr.GroupNames
+				for key, value := range oldEntry.Extended {
+					if _, ok := entry.Extended[key]; !ok && strings.HasPrefix(key, "xattr-") {
+						entry.Extended[key] = value
+					}
+				}
+			}
 		}
 		glog.V(4).InfofCtx(ctx, "UpdateEntry %s: old entry: %v", entry.FullPath, oldEntry.Name())
 		f.stampEntryCommitTsNs(entry)
@@ -724,6 +813,9 @@ func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath,
 }
 
 func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry, isFromOtherCluster bool) (err error) {
+	if entry.FullPath.HasDotSegment() {
+		return fmt.Errorf("invalid path %s", entry.FullPath)
+	}
 	ctx = f.syncWriteContext(ctx, entry.FullPath)
 	if oldEntry != nil {
 		entry.Attr.Crtime = oldEntry.Attr.Crtime

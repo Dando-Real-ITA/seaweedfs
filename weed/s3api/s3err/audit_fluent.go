@@ -116,10 +116,14 @@ func getREST(httpMetod string, resourceType string) string {
 }
 
 func getResourceType(object string, query_key string, method string) (string, bool) {
-	if object == "/" {
+	// Bucket-level routes have no object; NormalizeObjectKey makes that "", not "/".
+	if object == "" || object == "/" {
 		switch query_key {
 		case "delete":
-			return "BATCH.DELETE.OBJECT", true
+			if method == http.MethodPost {
+				return "BATCH.DELETE.OBJECT", true
+			}
+			return getREST(method, "BUCKET"), false
 		case "tagging":
 			return getREST(method, "OBJECTTAGGING"), true
 		case "lifecycle":
@@ -141,7 +145,16 @@ func getResourceType(object string, query_key string, method string) (string, bo
 	}
 }
 
+type accessLogOperationKey struct{}
+
+func WithAccessLogOperation(r *http.Request, operation string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), accessLogOperationKey{}, operation))
+}
+
 func getOperation(object string, r *http.Request) string {
+	if operation, ok := r.Context().Value(accessLogOperationKey{}).(string); ok {
+		return operation
+	}
 	queries := r.URL.Query()
 	var operation string
 	var queryFound bool
@@ -206,7 +219,7 @@ func PostLog(r *http.Request, HTTPStatusCode int, errorCode ErrorCode) {
 }
 
 func PostAccessLog(log AccessLog) {
-	if Logger == nil || len(log.Key) == 0 {
+	if Logger == nil {
 		return
 	}
 	if err := Logger.Post(tag, log); err != nil {

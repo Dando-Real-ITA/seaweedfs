@@ -22,11 +22,14 @@ path = "src/main.rs"
 seaweed-common = { path = "../../../seaweed-common" }
 seaweed-worker-core = { path = "../core" }
 seaweed-worker-sort = { path = "../sort" }
+sw-client = { path = "../sw-client" }
 prometheus.workspace = true
 # Only the S3 backend: the other object stores lance enables by default are
 # build time this worker never spends.
 lance = { version = "10", default-features = false, features = ["aws"] }
 lance-index = "10"
+lance-linalg = "10"
+roaring = "0.11"
 # For the manifest's own fragment type, which the sort marker summarises.
 lance-table = "10"
 # For the execution options the sort needs; the scanner's own stream helper
@@ -45,14 +48,51 @@ serde_json = "1"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Reads straight from the filer and volume servers: object_store's trait,
+# the gateway's object attributes and ETags, and a read JWT per volume read.
+object_store = "0.13"
+bytes = "1"
+moka = { version = "0.12", features = ["sync"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+md-5 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+# The S3 gateway's SSE-S3 envelope: AES-256-GCM wraps keys, AES-256-CTR wraps
+# bytes, HMAC-SHA256 commits them; the filer's volume encryption is AES-256-GCM.
+aes = "0.8"
+ctr = "0.9"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+flate2 = "1"
+zstd = "0.13"
+# security.toml and the gRPC TLS weed processes use with it: the client
+# connector with the server allowlist, and the acceptor the engine serves with.
+toml = "0.8"
+rustls = "0.23"
+tokio-rustls = "0.26"
+x509-parser = "0.16"
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+tokio-stream.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tonic.workspace = true
 arrow-array = "58"
 arrow-schema = "58"
 arrow-cast = "58"
 lance-linalg = "10"
+tempfile = "3"
 
 [lints]
 workspace = true

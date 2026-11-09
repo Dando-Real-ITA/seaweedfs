@@ -194,7 +194,7 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		fs.GetOrHeadHandler(w, r)
+		fs.GetOrHeadHandler(w, r.WithContext(context.WithValue(r.Context(), readOnlyListingKey{}, true)))
 	default:
 		requestMethod = "INVALID"
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -309,10 +309,14 @@ func authorizeFilerJwtPaths(r *http.Request, claims *security.SeaweedFilerClaims
 }
 
 // jwtScopedRequestPaths returns every filer path a request touches that must be
-// covered by the JWT AllowedPrefixes: the write target (r.URL.Path) plus any
-// copy/move source named by the cp.from / mv.from query parameters.
+// covered by the JWT AllowedPrefixes: the write target (r.URL.Path), the
+// directory a zip extract writes under, and any copy/move source named by the
+// cp.from / mv.from query parameters.
 func jwtScopedRequestPaths(r *http.Request) []string {
 	paths := []string{r.URL.Path}
+	if (r.Method == http.MethodPost || r.Method == http.MethodPut) && isExtractZip(r) {
+		paths = append(paths, extractZipRoot(r)+"/")
+	}
 	if query := r.URL.Query(); query.Has("cp.from") || query.Has("mv.from") {
 		if from := query.Get("cp.from"); from != "" {
 			paths = append(paths, from)

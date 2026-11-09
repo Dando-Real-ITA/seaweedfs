@@ -17,11 +17,30 @@ import (
 
 const defaultPageSize = 1000
 
+// manager is the S3 Tables manager a request runs through: a cluster process,
+// authenticated by the cluster token alone, has no identity of its own and is
+// trusted; every other caller is checked against its grants.
+func (s *Server) manager(r *http.Request) *s3tables.Manager {
+	if s3_constants.GetIdentityNameFromContext(r) == "" && isTrustedCaller(r.Context()) {
+		return s.internal
+	}
+	return s.tablesManager
+}
+
 // execute runs one S3 Tables operation as the request's authenticated caller.
 func (s *Server) execute(r *http.Request, operation string, req, resp interface{}) error {
 	identityName := s3_constants.GetIdentityNameFromContext(r)
 	return s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		return s.tablesManager.Execute(r.Context(), s3tables.NewManagerClient(client), operation, req, resp, identityName)
+		return s.manager(r).Execute(r.Context(), s3tables.NewManagerClient(client), operation, req, resp, identityName)
+	})
+}
+
+// executeInternal runs one S3 Tables operation through the trusted manager —
+// the caller's catalog grants must not gate an internal resolution that the
+// caller's own vector permission already authorized.
+func (s *Server) executeInternal(r *http.Request, operation string, req, resp interface{}) error {
+	return s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return s.internal.Execute(r.Context(), s3tables.NewManagerClient(client), operation, req, resp, "")
 	})
 }
 
@@ -149,12 +168,22 @@ func (s *Server) storageOptions(r *http.Request, bucket, location string, vend b
 	if s.s3Region != "" {
 		options["aws_region"] = s.s3Region
 	}
+	if !s.authEnabled() {
+		// The S3 port takes unsigned requests, and a client with no
+		// credentials of its own would otherwise fail looking for some.
+		options["aws_skip_signature"] = "true"
+	}
 
 	if !vend || s.credentialVendor == nil {
 		return options, nil
 	}
 
 	principal := s3_constants.GetIdentityNameFromContext(r)
+	// A cluster process reaches the table's files on the filers and volume
+	// servers itself; it has no principal and needs no S3 credentials.
+	if principal == "" && isTrustedCaller(r.Context()) {
+		return options, nil
+	}
 	credentials, err := s.credentialVendor.VendTableCredentials(r.Context(), principal, bucket, locationPrefix(location), canWrite == nil || !canWrite())
 	if err != nil {
 		return nil, err
@@ -177,6 +206,9 @@ func (s *Server) storageOptions(r *http.Request, bucket, location string, vend b
 // credentials would cover, the same gate the Iceberg catalog applies so a
 // read-only caller never gets write-capable storage_options.
 func (s *Server) mayUpdateTable(r *http.Request, bucket string, ns []string, name string) bool {
+	if !s.mayWriteNamespace(r, bucket, ns) {
+		return false
+	}
 	req := &s3tables.UpdateTableRequest{
 		TableBucketARN: bucketARN(bucket),
 		Namespace:      ns,
@@ -188,6 +220,20 @@ func (s *Server) mayUpdateTable(r *http.Request, bucket string, ns []string, nam
 	})
 	if err != nil {
 		glog.V(1).Infof("lance: UpdateTable check for %s/%s failed, vending read-only: %v", bucket, name, err)
+	}
+	return err == nil
+}
+
+// mayWriteNamespace keeps the vector namespace of a vector bucket out of reach
+// of s3tables grants: its index data is written only by trusted callers, and
+// the vector bucket policy gates everyone else through S3 Vectors.
+func (s *Server) mayWriteNamespace(r *http.Request, bucket string, ns []string) bool {
+	if isTrustedCaller(r.Context()) {
+		return true
+	}
+	err := s.tablesManager.CheckVectorNamespaceWrite(r.Context(), s.filerClient, bucket, ns)
+	if err != nil {
+		glog.V(1).Infof("lance: %s/%s is read-only to this caller: %v", bucket, strings.Join(ns, "."), err)
 	}
 	return err == nil
 }

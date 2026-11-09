@@ -37,6 +37,13 @@ type MemFiler struct {
 	// BeforeDelete runs once before the next DeleteEntry, so a test can land a
 	// competing write in a handler's check-to-delete window.
 	BeforeDelete func()
+	// OnLookup runs at the start of every LookupDirectoryEntry with the target
+	// path, so a test can land a competing write between two reads.
+	OnLookup func(dir, name string)
+	// OnUpdate runs at the start of every UpdateEntry with the target path, so
+	// a test can land a competing write at a chosen step of a multi-update
+	// operation.
+	OnUpdate func(dir, name string)
 	// RejectDelete returns the reason DeleteEntry refuses a path, answered the
 	// way the filer answers one: no transport error, the reason in the response.
 	RejectDelete func(dir, name string) string
@@ -79,6 +86,9 @@ func (f *MemFiler) PutFile(dir, name string, mtime time.Time) {
 }
 
 func (f *MemFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	if hook := f.OnLookup; hook != nil {
+		hook(req.Directory, req.Name)
+	}
 	if e := f.Get(req.Directory, req.Name); e != nil {
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
 	}
@@ -144,23 +154,33 @@ func (f *MemFiler) CreateEntry(_ context.Context, req *filer_pb.CreateEntryReque
 }
 
 func (f *MemFiler) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
-	// The hook runs before the lock is taken: its whole purpose is to land a
+	// The hooks run before the lock is taken: their whole purpose is to land a
 	// competing write in the read-to-write window, and that write needs the lock.
+	if hook := f.OnUpdate; hook != nil {
+		hook(req.Directory, req.Entry.Name)
+	}
 	if hook := f.BeforeUpdate; hook != nil {
 		f.BeforeUpdate = nil
 		hook()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// The real filer looks the entry up before anything else and answers a
+	// missing one with codes.NotFound, not a failed precondition.
+	existing := f.entries[req.Directory][req.Entry.Name]
+	if existing == nil {
+		return nil, status.Errorf(codes.NotFound, "not found %s: %v", path.Join(req.Directory, req.Entry.Name), filer_pb.ErrNotFound)
+	}
+	// The real filer will not write a directory entry over a file or the
+	// reverse; without it here a write that raced a replacement would turn the
+	// replacement into the entry it never was.
+	if existing.IsDirectory != req.Entry.IsDirectory {
+		return nil, status.Errorf(codes.Unknown, "%s: existing entry type differs", path.Join(req.Directory, req.Entry.Name))
+	}
 	// The real filer validates ExpectedExtended under the per-path lock; without
 	// it here a lost update would look like a success.
 	for key, expected := range req.ExpectedExtended {
-		var actual []byte
-		if d, ok := f.entries[req.Directory]; ok {
-			if existing := d[req.Entry.Name]; existing != nil {
-				actual = existing.Extended[key]
-			}
-		}
+		actual := existing.Extended[key]
 		if !bytes.Equal(actual, expected) {
 			return nil, status.Errorf(codes.FailedPrecondition, "extended attribute %q changed", key)
 		}
@@ -185,7 +205,9 @@ func (f *MemFiler) DeleteEntry(_ context.Context, req *filer_pb.DeleteEntryReque
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// The real filer evaluates ExpectedExtended under the path lock and refuses
-	// the delete when the entry no longer matches what the caller captured.
+	// the delete when the entry no longer matches what the caller captured. It
+	// does so before anything else, so a directory that changed hands is a
+	// changed entry whether or not it also holds something.
 	for key, expected := range req.ExpectedExtended {
 		var actual []byte
 		if d, ok := f.entries[req.Directory]; ok {
@@ -196,6 +218,10 @@ func (f *MemFiler) DeleteEntry(_ context.Context, req *filer_pb.DeleteEntryReque
 		if !bytes.Equal(actual, expected) {
 			return nil, status.Errorf(codes.FailedPrecondition, "extended attribute %q changed", key)
 		}
+	}
+	// The real filer then refuses a non-recursive delete of a non-empty folder.
+	if child := path.Join(req.Directory, req.Name); !req.IsRecursive && len(f.entries[child]) > 0 {
+		return &filer_pb.DeleteEntryResponse{Error: "fail to delete non-empty folder: " + child}, nil
 	}
 	if d, ok := f.entries[req.Directory]; ok {
 		delete(d, req.Name)

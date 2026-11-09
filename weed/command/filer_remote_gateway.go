@@ -31,6 +31,7 @@ type RemoteGatewayOptions struct {
 	bucketsDir  string
 	clientId    int32
 	clientEpoch int32
+	resumeTsNs  int64
 }
 
 var _ = filer_pb.FilerClient(&RemoteGatewayOptions{})
@@ -73,6 +74,11 @@ var cmdFilerRemoteGateway = &Command{
 	If any bucket is created, deleted, or updated, it will mirror the changes to remote object store.
 
 		weed filer.remote.gateway -createBucketAt=cloud1
+
+	In a versioned bucket every version is written to the object's key, so the
+	remote keeps earlier versions only when versioning is enabled on it. A delete
+	marker over a version with a legal hold or retention keeps the remote object
+	until a later change to that version releases the lock.
 
 `,
 }

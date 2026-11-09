@@ -1,24 +1,23 @@
 package s3vectors
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 )
 
-type contextKey string
-
-const identityKey contextKey = "s3vectors-identity"
-
 func contextWithIdentity(ctx context.Context, identity string) context.Context {
-	return context.WithValue(ctx, identityKey, identity)
+	return s3_constants.SetIdentityNameInContext(ctx, identity)
 }
 
 func identityOf(r *http.Request) string {
-	v, _ := r.Context().Value(identityKey).(string)
-	return v
+	return s3_constants.GetIdentityNameFromContext(r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -38,10 +37,31 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	})
 }
 
-const maxRequestBodyBytes = 32 << 20
+const maxRequestBodyBytes = s3_constants.S3VectorsMaxRequestBodyBytes
+
+var errRequestBodyTooLarge = fmt.Errorf("request body exceeds %d MiB", maxRequestBodyBytes>>20)
 
 func readJSON(r *http.Request, req interface{}) error {
-	return json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(req)
+	info, _ := r.Context().Value(requestInfoKey{}).(*requestInfo)
+	var body []byte
+	if info != nil {
+		body = info.body
+	}
+	if body == nil {
+		var err error
+		body, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+		if err != nil {
+			return err
+		}
+		if len(body) > maxRequestBodyBytes {
+			return errRequestBodyTooLarge
+		}
+		if info != nil {
+			info.received += int64(len(body))
+			info.body = body
+		}
+	}
+	return json.NewDecoder(bytes.NewReader(body)).Decode(req)
 }
 
 // Request/response shapes for the AWS S3 Vectors API (awsJson1_1).
@@ -54,7 +74,7 @@ type vectorBucketARNs struct {
 type CreateVectorBucketRequest struct {
 	VectorBucketName        string                 `json:"vectorBucketName"`
 	EncryptionConfiguration map[string]interface{} `json:"encryptionConfiguration,omitempty"`
-	MetadataResourceTags    map[string]string      `json:"-"`
+	Tags                    map[string]string      `json:"tags,omitempty"`
 }
 
 type CreateVectorBucketResponse struct {
@@ -71,13 +91,14 @@ type GetVectorBucketResponse struct {
 }
 
 type VectorBucket struct {
-	VectorBucketArn  string    `json:"vectorBucketArn"`
-	VectorBucketName string    `json:"vectorBucketName"`
-	CreationTime     time.Time `json:"creationTime"`
+	VectorBucketArn         string                 `json:"vectorBucketArn"`
+	VectorBucketName        string                 `json:"vectorBucketName"`
+	CreationTime            time.Time              `json:"creationTime"`
+	EncryptionConfiguration map[string]interface{} `json:"encryptionConfiguration,omitempty"`
 }
 
 type ListVectorBucketsRequest struct {
-	MaxResults int    `json:"maxResults"`
+	MaxResults *int   `json:"maxResults"`
 	NextToken  string `json:"nextToken"`
 	Prefix     string `json:"prefix"`
 }
@@ -94,6 +115,30 @@ type DeleteVectorBucketRequest struct {
 
 type DeleteVectorBucketResponse struct{}
 
+type PutVectorBucketPolicyRequest struct {
+	VectorBucketName string `json:"vectorBucketName"`
+	VectorBucketArn  string `json:"vectorBucketArn"`
+	Policy           string `json:"policy"`
+}
+
+type PutVectorBucketPolicyResponse struct{}
+
+type GetVectorBucketPolicyRequest struct {
+	VectorBucketName string `json:"vectorBucketName"`
+	VectorBucketArn  string `json:"vectorBucketArn"`
+}
+
+type GetVectorBucketPolicyResponse struct {
+	Policy string `json:"policy"`
+}
+
+type DeleteVectorBucketPolicyRequest struct {
+	VectorBucketName string `json:"vectorBucketName"`
+	VectorBucketArn  string `json:"vectorBucketArn"`
+}
+
+type DeleteVectorBucketPolicyResponse struct{}
+
 type CreateIndexRequest struct {
 	DataType              string                 `json:"dataType"`
 	Dimension             int32                  `json:"dimension"`
@@ -103,6 +148,7 @@ type CreateIndexRequest struct {
 	MetadataConfiguration *MetadataConfiguration `json:"metadataConfiguration,omitempty"`
 	VectorBucketName      string                 `json:"vectorBucketName"`
 	VectorBucketArn       string                 `json:"vectorBucketArn"`
+	Tags                  map[string]string      `json:"tags,omitempty"`
 }
 
 type MetadataConfiguration struct {
@@ -136,7 +182,7 @@ type GetIndexResponse struct {
 }
 
 type ListIndexesRequest struct {
-	MaxResults       int    `json:"maxResults"`
+	MaxResults       *int   `json:"maxResults"`
 	NextToken        string `json:"nextToken"`
 	Prefix           string `json:"prefix"`
 	VectorBucketName string `json:"vectorBucketName"`
@@ -211,12 +257,12 @@ type ListVectorsRequest struct {
 	IndexName        string `json:"indexName"`
 	VectorBucketName string `json:"vectorBucketName"`
 	VectorBucketArn  string `json:"vectorBucketArn"`
-	MaxResults       int    `json:"maxResults"`
+	MaxResults       *int   `json:"maxResults"`
 	NextToken        string `json:"nextToken"`
 	ReturnData       bool   `json:"returnData"`
 	ReturnMetadata   bool   `json:"returnMetadata"`
-	SegmentCount     int    `json:"segmentCount"`
-	SegmentIndex     int    `json:"segmentIndex"`
+	SegmentCount     *int   `json:"segmentCount"`
+	SegmentIndex     *int   `json:"segmentIndex"`
 }
 
 type ListVectorsResponse struct {
@@ -261,4 +307,26 @@ type QueryOutputVector struct {
 type QueryVectorsResponse struct {
 	DistanceMetric string               `json:"distanceMetric"`
 	Vectors        []*QueryOutputVector `json:"vectors"`
+}
+
+type TagResourceRequest struct {
+	ResourceArn string            `json:"resourceArn"`
+	Tags        map[string]string `json:"tags"`
+}
+
+type TagResourceResponse struct{}
+
+type UntagResourceRequest struct {
+	ResourceArn string   `json:"resourceArn"`
+	TagKeys     []string `json:"tagKeys"`
+}
+
+type UntagResourceResponse struct{}
+
+type ListTagsForResourceRequest struct {
+	ResourceArn string `json:"resourceArn"`
+}
+
+type ListTagsForResourceResponse struct {
+	Tags map[string]string `json:"tags"`
 }

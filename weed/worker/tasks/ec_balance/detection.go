@@ -86,7 +86,7 @@ func Detection(
 		VolumeRatio: volumeRatio,
 		// Move incrementally across detection cycles rather than draining a rack
 		// in one batch; the scheduler re-evaluates each cycle.
-		GlobalMaxMovesPerRack: 10,
+		GlobalMaxMovesPerRack: globalMaxMovesPerRack(ecConfig, maxResults),
 		// Balance heterogeneous-capacity racks by fractional fullness.
 		GlobalUtilizationBased: true,
 		RackTotalCapRaised: func(collection string, vid uint32, rackCap, evenCap int) {
@@ -96,6 +96,12 @@ func Detection(
 	if len(moves) == 0 {
 		return nil, false, nil
 	}
+
+	// The global phase is capped per rack while the per-volume phases are not,
+	// so order it ahead of the within-rack moves: otherwise a long within-rack
+	// backlog pushes every global move past the detection cap, and a server that
+	// holds far more shards than its peers never drains.
+	sortMovesByPhase(moves)
 
 	hasMore := false
 	if maxResults > 0 && len(moves) > maxResults {
@@ -337,6 +343,63 @@ func countEcShards(ecShardInfos []*master_pb.VolumeEcShardInformationMessage) in
 		count += erasure_coding.GetShardCount(eci)
 	}
 	return count
+}
+
+// sortMovesByPhase orders a plan for truncation, keeping the planner's order
+// within a phase: dedup and cross-rack first, then the capped global phase,
+// then within-rack. A volume's moves keep their plan order: a global move can
+// take a shard that an earlier within-rack move placed, and the scheduler runs
+// only a volume's first move per cycle.
+func sortMovesByPhase(moves []ecbalancer.Move) {
+	type volumeKey struct {
+		collection string
+		vid        uint32
+	}
+	volumeOrder := make(map[volumeKey]int)
+	order := make([]int, len(moves))
+	for i, m := range moves {
+		vk := volumeKey{m.Collection, m.VolumeID}
+		volumeOrder[vk] = max(volumeOrder[vk], movePhaseOrder(m.Phase))
+		order[i] = volumeOrder[vk]
+	}
+	idx := make([]int, len(moves))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortStableFunc(idx, func(a, b int) int { return order[a] - order[b] })
+	sorted := make([]ecbalancer.Move, len(moves))
+	for i, j := range idx {
+		sorted[i] = moves[j]
+	}
+	copy(moves, sorted)
+}
+
+func movePhaseOrder(phase string) int {
+	switch phase {
+	case "dedup":
+		return 0
+	case "cross_rack":
+		return 1
+	case "global":
+		return 2
+	default:
+		return 3
+	}
+}
+
+// globalMaxMovesPerRack is the configured per-rack cap on global moves, or the default
+// when unset (0 would otherwise mean unlimited to the planner). It never exceeds
+// maxResults: the detection keeps at most that many moves, and each planned global move
+// costs a scan of the source node's volumes, so a larger cap only adds planning time.
+func globalMaxMovesPerRack(c *Config, maxResults int) int {
+	moves := c.GlobalMaxMovesPerRack
+	if moves <= 0 {
+		moves = DefaultGlobalMaxMovesPerRack
+	}
+	if maxResults > 0 {
+		moves = min(moves, maxResults)
+	}
+	return moves
 }
 
 func movePhasePriority(phase string) types.TaskPriority {

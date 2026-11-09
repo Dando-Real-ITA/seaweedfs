@@ -3,6 +3,7 @@ package s3tables
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
@@ -164,6 +165,61 @@ func ValidateMetadataLocation(metadataLocation, bucketName, namespace string) er
 	return nil
 }
 
+// ValidateEncryptionConfiguration admits only the AES256 declaration, under the
+// caller's wire name — s3tables sends sseAlgorithm, s3vectors sends sseType. A
+// caller-chosen key is never read back by the storage path, so recording one
+// would claim protection the data does not get.
+func ValidateEncryptionConfiguration(cfg map[string]interface{}, sseField string) error {
+	if len(cfg) == 0 {
+		return nil
+	}
+	otherField := "sseAlgorithm"
+	if sseField == otherField {
+		otherField = "sseType"
+	}
+	if _, ok := cfg[otherField]; ok {
+		return fmt.Errorf("encryptionConfiguration field is %s", sseField)
+	}
+	value, ok := cfg[sseField].(string)
+	if !ok {
+		return fmt.Errorf("encryptionConfiguration requires %s", sseField)
+	}
+	if value != "AES256" {
+		return fmt.Errorf("unsupported %s %q", sseField, value)
+	}
+	if _, ok := cfg["kmsKeyArn"]; ok {
+		return fmt.Errorf("kmsKeyArn is not supported")
+	}
+	return nil
+}
+
+// DeclaredBucketEncryption returns the sseAlgorithm a table bucket's record
+// declares, for the S3 write path to apply, when the bucket's format leaves
+// every file to its clients. An ICEBERG bucket gets "": its catalog reads the
+// manifests clients upload straight from the filer, past S3 decryption.
+func DeclaredBucketEncryption(entry *filer_pb.Entry) string {
+	if !IsTableBucketEntry(entry) {
+		return ""
+	}
+	var metadata tableBucketMetadata
+	if json.Unmarshal(entry.Extended[ExtendedKeyMetadata], &metadata) != nil {
+		return ""
+	}
+	return DeclaredEncryption(metadata.Format, metadata.EncryptionConfiguration)
+}
+
+// DeclaredEncryption is DeclaredBucketEncryption for a bucket record already
+// read: its format and encryption configuration.
+func DeclaredEncryption(format string, encryption map[string]interface{}) string {
+	if !IsCatalogOnlyFormat(format) {
+		return ""
+	}
+	if algorithm, _ := encryption["sseAlgorithm"].(string); algorithm == "AES256" {
+		return algorithm
+	}
+	return ""
+}
+
 func parseS3Location(location string) (bucket, tablePath string, err error) {
 	if !strings.HasPrefix(location, "s3://") {
 		return "", "", fmt.Errorf("unsupported location: %s", location)
@@ -197,10 +253,11 @@ func GetTableObjectBucketPath(bucketName string) string {
 // Metadata structures
 
 type tableBucketMetadata struct {
-	Name           string    `json:"name"`
-	CreatedAt      time.Time `json:"createdAt"`
-	OwnerAccountID string    `json:"ownerAccountId"`
-	Format         string    `json:"format,omitempty"`
+	Name                    string                 `json:"name"`
+	CreatedAt               time.Time              `json:"createdAt"`
+	OwnerAccountID          string                 `json:"ownerAccountId"`
+	Format                  string                 `json:"format,omitempty"`
+	EncryptionConfiguration map[string]interface{} `json:"encryptionConfiguration,omitempty"`
 }
 
 // namespaceMetadata stores metadata for a namespace
@@ -223,6 +280,9 @@ type tableMetadataInternal struct {
 	MetadataVersion  int            `json:"metadataVersion"`
 	MetadataLocation string         `json:"metadataLocation,omitempty"`
 	Metadata         *TableMetadata `json:"metadata,omitempty"`
+	// WarehouseLocation is where a table created without a location keeps
+	// its files. Records written before it existed keep them under their path.
+	WarehouseLocation string `json:"warehouseLocation,omitempty"`
 }
 
 // IsTableBucketEntry returns true when the entry is marked as a table bucket.

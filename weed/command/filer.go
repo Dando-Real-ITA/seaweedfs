@@ -184,7 +184,7 @@ func init() {
 	filerS3Options.concurrentUploadLimitMB = cmdFiler.Flag.Int("s3.concurrentUploadLimitMB", 0, "limit total concurrent upload size for S3, 0 means unlimited")
 	filerS3Options.concurrentFileUploadLimit = cmdFiler.Flag.Int("s3.concurrentFileUploadLimit", 0, "limit number of concurrent file uploads for S3, 0 means unlimited")
 	filerS3Options.enableIam = cmdFiler.Flag.Bool("s3.iam", true, "enable embedded IAM API on the same S3 port")
-	filerS3Options.cipher = cmdFiler.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads")
+	filerS3Options.cipher = cmdFiler.Flag.Bool("s3.encryptVolumeData", false, "encrypt data on volume servers for S3 uploads; on whenever -encryptVolumeData is")
 	filerS3Options.iamReadOnly = cmdFiler.Flag.Bool("s3.iam.readOnly", true, "disable IAM write operations on this server")
 	filerS3Options.portIceberg = cmdFiler.Flag.Int("s3.port.iceberg", 8181, "Iceberg REST Catalog server listen port (0 to disable)")
 	filerS3Options.portLance = cmdFiler.Flag.Int("s3.port.lance", 9101, "Lance Namespace server listen port (0 to disable)")
@@ -506,12 +506,9 @@ func (fo *FilerOptions) startFiler() {
 	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.filer"))
 	filer_pb.RegisterSeaweedFilerServer(grpcS, fs)
 
-	// Register the IAM gRPC service. Auth is opt-in: when
-	// jwt.filer_signing.key is configured the service requires a Bearer token
-	// signed with that key; otherwise it runs unauthenticated, matching the
-	// rest of the filer's gRPC surface. Operators who expose the filer gRPC
-	// port beyond a trusted network should set jwt.filer_signing.key on both
-	// the filer and the admin server.
+	// IAM RPCs require a Bearer token signed with jwt.filer_signing.key when it
+	// is set. The key does not protect the rest of this port; that needs
+	// [grpc.filer] mTLS.
 	if credentialManager != nil {
 		adminSigningKey := security.SigningKey(util.GetViper().GetString("jwt.filer_signing.key"))
 		iamGrpcServer := weed_server.NewIamGrpcServer(credentialManager, adminSigningKey)

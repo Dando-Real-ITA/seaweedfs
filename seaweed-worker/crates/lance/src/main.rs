@@ -36,13 +36,22 @@ struct Args {
     #[arg(long, default_value = "1")]
     max_concurrency: i32,
 
-    /// Storage credentials to use where the namespace vends none. A gateway
-    /// with STS configured vends its own and these are ignored.
-    #[arg(long, env = "WEED_S3_ACCESS_KEY")]
-    access_key: Option<String>,
-
-    #[arg(long, env = "WEED_S3_SECRET_KEY")]
-    secret_key: Option<String>,
+    /// Comma-separated master addresses: the worker asks them for the filers
+    /// it keeps tables through.
+    #[arg(long, alias = "master", env = "WEED_MASTERS")]
+    masters: String,
+    /// The filer group whose filers the worker uses.
+    #[arg(
+        long,
+        alias = "filer.group",
+        env = "WEED_FILER_GROUP",
+        default_value = ""
+    )]
+    filer_group: String,
+    /// The cluster's security.toml; by default the file weed processes find
+    /// in -config_dir, ., ~/.seaweedfs and /etc/seaweedfs.
+    #[arg(long, env = "WEED_WORKER_SECURITY_TOML")]
+    security_toml: Option<std::path::PathBuf>,
 
     /// mTLS for the admin stream, the same certificates the Go worker reads
     /// from the [grpc.worker] section of security.toml. All three together, or
@@ -61,17 +70,20 @@ struct Args {
     #[arg(long)]
     tls_server_name: Option<String>,
 
-    /// Shared secret for the admin control stream, the `jwt.filer_signing.key`
-    /// value the Go worker reads from its config file. Required by admins that
-    /// authenticate the worker stream with a signing key.
+    /// The cluster's `jwt.filer_signing.key`. The Lance namespace knows the
+    /// worker by a token derived from it, and admins that authenticate the
+    /// worker stream with a signing key require it. When not given, read from
+    /// where the Go worker reads it: WEED_JWT_FILER_SIGNING_KEY, then
+    /// security.toml.
     #[arg(long, env = "WEED_FILER_SIGNING_KEY")]
     filer_signing_key: Option<String>,
 
     /// Lifetime of the token minted from the signing key, mirroring
     /// `jwt.filer_signing.expires_after_seconds`. Zero mints a token with no
-    /// expiry.
-    #[arg(long, default_value = "0")]
-    filer_signing_key_expires_after_seconds: u64,
+    /// expiry. When not given, the expiry configured beside a discovered key,
+    /// else zero.
+    #[arg(long)]
+    filer_signing_key_expires_after_seconds: Option<u64>,
 
     /// Serve /health, /ready and /metrics on this port, the way
     /// `weed worker -metricsPort` does. Zero, the default, serves nothing.
@@ -136,6 +148,28 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let tls = args.tls()?;
+    // One security.toml for everything: the admin stream's and the catalog's
+    // signing key, and the cluster connection.
+    let security =
+        weed_lance_worker::security::Security::load(args.security_toml.as_deref(), None)?;
+    let filer_signing = match args.filer_signing_key.filter(|key| !key.is_empty()) {
+        Some(key) => Some((key, 0)),
+        None => security
+            .get("jwt.filer_signing.key")
+            .filter(|key| !key.is_empty())
+            .map(|key| {
+                if let Some(path) = security.path() {
+                    tracing::info!(source = %path.display(), "using jwt.filer_signing.key");
+                }
+                let expires = security
+                    .get("jwt.filer_signing.expires_after_seconds")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                (key, expires)
+            }),
+    };
+    let (filer_signing_key, configured_expiry) = filer_signing.unzip();
+    let signing_key = weed_lance_worker::catalog::SigningKey::new(filer_signing_key.clone());
     let options = WorkerOptions {
         admin_address: args.admin,
         worker_id: args.id,
@@ -143,16 +177,17 @@ async fn main() -> Result<()> {
         max_detection_concurrency: args.max_concurrency,
         max_execution_concurrency: args.max_concurrency,
         tls,
-        signing_key: args.filer_signing_key,
-        signing_key_expires_after_seconds: args.filer_signing_key_expires_after_seconds,
+        signing_key: filer_signing_key,
+        signing_key_expires_after_seconds: args
+            .filer_signing_key_expires_after_seconds
+            .or(configured_expiry)
+            .unwrap_or(0),
         ..Default::default()
     };
 
-    let mut fallback = weed_lance_worker::dataset::FallbackOptions::new();
-    if let (Some(access), Some(secret)) = (args.access_key, args.secret_key) {
-        fallback.insert("aws_access_key_id".to_string(), access);
-        fallback.insert("aws_secret_access_key".to_string(), secret);
-    }
+    let cluster =
+        weed_lance_worker::cluster::Cluster::new(&args.masters, &args.filer_group, &security)?;
+    let storage = weed_lance_worker::dataset::Storage(Some(cluster.storage(&security).await?));
 
     let metrics = Metrics::new(&options.worker_id, &options.worker_version)?;
     let lance_metrics = LanceMetrics::new(&metrics)?;
@@ -164,9 +199,10 @@ async fn main() -> Result<()> {
     }
 
     let mut registry = Registry::new().with_preview(Arc::new(
-        weed_lance_worker::preview::LancePreview::new(args.namespace.clone(), fallback.clone()),
+        weed_lance_worker::preview::LancePreview::new(args.namespace.clone(), storage.clone())
+            .with_signing_key(signing_key.clone()),
     ));
-    for handler in handlers(args.namespace, fallback, Some(lance_metrics)) {
+    for handler in handlers(args.namespace, storage, signing_key, Some(lance_metrics)) {
         registry = registry.register(handler);
     }
 

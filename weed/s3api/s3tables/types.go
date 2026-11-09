@@ -2,6 +2,7 @@ package s3tables
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 )
@@ -17,8 +18,9 @@ type TableBucket struct {
 }
 
 type CreateTableBucketRequest struct {
-	Name string            `json:"name"`
-	Tags map[string]string `json:"tags,omitempty"`
+	Name                    string                 `json:"name"`
+	Tags                    map[string]string      `json:"tags,omitempty"`
+	EncryptionConfiguration map[string]interface{} `json:"encryptionConfiguration,omitempty"`
 	// Format is the table format this bucket holds. A bucket is a catalog and a
 	// catalog serves one protocol, so declaring it here is what lets a caller be
 	// told where to connect. Empty means ICEBERG, which is what AWS S3 Tables
@@ -41,7 +43,8 @@ type GetTableBucketResponse struct {
 	CreatedAt      time.Time `json:"createdAt"`
 	// Format is empty for a bucket created before formats were declared. Such a
 	// bucket accepts any format, which is what it did when it was made.
-	Format string `json:"format,omitempty"`
+	Format                  string                 `json:"format,omitempty"`
+	EncryptionConfiguration map[string]interface{} `json:"encryptionConfiguration,omitempty"`
 }
 
 type ListTableBucketsRequest struct {
@@ -240,6 +243,8 @@ type GetTableResponse struct {
 	VersionToken     string         `json:"versionToken"`
 	MetadataVersion  int            `json:"metadataVersion"`
 	Metadata         *TableMetadata `json:"metadata,omitempty"`
+	// WarehouseLocation is set on tables created without a location.
+	WarehouseLocation string `json:"warehouseLocation,omitempty"`
 }
 
 type ListTablesRequest struct {
@@ -299,6 +304,9 @@ type RenameTableRequest struct {
 	SourceName      string   `json:"sourceName"`
 	DestNamespace   []string `json:"destNamespace"`
 	DestName        string   `json:"destName"`
+	// VersionToken, when set, makes the rename conditional on the source still
+	// carrying this version token.
+	VersionToken string `json:"versionToken,omitempty"`
 }
 
 type RenameTableResponse struct {
@@ -582,6 +590,23 @@ type S3TablesError struct {
 
 func (e *S3TablesError) Error() string {
 	return e.Message
+}
+
+// PublishedTableChangedMessage is the message of the conflict a CreateTable
+// answers when the table it registered was already visible, and another
+// caller updated or renamed it before the create could back it out. The
+// record survives, under this name or another, so whatever the caller staged
+// for it may still be in use.
+const PublishedTableChangedMessage = "table was registered and then changed by another request before the create finished"
+
+// IsPublishedTableChanged reports whether err, as a CreateTable caller
+// receives it, is the conflict PublishedTableChangedMessage describes.
+func IsPublishedTableChanged(err error) bool {
+	if errors.Is(err, ErrPublishedRecordChanged) {
+		return true
+	}
+	var tableErr *S3TablesError
+	return errors.As(err, &tableErr) && tableErr.Type == ErrCodeConflict && tableErr.Message == PublishedTableChangedMessage
 }
 
 // Table formats a catalog entry may declare.

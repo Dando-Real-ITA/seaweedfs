@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -150,6 +151,11 @@ func (h *S3TablesHandler) handleCreateNamespace(w http.ResponseWriter, r *http.R
 		return err
 	}
 
+	if otherTableBucket(r.Context(), bucketMetadata.CreatedAt) {
+		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchBucket, fmt.Sprintf("table bucket %s not found", bucketName))
+		return filer_pb.ErrNotFound
+	}
+
 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
 	principal := h.getAccountID(r)
 	identityActions := getIdentityActions(r)
@@ -169,19 +175,49 @@ func (h *S3TablesHandler) handleCreateNamespace(w http.ResponseWriter, r *http.R
 	}
 
 	namespacePath := GetNamespacePath(bucketName, namespaceName)
+	// The authorization above holds for this bucket only. One deleted and
+	// created again under the same name since then is another bucket, and is
+	// treated as gone by both checks below.
+	isAuthorizedBucket := isTableBucketCreatedAt(bucketMetadata.CreatedAt)
 
-	// Check if namespace already exists
+	// A delete that has claimed the bucket is scanning it for namespaces, so
+	// refuse before writing anything. Checked after the authorization above, so
+	// denied callers never see the delete.
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		_, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+		return h.checkParentOpen(r.Context(), client, bucketPath, isAuthorizedBucket)
+	})
+	if h.writeBucketClosedError(w, err, bucketName) {
 		return err
+	}
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check table bucket: %v", err))
+		return err
+	}
+
+	// Check if namespace already exists. One still marked unfinished does not:
+	// its create either confirmed it or lost it, and the mark left behind would
+	// wedge the name, so this create takes it over the way a table's does.
+	exists := false
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		entry, err := h.lookupEntry(r.Context(), client, namespacePath)
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		_, hasMetadata := entry.Extended[ExtendedKeyMetadata]
+		exists = hasMetadata && !isUnfinishedCreate(entry.Extended)
+		return nil
 	})
 
-	if err == nil {
-		h.writeError(w, http.StatusConflict, ErrCodeNamespaceAlreadyExists, fmt.Sprintf("namespace %s already exists", namespaceName))
-		return fmt.Errorf("namespace already exists")
-	} else if !errors.Is(err, filer_pb.ErrNotFound) {
+	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check namespace: %v", err))
 		return err
+	}
+	if exists {
+		h.writeError(w, http.StatusConflict, ErrCodeNamespaceAlreadyExists, fmt.Sprintf("namespace %s already exists", namespaceName))
+		return fmt.Errorf("namespace already exists")
 	}
 
 	// Create the namespace with bucket owner to maintain consistency
@@ -200,20 +236,52 @@ func (h *S3TablesHandler) handleCreateNamespace(w http.ResponseWriter, r *http.R
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
+	// The unfinished mark keeps a table or view from being created in the
+	// namespace until the bucket check below has passed: one created before it
+	// would be left under a namespace that check then backs out.
+	attrs := map[string][]byte{
+		ExtendedKeyMetadata: metadataBytes,
+		ExtendedKeyDeleting: []byte(createClaim),
+	}
 	var taken error
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		err := h.createDirectoryExclusive(r.Context(), client, namespacePath, map[string][]byte{ExtendedKeyMetadata: metadataBytes})
+		err := h.createDirectoryExclusive(r.Context(), client, namespacePath, attrs)
 		if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
-			taken = err // an answer, not a filer failure
-			return nil
+			// A directory is already there. If it is a leftover — a delete kept
+			// it for the data under it and cleared its catalog attributes —
+			// take it back; claimCatalogEntry refuses a real namespace.
+			err = h.retakeDirectory(r.Context(), client, namespacePath, attrs)
+			if errors.Is(err, ErrNameTaken) {
+				taken = filer_pb.ErrEntryAlreadyExists // an answer, not a filer failure
+				return nil
+			}
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		// A delete may have claimed the bucket since the check above, after it
+		// scanned for namespaces and before this write. Confirm the bucket once
+		// more now that the namespace is there: a delete claiming it later scans
+		// the namespace, marked or not, and one that claimed it already makes
+		// this back out what it wrote. The mark comes off only after that check
+		// and the bucket is not checked again: a table created in the window
+		// between the two would be left under a namespace the second check backs out.
+		// A bucket recreated since the authorization fails the check as gone, so
+		// the namespace is backed out of it rather than left with this owner.
+		return h.confirmParentOnce(r.Context(), client, bucketPath, isAuthorizedBucket, namespacePath, attrs, namespacePath)
 	})
 	if err == nil && taken != nil {
 		err = taken
 	}
 	if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
 		h.writeError(w, http.StatusConflict, ErrCodeNamespaceAlreadyExists, fmt.Sprintf("namespace %s already exists", namespaceName))
+		return err
+	}
+	if errors.Is(err, ErrConcurrentUpdate) || errors.Is(err, filer_pb.ErrNotFound) {
+		h.writeError(w, http.StatusConflict, ErrCodeConflict, "namespace changed during create, retry the request")
+		return err
+	}
+	if h.writeBucketClosedError(w, err, bucketName) {
 		return err
 	}
 	if err != nil {
@@ -229,6 +297,25 @@ func (h *S3TablesHandler) handleCreateNamespace(w http.ResponseWriter, r *http.R
 
 	h.writeJSON(w, http.StatusOK, resp)
 	return nil
+}
+
+// writeBucketClosedError answers a create refused because its bucket is being
+// created, being deleted, or was deleted, and reports whether err was one of
+// those.
+func (h *S3TablesHandler) writeBucketClosedError(w http.ResponseWriter, err error, bucketName string) bool {
+	switch {
+	case errors.Is(err, errParentCreating):
+		h.writeError(w, http.StatusConflict, ErrCodeConflict, fmt.Sprintf("table bucket %s is still being created, retry the request", bucketName))
+	case errors.Is(err, errParentDeleting):
+		h.writeError(w, http.StatusConflict, ErrCodeConflict, fmt.Sprintf("table bucket %s is being deleted", bucketName))
+	case errors.Is(err, errParentGone):
+		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchBucket, fmt.Sprintf("table bucket %s not found", bucketName))
+	case errors.Is(err, errBackOutFailed):
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("table bucket %s was deleted during the request and the new namespace may remain", bucketName))
+	default:
+		return false
+	}
+	return true
 }
 
 // handleGetNamespace gets details of a namespace
@@ -264,7 +351,7 @@ func (h *S3TablesHandler) handleGetNamespace(w http.ResponseWriter, r *http.Requ
 	var bucketPolicy string
 	var bucketTags map[string]string
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		data, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+		data, err := h.readNamespaceMetadataAttr(r.Context(), client, namespacePath)
 		if err != nil {
 			return err
 		}
@@ -357,7 +444,7 @@ func (h *S3TablesHandler) handleUpdateNamespace(w http.ResponseWriter, r *http.R
 	var bucketPolicy string
 	var bucketTags map[string]string
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		data, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+		data, err := h.readNamespaceMetadataAttr(r.Context(), client, namespacePath)
 		if err != nil {
 			return err
 		}
@@ -412,9 +499,25 @@ func (h *S3TablesHandler) handleUpdateNamespace(w http.ResponseWriter, r *http.R
 	}
 
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		return h.setExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata, metadataBytes)
+		return h.mutateCatalogRecord(r.Context(), client, namespacePath, func(extended map[string][]byte) error {
+			// The write carries the authorized record's owner and creation
+			// time, so it must not land on a namespace created again since.
+			if !isNamespaceCreatedAt(metadata.CreatedAt)(&filer_pb.Entry{Extended: extended}) {
+				return fmt.Errorf("%w: %s holds another namespace", ErrConcurrentUpdate, namespacePath)
+			}
+			extended[ExtendedKeyMetadata] = metadataBytes
+			return nil
+		})
 	})
 	if err != nil {
+		if errors.Is(err, ErrConcurrentUpdate) {
+			h.writeError(w, http.StatusConflict, ErrCodeConflict, "namespace changed during update, retry the request")
+			return err
+		}
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", flattenNamespace(req.Namespace)))
+			return err
+		}
 		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update namespace")
 		return err
 	}
@@ -557,9 +660,10 @@ func (h *S3TablesHandler) handleListNamespaces(w http.ResponseWriter, r *http.Re
 					continue
 				}
 
-				// Read metadata from extended attribute
+				// Read metadata from extended attribute. A namespace its create has
+				// not confirmed is not one yet.
 				data, ok := entry.Entry.Extended[ExtendedKeyMetadata]
-				if !ok {
+				if !ok || isUnfinishedCreate(entry.Entry.Extended) {
 					continue
 				}
 
@@ -646,12 +750,23 @@ func (h *S3TablesHandler) handleDeleteNamespace(w http.ResponseWriter, r *http.R
 	var bucketPolicy string
 	var bucketTags map[string]string
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		data, err := h.getExtendedAttribute(r.Context(), client, namespacePath, ExtendedKeyMetadata)
+		data, err := h.readNamespaceMetadataAttr(r.Context(), client, namespacePath)
 		if err != nil {
 			return err
 		}
 		if err := json.Unmarshal(data, &metadata); err != nil {
 			return fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+		// Checked after the namespace read: a bucket created again holds only
+		// namespaces of its own, and the claim below is bound to this one.
+		if createdAt, bound := boundTableBucket(r.Context()); bound {
+			bucket, err := h.lookupEntry(r.Context(), client, bucketPath)
+			if err != nil {
+				return err
+			}
+			if !isTableBucketCreatedAt(createdAt)(bucket) {
+				return filer_pb.ErrNotFound
+			}
 		}
 
 		// Fetch bucket policy if it exists
@@ -694,34 +809,102 @@ func (h *S3TablesHandler) handleDeleteNamespace(w http.ResponseWriter, r *http.R
 		return ErrAccessDenied
 	}
 
+	// Claim before scanning, so a create that writes after the scan sees it.
+	// A namespace whose create has not confirmed it is absent, and claiming it
+	// would replace the create's mark: a refused delete then lifts the claim and
+	// leaves the namespace looking confirmed before its create checked the bucket.
+	// One created again since it was authorized is absent too.
+	var claim string
+	var claimed map[string][]byte
+	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		var claimErr error
+		claim, claimed, claimErr = h.claimForDelete(r.Context(), client, namespacePath, isNamespaceCreatedAt(metadata.CreatedAt))
+		return claimErr
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, filer_pb.ErrNotFound):
+			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", flattenNamespace(req.Namespace)))
+		case errors.Is(err, ErrConcurrentUpdate):
+			h.writeError(w, http.StatusConflict, ErrCodeConflict, "namespace changed during delete, retry the request")
+		default:
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to claim namespace for delete: %v", err))
+		}
+		return err
+	}
+	releaseClaim := func() {
+		_ = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+			h.releaseDeleteClaim(r.Context(), client, namespacePath, claim)
+			return nil
+		})
+	}
+
 	// Check if namespace is empty
 	hasChildren := false
+	keepDir := false
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		resp, err := client.ListEntries(r.Context(), &filer_pb.ListEntriesRequest{
-			Directory: namespacePath,
-			Limit:     10,
-		})
-		if err != nil {
-			return err
-		}
-
-		for {
-			entry, err := resp.Recv()
+		lastFileName := ""
+		for !hasChildren {
+			resp, err := client.ListEntries(r.Context(), &filer_pb.ListEntriesRequest{
+				Directory:          namespacePath,
+				Limit:              10,
+				StartFromFileName:  lastFileName,
+				InclusiveStartFrom: lastFileName == "",
+			})
 			if err != nil {
-				if err == io.EOF {
-					break
-				}
 				return err
 			}
-			if entry.Entry != nil && !strings.HasPrefix(entry.Entry.Name, ".") {
-				// Only consider it a child if it's a table (has metadata) or a file.
-				// Empty directories left by dropped tables or S3 clients should not
-				// prevent the namespace from being deleted.
-				_, hasMetadata := entry.Entry.Extended[ExtendedKeyMetadata]
-				if hasMetadata || !entry.Entry.IsDirectory {
-					hasChildren = true
-					break
+
+			hasMore := false
+			for {
+				entry, err := resp.Recv()
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					return err
 				}
+				if entry.Entry == nil {
+					continue
+				}
+				hasMore = true
+				lastFileName = entry.Entry.Name
+				// Hidden entries are never children.
+				if !strings.HasPrefix(entry.Entry.Name, ".") {
+					// A record still marked by its create is absent to readers and
+					// cannot confirm under the claim this delete holds, so it is no
+					// child — the delete removes it with the namespace.
+					if isUnfinishedCreate(entry.Entry.Extended) {
+						continue
+					}
+					// Only consider it a child if it's a table (has metadata), a file,
+					// or a record an in-flight operation claimed — a rename's cleared
+					// source still holds its claim, and removing its directory takes
+					// the data the destination keeps pointing at. Bare directories
+					// left by dropped tables or S3 clients should not prevent the
+					// namespace from being deleted.
+					_, hasMetadata := entry.Entry.Extended[ExtendedKeyMetadata]
+					_, claimed := entry.Entry.Extended[ExtendedKeyDeleting]
+					if hasMetadata || claimed || !entry.Entry.IsDirectory {
+						hasChildren = true
+						break
+					}
+				}
+				// A bare directory with files under it, hidden or not, is a
+				// renamed-away table's data, which the destination still points
+				// at — a table's location may sit under any directory of the
+				// namespace: the namespace directory stays, minus its catalog
+				// record. One such directory settles it, so the rest are not walked.
+				if entry.Entry.IsDirectory && !keepDir {
+					holdsFiles, err := h.dirHoldsFiles(r.Context(), client, path.Join(namespacePath, entry.Entry.Name))
+					if err != nil {
+						return err
+					}
+					keepDir = holdsFiles
+				}
+			}
+			if !hasMore {
+				break
 			}
 		}
 
@@ -729,6 +912,7 @@ func (h *S3TablesHandler) handleDeleteNamespace(w http.ResponseWriter, r *http.R
 	})
 
 	if err != nil {
+		releaseClaim()
 		if errors.Is(err, filer_pb.ErrNotFound) {
 			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, fmt.Sprintf("namespace %s not found", flattenNamespace(req.Namespace)))
 		} else {
@@ -738,17 +922,26 @@ func (h *S3TablesHandler) handleDeleteNamespace(w http.ResponseWriter, r *http.R
 	}
 
 	if hasChildren {
+		releaseClaim()
 		h.writeError(w, http.StatusConflict, ErrCodeNamespaceNotEmpty, "namespace is not empty")
 		return fmt.Errorf("namespace not empty")
 	}
 
-	// Delete the namespace
+	// Delete the namespace, or stop it being one while the data under it stays.
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		return h.deleteDirectory(r.Context(), client, namespacePath)
+		if keepDir {
+			return h.keepAsLeftover(r.Context(), client, namespacePath, claimed)
+		}
+		return h.deleteDirectoryIfMatches(r.Context(), client, namespacePath, &filer_pb.Entry{Extended: claimed})
 	})
 
 	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to delete namespace")
+		releaseClaim()
+		if errors.Is(err, ErrConcurrentUpdate) {
+			h.writeError(w, http.StatusConflict, ErrCodeConflict, "namespace changed during delete, retry the request")
+		} else {
+			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to delete namespace")
+		}
 		return err
 	}
 

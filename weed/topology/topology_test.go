@@ -471,6 +471,37 @@ func TestVolumeReadOnlyStatusChange(t *testing.T) {
 	assert(t, "activeVolumeCount after writable again", int(usageCounts.activeVolumeCount), 1)
 }
 
+func TestDeletingReadOnlyVolumeKeepsActiveCount(t *testing.T) {
+	topo := NewTopology("weedfs", sequence.NewMemorySequencer(), 32*1024, 5, false)
+	dn := topo.GetOrCreateDataCenter("dc1").GetOrCreateRack("rack1").
+		GetOrCreateDataNode("127.0.0.1", 34534, 0, "127.0.0.1", "", map[string]uint32{"": 25})
+
+	v := storage.VolumeInfo{
+		Id:               needle.VolumeId(1),
+		Version:          needle.GetCurrentVersion(),
+		ReplicaPlacement: &super_block.ReplicaPlacement{},
+		Ttl:              needle.EMPTY_TTL,
+	}
+	dn.UpdateVolumes([]storage.VolumeInfo{v})
+	topo.RegisterVolumeLayout(v, dn)
+	v.ReadOnly = true
+	dn.UpdateVolumes([]storage.VolumeInfo{v})
+	assert(t, "activeVolumeCount after read-only", int(topo.diskUsages.usages[types.HardDriveType].activeVolumeCount), 0)
+
+	// The server's delete report does not say the volume was read-only.
+	topo.IncrementalSyncDataNodeRegistration(nil, []*master_pb.VolumeShortInformationMessage{
+		{Id: 1, Version: uint32(needle.GetCurrentVersion())},
+	}, dn)
+
+	for name, usage := range map[string]*DiskUsageCounts{
+		"topology": topo.diskUsages.usages[types.HardDriveType],
+		"node":     dn.diskUsages.usages[types.HardDriveType],
+	} {
+		assert(t, name+" volumeCount after delete", int(usage.volumeCount), 0)
+		assert(t, name+" activeVolumeCount after delete", int(usage.activeVolumeCount), 0)
+	}
+}
+
 func TestVolumeReadOnlyAndRemoteStatusChange(t *testing.T) {
 	topo := NewTopology("weedfs", sequence.NewMemorySequencer(), 32*1024, 5, false)
 
@@ -607,6 +638,40 @@ func TestListCollections(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// A collection delete that queues for the write lock while ListCollections
+// reads the collections must not wedge both.
+func TestListCollectionsWithConcurrentCollectionDelete(t *testing.T) {
+	rp, _ := super_block.NewReplicaPlacementFromString("000")
+	topo := NewTopology("weedfs", sequence.NewMemorySequencer(), 32*1024, 5, false)
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			topo.GetVolumeLayout("churn", rp, needle.EMPTY_TTL, types.HardDriveType)
+			topo.DeleteCollection("churn")
+		}
+	}()
+
+	listed := make(chan struct{})
+	go func() {
+		defer close(listed)
+		for i := 0; i < 100000; i++ {
+			topo.ListCollections(true, false)
+		}
+	}()
+	select {
+	case <-listed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ListCollections deadlocked with a concurrent DeleteCollection")
 	}
 }
 

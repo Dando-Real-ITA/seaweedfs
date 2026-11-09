@@ -387,14 +387,12 @@ func applyMultipartSSES3HeadersFromUploadEntry(dst *filer_pb.Entry, sses3Info *m
 }
 
 func (s3a *S3ApiServer) prepareMultipartCompletionState(r *http.Request, input *s3.CompleteMultipartUploadInput, parts *CompleteMultipartUpload, uploadDirectory, entryName, dirName string, completedPartNumbers []int, completedPartMap map[int][]string, maxPartNo int) (*multipartCompletionState, *CompleteMultipartUploadResult, s3err.ErrorCode) {
-	if entry, err := s3a.resolveObjectEntry(*input.Bucket, *input.Key, ""); err == nil && entry != nil && entry.Extended != nil {
-		if uploadId, ok := entry.Extended[s3_constants.SeaweedFSUploadId]; ok && *input.UploadId == string(uploadId) {
-			cleanupEntries, _, cleanupErr := s3a.list(uploadDirectory, "", "", false, s3_constants.MaxS3MultipartParts+1)
-			if cleanupErr != nil && !errors.Is(cleanupErr, filer_pb.ErrNotFound) {
-				glog.Warningf("completeMultipartUpload: failed to list stale upload directory %s for cleanup: %v", uploadDirectory, cleanupErr)
-			}
-			return &multipartCompletionState{deleteEntries: cleanupEntries, metadataOnlyCleanup: true}, completeMultipartResult(r, input, getEtagFromEntry(entry), entry), s3err.ErrNone
+	if output, _ := s3a.committedCompletion(r, input); output != nil {
+		cleanupEntries, _, cleanupErr := s3a.list(uploadDirectory, "", "", false, s3_constants.MaxS3MultipartParts+1)
+		if cleanupErr != nil && !errors.Is(cleanupErr, filer_pb.ErrNotFound) {
+			glog.Warningf("completeMultipartUpload: failed to list stale upload directory %s for cleanup: %v", uploadDirectory, cleanupErr)
 		}
+		return &multipartCompletionState{deleteEntries: cleanupEntries, metadataOnlyCleanup: true}, output, s3err.ErrNone
 	}
 
 	entries, _, err := s3a.list(uploadDirectory, "", "", false, s3_constants.MaxS3MultipartParts+1)
@@ -625,7 +623,7 @@ func (s3a *S3ApiServer) prepareMultipartCompletionState(r *http.Request, input *
 			glog.Errorf("completeMultipartUpload: %s checksum computation failed: %v", checksumType, checksumErr)
 			return nil, nil, s3err.ErrInvalidPart
 		}
-		if objectChecksum := lookupHeaderOrQuery(r, query, checksumHeaderName); objectChecksum != "" && objectChecksum != checksumValue {
+		if objectChecksum := lookupHeaderOrQuery(r, query, checksumHeaderName); objectChecksum != "" && !matchesObjectChecksum(objectChecksum, checksumValue) {
 			return nil, nil, s3err.ErrBadDigest
 		}
 	}
@@ -689,6 +687,12 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 	// retries. With no owner yet (no ring), keep the lock as the bootstrap path.
 	owner := s3a.objectWriteOwner(*input.Bucket, *input.Key)
 	routeKey := s3a.objectRouteKey(*input.Bucket, *input.Key)
+	// The write condition rides the commit transaction so the owner filer
+	// evaluates it under the object's path lock — the gateway's earlier
+	// checkConditionalHeaders is only a fast-path. Every header form reduces
+	// to clauses, so reducible is false only when the headers cannot parse,
+	// where the lock path reports the same parse error.
+	cond, reducible := buildWriteCondition(r)
 	completionBody := func() s3err.ErrorCode {
 		var prepCode s3err.ErrorCode
 		completionState, output, prepCode = s3a.prepareMultipartCompletionState(r, input, parts, uploadDirectory, entryName, dirName, completedPartNumbers, completedPartMap, maxPartNo)
@@ -796,7 +800,7 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 					glog.Errorf("completeMultipartUpload %s upload %s unused part cleanup: %v", *input.Bucket, *input.UploadId, err)
 					return s3err.ErrInternalError
 				}
-				if code := s3a.routedMultipartFinalize(owner, *input.Bucket, *input.Key, useInvertedFormat, versionDir, versionFileName, completionState.finalParts, decorateVersionEntry, *input.UploadId); code != s3err.ErrNone {
+				if code := s3a.routedMultipartFinalize(owner, *input.Bucket, *input.Key, useInvertedFormat, versionDir, versionFileName, completionState.finalParts, decorateVersionEntry, *input.UploadId, cond); code != s3err.ErrNone {
 					if code == s3err.ErrNoSuchUpload {
 						return code
 					}
@@ -850,6 +854,9 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 				glog.Errorf("completeMultipartUpload %s upload %s unused part cleanup: %v", *input.Bucket, *input.UploadId, err)
 				return s3err.ErrInternalError
 			}
+			// The condition checks the null slot first, then the latest version,
+			// same resolution the gateway's conditional check performs.
+			versionsDir := dirName + "/" + entryName + s3_constants.VersionsFolder
 			if err := s3a.writeMultipartObject(owner, routeKey, dirName, entryName, completionState.finalParts, func(entry *filer_pb.Entry) {
 				if entry.Extended == nil {
 					entry.Extended = make(map[string][]byte)
@@ -898,9 +905,12 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 					entry.Attributes.Mime = completionState.mime
 				}
 				entry.Attributes.FileSize = uint64(completionState.offset)
-			}, removal); err != nil {
+			}, removal, cond, versionsDir); err != nil {
 				if errors.Is(err, errUploadRemoved) {
 					return s3err.ErrNoSuchUpload
+				}
+				if errors.Is(err, errObjectPrecondition) {
+					return s3err.ErrPreconditionFailed
 				}
 				// The transaction may have committed the object before failing on
 				// the upload removal; a surviving entry references the manifests.
@@ -991,9 +1001,12 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 			if completionState.entityWithTtl {
 				entry.Extended[s3_constants.SeaweedFSExpiresS3] = []byte("true")
 			}
-		}, removal); err != nil {
+		}, removal, cond, ""); err != nil {
 			if errors.Is(err, errUploadRemoved) {
 				return s3err.ErrNoSuchUpload
+			}
+			if errors.Is(err, errObjectPrecondition) {
+				return s3err.ErrPreconditionFailed
 			}
 			// The transaction may have committed the object before failing on
 			// the upload removal; a surviving entry references the manifests.
@@ -1017,7 +1030,7 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 		return s3err.ErrNone
 	}
 	var finalizeCode s3err.ErrorCode
-	if owner != "" {
+	if owner != "" && reducible {
 		if code := s3a.checkConditionalHeaders(r, *input.Bucket, *input.Key); code != s3err.ErrNone {
 			finalizeCode = code
 		} else {
@@ -1029,11 +1042,27 @@ func (s3a *S3ApiServer) completeMultipartUpload(r *http.Request, input *s3.Compl
 		}, completionBody)
 	}
 	if finalizeCode != s3err.ErrNone {
-		// this attempt's manifests are orphans unless a failed rollback left an entry holding them
-		if completionState != nil && !completionState.manifestsReferenced && len(completionState.newManifestChunks) > 0 {
-			s3a.deleteOrphanedChunks(completionState.newManifestChunks)
+		// A finalize can fail after its commit. When the key now holds this
+		// upload's object, answer as a retry would.
+		var committed *CompleteMultipartUploadResult
+		var committedEntry *filer_pb.Entry
+		if completionState != nil && completionState.manifestsReferenced {
+			committed, committedEntry = s3a.committedCompletion(r, input)
 		}
-		return nil, finalizeCode
+		if committed == nil {
+			// this attempt's manifests are orphans unless a failed rollback left an entry holding them
+			if completionState != nil && !completionState.manifestsReferenced && len(completionState.newManifestChunks) > 0 {
+				s3a.deleteOrphanedChunks(completionState.newManifestChunks)
+			}
+			return nil, finalizeCode
+		}
+		glog.Warningf("completeMultipartUpload %s/%s upload %s: committed despite %s", *input.Bucket, *input.Key, *input.UploadId, s3err.GetAPIError(finalizeCode).Code)
+		// Another attempt of this upload may own the commit, and its parts can
+		// include ones this attempt counts as unused.
+		if !sameFileChunks(committedEntry.GetChunks(), completionState.finalParts) {
+			completionState.metadataOnlyCleanup = true
+		}
+		output = committed
 	}
 
 	if completionState != nil {
@@ -1071,6 +1100,19 @@ func (s3a *S3ApiServer) deleteUnusedPartEntries(ctx context.Context, uploadDirec
 		}
 	}
 	return lastErr
+}
+
+// committedCompletion returns this upload's completion result, and the object
+// entry, when the key's current object is the one the upload committed.
+func (s3a *S3ApiServer) committedCompletion(r *http.Request, input *s3.CompleteMultipartUploadInput) (*CompleteMultipartUploadResult, *filer_pb.Entry) {
+	entry, err := s3a.resolveObjectEntry(*input.Bucket, *input.Key, "")
+	if err != nil || entry == nil || entry.Extended == nil {
+		return nil, nil
+	}
+	if uploadId, ok := entry.Extended[s3_constants.SeaweedFSUploadId]; !ok || string(uploadId) != *input.UploadId {
+		return nil, nil
+	}
+	return completeMultipartResult(r, input, getEtagFromEntry(entry), entry), entry
 }
 
 // resumeCommittedObject finds an entry this upload already committed at the
@@ -1141,15 +1183,17 @@ func (s3a *S3ApiServer) abortMultipartUpload(input *s3.AbortMultipartUploadInput
 
 	uploadsFolder := s3a.genUploadsFolder(*input.Bucket)
 	uploadEntry, err := s3a.getEntry(uploadsFolder, *input.UploadId)
+	// complete and abort both remove .uploads/<id>; a missing record is an upload
+	// that does not exist (NoSuchUpload on AWS), not one this call discarded
 	if err != nil {
 		if isFilerNotFound(err) {
-			return &s3.AbortMultipartUploadOutput{}, s3err.ErrNone
+			return nil, s3err.ErrNoSuchUpload
 		}
 		glog.Errorf("bucket %s abort upload %s: %v", *input.Bucket, *input.UploadId, err)
 		return nil, s3err.ErrInternalError
 	}
 	if uploadEntry == nil {
-		return &s3.AbortMultipartUploadOutput{}, s3err.ErrNone
+		return nil, s3err.ErrNoSuchUpload
 	}
 
 	object := string(uploadEntry.Extended[s3_constants.ExtMultipartObjectKey])
@@ -1165,7 +1209,7 @@ func (s3a *S3ApiServer) abortMultipartUpload(input *s3.AbortMultipartUploadInput
 // lock: a directory that outlived the object it completed into shares chunks
 // with it and goes metadata-only; anything else frees the parts' chunks.
 func (s3a *S3ApiServer) removeUploadDir(bucket, uploadId, object string) s3err.ErrorCode {
-	completed, err := s3a.uploadCompleted(s3a.bucketDir(bucket), uploadId, object)
+	completed, err := s3a.uploadCompleted(bucket, uploadId, object)
 	if err != nil {
 		glog.Errorf("bucket %s remove upload %s completed check: %v", bucket, uploadId, err)
 		return s3err.ErrInternalError
@@ -1237,10 +1281,11 @@ func (s3a *S3ApiServer) routedUploadDirDelete(bucket, uploadId, object string) s
 // uploadCompleted reports whether the upload assembled into an object: the
 // object entry, or any version file under <key>.versions, still carries the
 // upload id completion stamps on it.
-func (s3a *S3ApiServer) uploadCompleted(bucketDir, uploadId, objectKey string) (bool, error) {
+func (s3a *S3ApiServer) uploadCompleted(bucket, uploadId, objectKey string) (bool, error) {
 	if objectKey == "" {
 		return false, nil
 	}
+	bucketDir := s3a.bucketDir(bucket)
 	name := path.Base(objectKey)
 	dir := path.Dir(objectKey)
 	if dir == "." {
@@ -1248,7 +1293,7 @@ func (s3a *S3ApiServer) uploadCompleted(bucketDir, uploadId, objectKey string) (
 	}
 	objectDir := path.Join(bucketDir, dir)
 
-	entry, err := s3a.getEntry(objectDir, name)
+	entry, err := s3a.getObjectEntryRoutedByKey(bucket, objectKey)
 	if err != nil && !isFilerNotFound(err) {
 		return false, err
 	}
@@ -1256,7 +1301,7 @@ func (s3a *S3ApiServer) uploadCompleted(bucketDir, uploadId, objectKey string) (
 		return true, nil
 	}
 
-	versions, _, err := s3a.list(objectDir+"/"+name+s3_constants.VersionsFolder, "", "", false, math.MaxInt32)
+	versions, _, err := s3a.listObjectScopedEntriesRoutedByKey(bucket, objectKey, objectDir+"/"+name+s3_constants.VersionsFolder, "", "", false, math.MaxInt32)
 	if err != nil {
 		if isFilerNotFound(err) {
 			return false, nil
@@ -1855,6 +1900,18 @@ func decodePartChecksum(partNumber int, entries []*filer_pb.Entry, checksumHeade
 		return nil, nil, fmt.Errorf("part %d has invalid checksum encoding: %w", partNumber, err)
 	}
 	return raw, entry, nil
+}
+
+// matchesObjectChecksum accepts the computed checksum verbatim or, for a
+// composite checksum, its bare base64 form without the "-N" part-count suffix.
+func matchesObjectChecksum(provided, computed string) bool {
+	if provided == computed {
+		return true
+	}
+	if i := strings.LastIndexByte(computed, '-'); i > 0 {
+		return provided == computed[:i]
+	}
+	return false
 }
 
 // computeCompositeChecksum computes a composite checksum from per-part checksums.

@@ -66,13 +66,23 @@ func (s3a *S3ApiServer) latestPointerRecompute(bucket, object string, useInverte
 
 // routedVersionedFinalize flips the .versions pointer to the newest version and
 // demotes the prior latest, atomically under the object's per-path lock on the
-// owner filer, via a single RECOMPUTE_LATEST. The version file is already
-// written; the owner re-derives the pointer by scanning the directory.
-func (s3a *S3ApiServer) routedVersionedFinalize(owner pb.ServerAddress, bucket, object string, useInvertedFormat bool) s3err.ErrorCode {
+// owner filer, via a single RECOMPUTE_LATEST. versionEntry, when set, is PUT
+// into .versions in the same transaction, so the recompute's scan sees it even
+// when the gateway's own filer is not the owner; otherwise the version file is
+// already written on the owner.
+func (s3a *S3ApiServer) routedVersionedFinalize(owner pb.ServerAddress, bucket, object string, useInvertedFormat bool, versionEntry *filer_pb.Entry) s3err.ErrorCode {
+	mutations := []*filer_pb.ObjectMutation{s3a.latestPointerRecompute(bucket, object, useInvertedFormat, "", true)}
+	if versionEntry != nil {
+		mutations = append([]*filer_pb.ObjectMutation{{
+			Type:      filer_pb.ObjectMutation_PUT,
+			Directory: s3a.toFilerPath(bucket, object+s3_constants.VersionsFolder),
+			Entry:     versionEntry,
+		}}, mutations...)
+	}
 	req := &filer_pb.ObjectTransactionRequest{
 		LockKey:   s3a.toFilerPath(bucket, object),
 		RouteKey:  s3a.objectRouteKey(bucket, object),
-		Mutations: []*filer_pb.ObjectMutation{s3a.latestPointerRecompute(bucket, object, useInvertedFormat, "", true)},
+		Mutations: mutations,
 	}
 	resp, err := s3a.objectTxnOnFiler(owner, req)
 	switch {
@@ -116,8 +126,10 @@ func uploadExistsCondition(uploadDirectory string) (string, *filer_pb.WriteCondi
 // reachable: PUT first keeps the chunks referenced at all times, and removing
 // the upload directory before the recompute means a published object never
 // coexists with a leftover .uploads directory that s3.clean.uploads would purge
-// with data.
-func (s3a *S3ApiServer) routedMultipartFinalize(owner pb.ServerAddress, bucket, object string, useInvertedFormat bool, versionDir, versionFileName string, chunks []*filer_pb.FileChunk, decorate func(*filer_pb.Entry), uploadID string) s3err.ErrorCode {
+// with data. cond is the request's write condition, checked against the object
+// (its latest version when the slot at the object path is empty) under the same
+// lock; the upload directory rides the PUT as a mutation precondition.
+func (s3a *S3ApiServer) routedMultipartFinalize(owner pb.ServerAddress, bucket, object string, useInvertedFormat bool, versionDir, versionFileName string, chunks []*filer_pb.FileChunk, decorate func(*filer_pb.Entry), uploadID string, cond *filer_pb.WriteCondition) s3err.ErrorCode {
 	now := time.Now().Unix()
 	versionEntry := &filer_pb.Entry{
 		Name: versionFileName,
@@ -138,8 +150,14 @@ func (s3a *S3ApiServer) routedMultipartFinalize(owner pb.ServerAddress, bucket, 
 	if owner != "" {
 		routeKey = s3a.objectRouteKey(bucket, object)
 	}
-	conditionKey, condition := uploadExistsCondition(s3a.genUploadsFolder(bucket) + "/" + uploadID)
-	resp, err := s3a.routedPut(owner, routeKey, s3a.toFilerPath(bucket, object), versionDir+"/"+versionFileName, versionEntry, condition, conditionKey, "", []*filer_pb.ObjectMutation{
+	// A filer older than the mutation-condition support silently ignores
+	// putCondition, so on upgrade the guard degrades to this gateway-side
+	// check — the same window the pre-transaction code had.
+	if exists, err := s3a.exists(s3a.genUploadsFolder(bucket), uploadID, true); err == nil && !exists {
+		return s3err.ErrNoSuchUpload
+	}
+	putConditionKey, putCondition := uploadExistsCondition(s3a.genUploadsFolder(bucket) + "/" + uploadID)
+	resp, err := s3a.routedPut(owner, routeKey, s3a.toFilerPath(bucket, object), versionDir+"/"+versionFileName, versionEntry, cond, "", versionDir, true, putCondition, putConditionKey, []*filer_pb.ObjectMutation{
 		s3a.removeUploadDirMutation(bucket, uploadID),
 		s3a.latestPointerRecompute(bucket, object, useInvertedFormat, "", true),
 	})
@@ -148,6 +166,9 @@ func (s3a *S3ApiServer) routedMultipartFinalize(owner pb.ServerAddress, bucket, 
 		glog.Errorf("routedMultipartFinalize: %s/%s upload %s on %s: %v", bucket, object, uploadID, owner, err)
 		return s3err.ErrInternalError
 	case resp.ErrorCode == filer_pb.FilerError_PRECONDITION_FAILED:
+		if resp.FailedMutation == nil {
+			return s3err.ErrPreconditionFailed
+		}
 		return s3err.ErrNoSuchUpload
 	case resp.Error != "":
 		glog.Errorf("routedMultipartFinalize: %s/%s upload %s: %s", bucket, object, uploadID, resp.Error)
@@ -178,13 +199,20 @@ func wormDeleteCondition(worm, bypass bool) *filer_pb.WriteCondition {
 	}}
 }
 
-// routedDeleteSpecificVersion removes one version under the owner filer's object
-// lock, first repointing .versions while excluding the deleted version.
-func (s3a *S3ApiServer) routedDeleteSpecificVersion(owner pb.ServerAddress, bucket, object, versionId string, worm, bypass bool) s3err.ErrorCode {
+// routedDeleteSpecificVersion removes one version under the owner filer's
+// object lock. The repoint and the delete ride one transaction so the version's
+// WORM guards gate both; the recompute is itself guarded to fire only while the
+// pointer still names the deleted version — a noncurrent delete must leave it
+// alone, since it can point at an older version than a re-derive would pick, or
+// at nothing, as when a suspended bucket's null write cleared it while the null
+// object stays current.
+func (s3a *S3ApiServer) routedDeleteSpecificVersion(owner pb.ServerAddress, bucket, object, versionId string, worm, bypass, metadataOnly bool) s3err.ErrorCode {
 	if !isValidVersionID(versionId) {
 		return s3err.ErrInvalidRequest
 	}
 	versionFileName := s3a.getVersionFileName(versionId)
+	recompute := s3a.latestPointerRecompute(bucket, object, isNewFormatVersionId(versionId), versionFileName, false)
+	recompute.GetRecompute().OnlyIfCurrentName = versionFileName
 	versionsPath := s3a.toFilerPath(bucket, object+s3_constants.VersionsFolder)
 	cond := wormDeleteCondition(worm, bypass)
 	req := &filer_pb.ObjectTransactionRequest{
@@ -193,8 +221,8 @@ func (s3a *S3ApiServer) routedDeleteSpecificVersion(owner pb.ServerAddress, buck
 		ConditionKey: versionsPath + "/" + versionFileName,
 		Condition:    cond,
 		Mutations: []*filer_pb.ObjectMutation{
-			s3a.latestPointerRecompute(bucket, object, isNewFormatVersionId(versionId), versionFileName, false),
-			{Type: filer_pb.ObjectMutation_DELETE, Directory: versionsPath, Name: versionFileName, IsDeleteData: true, RemoveEmptyParent: true},
+			recompute,
+			{Type: filer_pb.ObjectMutation_DELETE, Directory: versionsPath, Name: versionFileName, IsDeleteData: !metadataOnly, RemoveEmptyParent: true},
 		},
 	}
 	resp, err := s3a.objectTxnOnFiler(owner, req)
@@ -219,7 +247,7 @@ func (s3a *S3ApiServer) routedDeleteSpecificVersion(owner pb.ServerAddress, buck
 // (condition defaults to lock_key). The second return reports whether the delete
 // was settled here: the raw delete cannot remove an entry other keys are nested
 // under, which the lock path handles by stripping the object off it instead.
-func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, object string, worm, bypass bool) (s3err.ErrorCode, bool) {
+func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, object string, worm, bypass, metadataOnly bool) (s3err.ErrorCode, bool) {
 	fullpath := util.NewFullPath(s3a.bucketDir(bucket), object)
 	dir, name := fullpath.DirAndName()
 	resp, err := s3a.objectTxnOnFiler(owner, &filer_pb.ObjectTransactionRequest{
@@ -227,7 +255,7 @@ func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, 
 		RouteKey:  s3a.objectRouteKey(bucket, object),
 		Condition: wormDeleteCondition(worm, bypass),
 		Mutations: []*filer_pb.ObjectMutation{
-			{Type: filer_pb.ObjectMutation_DELETE, Directory: dir, Name: name, IsDeleteData: true},
+			{Type: filer_pb.ObjectMutation_DELETE, Directory: dir, Name: name, IsDeleteData: !metadataOnly},
 		},
 	})
 	switch {
@@ -248,12 +276,18 @@ func (s3a *S3ApiServer) routedDeleteNullVersion(owner pb.ServerAddress, bucket, 
 // on the routed path RECOMPUTE_LATEST rides in the version file's PUT transaction,
 // committing atomically under the object's per-path lock; off the ring
 // updateLatestVersionInDirectory does it under the object write lock.
-func (s3a *S3ApiServer) versionedFinalize(bucket, object, versionId, versionFileName string, useInvertedFormat bool) *putFinalize {
+func (s3a *S3ApiServer) versionedFinalize(bucket, object string, versionId *string, useInvertedFormat bool) *putFinalize {
 	return &putFinalize{
 		lockKey:   s3a.toFilerPath(bucket, object),
 		mutations: []*filer_pb.ObjectMutation{s3a.latestPointerRecompute(bucket, object, useInvertedFormat, "", true)},
+		newVersion: func(entry *filer_pb.Entry) string {
+			*versionId = generateVersionId(useInvertedFormat)
+			entry.Name = s3a.getVersionFileName(*versionId)
+			entry.Extended[s3_constants.ExtVersionIdKey] = []byte(*versionId)
+			return s3a.toFilerPath(bucket, object+s3_constants.VersionsFolder+"/"+entry.Name)
+		},
 		afterCreate: func(versionEntry *filer_pb.Entry) s3err.ErrorCode {
-			if err := s3a.updateLatestVersionInDirectory(bucket, object, versionId, versionFileName, versionEntry); err != nil {
+			if err := s3a.updateLatestVersionInDirectory(bucket, object, *versionId, s3a.getVersionFileName(*versionId), versionEntry); err != nil {
 				glog.Errorf("putVersionedObject: failed to update latest version in directory: %v", err)
 				return s3err.ErrInternalError
 			}

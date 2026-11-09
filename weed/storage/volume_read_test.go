@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -323,6 +325,190 @@ func TestReadNeedleDataIntoChecksumMismatchHoldsLastPage(t *testing.T) {
 	}
 }
 
+// A range carries no checksum of its own, so the first ranged read of a
+// needle checks the whole needle's CRC and writes nothing on a mismatch. The
+// reader can then fall back to another replica.
+func TestReadNeedleDataIntoRangeChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	data := bytes.Repeat([]byte("0123456789"), 300)
+	// One buffer holds the whole needle, or the check streams it in pages.
+	for i, page := range []int{4096, 1024} {
+		write := func(id uint64) (types.Offset, int64) {
+			n := &needle.Needle{Id: types.Uint64ToNeedleId(id), Cookie: 0x1234, Data: append([]byte(nil), data...)}
+			n.Checksum = needle.NewCRC(n.Data)
+			offset, _, _, err := v.writeNeedle2(n, true, false, false)
+			if err != nil {
+				t.Fatalf("write needle: %v", err)
+			}
+			nv, _ := v.nm.Get(n.Id)
+			return nv.Offset, int64(offset)
+		}
+		read := func(id uint64, at types.Offset) (bytes.Buffer, error) {
+			meta := &needle.Needle{Id: types.Uint64ToNeedleId(id)}
+			nv, _ := v.nm.Get(meta.Id)
+			if err := v.readNeedleMetaAt(meta, at.ToActualOffset(), int32(nv.Size)); err != nil {
+				t.Fatalf("read meta: %v", err)
+			}
+			var buf bytes.Buffer
+			err := v.readNeedleDataInto(meta, &ReadOption{ReadBufferSize: page}, &buf, 1000, 500)
+			return buf, err
+		}
+
+		intact := uint64(10*i + 1)
+		at, _ := write(intact)
+		if got, err := read(intact, at); err != nil || !bytes.Equal(got.Bytes(), data[1000:1500]) {
+			t.Fatalf("page %d: intact range read: %d bytes, %v", page, got.Len(), err)
+		}
+
+		// Damage a byte outside the range: the range itself is intact, but
+		// the needle is not, so this replica must not serve it.
+		damaged := uint64(10*i + 2)
+		at, raw := write(damaged)
+		if _, err := v.DataBackend.WriteAt([]byte{0xff}, raw+types.NeedleHeaderSize+types.DataSizeSize+10); err != nil {
+			t.Fatalf("damage needle: %v", err)
+		}
+		got, err := read(damaged, at)
+		if err == nil || !strings.Contains(err.Error(), "checksum") || got.Len() != 0 {
+			t.Fatalf("page %d: damaged range read wrote %d bytes, err %v; want a checksum error and nothing written", page, got.Len(), err)
+		}
+
+		// Concurrent first ranges of a needle all see the outcome of the check.
+		for _, tc := range []struct {
+			id     uint64
+			damage bool
+		}{{uint64(10*i + 3), false}, {uint64(10*i + 4), true}} {
+			at, raw := write(tc.id)
+			if tc.damage {
+				if _, err := v.DataBackend.WriteAt([]byte{0xff}, raw+types.NeedleHeaderSize+types.DataSizeSize+10); err != nil {
+					t.Fatalf("damage needle: %v", err)
+				}
+			}
+			var wg sync.WaitGroup
+			errs := make([]error, 8)
+			for g := range errs {
+				wg.Add(1)
+				go func(g int) {
+					defer wg.Done()
+					_, errs[g] = read(tc.id, at)
+				}(g)
+			}
+			wg.Wait()
+			for _, err := range errs {
+				if (err != nil) != tc.damage {
+					t.Fatalf("page %d: concurrent range read of needle %d (damaged %v): %v", page, tc.id, tc.damage, err)
+				}
+			}
+		}
+
+		// A verified needle is checked again after a reload, as a remounted
+		// copy or a compaction commit gets.
+		reloaded := uint64(10*i + 5)
+		at, raw = write(reloaded)
+		if _, err := read(reloaded, at); err != nil {
+			t.Fatalf("page %d: first range read: %v", page, err)
+		}
+		if _, err := v.DataBackend.WriteAt([]byte{0xff}, raw+types.NeedleHeaderSize+types.DataSizeSize+10); err != nil {
+			t.Fatalf("damage needle: %v", err)
+		}
+		v.loadGeneration.Store(volumeLoads.Add(1))
+		if _, err := read(reloaded, at); err == nil || !strings.Contains(err.Error(), "checksum") {
+			t.Fatalf("page %d: range read after reload: %v; want a checksum error", page, err)
+		}
+	}
+
+	// The verification pass leaves the io error streak to the range read.
+	v.checkReadWriteError(fmt.Errorf("eio: %w", syscall.EIO))
+	meta := &needle.Needle{Id: types.Uint64ToNeedleId(1)}
+	nv, _ := v.nm.Get(meta.Id)
+	if err := v.readNeedleMetaAt(meta, nv.Offset.ToActualOffset(), int32(nv.Size)); err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	v.loadGeneration.Store(volumeLoads.Add(1))
+	if _, err := v.verifiedNeedleBlocks(meta, &ReadOption{ReadBufferSize: 4096}); err != nil {
+		t.Fatalf("verification pass: %v", err)
+	}
+	if _, count, _ := v.getIoErrorState(); count != 1 {
+		t.Errorf("io error streak %d after a verification pass, want 1", count)
+	}
+}
+
+// Damage that appears after a needle passed its check is caught too: a later
+// range checks the blocks it covers against the CRCs the check recorded, so it
+// never serves damaged bytes, while ranges over intact blocks still read.
+func TestReadNeedleDataIntoRangeDamagedAfterCheck(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	const block = minRangeCheckBlockSize
+	data := make([]byte, 5*block-100)
+	for i := range data {
+		data[i] = byte(i*7 + i/251)
+	}
+	for i, page := range []int{4096, PagedReadLimit} {
+		n := &needle.Needle{Id: types.Uint64ToNeedleId(uint64(i + 1)), Cookie: 0x1234, Data: append([]byte(nil), data...)}
+		n.Checksum = needle.NewCRC(n.Data)
+		raw, _, _, err := v.writeNeedle2(n, true, false, false)
+		if err != nil {
+			t.Fatalf("write needle: %v", err)
+		}
+		read := func(offset, size int64) ([]byte, error) {
+			meta := &needle.Needle{Id: n.Id}
+			nv, _ := v.nm.Get(meta.Id)
+			if err := v.readNeedleMetaAt(meta, nv.Offset.ToActualOffset(), int32(nv.Size)); err != nil {
+				t.Fatalf("read meta: %v", err)
+			}
+			var buf bytes.Buffer
+			err := v.readNeedleDataInto(meta, &ReadOption{ReadBufferSize: page}, &buf, offset, size)
+			return buf.Bytes(), err
+		}
+
+		ranges := [][2]int64{{3*block + 10, 100}, {block - 50, 3 * block}, {4*block + 5, int64(len(data)) - 4*block - 5}}
+		for _, r := range ranges {
+			if got, err := read(r[0], r[1]); err != nil || !bytes.Equal(got, data[r[0]:r[0]+r[1]]) {
+				t.Fatalf("page %d: range %v before damage: %d bytes, %v", page, r, len(got), err)
+			}
+		}
+
+		damagedAt := int64(3*block + 500)
+		if _, err := v.DataBackend.WriteAt([]byte{^data[damagedAt]}, int64(raw)+types.NeedleHeaderSize+types.DataSizeSize+damagedAt); err != nil {
+			t.Fatalf("damage needle: %v", err)
+		}
+		for _, r := range ranges[:2] {
+			got, err := read(r[0], r[1])
+			if err == nil || !strings.Contains(err.Error(), "checksum") {
+				t.Fatalf("page %d: range %v over a block damaged after the check: %v; want a checksum error", page, r, err)
+			}
+			// Only bytes of blocks that passed go out, and they are intact.
+			if int64(len(got)) > max(0, 3*block-r[0]) || !bytes.Equal(got, data[r[0]:r[0]+int64(len(got))]) {
+				t.Fatalf("page %d: range %v wrote %d bytes reaching into the damaged block", page, r, len(got))
+			}
+		}
+		for _, r := range [][2]int64{ranges[2], {10, 100}, {2*block + 1, block - 1}} {
+			if got, err := read(r[0], r[1]); err != nil || !bytes.Equal(got, data[r[0]:r[0]+r[1]]) {
+				t.Fatalf("page %d: range %v over intact blocks: %d bytes, %v", page, r, len(got), err)
+			}
+		}
+	}
+
+	for _, tc := range []struct{ size, block int64 }{
+		{0, block}, {64 * block, block}, {64*block + 1, 2 * block}, {64 * PagedReadLimit, PagedReadLimit}, {1 << 34, PagedReadLimit},
+	} {
+		if got := rangeCheckBlockSize(tc.size); got != tc.block {
+			t.Errorf("rangeCheckBlockSize(%d) = %d, want %d", tc.size, got, tc.block)
+		}
+	}
+}
+
 // With MustMetaOnly set, the payload is skipped whatever the needle's size.
 // This is the option a delete uses. A chunk manifest is the exception: its
 // data is still read, because a delete needs it to find the chunks.
@@ -391,6 +577,201 @@ func TestReadNeedleMustMetaOnly(t *testing.T) {
 	}
 	if _, err := read(1, metaOnly()); err != nil {
 		t.Errorf("metadata read of a damaged needle: %v", err)
+	}
+}
+
+// HasRange skips the payload at any size, like MustMetaOnly, but the range
+// read that follows reports the outcome, so the metadata read leaves the io
+// error streak alone.
+func TestReadNeedleHasRange(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	plain := &needle.Needle{Id: 1, Cookie: 0x1234, Data: bytes.Repeat([]byte("0123456789"), 400)}
+	plain.Checksum = needle.NewCRC(plain.Data)
+	if _, _, _, err := v.writeNeedle2(plain, true, false, false); err != nil {
+		t.Fatalf("write needle: %v", err)
+	}
+	manifest := newRandomNeedle(2)
+	manifest.SetIsChunkManifest()
+	if _, _, _, err := v.writeNeedle2(manifest, true, false, false); err != nil {
+		t.Fatalf("write chunk manifest: %v", err)
+	}
+	compressed := newRandomNeedle(3)
+	compressed.SetIsCompressed()
+	if _, _, _, err := v.writeNeedle2(compressed, true, false, false); err != nil {
+		t.Fatalf("write compressed needle: %v", err)
+	}
+
+	v.checkReadWriteError(fmt.Errorf("eio: %w", syscall.EIO))
+	option := &ReadOption{AttemptMetaOnly: true, HasRange: true, ReadBufferSize: 1024}
+	got := &needle.Needle{Id: plain.Id}
+	if _, err := v.readNeedle(got, option, nil); err != nil {
+		t.Fatalf("metadata read: %v", err)
+	}
+	if !option.IsMetaOnly || len(got.Data) != 0 || got.Cookie != plain.Cookie || got.DataSize != plain.DataSize {
+		t.Errorf("metadata read: IsMetaOnly %v, %d bytes of data, cookie %x, data size %d", option.IsMetaOnly, len(got.Data), got.Cookie, got.DataSize)
+	}
+	if _, count, _ := v.getIoErrorState(); count != 1 {
+		t.Errorf("io error streak %d after the metadata read, want 1", count)
+	}
+
+	var buf bytes.Buffer
+	if err := v.readNeedleDataInto(got, option, &buf, 1500, 2000); err != nil {
+		t.Fatalf("range read: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), plain.Data[1500:3500]) {
+		t.Errorf("range read returned %d bytes that differ from the needle", buf.Len())
+	}
+	if _, count, _ := v.getIoErrorState(); count != 0 {
+		t.Errorf("io error streak %d after the range read, want 0", count)
+	}
+
+	// A chunk manifest or a compressed needle is still read whole.
+	for _, want := range []*needle.Needle{manifest, compressed} {
+		option = &ReadOption{AttemptMetaOnly: true, HasRange: true}
+		got = &needle.Needle{Id: want.Id}
+		if _, err := v.readNeedle(got, option, nil); err != nil || option.IsMetaOnly || !bytes.Equal(got.Data, want.Data) {
+			t.Errorf("ranged read of needle %d: IsMetaOnly %v, %d bytes, %v", want.Id, option.IsMetaOnly, len(got.Data), err)
+		}
+	}
+}
+
+// A range streams from the record its metadata read resolved, not from a
+// replacement written in between, whatever the replacement's size.
+func TestReadNeedleDataIntoKeepsTheMetaRecord(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	write := func(data []byte) {
+		t.Helper()
+		n := &needle.Needle{Id: 1, Cookie: 0x1234, Data: data}
+		n.Checksum = needle.NewCRC(n.Data)
+		if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
+			t.Fatalf("write needle: %v", err)
+		}
+	}
+	old := bytes.Repeat([]byte("old-"), 1000)
+	for _, replacement := range [][]byte{bytes.Repeat([]byte("new-"), 1000), bytes.Repeat([]byte("short"), 10)} {
+		write(old)
+		option := &ReadOption{AttemptMetaOnly: true, HasRange: true, ReadBufferSize: 1024}
+		got := &needle.Needle{Id: 1}
+		if _, err := v.readNeedle(got, option, nil); err != nil || !option.IsMetaOnly {
+			t.Fatalf("metadata read: IsMetaOnly %v, %v", option.IsMetaOnly, err)
+		}
+		write(replacement)
+		var buf bytes.Buffer
+		if err := v.readNeedleDataInto(got, option, &buf, 100, 2000); err != nil {
+			t.Fatalf("range read after a %d-byte replacement: %v", len(replacement), err)
+		}
+		if !bytes.Equal(buf.Bytes(), old[100:2100]) {
+			t.Errorf("range read after a %d-byte replacement returned bytes of another record", len(replacement))
+		}
+	}
+}
+
+// A compaction moves the record between the parts of a multi-range reply;
+// every later part follows it, not only the first. A pre-3.09 checksum,
+// which compaction rewrites in the current encoding, still matches.
+func TestReadNeedleDataIntoFollowsACompaction(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy checksum %v", legacy), func(t *testing.T) {
+			dir := t.TempDir()
+			v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+			if err != nil {
+				t.Fatalf("volume creation: %v", err)
+			}
+			defer v.Close()
+
+			gone := &needle.Needle{Id: 1, Cookie: 0x1234, Data: bytes.Repeat([]byte("gone"), 1000)}
+			gone.Checksum = needle.NewCRC(gone.Data)
+			data := bytes.Repeat([]byte("0123456789"), 400)
+			kept := &needle.Needle{Id: 2, Cookie: 0x1234, Data: data}
+			kept.Checksum = needle.NewCRC(kept.Data)
+			if legacy {
+				kept.Checksum = needle.CRC(kept.Checksum.Value())
+			}
+			for _, n := range []*needle.Needle{gone, kept} {
+				if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
+					t.Fatalf("write needle %d: %v", n.Id, err)
+				}
+			}
+			if _, err := v.deleteNeedle2(newEmptyNeedle(1)); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+
+			option := &ReadOption{AttemptMetaOnly: true, HasRange: true, ReadBufferSize: 1024}
+			got := &needle.Needle{Id: kept.Id}
+			if _, err := v.readNeedle(got, option, nil); err != nil || !option.IsMetaOnly {
+				t.Fatalf("metadata read: IsMetaOnly %v, %v", option.IsMetaOnly, err)
+			}
+			if err := v.CompactByIndex(nil); err != nil {
+				t.Fatalf("compact: %v", err)
+			}
+			if err := v.CommitCompact(); err != nil {
+				t.Fatalf("commit compact: %v", err)
+			}
+
+			for _, part := range [][2]int64{{0, 100}, {2000, 500}} {
+				var buf bytes.Buffer
+				if err := v.readNeedleDataInto(got, option, &buf, part[0], part[1]); err != nil {
+					t.Fatalf("part at %d: %v", part[0], err)
+				}
+				if !bytes.Equal(buf.Bytes(), data[part[0]:part[0]+part[1]]) {
+					t.Errorf("part at %d returned bytes of another record", part[0])
+				}
+			}
+		})
+	}
+}
+
+// A compaction that drops the record the metadata came from leaves only its
+// replacement; a range then fails rather than send the replacement's bytes,
+// even when the sizes match.
+func TestReadNeedleDataIntoRefusesAReplacementAfterCompaction(t *testing.T) {
+	dir := t.TempDir()
+
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	write := func(data []byte) {
+		t.Helper()
+		n := &needle.Needle{Id: 1, Cookie: 0x1234, Data: data}
+		n.Checksum = needle.NewCRC(n.Data)
+		if _, _, _, err := v.writeNeedle2(n, true, false, false); err != nil {
+			t.Fatalf("write needle: %v", err)
+		}
+	}
+	write(bytes.Repeat([]byte("old-"), 1000))
+	option := &ReadOption{AttemptMetaOnly: true, HasRange: true, ReadBufferSize: 1024}
+	got := &needle.Needle{Id: 1}
+	if _, err := v.readNeedle(got, option, nil); err != nil || !option.IsMetaOnly {
+		t.Fatalf("metadata read: IsMetaOnly %v, %v", option.IsMetaOnly, err)
+	}
+	write(bytes.Repeat([]byte("new-"), 1000))
+	if err := v.CompactByIndex(nil); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if err := v.CommitCompact(); err != nil {
+		t.Fatalf("commit compact: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := v.readNeedleDataInto(got, option, &buf, 100, 2000); err != ErrorNotFound || buf.Len() != 0 {
+		t.Errorf("range read after the record was replaced and compacted: %d bytes, %v; want %v", buf.Len(), err, ErrorNotFound)
 	}
 }
 

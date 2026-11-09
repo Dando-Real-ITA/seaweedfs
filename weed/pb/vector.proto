@@ -27,11 +27,19 @@ enum DistanceMetric {
 }
 
 // Table addresses a Lance table through the namespace: the id parts as the
-// namespace catalog joins them.
+// namespace catalog joins them. The gateway resolves the table before it
+// calls, so the engine opens it without a catalog round trip of its own.
 message Table {
   repeated string id = 1;
   // Dataset version to pin reads to; 0 means latest.
   uint64 version = 2;
+  // The table's Lance location, as the catalog describes it.
+  string location = 3;
+  reserved 4;
+  reserved "storage_options";
+  // The bucket encrypts its objects with SSE-S3; the engine writes the
+  // table's files that way.
+  bool sse_s3 = 5;
 }
 
 message CreateIndexRequest {
@@ -93,11 +101,17 @@ message ListVectorsRequest {
   string next_token = 3;
   bool return_data = 4;
   bool return_metadata = 5;
+  // A nonzero segment_count lists only the rows whose position modulo
+  // segment_count is segment_index; next_token stays a row position.
+  uint32 segment_count = 6;
+  uint32 segment_index = 7;
 }
 
 message ListVectorsResponse {
   repeated Vector vectors = 1;
   string next_token = 2;
+  // Set when segment_count was applied; an older engine ignores it.
+  bool segmented = 3;
 }
 
 message QueryVectorsRequest {

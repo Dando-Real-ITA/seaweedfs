@@ -43,9 +43,9 @@ concurrency:
 jobs:
 
   # ── Pre-build the Rust binaries natively ────────────────────────────
-  # The volume server and the Rust maintenance worker, cross-compiled for
-  # amd64 and arm64 without QEMU, turning a 5-hour emulated cargo build into
-  # ~15 minutes of native compilation.
+  # The volume server, the Rust maintenance worker and the vector engine,
+  # cross-compiled for amd64 and arm64 without QEMU, turning a 5-hour emulated
+  # cargo build into ~15 minutes of native compilation.
   build-rust-binaries:
     runs-on: ubuntu-24.04
     strategy:
@@ -55,57 +55,14 @@ jobs:
             arch: amd64
           - target: aarch64-unknown-linux-musl
             arch: arm64
-            cross: true
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up the musl target
+        uses: ./.github/actions/rust-musl-target
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl tools (amd64)
-        if: ${{ !matrix.cross }}
-        run: |
-          sudo apt-get install -y musl-tools
-          # C deps (aws-lc-sys) must compile against musl headers, not the host
-          # gcc's glibc headers — glibc's C23 redirects (__isoc23_sscanf,
-          # __isoc23_strtol) don't exist in musl and fail the link.
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
-
-      - name: Install cross-compilation tools (arm64)
-        if: matrix.cross
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          # Disable glibc fortify source — its __memcpy_chk etc. symbols don't exist in musl
-          echo "CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE" >> "$GITHUB_ENV"
-          # aws-lc-sys compiles against glibc headers, which redirect
-          # sscanf/strtol to C23 __isoc23_* symbols musl does not provide.
-          # Link a tiny forwarding shim so those references resolve to the
-          # musl implementations. Prototypes are declared manually: including
-          # glibc headers here would re-redirect the calls back to __isoc23_*.
-          cat > /tmp/isoc23-shim.c <<'SHIM'
-          #include <stdarg.h>
-          extern int vsscanf(const char *s, const char *fmt, va_list ap);
-          extern long strtol(const char *nptr, char **endptr, int base);
-          int __isoc23_sscanf(const char *s, const char *fmt, ...) {
-              va_list ap;
-              va_start(ap, fmt);
-              int r = vsscanf(s, fmt, ap);
-              va_end(ap);
-              return r;
-          }
-          long __isoc23_strtol(const char *nptr, char **endptr, int base) {
-              return strtol(nptr, endptr, base);
-          }
-          SHIM
-          aarch64-linux-gnu-gcc -O2 -c /tmp/isoc23-shim.c -o /tmp/isoc23-shim.o
-          # link-args land after libc on the link line; rescan musl libc so
-          # the shim's own vsscanf/strtol references resolve, and libgcc for
-          # the fp128 builtins musl's vfscanf/floatscan pull in on aarch64.
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-Clink-arg=/tmp/isoc23-shim.o -Clink-arg=-lc -Clink-arg=-lgcc" >> "$GITHUB_ENV"
+          target: ${{ matrix.target }}
 
       - name: Cache cargo registry and target
         if: runner.environment == 'github-hosted'
@@ -116,7 +73,8 @@ jobs:
             ~/.cargo/git
             seaweed-volume/target
             seaweed-worker/target/${{ matrix.target }}/release
-          key: rust-docker-${{ matrix.target }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-worker/Cargo.lock') }}
+            seaweed-vector/target/${{ matrix.target }}/release
+          key: rust-docker-${{ matrix.target }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-worker/Cargo.lock', 'seaweed-vector/Cargo.lock') }}
           restore-keys: |
             rust-docker-${{ matrix.target }}-
 
@@ -157,6 +115,12 @@ jobs:
           cargo build --release -p weed-lance-worker --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/weed-worker ../weed-worker-${{ matrix.arch }}
 
+      - name: Build the vector engine
+        run: |
+          cd seaweed-vector
+          cargo build --release -p weed-vector-server --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/weed-vector ../weed-vector-${{ matrix.arch }}
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -165,6 +129,7 @@ jobs:
             weed-volume-large-disk-${{ matrix.arch }}
             weed-volume-normal-${{ matrix.arch }}
             weed-worker-${{ matrix.arch }}
+            weed-vector-${{ matrix.arch }}
 
   # One job per (variant, platform) on a native runner, pushed by digest;
   # the merge job stitches the digests into one multi-arch tag.
@@ -241,8 +206,17 @@ jobs:
               echo "Placed pre-built Rust worker for ${arch}"
             fi
           done
+          mkdir -p docker/weed-vector-prebuilt
+          for arch in amd64 arm64; do
+            src="./rust-bins/weed-vector-${arch}"
+            if [ -f "$src" ]; then
+              cp "$src" "docker/weed-vector-prebuilt/weed-vector-${arch}"
+              echo "Placed pre-built vector engine for ${arch}"
+            fi
+          done
           ls -la docker/weed-volume-prebuilt/
           ls -la docker/weed-worker-prebuilt/
+          ls -la docker/weed-vector-prebuilt/
 
       - name: Free Disk Space
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.variant == 'all' || github.event.inputs.variant == matrix.variant
@@ -288,7 +262,7 @@ jobs:
 
       - name: Login to GHCR
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.variant == 'all' || github.event.inputs.variant == matrix.variant
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
@@ -378,7 +352,7 @@ jobs:
 
       - name: Login to GHCR
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.variant == 'all' || github.event.inputs.variant == matrix.variant
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
@@ -400,7 +374,7 @@ jobs:
 
       - name: Login to Docker Hub
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.variant == 'all' || github.event.inputs.variant == matrix.variant
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -513,7 +487,7 @@ jobs:
             variant: large_disk
     steps:
       - name: Login to GHCR
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
@@ -541,7 +515,7 @@ jobs:
 
       - name: Upload Trivy scan results to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v4.39.1
+        uses: github/codeql-action/upload-sarif@v4.39.3
         with:
           sarif_file: trivy-results.sarif
           category: trivy-${{ matrix.variant }}
@@ -565,13 +539,13 @@ jobs:
             latest_tag: latest_large_disk
     steps:
       - name: Login to Docker Hub
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Login to GHCR
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}

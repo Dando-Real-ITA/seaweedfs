@@ -2,13 +2,16 @@ package command
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 )
 
 type recordingRemoteMaker struct{ client *recordingRemote }
@@ -63,11 +66,13 @@ func TestGatewayDroppedLocalCopyIsNotUploaded(t *testing.T) {
 	}
 }
 
-// TestGatewayUncachedRewriteIsStillUploaded: a rewrite of an uncached entry
-// holds local data, so the dropped-copy skip does not apply and the rewrite
-// uploads. The stamp cannot reach a filer in the test, so the call errors;
-// the upload is what is asserted.
-func TestGatewayUncachedRewriteIsStillUploaded(t *testing.T) {
+// TestGatewayUncachedRewriteWaitsForTheSupersessionLookup: a rewrite of an
+// uncached entry holds local data, so the dropped-copy skip does not apply
+// and the rewrite is an upload. The lookup that guards the upload cannot
+// reach a filer in the test, so the event fails with that error and nothing
+// is uploaded: an unanswered lookup never lets a snapshot overwrite the
+// remote object, and the processor retries the event.
+func TestGatewayUncachedRewriteWaitsForTheSupersessionLookup(t *testing.T) {
 	option, remote := gatewayTestOption("gatewaytest-rewrite")
 	t.Cleanup(func() { delete(remote_storage.RemoteStorageClientMakers, "gatewaytest-rewrite") })
 	process, err := option.makeBucketedEventProcessor(&source.FilerSource{})
@@ -77,14 +82,12 @@ func TestGatewayUncachedRewriteIsStillUploaded(t *testing.T) {
 
 	rewrite := entryWith(droppedCopyName, droppedCopyStamp(), chunk("4,02", "e2"))
 	resp := droppedCopyUpdate(droppedCopyEntry(droppedCopyStamp()), rewrite)
-	if err := process(resp); err != nil {
-		t.Logf("stamp against the test filer fails as expected: %v", err)
+	err = process(resp)
+	if err == nil || !strings.Contains(err.Error(), "supersession lookup") {
+		t.Fatalf("process = %v, want the supersession lookup error", err)
 	}
-	if len(remote.writes) != 1 {
-		t.Fatalf("writes = %+v, want the rewrite uploaded once", remote.writes)
-	}
-	if !slices.Equal(remote.writtenChunks[0], []string{"4,02"}) {
-		t.Errorf("uploaded chunks %v, want the rewrite's [4,02]", remote.writtenChunks[0])
+	if len(remote.writes) != 0 {
+		t.Fatalf("writes = %+v, want none until the lookup answers", remote.writes)
 	}
 }
 
@@ -338,5 +341,237 @@ func TestGatewayMetadataOnlyDeleteKeepsTheRemoteObject(t *testing.T) {
 	}
 	if len(remote.deletes) != 1 {
 		t.Fatalf("deletes = %+v, want the ordinary delete", remote.deletes)
+	}
+}
+
+func TestGatewayUnmountedBucketDeleteIsSkipped(t *testing.T) {
+	remote := &recordingRemote{}
+	remote_storage.RemoteStorageClientMakers["gatewaytest"] = recordingRemoteMaker{client: remote}
+	t.Cleanup(func() { delete(remote_storage.RemoteStorageClientMakers, "gatewaytest") })
+	option := &RemoteGatewayOptions{
+		bucketsDir:  "/buckets",
+		mappings:    &remote_pb.RemoteStorageMapping{Mappings: map[string]*remote_pb.RemoteStorageLocation{}},
+		remoteConfs: map[string]*remote_pb.RemoteConf{"gatewaytest": {Name: "gatewaytest", Type: "gatewaytest"}},
+	}
+	process, err := option.makeBucketedEventProcessor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deleteBucketEvent := &filer_pb.SubscribeMetadataResponse{
+		Directory: "/buckets",
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: &filer_pb.Entry{
+				Name:        "unmounted-bucket",
+				IsDirectory: true,
+			},
+		},
+	}
+
+	// Deleting a bucket that is not mounted (for instance because it was already unmounted
+	// by an earlier copy of the delete event) should return nil and not error.
+	if err := process(deleteBucketEvent); err != nil {
+		t.Fatalf("expected nil for unmounted bucket delete, got: %v", err)
+	}
+}
+
+// TestGatewayCreatesABucketAfterTheMappingFileIsDeleted: deleting
+// mount.mapping empties the mapping table, and a later bucket create still
+// records its mount in it.
+func TestGatewayCreatesABucketAfterTheMappingFileIsDeleted(t *testing.T) {
+	option, remote := gatewayTestOption("gatewaytest-mapping-reset")
+	t.Cleanup(func() {
+		delete(remote_storage.RemoteStorageClientMakers, "gatewaytest-mapping-reset")
+		remote_storage.ResetRemoteStorageClients()
+	})
+	createAt, noFilter, noSuffix := "gatewaytest-mapping-reset", "", false
+	option.createBucketAt, option.include, option.exclude, option.createBucketRandomSuffix = &createAt, &noFilter, &noFilter, &noSuffix
+	process, err := option.makeBucketedEventProcessor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := process(&filer_pb.SubscribeMetadataResponse{
+		Directory:         filer.DirectoryEtcRemote,
+		EventNotification: &filer_pb.EventNotification{OldEntry: &filer_pb.Entry{Name: filer.REMOTE_STORAGE_MOUNT_FILE}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// saving the new mount needs a filer, so the create itself errors
+	_ = process(&filer_pb.SubscribeMetadataResponse{
+		Directory: "/buckets",
+		EventNotification: &filer_pb.EventNotification{
+			NewParentPath: "/buckets",
+			NewEntry:      &filer_pb.Entry{Name: "fresh", IsDirectory: true},
+		},
+	})
+
+	if !slices.Equal(remote.bucketCreates, []string{"fresh"}) {
+		t.Errorf("bucket creates = %v, want [fresh]", remote.bucketCreates)
+	}
+	if loc := option.mappings.Mappings["/buckets/fresh"]; loc.GetBucket() != "fresh" {
+		t.Errorf("mapping for /buckets/fresh = %v, want bucket fresh", loc)
+	}
+}
+
+// TestGatewayDeleteOfAnAbsentObjectSucceeds: a repeated delete finds the
+// object gone, which GCS reports as ErrRemoteObjectNotFound; the event has
+// nothing left to do and must not hold the sync offset.
+func TestGatewayDeleteOfAnAbsentObjectSucceeds(t *testing.T) {
+	option, remote := gatewayTestOption("gatewaytest-absent-delete")
+	t.Cleanup(func() {
+		delete(remote_storage.RemoteStorageClientMakers, "gatewaytest-absent-delete")
+		remote_storage.ResetRemoteStorageClients()
+	})
+	remote.deleteErr = remote_storage.ErrRemoteObjectNotFound
+	process, err := option.makeBucketedEventProcessor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := process(&filer_pb.SubscribeMetadataResponse{
+		Directory: "/buckets/gold/dir",
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: &filer_pb.Entry{Name: "obj.bin", Attributes: &filer_pb.FuseAttributes{}},
+		},
+	}); err != nil {
+		t.Fatalf("delete of an absent object: %v", err)
+	}
+	if len(remote.deletes) != 1 || remote.deletes[0].Path != "/dir/obj.bin" {
+		t.Errorf("deletes = %+v, want /dir/obj.bin", remote.deletes)
+	}
+}
+
+// TestGatewayKeepsTheDefaultStorageAcrossMappingChanges: the default storage
+// for new buckets is derived at startup and never saved in mount.mapping, so
+// replacing or deleting that file must not drop it.
+func TestGatewayKeepsTheDefaultStorageAcrossMappingChanges(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		event *filer_pb.EventNotification
+	}{
+		{"mapping updated", &filer_pb.EventNotification{NewParentPath: filer.DirectoryEtcRemote, NewEntry: &filer_pb.Entry{Name: filer.REMOTE_STORAGE_MOUNT_FILE}}},
+		{"mapping deleted", &filer_pb.EventNotification{OldEntry: &filer_pb.Entry{Name: filer.REMOTE_STORAGE_MOUNT_FILE}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			option, remote := gatewayTestOption("gatewaytest-default-storage")
+			t.Cleanup(func() {
+				delete(remote_storage.RemoteStorageClientMakers, "gatewaytest-default-storage")
+				remote_storage.ResetRemoteStorageClients()
+			})
+			option.mappings.PrimaryBucketStorageName = "gatewaytest-default-storage"
+			createAt, noFilter, noSuffix := "", "", false
+			option.createBucketAt, option.include, option.exclude, option.createBucketRandomSuffix = &createAt, &noFilter, &noFilter, &noSuffix
+			process, err := option.makeBucketedEventProcessor(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := process(&filer_pb.SubscribeMetadataResponse{Directory: filer.DirectoryEtcRemote, EventNotification: tt.event}); err != nil {
+				t.Fatal(err)
+			}
+			// saving the new mount needs a filer, so the create itself errors
+			_ = process(&filer_pb.SubscribeMetadataResponse{
+				Directory: "/buckets",
+				EventNotification: &filer_pb.EventNotification{
+					NewParentPath: "/buckets",
+					NewEntry:      &filer_pb.Entry{Name: "fresh", IsDirectory: true},
+				},
+			})
+
+			if !slices.Equal(remote.bucketCreates, []string{"fresh"}) {
+				t.Errorf("bucket creates = %v, want [fresh] in the default storage", remote.bucketCreates)
+			}
+		})
+	}
+}
+
+// TestGatewayKeptDeleteMarkerRetry: once a lock is released, the kept marker's
+// delete goes to the object key the bucket mount maps the version to, and the
+// marker is stamped with the mount's storage.
+func TestGatewayKeptDeleteMarkerRetry(t *testing.T) {
+	const versionsDir = "/buckets/gold/dir/held.bin.versions"
+	option, remote := gatewayTestOption("gatewaytest-kept-marker")
+	t.Cleanup(func() {
+		delete(remote_storage.RemoteStorageClientMakers, "gatewaytest-kept-marker")
+		remote_storage.ResetRemoteStorageClients()
+	})
+	filerClient := &stubFilerClient{entries: map[string]*filer_pb.Entry{
+		versionsDir: {Name: "held.bin.versions", IsDirectory: true, Extended: map[string][]byte{
+			s3_constants.ExtLatestVersionFileNameKey:    []byte("v_marker"),
+			s3_constants.ExtLatestVersionIsDeleteMarker: []byte("true"),
+		}},
+		versionsDir + "/v_marker": {
+			Name:       "v_marker",
+			Attributes: &filer_pb.FuseAttributes{Mtime: 1786096669},
+			Extended:   map[string][]byte{s3_constants.ExtDeleteMarkerKey: []byte("true")},
+		},
+	}}
+
+	if err := syncGatewayKeptDeleteMarker(filerClient, option, versionsDir, "v_old"); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.deletes) != 1 || remote.deletes[0].Bucket != "gold" || remote.deletes[0].Path != "/dir/held.bin" {
+		t.Errorf("deletes = %+v, want gold:/dir/held.bin", remote.deletes)
+	}
+	stamped := filerClient.updated.GetEntry()
+	if filerClient.updates != 1 || stamped.GetName() != "v_marker" || stamped.GetRemoteEntry().GetStorageName() != "gatewaytest-kept-marker" {
+		t.Errorf("stamps = %d (%v), want v_marker stamped with the mount's storage", filerClient.updates, stamped)
+	}
+
+	if err := syncGatewayKeptDeleteMarker(filerClient, option, "/buckets/unmounted/held.bin.versions", "v_old"); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.deletes) != 1 || filerClient.updates != 1 {
+		t.Errorf("deletes = %+v, stamps = %d; want nothing more for an unmounted bucket", remote.deletes, filerClient.updates)
+	}
+}
+
+// TestGatewayLockReleaseLooksUpTheKeptMarker: an update or delete that
+// releases a version's lock reads the key's versions from the gateway's filer,
+// which the test cannot reach, so the event fails with that filer's address
+// instead of being skipped. A change to an unlocked version is skipped
+// without a lookup.
+func TestGatewayLockReleaseLooksUpTheKeptMarker(t *testing.T) {
+	const versionsDir = "/buckets/gold/dir/held.bin.versions"
+	option, remote := gatewayTestOption("gatewaytest-lock-release")
+	t.Cleanup(func() {
+		delete(remote_storage.RemoteStorageClientMakers, "gatewaytest-lock-release")
+		remote_storage.ResetRemoteStorageClients()
+	})
+	filerGrpcAddress := pb.ServerAddress(*option.filerAddress).ToGrpcAddress()
+	process, err := option.makeBucketedEventProcessor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := func(extended map[string][]byte) *filer_pb.Entry {
+		return &filer_pb.Entry{Name: "v_old", Attributes: &filer_pb.FuseAttributes{FileSize: 8192}, Extended: extended}
+	}
+	held := map[string][]byte{s3_constants.ExtLegalHoldKey: []byte(s3_constants.LegalHoldOn)}
+	released := map[string][]byte{s3_constants.ExtLegalHoldKey: []byte(s3_constants.LegalHoldOff)}
+
+	for _, tc := range []struct {
+		name       string
+		event      *filer_pb.EventNotification
+		wantLookup bool
+	}{
+		{"hold released", &filer_pb.EventNotification{OldEntry: version(held), NewParentPath: versionsDir, NewEntry: version(released)}, true},
+		{"held version deleted", &filer_pb.EventNotification{OldEntry: version(held)}, true},
+		{"unlocked version updated", &filer_pb.EventNotification{OldEntry: version(nil), NewParentPath: versionsDir, NewEntry: version(released)}, false},
+		{"unlocked version deleted", &filer_pb.EventNotification{OldEntry: version(nil)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := process(&filer_pb.SubscribeMetadataResponse{Directory: versionsDir, EventNotification: tc.event})
+			if tc.wantLookup {
+				if err == nil || !strings.Contains(err.Error(), filerGrpcAddress) {
+					t.Errorf("process = %v, want an unanswered lookup on %s", err, filerGrpcAddress)
+				}
+			} else if err != nil {
+				t.Errorf("process = %v, want the change skipped", err)
+			}
+			if len(remote.deletes) != 0 || len(remote.writes) != 0 {
+				t.Errorf("deletes = %+v, writes = %+v; want the remote untouched", remote.deletes, remote.writes)
+			}
+		})
 	}
 }

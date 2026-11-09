@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -46,6 +47,60 @@ func (m *Manager) SetTrusted(trusted bool) {
 	m.handler.SetTrusted(trusted)
 }
 
+// SetEncryptionChecker sets the handler's SSE-S3 availability predicate.
+func (m *Manager) SetEncryptionChecker(fn func() bool) {
+	m.handler.SetEncryptionChecker(fn)
+}
+
+// PrincipalFor resolves the caller of r the way the catalog's handlers do,
+// so it matches the owner CreateTableBucket records. A nil request is the
+// handler's account ID.
+func (m *Manager) PrincipalFor(r *http.Request) string {
+	if r == nil {
+		return m.handler.accountID
+	}
+	return m.handler.getAccountID(r)
+}
+
+// PolicyContext builds the evaluation context a Manager call's synthesized
+// request produces: the configured local-account predicate, the caller's own
+// identity actions so admin and action grants resolve on privileges rather
+// than the forwarded name, plus the open-by-default fallback only for a
+// trusted caller or no resolved identity. A non-empty bucket lets an identity
+// action scoped to that bucket apply, as the handlers do.
+func (m *Manager) PolicyContext(r *http.Request, bucket string) *PolicyContext {
+	ctx := &PolicyContext{IsLocalAccountID: m.handler.localAccountIDs, IdentityActions: getIdentityActions(r),
+		TrustedIssuers: m.handler.trustedIssuers(r), TableBucketName: bucket}
+	if m.handler.trusted || (m.handler.defaultAllow && s3_constants.GetIdentityNameFromContext(r) == "") {
+		ctx.DefaultAllow = true
+	}
+	return ctx
+}
+
+type tableBucketCreatedAtKey struct{}
+
+// WithTableBucketCreatedAt binds a DeleteTableBucket, CreateNamespace,
+// DeleteNamespace, CreateTable, DeleteTable or tag operation run through
+// Execute to the bucket created at createdAt, so a caller that authorized the
+// bucket itself never writes into one created again under its name.
+// In-process only: no wire request can carry it.
+func WithTableBucketCreatedAt(ctx context.Context, createdAt time.Time) context.Context {
+	return context.WithValue(ctx, tableBucketCreatedAtKey{}, createdAt)
+}
+
+// boundTableBucket returns the bucket creation time ctx binds the request to.
+func boundTableBucket(ctx context.Context) (time.Time, bool) {
+	createdAt, ok := ctx.Value(tableBucketCreatedAtKey{}).(time.Time)
+	return createdAt, ok
+}
+
+// otherTableBucket reports whether ctx binds the request to a bucket other
+// than the one created at createdAt.
+func otherTableBucket(ctx context.Context, createdAt time.Time) bool {
+	want, ok := boundTableBucket(ctx)
+	return ok && !createdAt.Equal(want)
+}
+
 // Execute runs an S3 Tables operation and decodes the response into resp (if provided).
 func (m *Manager) Execute(ctx context.Context, filerClient FilerClient, operation string, req interface{}, resp interface{}, identity string) error {
 	body, err := json.Marshal(req)
@@ -71,9 +126,20 @@ func (m *Manager) AuthorizeCreateTable(ctx context.Context, filerClient FilerCli
 		return err
 	}
 	recorder := httptest.NewRecorder()
-	_, authErr := m.handler.authorizeCreateTable(recorder, httpReq, filerClient, req.TableBucketARN, req.Namespace, req.Name, req.Tags, req.AllowMissingNamespace)
+	target, authErr := m.handler.authorizeCreateTable(recorder, httpReq, filerClient, req.TableBucketARN, req.Namespace, req.Name, req.Tags, req.AllowMissingNamespace)
 	if authErr == nil {
-		return nil
+		if err := m.handler.checkVectorNamespaceWrite(ctx, filerClient, target.bucketName, req.Namespace); err != nil {
+			return err
+		}
+		if req.MetadataLocation == "" {
+			return nil
+		}
+		tablePath := GetTablePath(target.bucketName, target.namespaceName, target.tableName)
+		if authErr = ValidateMetadataLocation(req.MetadataLocation, target.bucketName, target.namespaceName); authErr != nil {
+			m.handler.writeError(recorder, http.StatusBadRequest, ErrCodeInvalidRequest, authErr.Error())
+		} else if authErr = m.handler.refuseClaimedLocation(recorder, httpReq, filerClient, target.bucketName, tablePath, CatalogRecordRoot(target.bucketName, tablePath, req.MetadataLocation, "")); authErr == nil {
+			return nil
+		}
 	}
 	if decoded := decodeS3TablesHTTPResponse(recorder, nil); decoded != nil {
 		return decoded

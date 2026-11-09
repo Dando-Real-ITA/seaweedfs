@@ -22,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -153,6 +154,7 @@ func TestCopyObjectDestinationACL(t *testing.T) {
 		mime                                                                             string
 		race, condition                                                                  string
 		prefix                                                                           bool
+		blockPublicAcls                                                                  bool
 	}{
 		{name: "default private"},
 		{name: "replace metadata also defaults private", replace: true},
@@ -204,6 +206,9 @@ func TestCopyObjectDestinationACL(t *testing.T) {
 		{name: "prefix private control", self: true, replace: true, routed: true, prefix: true},
 		{name: "prefix mode changes before commit", self: true, replace: true, routed: true, prefix: true, race: "commit"},
 		{name: "self copy reads owner ahead of replica", self: true, replace: true, routed: true, race: "replica"},
+		{name: "block public acls private", acl: "private", blockPublicAcls: true},
+		{name: "block public acls rejects public", acl: "public-read", blockPublicAcls: true, errorCode: "AccessDenied"},
+		{name: "block public acls rejects public self copy", self: true, replace: true, routed: true, acl: "public-read", blockPublicAcls: true, errorCode: "AccessDenied"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -234,7 +239,11 @@ func TestCopyObjectDestinationACL(t *testing.T) {
 			}}
 			filer.entries["/buckets/"+bucket] = bucketEntry
 			s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
-			s3a.bucketConfigCache.Set(bucket, &BucketConfig{Name: bucket, Owner: bucketOwner, Ownership: ownership, Versioning: tt.versioning})
+			bucketConfig := &BucketConfig{Name: bucket, Owner: bucketOwner, Ownership: ownership, Versioning: tt.versioning}
+			if tt.blockPublicAcls {
+				bucketConfig.PublicAccessBlock = &PublicAccessBlockConfiguration{BlockPublicAcls: true}
+			}
+			s3a.bucketConfigCache.Set(bucket, bucketConfig)
 			s3a.bucketRegistry = NewBucketRegistry(s3a)
 			s3a.bucketRegistry.LoadBucketMetadata(bucketEntry)
 			mode := tt.sourceMode
@@ -481,4 +490,56 @@ func TestCopyObjectDestinationACL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A copy that sets an ACL is re-authenticated for s3:PutObjectAcl. The
+// destination bucket's default encryption must not be written into the client
+// request before that check: the synthesized x-amz-server-side-encryption
+// headers are not in SignedHeaders and fail with SignatureDoesNotMatch.
+func TestCopyObjectACLWithBucketDefaultEncryption(t *testing.T) {
+	const bucket, writer = "copy-acl-sse", "copy-writer"
+	kmsKey := SetupTestKMS(t)
+	t.Cleanup(kmsKey.Cleanup)
+	filer := &copyACLFiler{ambiguousPutFiler: &ambiguousPutFiler{apply: true, entries: map[string]*filer_pb.Entry{}}}
+	s3a := newPutTestServer(t, startFakeFiler(t, filer))
+	s3a.iam = NewIdentityAccessManagementWithStore(s3a.option, nil, "memory")
+	t.Cleanup(s3a.iam.Shutdown)
+	s3a.iam.isAuthEnabled = true
+	account := &Account{Id: writer, DisplayName: writer}
+	identity := &Identity{Name: "copy-acl-sse-test", Account: account, IsStatic: true,
+		Credentials: []*Credential{{AccessKey: routingTestAccessKey, SecretKey: routingTestSecretKey}},
+		Actions:     []Action{"Read:" + bucket, "Write:" + bucket, "WriteAcp:" + bucket}}
+	s3a.iam.accessKeyIdent[routingTestAccessKey] = identity
+	s3a.iam.nameToIdentity[identity.Name] = identity
+	s3a.iam.accounts[writer] = account
+	bucketEntry := &filer_pb.Entry{Name: bucket, IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}, Extended: map[string][]byte{
+		s3_constants.ExtAmzOwnerKey: []byte(writer), s3_constants.ExtOwnershipKey: []byte(s3_constants.OwnershipObjectWriter),
+	}}
+	filer.entries["/buckets/"+bucket] = bucketEntry
+	s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+	s3a.bucketConfigCache.Set(bucket, &BucketConfig{Name: bucket, Owner: writer, Ownership: s3_constants.OwnershipObjectWriter,
+		Encryption: &s3_pb.EncryptionConfiguration{SseAlgorithm: "aws:kms", KmsKeyId: kmsKey.KeyID}})
+	s3a.bucketRegistry = NewBucketRegistry(s3a)
+	s3a.bucketRegistry.LoadBucketMetadata(bucketEntry)
+	filer.entries["/buckets/"+bucket+"/source"] = &filer_pb.Entry{Name: "source", Content: []byte("data"),
+		Attributes: &filer_pb.FuseAttributes{FileMode: defaultFileMode, FileSize: 4, Mime: "text/plain"}}
+
+	req := httptest.NewRequest(http.MethodPut, "http://s3/"+bucket+"/destination", nil)
+	req = mux.SetURLVars(req, map[string]string{"bucket": bucket, "object": "destination"})
+	req.Header.Set("X-Amz-Copy-Source", "/"+bucket+"/source")
+	req.Header.Set(s3_constants.AmzCannedAcl, "private")
+	signRoutingTestRequest(t, req, "", "s3")
+	rr := httptest.NewRecorder()
+	s3a.iam.Auth(s3a.CopyObjectHandler, s3_constants.ACTION_WRITE)(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	filer.mu.Lock()
+	defer filer.mu.Unlock()
+	stored := filer.entries["/buckets/"+bucket+"/destination"]
+	require.NotNil(t, stored)
+	sseKMSKey, err := DeserializeSSEKMSMetadata(stored.Extended[s3_constants.SeaweedFSSSEKMSKey])
+	require.NoError(t, err, "the copy must still take the bucket default SSE-KMS")
+	require.Equal(t, kmsKey.KeyID, sseKMSKey.KeyID)
+	require.NotEmpty(t, stored.Content)
+	require.NotEqual(t, []byte("data"), stored.Content, "the copy must be stored encrypted")
 }
