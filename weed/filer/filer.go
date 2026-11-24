@@ -292,7 +292,7 @@ func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*maste
 		for _, s := range update.Servers {
 			servers = append(servers, pb.ServerAddress(s))
 		}
-		glog.V(0).Infof("LockRing: applying master ring update v%d: %v", update.Version, servers)
+		glog.V(1).Infof("LockRing: applying master ring update v%d: %v", update.Version, servers)
 		f.Dlm.LockRing.SetSnapshot(servers, update.Version)
 	})
 	f.MasterClient.SetOnMasterChangeFn(func(previous, current pb.ServerAddress) {

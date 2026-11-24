@@ -155,7 +155,7 @@ func (lrm *LockRingManager) sendUpdate(filerGroup FilerGroupName, update *master
 	if update == nil {
 		return
 	}
-	glog.V(0).Infof("LockRing: broadcasting ring update for group %q version %d: %v", filerGroup, update.Version, update.Servers)
+	glog.V(1).Infof("LockRing: broadcasting ring update for group %q version %d: %v", filerGroup, update.Version, update.Servers)
 	if lrm.broadcastFn != nil {
 		lrm.broadcastFn(&master_pb.KeepConnectedResponse{
 			LockRingUpdate: update,

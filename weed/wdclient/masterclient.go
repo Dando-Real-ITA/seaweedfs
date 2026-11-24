@@ -477,7 +477,7 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 				mc.OnLockRingUpdateLock.RLock()
 				if mc.OnLockRingUpdate != nil {
 					if update.FilerGroup == mc.FilerGroup {
-						glog.V(0).Infof("LockRing: %s@%s received ring update v%d: %v", mc.clientType, mc.clientHost, update.Version, update.Servers)
+						glog.V(1).Infof("LockRing: %s@%s received ring update v%d: %v", mc.clientType, mc.clientHost, update.Version, update.Servers)
 						mc.OnLockRingUpdate(update)
 					}
 				}
