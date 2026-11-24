@@ -406,7 +406,9 @@ func ReadUrlAsStream(ctx context.Context, fileUrl, jwt string, cipherKey []byte,
 		return true, err
 	}
 	recordReachable(req.URL.Host)
-	defer CloseResponse(r)
+	// Do not drain a failed or abandoned stream: draining can wait forever for
+	// a stalled peer, delaying cancellation and holding prefetch resources.
+	defer r.Body.Close()
 	if r.StatusCode >= 400 {
 		if r.StatusCode == http.StatusNotFound {
 			return true, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrNotFound)
@@ -472,10 +474,11 @@ func readEncryptedUrl(ctx context.Context, fileUrl, jwt string, cipherKey []byte
 		decryptedData, err = util.DecompressData(decryptedData)
 		if err != nil {
 			glog.V(0).InfofCtx(ctx, "unzip decrypt %s: %v", fileUrl, err)
+			return true, err
 		}
 	}
 	if len(decryptedData) < int(offset)+size {
-		return false, fmt.Errorf("read decrypted %s size %d [%d, %d)", fileUrl, len(decryptedData), offset, int(offset)+size)
+		return true, fmt.Errorf("read decrypted %s size %d [%d, %d): %w", fileUrl, len(decryptedData), offset, int(offset)+size, io.ErrUnexpectedEOF)
 	}
 	if isFullChunk {
 		fn(decryptedData)
