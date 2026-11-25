@@ -3,6 +3,7 @@ package chunk_cache
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/syndtr/goleveldb/leveldb/opt"
@@ -26,6 +27,10 @@ type ChunkCacheVolume struct {
 	sizeLimit   int64
 	lastModTime time.Time
 	fileSize    int64
+	// refs counts the owning layer plus unlocked readers and writers.
+	refs    atomic.Int32
+	retired bool
+	closed  chan struct{}
 }
 
 func LoadOrCreateChunkCacheVolume(fileName string, preallocate int64) (*ChunkCacheVolume, error) {
@@ -34,7 +39,9 @@ func LoadOrCreateChunkCacheVolume(fileName string, preallocate int64) (*ChunkCac
 		smallBuffer: make([]byte, types.NeedlePaddingSize),
 		fileName:    fileName,
 		sizeLimit:   preallocate,
+		closed:      make(chan struct{}),
 	}
+	v.refs.Store(1)
 
 	var err error
 	var indexFile *os.File
@@ -63,7 +70,8 @@ func LoadOrCreateChunkCacheVolume(fileName string, preallocate int64) (*ChunkCac
 		}
 		v.DataBackend = backend.NewDiskFile(dataFile)
 		v.lastModTime = modTime
-		v.fileSize = fileSize
+		// Entry offsets must stay aligned even if a crash left a partial tail.
+		v.fileSize = (fileSize + types.NeedlePaddingSize - 1) / types.NeedlePaddingSize * types.NeedlePaddingSize
 	} else {
 		if v.DataBackend, err = backend.CreateVolumeFile(v.fileName+".dat", preallocate, 0); err != nil {
 			return nil, fmt.Errorf("cannot create cache file %s.dat: %v", v.fileName, err)
@@ -89,28 +97,37 @@ func LoadOrCreateChunkCacheVolume(fileName string, preallocate int64) (*ChunkCac
 
 }
 
+// Shutdown requires the cache write lock. The data file stays open until
+// in-flight unlocked copies release it.
 func (v *ChunkCacheVolume) Shutdown() {
-	if v.DataBackend != nil {
-		v.DataBackend.Close()
-		v.DataBackend = nil
+	if v.retired {
+		return
 	}
+	v.retired = true
 	if v.nm != nil {
 		v.nm.Close()
 		v.nm = nil
 	}
+	v.release()
 }
 
 func (v *ChunkCacheVolume) doReset() {
 	v.Shutdown()
+	// In-flight copies keep reading the unlinked file; only platforms that
+	// cannot unlink open files wait for them.
 	fn := v.fileName + ".dat"
-	err := os.Truncate(fn, 0)
-	if err != nil {
-		glog.Errorf("ChunkCacheVolume.doReset: truncate %q failed: %s", fn, err)
+	err := os.Remove(fn)
+	if err != nil && !os.IsNotExist(err) {
+		<-v.closed
+		err = os.Remove(fn)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		glog.Errorf("ChunkCacheVolume.doReset: remove %q failed: %s", fn, err)
 	}
 	fn = v.fileName + ".idx"
-	err = os.Truncate(fn, 0)
-	if err != nil {
-		glog.Errorf("ChunkCacheVolume.doReset: truncate %q failed: %s", fn, err)
+	err = os.Remove(fn)
+	if err != nil && !os.IsNotExist(err) {
+		glog.Errorf("ChunkCacheVolume.doReset: remove %q failed: %s", fn, err)
 	}
 	fn = v.fileName + ".ldb"
 	err = os.RemoveAll(fn)
@@ -174,62 +191,4 @@ func (v *ChunkCacheVolume) GetNeedle(key types.NeedleId) ([]byte, error) {
 
 	v.dropReadCache(readOffset, int64(nv.Size))
 	return data, nil
-}
-
-func (v *ChunkCacheVolume) readNeedleSliceAt(data []byte, key types.NeedleId, offset uint64) (n int, err error) {
-	nv, ok := v.nm.Get(key)
-	if !ok {
-		return 0, storage.ErrorNotFound
-	}
-	wanted := min(len(data), int(nv.Size)-int(offset))
-	if wanted < 0 {
-		// should never happen, but better than panicking
-		return 0, ErrorOutOfBounds
-	}
-	readOffset := nv.Offset.ToActualOffset() + int64(offset)
-	if n, err = v.DataBackend.ReadAt(data[:wanted], readOffset); err != nil {
-		if n != wanted {
-			return n, fmt.Errorf("read %s.dat [%d,%d): %v",
-				v.fileName, readOffset, int64(readOffset)+int64(wanted), err)
-		}
-	} else {
-		if n != wanted {
-			return n, fmt.Errorf("read %d, expected %d", n, wanted)
-		}
-	}
-	if err != nil && n == wanted {
-		err = nil
-	}
-	if n > 0 {
-		v.dropReadCache(readOffset, int64(n))
-	}
-	return n, err
-}
-
-func (v *ChunkCacheVolume) WriteNeedle(key types.NeedleId, data []byte) error {
-
-	offset := v.fileSize
-
-	written, err := v.DataBackend.WriteAt(data, offset)
-	if err != nil {
-		return err
-	} else if written != len(data) {
-		return fmt.Errorf("partial written %d, expected %d", written, len(data))
-	}
-
-	v.fileSize += int64(written)
-	extraSize := written % types.NeedlePaddingSize
-	if extraSize != 0 {
-		_, err = v.DataBackend.WriteAt(v.smallBuffer[:types.NeedlePaddingSize-extraSize], offset+int64(written))
-		if err != nil {
-			return err
-		}
-		v.fileSize += int64(types.NeedlePaddingSize - extraSize)
-	}
-
-	if err := v.nm.Put(key, types.ToOffset(offset), types.Size(len(data))); err != nil {
-		return err
-	}
-
-	return nil
 }
