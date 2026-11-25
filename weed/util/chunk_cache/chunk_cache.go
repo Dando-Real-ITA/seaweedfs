@@ -152,7 +152,7 @@ func (c *TieredChunkCache) SetChunk(fileId string, data []byte) {
 		c.memCache.SetChunk(fileId, data)
 	}
 	if err := c.SetChunkFromReader(fileId, bytes.NewReader(data), int64(len(data))); err != nil {
-		glog.V(0).Infof("cache write %s size %d: %v", fileId, len(data), err)
+		glog.V(1).Infof("cache write %s size %d: %v", fileId, len(data), err)
 	}
 }
 
