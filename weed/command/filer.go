@@ -101,6 +101,8 @@ type FilerOptions struct {
 
 	allowUntrustedRemoteEndpoints *bool
 	remoteCacheEvictThreshold     *float64
+
+	downloadCache filerDownloadCacheOptions
 	// shutdownCtx, when non-nil, tells startFiler to gracefully shut down its
 	// HTTP/gRPC servers once the ctx is cancelled. Used by integration tests
 	// and by weed mini; nil for standalone weed filer.
@@ -149,6 +151,7 @@ func init() {
 	f.localSocket = cmdFiler.Flag.String("localSocket", "", "default to /tmp/seaweedfs-filer-<port>.sock")
 	f.showUIDirectoryDelete = cmdFiler.Flag.Bool("ui.deleteDir", true, "enable filer UI show delete directory button")
 	f.downloadMaxMBps = cmdFiler.Flag.Int("downloadMaxMBps", 0, "download max speed for each download request, in MB per second")
+	f.downloadCache.registerFlags(&cmdFiler.Flag, "")
 	f.diskType = cmdFiler.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	f.allowedOrigins = cmdFiler.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
 	f.exposeDirectoryData = cmdFiler.Flag.Bool("exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
@@ -450,6 +453,8 @@ func (fo *FilerOptions) startFiler() {
 
 		AllowUntrustedRemoteEndpoints: *fo.allowUntrustedRemoteEndpoints,
 		RemoteCacheEvictThreshold:     *fo.remoteCacheEvictThreshold,
+
+		DownloadCacheOption: fo.downloadCache.serverOption(),
 	})
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)

@@ -345,12 +345,7 @@ func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64
 	bufferedWriter.Reset(sink)
 	discardBuffered := false
 	defer func() {
-		if discardBuffered {
-			bufferedWriter.Reset(io.Discard)
-		} else {
-			bufferedWriter.Flush()
-		}
-		writePool.Put(bufferedWriter)
+		finishRangeWriter(bufferedWriter, discardBuffered)
 	}()
 
 	if rangeReq == "" {

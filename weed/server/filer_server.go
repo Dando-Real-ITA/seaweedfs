@@ -114,6 +114,8 @@ type FilerOption struct {
 	// RemoteCacheEvictThreshold is the disk usage fraction at which the filer
 	// evicts remote-mounted cached chunks; 0 disables eviction.
 	RemoteCacheEvictThreshold float64
+
+	DownloadCacheOption
 }
 
 type FilerServer struct {
@@ -145,6 +147,9 @@ type FilerServer struct {
 
 	// deduplicates concurrent remote object caching operations
 	remoteCacheGroup singleflight.Group
+
+	downloadCache      *filer.DownloadCache
+	closeDownloadCache func()
 
 	// serializes remote-cache eviction passes; lastVacuum rate-limits the
 	// compaction trigger that reclaims evicted chunks.
@@ -228,6 +233,15 @@ type FilerServer struct {
 }
 
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
+	downloadCache, closeDownloadCache, err := newFilerDownloadCache(option)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			closeDownloadCache()
+		}
+	}()
 
 	v := util.GetViper()
 	signingKey := v.GetString("jwt.filer_signing.key")
@@ -259,6 +273,8 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	option.ExposeDirectoryData = option.ExposeDirectoryData && v.GetBool("filer.expose_directory_metadata.enabled")
 
 	fs = &FilerServer{
+		downloadCache:         downloadCache,
+		closeDownloadCache:    closeDownloadCache,
 		option:                option,
 		grpcDialOption:        security.LoadClientTLS(util.GetViper(), "grpc.filer"),
 		grpcDialOptionMaster:  security.LoadClientTLSForTarget(util.GetViper(), "grpc.filer", "grpc.master"),
@@ -489,6 +505,9 @@ func (fs *FilerServer) checkWithMaster() {
 // This prevents data corruption when the process receives SIGTERM during active uploads.
 func (fs *FilerServer) Shutdown() {
 	glog.V(0).Infof("Shutting down filer")
+	if fs.closeDownloadCache != nil {
+		fs.closeDownloadCache()
+	}
 	if fs.posixLockSweeperStop != nil {
 		close(fs.posixLockSweeperStop)
 	}

@@ -368,12 +368,12 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			chunks = resp.Entry.GetChunks()
 		}
 
-		// Use a detached context for streaming so client disconnects/cancellations don't abort volume server operations,
-		// while preserving request-scoped values like tracing IDs.
-		// Matches S3 API behavior. Request context (ctx) is used for metadata operations above.
-		streamCtx, streamCancel := context.WithCancel(context.WithoutCancel(ctx))
+		// Downloads are read-only. Cancel upstream reads and release spool
+		// reservations when the client disconnects, including while waiting
+		// for a prefetched chunk before the first response write.
+		streamCtx, streamCancel := context.WithCancel(ctx)
 
-		streamFn, err := filer.PrepareStreamContentWithPrefetch(streamCtx, fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs, 4)
+		streamFn, err := filer.PrepareStreamContentWithPrefetch(streamCtx, fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs, 4, fs.downloadCache)
 		if err != nil {
 			streamCancel()
 			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
