@@ -14,6 +14,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/cluster/maintenance"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/server/constants"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -152,8 +153,54 @@ func reportsPriorClusterState(heartbeat *master_pb.Heartbeat, topologyId string,
 	return false
 }
 
+// volumeHeartbeatTimeout is how long SendHeartbeat waits for the next
+// heartbeat before it ends the stream and unregisters the volume server.
+var volumeHeartbeatTimeout = 3 * constants.VolumePulsePeriod
+
+// heartbeatReceiver returns a function that receives the next heartbeat from
+// stream, or fails with DeadlineExceeded once none has arrived for timeout,
+// and a function that releases the receiving goroutine. A volume server sends
+// a heartbeat every VolumePulsePeriod. One that goes silent without closing
+// its connection (a hung host, a network partition) leaves Recv blocked until
+// gRPC keepalive closes the connection, which takes 80 s or more, and until
+// then the master keeps assigning writes to its volumes.
+func heartbeatReceiver(stream master_pb.Seaweed_SendHeartbeatServer, timeout time.Duration) (recv func() (*master_pb.Heartbeat, error), stop func()) {
+	type received struct {
+		heartbeat *master_pb.Heartbeat
+		err       error
+	}
+	ch := make(chan received)
+	done := make(chan struct{})
+	go func() {
+		for {
+			heartbeat, err := stream.Recv()
+			select {
+			case ch <- received{heartbeat, err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	recv = func() (*master_pb.Heartbeat, error) {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case r := <-ch:
+			return r.heartbeat, r.err
+		case <-timer.C:
+			return nil, status.Errorf(codes.DeadlineExceeded, "no heartbeat for %v", timeout)
+		}
+	}
+	return recv, func() { close(done) }
+}
+
 func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServer) error {
 	var dn *topology.DataNode
+	recv, stopRecv := heartbeatReceiver(stream, volumeHeartbeatTimeout)
+	defer stopRecv()
 
 	defer func() {
 		if dn != nil {
@@ -191,7 +238,7 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 	var echoedVid needle.VolumeId
 	var echoedTopoId string
 	for {
-		heartbeat, err := stream.Recv()
+		heartbeat, err := recv()
 		if err != nil {
 			// Graceful shutdown on either side cancels the stream; don't warn.
 			canceled := errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
@@ -524,6 +571,10 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		glog.V(1).Infof("Cluster: %s node %s added to group '%s'", req.ClientType, peerAddress, req.FilerGroup)
 		ms.broadcastToClients(update)
 	}
+	if req.ClientType == cluster.S3Type {
+		ms.Cluster.SetLancePort(req.FilerGroup, peerAddress, req.LancePort)
+		ms.Cluster.SetS3Endpoint(req.FilerGroup, peerAddress, req.S3Endpoint)
+	}
 	ms.updateLockRing(req, peerAddress)
 	ms.clusterNodeLock.Unlock()
 	if req.ClientType == cluster.MasterType {
@@ -667,10 +718,10 @@ func (ms *MasterServer) initialLockRingUpdate(clientType string, filerGroup stri
 	if ms.LockRingManager == nil {
 		return nil
 	}
-	// Filers are ring members; S3 gateways are lock clients that need the same
-	// view to dial a key's primary directly. Both get the initial snapshot;
-	// later membership changes already broadcast to every connected client.
-	if clientType != cluster.FilerType && clientType != cluster.S3Type {
+	// Filers are ring members; S3 gateways and mounts are lock clients that
+	// need the same view to dial a key's primary directly. All get the initial
+	// snapshot; later membership changes already broadcast to every client.
+	if clientType != cluster.FilerType && clientType != cluster.S3Type && clientType != cluster.MountType {
 		return nil
 	}
 

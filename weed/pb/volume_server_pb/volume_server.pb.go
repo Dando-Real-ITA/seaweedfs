@@ -185,6 +185,7 @@ type BatchDeleteRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	FileIds         []string               `protobuf:"bytes,1,rep,name=file_ids,json=fileIds,proto3" json:"file_ids,omitempty"`
 	SkipCookieCheck bool                   `protobuf:"varint,2,opt,name=skip_cookie_check,json=skipCookieCheck,proto3" json:"skip_cookie_check,omitempty"`
+	Fsync           bool                   `protobuf:"varint,3,opt,name=fsync,proto3" json:"fsync,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -229,6 +230,13 @@ func (x *BatchDeleteRequest) GetFileIds() []string {
 func (x *BatchDeleteRequest) GetSkipCookieCheck() bool {
 	if x != nil {
 		return x.SkipCookieCheck
+	}
+	return false
+}
+
+func (x *BatchDeleteRequest) GetFsync() bool {
+	if x != nil {
+		return x.Fsync
 	}
 	return false
 }
@@ -3656,6 +3664,7 @@ type VolumeEcShardsCopyRequest struct {
 	DiskId          uint32                 `protobuf:"varint,8,opt,name=disk_id,json=diskId,proto3" json:"disk_id,omitempty"`                                 // Target disk ID for storing EC shards
 	CopyEcsumFile   bool                   `protobuf:"varint,9,opt,name=copy_ecsum_file,json=copyEcsumFile,proto3" json:"copy_ecsum_file,omitempty"`          // copy the bitrot checksum sidecar (.ecsum) when present; tolerant of a missing source (no-op), since this non-2PC path has no Prepare backstop
 	IoBytePerSecond int64                  `protobuf:"varint,10,opt,name=io_byte_per_second,json=ioBytePerSecond,proto3" json:"io_byte_per_second,omitempty"` // limit the copy rate; 0 falls back to the server's maintenance rate
+	DiskType        string                 `protobuf:"bytes,11,opt,name=disk_type,json=diskType,proto3" json:"disk_type,omitempty"`                           // with disk_id 0, pick only among disks of this type; empty means any
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -3758,6 +3767,13 @@ func (x *VolumeEcShardsCopyRequest) GetIoBytePerSecond() int64 {
 		return x.IoBytePerSecond
 	}
 	return 0
+}
+
+func (x *VolumeEcShardsCopyRequest) GetDiskType() string {
+	if x != nil {
+		return x.DiskType
+	}
+	return ""
 }
 
 type VolumeEcShardsCopyResponse struct {
@@ -7334,10 +7350,11 @@ const file_volume_server_proto_rawDesc = "" +
 	"\x13volume_server.proto\x12\x10volume_server_pb\x1a\fremote.proto\"O\n" +
 	"\x11VolumeServerState\x12 \n" +
 	"\vmaintenance\x18\x01 \x01(\bR\vmaintenance\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\rR\aversion\"[\n" +
+	"\aversion\x18\x02 \x01(\rR\aversion\"q\n" +
 	"\x12BatchDeleteRequest\x12\x19\n" +
 	"\bfile_ids\x18\x01 \x03(\tR\afileIds\x12*\n" +
-	"\x11skip_cookie_check\x18\x02 \x01(\bR\x0fskipCookieCheck\"O\n" +
+	"\x11skip_cookie_check\x18\x02 \x01(\bR\x0fskipCookieCheck\x12\x14\n" +
+	"\x05fsync\x18\x03 \x01(\bR\x05fsync\"O\n" +
 	"\x13BatchDeleteResponse\x128\n" +
 	"\aresults\x18\x01 \x03(\v2\x1e.volume_server_pb.DeleteResultR\aresults\"\x83\x01\n" +
 	"\fDeleteResult\x12\x17\n" +
@@ -7580,7 +7597,7 @@ const file_volume_server_proto_rawDesc = "" +
 	"collection\x122\n" +
 	"\x15unsafe_ignore_sidecar\x18\x03 \x01(\bR\x13unsafeIgnoreSidecar\"K\n" +
 	"\x1dVolumeEcShardsRebuildResponse\x12*\n" +
-	"\x11rebuilt_shard_ids\x18\x01 \x03(\rR\x0frebuiltShardIds\"\xf9\x02\n" +
+	"\x11rebuilt_shard_ids\x18\x01 \x03(\rR\x0frebuiltShardIds\"\x96\x03\n" +
 	"\x19VolumeEcShardsCopyRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\rR\bvolumeId\x12\x1e\n" +
 	"\n" +
@@ -7594,7 +7611,8 @@ const file_volume_server_proto_rawDesc = "" +
 	"\adisk_id\x18\b \x01(\rR\x06diskId\x12&\n" +
 	"\x0fcopy_ecsum_file\x18\t \x01(\bR\rcopyEcsumFile\x12+\n" +
 	"\x12io_byte_per_second\x18\n" +
-	" \x01(\x03R\x0fioBytePerSecond\"\x1c\n" +
+	" \x01(\x03R\x0fioBytePerSecond\x12\x1b\n" +
+	"\tdisk_type\x18\v \x01(\tR\bdiskType\"\x1c\n" +
 	"\x1aVolumeEcShardsCopyResponse\"\x81\x02\n" +
 	"\x1bVolumeEcShardsDeleteRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\rR\bvolumeId\x12\x1e\n" +

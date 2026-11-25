@@ -14,6 +14,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/viant/ptrie"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -172,6 +173,11 @@ func CreateEntryWithResponse(ctx context.Context, client SeaweedFilerClient, req
 	resp, err := client.CreateEntry(ctx, request)
 	if err != nil {
 		glog.V(1).InfofCtx(ctx, "create entry %s/%s %v: %v", request.Directory, request.Entry.Name, request.OExcl, err)
+		if st, ok := status.FromError(err); ok && st.Code() == codes.Unknown {
+			if readOnly := LegacyReadOnlyError(st.Message()); readOnly != nil {
+				return nil, fmt.Errorf("CreateEntry %s/%s: %w", request.Directory, request.Entry.Name, readOnly)
+			}
+		}
 		return nil, fmt.Errorf("CreateEntry: %w", err)
 	}
 	if resp.ErrorCode != FilerError_OK {
@@ -293,6 +299,36 @@ func AssignVolumeResponseError(resp *AssignVolumeResponse) error {
 	return &codedError{msg: resp.Error, sentinel: FilerErrorToSentinel(resp.ErrorCode)}
 }
 
+// IsFilerVerdict reports whether err carries a sentinel that a filer response
+// code maps to (see FilerErrorToSentinel). The filer answered over a working
+// channel, so the failure is neither transient nor a broken connection,
+// whatever its message says. The message names a path, which can contain a
+// word such as "transport" that text-based classifiers take for a network
+// failure.
+func IsFilerVerdict(err error) bool {
+	if err == nil {
+		return false
+	}
+	for code := range FilerError_name {
+		if sentinel := FilerErrorToSentinel(FilerError(code)); sentinel != nil && errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
+// LegacyReadOnlyError returns an error matching ErrReadOnly when msg is how an
+// older filer refused a create on a read-only path, or nil otherwise. Such a
+// filer has no FilerError_READ_ONLY in CreateEntryResponse. It fails the create
+// with a status-less error instead: codes.Unknown over unary gRPC, or a bare
+// message over StreamMutateEntry. The text is the only thing left to match.
+func LegacyReadOnlyError(msg string) error {
+	if msg != ErrReadOnly.Error() && !strings.HasPrefix(msg, ErrReadOnly.Error()+": ") {
+		return nil
+	}
+	return &codedError{msg: msg, sentinel: ErrReadOnly}
+}
+
 // codedError is a filer error message paired with the sentinel of the code
 // sent alongside it (nil for OK or an unknown code).
 type codedError struct {
@@ -412,6 +448,44 @@ func metadataEventMatchesPath(fullPath, dirPath, pathPrefix string, pathPrefixes
 		return true
 	}
 	return strings.HasPrefix(fullPath, pathPrefix)
+}
+
+// MetadataDirectoryMayMatchSubscription reports whether an event in dir could
+// match the subscription, before the event is decoded. It errs toward true.
+func MetadataDirectoryMayMatchSubscription(dir []byte, pathPrefix string, pathPrefixes []string, directories []string) bool {
+	if pathPrefix == "" || len(dir) == 0 || directoryMayHavePrefix(dir, pathPrefix) {
+		return true
+	}
+	for _, p := range pathPrefixes {
+		if directoryMayHavePrefix(dir, p) {
+			return true
+		}
+	}
+	for _, d := range directories {
+		if string(dir) == d {
+			return true
+		}
+	}
+	// matching cleans the joined path, so only a clean dir can be ruled out
+	for i := 0; i+1 < len(dir); i++ {
+		if dir[i] == '/' && (dir[i+1] == '/' || dir[i+1] == '.') {
+			return true
+		}
+	}
+	return false
+}
+
+// directoryMayHavePrefix reports whether some path dir/<name> can start with
+// prefix: dir+"/" and prefix agree on their common length.
+func directoryMayHavePrefix(dir []byte, prefix string) bool {
+	n := min(len(dir), len(prefix))
+	if string(dir[:n]) != prefix[:n] {
+		return false
+	}
+	if len(prefix) <= len(dir) || dir[len(dir)-1] == '/' {
+		return true
+	}
+	return prefix[len(dir)] == '/'
 }
 
 func hasPrefixIn(text string, prefixes []string) bool {

@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -73,19 +74,42 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	if status != fuse.OK || entry == nil {
 		return status
 	}
+	if input.Valid&fuse.FATTR_SIZE == 0 && path != "" {
+		var unlock func()
+		if path, fh, entry, unlock, status = wfs.lockNodePublication(ctx, input.NodeId, path, fh, entry); status != fuse.OK || entry == nil {
+			return status
+		}
+		defer unlock()
+	}
+	if snapshot, ok := wfs.attributeEntrySnapshot(fh, entry); ok && input.Valid&fuse.FATTR_SIZE == 0 && path != "" {
+		entry, status = wfs.saveEntryAttributes(ctx, path, snapshot, input.Valid&(fuse.FATTR_UID|fuse.FATTR_GID), func(next *filer_pb.Entry) fuse.Status {
+			return wfs.applySetAttr(path, input, next)
+		}, func(live, acked *filer_pb.Entry) {
+			retainSetAttr(input, live, acked)
+		})
+		if status != fuse.OK {
+			return status
+		}
+		if atime, ok := input.GetATime(); ok {
+			wfs.setAtime(input.NodeId, atime)
+		}
+		out.AttrValid = wfs.attrValidSec
+		wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry, true)
+		wfs.applyInMemoryAtime(&out.Attr, input.NodeId)
+		return fuse.OK
+	}
 	if size, ok := input.GetSize(); ok && fh != nil && fh.dirtyPages.HasWrites() && size < filer.FileSize(entry) {
 		// The truncation below trims chunks; dirty pages it cannot see. Left
 		// alone, pages beyond the new size come back with the next flush and
 		// grow the file again, so turn them into chunks first. Runs before
 		// the entry locks below: the flush takes its own.
-		ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-		flushStatus := wfs.doFlush(ctx, fh, input.Uid, input.Gid, false)
-		cancelFunc()
-		if flushStatus != fuse.OK {
+		if flushStatus := wfs.doFlush(context.Background(), fh, input.Uid, input.Gid, false, metadataFlushTimeout); flushStatus != fuse.OK {
 			return flushStatus
 		}
 	}
 	if fh != nil {
+		active := wfs.fhLockTable.AcquireLock("SetAttr", fh.fh, util.ExclusiveLock)
+		defer wfs.fhLockTable.ReleaseLock(fh.fh, active)
 		fh.entryLock.Lock()
 		defer fh.entryLock.Unlock()
 		// entry is the handle's shared LockedEntry.Entry. Async upload workers
@@ -99,7 +123,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		entry = fh.entry.Entry
 	}
 
-	wormEnforced, wormEnabled := wfs.wormEnforcedForEntry(path, entry)
+	wormEnforced, _ := wfs.wormEnforcedForEntry(path, entry)
 	if wormEnforced {
 		return fuse.EPERM
 	}
@@ -111,6 +135,9 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		wfs.invalidateOpenMtimeCache(input.NodeId)
 		oldFileSize := filer.FileSize(entry)
 		if size < oldFileSize {
+			if fh != nil {
+				fh.noteTruncate(size)
+			}
 			// fmt.Printf("truncate %v \n", fullPath)
 			var chunks []*filer_pb.FileChunk
 			var truncatedChunks []*filer_pb.FileChunk
@@ -134,6 +161,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 			// set the new chunks and reset entry cache
 			entry.Chunks = chunks
 			if fh != nil {
+				fh.wfs.readAuth.Track(fh.FullPath(), chunks)
 				fh.entryChunkGroup.SetChunks(chunks)
 			}
 		}
@@ -150,6 +178,75 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 
 	}
 
+	if code := wfs.applySetAttr(path, input, entry); code != fuse.OK {
+		return code
+	}
+	if atime, ok := input.GetATime(); ok {
+		wfs.setAtime(input.NodeId, atime)
+	}
+
+	out.AttrValid = wfs.attrValidSec
+	size, includeSize := input.GetSize()
+	if includeSize {
+		out.Attr.Size = size
+	}
+	wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry, !includeSize)
+	wfs.applyInMemoryAtime(&out.Attr, input.NodeId)
+	applyUnlinkedNlink(&out.Attr, path)
+
+	if fh != nil {
+		fh.dirtyMetadata = true
+		if includeSize {
+			fh.dirtyContent = true
+		}
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(input.NodeId, entry)
+		return fuse.OK
+	}
+
+	return wfs.saveEntry(path, entry)
+
+}
+
+func retainSetAttr(input *fuse.SetAttrIn, live, acked *filer_pb.Entry) {
+	if _, ok := input.GetMode(); ok {
+		live.Attributes.FileMode = chmod(live.Attributes.FileMode, acked.Attributes.FileMode)
+		live.WormEnforcedAtTsNs = acked.WormEnforcedAtTsNs
+	}
+	_, uidSet := input.GetUID()
+	_, gidSet := input.GetGID()
+	if uidSet {
+		live.Attributes.Uid = acked.Attributes.Uid
+	}
+	if gidSet {
+		live.Attributes.Gid = acked.Attributes.Gid
+	}
+	if (uidSet || gidSet) && chownKillsSetId(runtime.GOOS, input.Caller.Uid, live.IsDirectory) {
+		live.Attributes.FileMode &^= 0o6000
+	}
+	if _, ok := input.GetMTime(); ok {
+		live.Attributes.Mtime, live.Attributes.MtimeNs = acked.Attributes.Mtime, acked.Attributes.MtimeNs
+	}
+	live.Attributes.Ctime, live.Attributes.CtimeNs = acked.Attributes.Ctime, acked.Attributes.CtimeNs
+}
+
+// chownKillsSetId reports whether the mount clears the SUID and SGID bits on a
+// chown. Linux sends the cleared mode with the chown itself, since the mount
+// does not handle killpriv. Elsewhere a caller other than root clears them,
+// except on a directory. input.Uid is the new owner; the caller is
+// input.Caller.Uid.
+func chownKillsSetId(goos string, callerUid uint32, isDirectory bool) bool {
+	return goos != "linux" && callerUid != 0 && !isDirectory
+}
+
+func (wfs *WFS) applySetAttr(path util.FullPath, input *fuse.SetAttrIn, entry *filer_pb.Entry) fuse.Status {
+	wormEnforced, wormEnabled := wfs.wormEnforcedForEntry(path, entry)
+	if wormEnforced {
+		return fuse.EPERM
+	}
 	if mode, ok := input.GetMode(); ok {
 		// commit the file to worm when it is set to readonly at the first time
 		if entry.WormEnforcedAtTsNs == 0 && wormEnabled && !hasWritePermission(mode) {
@@ -180,13 +277,8 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		}
 	}
 
-	// POSIX: clear SUID/SGID bits when ownership changes (unless caller is root).
-	if ownerChanged && input.Uid != 0 {
+	if ownerChanged && chownKillsSetId(runtime.GOOS, input.Caller.Uid, entry.IsDirectory) {
 		entry.Attributes.FileMode &^= 0o6000
-	}
-
-	if atime, ok := input.GetATime(); ok {
-		wfs.setAtime(input.NodeId, atime)
 	}
 
 	if mtime, ok := input.GetMTime(); ok {
@@ -199,27 +291,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	entry.Attributes.Ctime = now.Unix()
 	entry.Attributes.CtimeNs = int32(now.Nanosecond())
 
-	out.AttrValid = wfs.attrValidSec
-	size, includeSize := input.GetSize()
-	if includeSize {
-		out.Attr.Size = size
-	}
-	wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry, !includeSize)
-	wfs.applyInMemoryAtime(&out.Attr, input.NodeId)
-	applyUnlinkedNlink(&out.Attr, path)
-
-	if fh != nil {
-		fh.dirtyMetadata = true
-		return fuse.OK
-	}
-	if path == "" {
-		// removed while open: the remembered entry is all there is to update
-		wfs.rememberRemovedDir(input.NodeId, entry)
-		return fuse.OK
-	}
-
-	return wfs.saveEntry(path, entry)
-
+	return fuse.OK
 }
 
 func (wfs *WFS) setRootAttr(out *fuse.AttrOut) {
@@ -340,6 +412,14 @@ func (wfs *WFS) touchDirMtimeCtimeBest(dirPath util.FullPath) {
 // touchDirMtimeCtime updates a directory's mtime and ctime on the filer.
 // POSIX requires this when entries are created or removed in the directory.
 func (wfs *WFS) touchDirMtimeCtime(dirPath util.FullPath) {
+	// The mount root reports its own times (setRootAttr), and maybeLoadEntry
+	// synthesizes its entry from the mount options instead of reading the
+	// filer. Saving that entry would replace the real directory on the filer,
+	// dropping what only the filer holds: its extended attributes and, when the
+	// root is a bucket, the bucket's quota and the settings S3 keeps on it.
+	if string(dirPath) == wfs.option.FilerMountRootPath {
+		return
+	}
 	dirEntry, _, code := wfs.maybeLoadEntry(context.Background(), dirPath)
 	if code != fuse.OK || dirEntry == nil || dirEntry.Attributes == nil {
 		return

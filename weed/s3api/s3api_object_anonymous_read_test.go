@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -15,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/gorilla/mux"
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -32,11 +35,15 @@ type anonymousReadFiler struct {
 	mu        sync.Mutex
 	entries   map[string]*filer_pb.Entry
 	lookupErr error
+	onLookup  func()
 }
 
 func (f *anonymousReadFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onLookup != nil {
+		f.onLookup()
+	}
 	if f.lookupErr != nil {
 		return nil, f.lookupErr
 	}
@@ -221,6 +228,132 @@ func TestAnonymousObjectACLVersionAndDirectory(t *testing.T) {
 	f.entries["/buckets/b/folder/.versions/v_private-version"] = private
 	rr = serveAnonymousRead(s3a, http.MethodGet, "folder/", "versionId=private-version", nil)
 	require.Equal(t, 403, rr.Code)
+}
+
+func TestSignedReadOfVersionFileKey(t *testing.T) {
+	s3a, f := newAnonymousReadTestServer(t)
+	config, _ := s3a.getBucketConfig("b")
+	config.Versioning = "Enabled"
+	version := anonymousReadEntry(nil)
+	version.Name = "v_v1"
+	version.Extended[s3_constants.ExtVersionIdKey] = []byte("v1")
+	f.entries["/buckets/b/o.versions/v_v1"] = version
+	f.entries["/buckets/b/u.versions/v_literal"] = anonymousReadEntry(nil)
+	identity := &Identity{Name: "reader", Actions: []Action{s3_constants.ACTION_READ}}
+	serve := func(method, object, query string, headers map[string]string) int {
+		r := httptest.NewRequest(method, "/b/"+object+"?"+query, nil)
+		r = mux.SetURLVars(r, map[string]string{"bucket": "b", "object": object})
+		r = r.WithContext(s3_constants.SetIdentityInContext(r.Context(), identity))
+		for name, value := range headers {
+			r.Header.Set(name, value)
+		}
+		handler := s3a.GetObjectHandler
+		if method == http.MethodHead {
+			handler = s3a.HeadObjectHandler
+		}
+		rr := httptest.NewRecorder()
+		handler(rr, r)
+		return rr.Code
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		require.Equal(t, 200, serve(method, "o", "versionId=v1", nil))
+		require.Equal(t, 403, serve(method, "o.versions/v_v1", "", nil))
+		require.NotEqual(t, 200, serve(method, "o.versions/v_v1/", "", nil))
+		require.Equal(t, 403, serve(method, "o.versions/v_v1", "", map[string]string{"If-None-Match": "*"}))
+		require.Equal(t, 200, serve(method, "u.versions/v_literal", "", nil))
+	}
+	r := httptest.NewRequest(http.MethodPut, "/b/dst", nil)
+	r = r.WithContext(s3_constants.SetIdentityInContext(r.Context(), identity))
+	require.Equal(t, s3err.ErrAccessDenied, s3a.recheckCopySourcePolicy(r, "b", "o.versions/v_v1", "", version.Extended, "CopyObjectHandler"))
+	require.Equal(t, s3err.ErrNone, s3a.recheckCopySourcePolicy(r, "b", "o", "v1", version.Extended, "CopyObjectHandler"))
+	for _, action := range []string{s3_constants.ACTION_GET_OBJECT_RETENTION, s3_constants.ACTION_PUT_OBJECT_LEGAL_HOLD, string(s3_constants.ACTION_WRITE)} {
+		require.Equal(t, s3err.ErrAccessDenied, s3a.recheckTagConditionedPolicyWithLookup(r, "b", "o.versions/v_v1", "", action, "t"))
+		require.Equal(t, s3err.ErrNone, s3a.recheckTagConditionedPolicyWithLookup(r, "b", "o", "v1", action, "t"))
+		require.Equal(t, s3err.ErrNone, s3a.recheckTagConditionedPolicyWithLookup(r, "b", "u.versions/v_literal", "", action, "t"))
+	}
+	require.Equal(t, s3err.ErrAccessDenied, s3a.deleteDirectoryMarker(r, "b", "o.versions/v_v1/"))
+	require.Contains(t, f.entries, "/buckets/b/o.versions/v_v1")
+	chunked := anonymousReadEntry(nil)
+	chunked.Name = "v_v2"
+	chunked.Content = nil
+	chunked.Chunks = []*filer_pb.FileChunk{{FileId: "1,02", Size: 11}}
+	chunked.Extended[s3_constants.ExtVersionIdKey] = []byte("v2")
+	f.entries["/buckets/b/o.versions/v_v2"] = chunked
+	require.Equal(t, s3err.ErrAccessDenied, s3a.deleteDirectoryMarker(r, "b", "o.versions/v_v2/"))
+}
+
+func TestWriteToVersionFileKey(t *testing.T) {
+	for _, state := range []string{"Suspended", "Enabled"} {
+		s3a, f := newAnonymousReadTestServer(t)
+		config, _ := s3a.getBucketConfig("b")
+		config.Versioning = state
+		version := anonymousReadEntry(nil)
+		version.Name = "v_v1"
+		version.Extended[s3_constants.ExtVersionIdKey] = []byte("v1")
+		f.entries["/buckets/b/o.versions/v_v1"] = version
+		f.entries["/buckets/b/u.versions/v_literal"] = anonymousReadEntry(nil)
+		nullVersion := anonymousReadEntry(nil)
+		nullVersion.Name = "v_null"
+		nullVersion.Extended[s3_constants.ExtVersionIdKey] = []byte("null")
+		f.entries["/buckets/b/o.versions/v_null"] = nullVersion
+		f.entries["/buckets/b/o.versions/v_null.versions"] = &filer_pb.Entry{Name: "v_null.versions", IsDirectory: true, Extended: map[string][]byte{
+			s3_constants.ExtLatestVersionIdKey:       []byte("v9"),
+			s3_constants.ExtLatestVersionFileNameKey: []byte("v_v9"),
+		}}
+		nested := anonymousReadEntry(nil)
+		nested.Name = "v_v9"
+		nested.Extended[s3_constants.ExtVersionIdKey] = []byte("v9")
+		f.entries["/buckets/b/o.versions/v_null.versions/v_v9"] = nested
+		require.Equal(t, s3err.ErrAccessDenied, s3a.checkVersionFileWrite("b", "o.versions/v_v1", "t"), state)
+		require.Equal(t, s3err.ErrAccessDenied, s3a.checkVersionFileWrite("b", "o.versions/v_null", "t"), state)
+		require.Equal(t, s3err.ErrAccessDenied, s3a.checkVersionFileWrite("b", "/o.versions/v_v1/", "t"), state)
+		require.Equal(t, s3err.ErrNone, s3a.checkVersionFileWrite("b", "o.versions/v_v2", "t"), state)
+		require.Equal(t, s3err.ErrNone, s3a.checkVersionFileWrite("b", "u.versions/v_literal", "t"), state)
+		require.Equal(t, s3err.ErrNone, s3a.checkVersionFileWrite("b", "o", "t"), state)
+	}
+}
+
+func TestWriteToVersionFileKeyReadsLogicalOwner(t *testing.T) {
+	gateway := &anonymousReadFiler{entries: make(map[string]*filer_pb.Entry)}
+	owner := &anonymousReadFiler{entries: make(map[string]*filer_pb.Entry)}
+	gatewayAddr, ownerAddr := startFakeFiler(t, gateway), startFakeFiler(t, owner)
+	s3a := newPutTestServer(t, gatewayAddr)
+	s3a.bucketConfigCache = NewBucketConfigCache(time.Minute)
+	s3a.bucketConfigCache.Set("b", &BucketConfig{Name: "b", Versioning: s3_constants.VersioningSuspended})
+	s3a.objectWriteLockClient = cluster.NewLockClient(s3a.option.GrpcDialOption, gatewayAddr)
+	s3a.objectWriteLockClient.SetRing([]pb.ServerAddress{gatewayAddr, ownerAddr}, 1)
+
+	object := ""
+	for i := 0; i < 1000 && object == ""; i++ {
+		candidate := fmt.Sprintf("o%d", i)
+		if s3a.routableWriteOwner("b", candidate) == ownerAddr && s3a.routableWriteOwner("b", candidate+".versions/v_v1") == gatewayAddr {
+			object = candidate
+		}
+	}
+	require.NotEmpty(t, object)
+	version := anonymousReadEntry(nil)
+	version.Name = "v_v1"
+	version.Extended[s3_constants.ExtVersionIdKey] = []byte("v1")
+	owner.entries["/buckets/b/"+object+".versions/v_v1"] = version
+	require.Equal(t, s3err.ErrAccessDenied, s3a.checkVersionFileWrite("b", object+".versions/v_v1", "t"))
+
+	s3a.markOwnerUnreachable(ownerAddr)
+	require.Equal(t, s3err.ErrAccessDenied, s3a.checkVersionFileWrite("b", object+".versions/v_v1", "t"))
+	gateway.mu.Lock()
+	gateway.onLookup = func() { s3a.unreachableOwners.Delete(ownerAddr) }
+	gateway.mu.Unlock()
+	s3a.markOwnerUnreachable(ownerAddr)
+	require.Equal(t, s3err.ErrAccessDenied, s3a.checkVersionFileWrite("b", object+".versions/v_v1", "t"))
+	gateway.mu.Lock()
+	gateway.onLookup = nil
+	gateway.mu.Unlock()
+	s3a.markOwnerUnreachable(ownerAddr)
+	require.Equal(t, s3err.ErrNone, s3a.checkVersionFileWrite("b", object+".versions/v_v2", "t"))
+	owner.mu.Lock()
+	owner.lookupErr = status.Error(codes.Unavailable, "owner down")
+	owner.mu.Unlock()
+	s3a.markOwnerUnreachable(ownerAddr)
+	require.Equal(t, s3err.ErrInternalError, s3a.checkVersionFileWrite("b", object+".versions/v_v2", "t"))
 }
 
 func TestAnonymousObjectACLDoesNotReplaceAuthentication(t *testing.T) {

@@ -81,6 +81,7 @@ type FilerOption struct {
 	SaveToFilerLimit          int64
 	ConcurrentUploadLimit     int64
 	ConcurrentFileUploadLimit int64
+	InflightUploadDataTimeout time.Duration
 	ShowUIDirectoryDelete     bool
 	DownloadMaxBytesPs        int64
 	DiskType                  string
@@ -121,6 +122,10 @@ type FilerOption struct {
 type FilerServer struct {
 	inFlightDataSize int64
 	inFlightUploads  int64
+	// unix nanos when this filer was first seen missing from its own lock ring;
+	// <= 0 while it is in the ring, with a new value on every reset
+	lockRingUnhealthySince atomic.Int64
+	lockRingResets         atomic.Int64
 
 	inFlightDataLimitCond *sync.Cond
 
@@ -128,11 +133,16 @@ type FilerServer struct {
 	option               *FilerOption
 	filer                *filer.Filer
 	filerGuard           *security.Guard
+	basicAuth            atomic.Pointer[security.BasicAuth]
+	basicAuthFile        string
 	volumeGuard          *security.Guard
 	grpcDialOption       grpc.DialOption
 	grpcDialOptionMaster grpc.DialOption
 	grpcDialOptionVolume grpc.DialOption
 	grpcDialOptionS3     grpc.DialOption
+
+	grpcScope         *filerGrpcScope
+	grpcScopeSettings atomic.Pointer[grpcScopeSettings]
 
 	// metrics read from the master
 	metricsAddress     string
@@ -336,8 +346,19 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	if v.GetString("guard.white_list") != "" {
 		glog.Warningf("filer: guard.white_list is configured but the IP whitelist feature is currently disabled. See https://github.com/seaweedfs/seaweedfs/issues/7094")
 	}
-	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
-	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec)
+	fs.filerGuard = security.NewGuard([]string{}, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec, v.GetString("jwt.filer_signing.previous_key"), v.GetString("jwt.filer_signing.read.previous_key"))
+	basicAuth, basicAuthFile := loadBasicAuth(nil, "")
+	fs.basicAuth.Store(basicAuth)
+	fs.basicAuthFile = basicAuthFile
+	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec, "", "")
+
+	fs.loadGrpcScopeConfig(v)
+	fs.grpcScope = newFilerGrpcScope(scopeConfig{
+		verificationKeys:  fs.grpcScopeVerificationKeys,
+		subscriptionScope: fs.metadataSubscriptionScope,
+		leeway:            func() time.Duration { return fs.grpcScopeSettings.Load().leeway },
+		assignLifetime:    func() time.Duration { return fs.grpcScopeSettings.Load().assignLifetime },
+	}, fs)
 
 	fs.checkWithMaster()
 
@@ -409,6 +430,9 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		glog.Warningf("%s cannot list existing peers: %v; retrying", option.Host, listErr)
 		time.Sleep(2 * time.Second)
 	}
+	if err := fs.filer.CheckPeerDigests(context.Background(), option.Host, existingNodes); err != nil {
+		glog.Fatalf("%s: %v", option.Host, err)
+	}
 	startFromTime := time.Now().Add(-filer.LogFlushInterval)
 	if isFresh {
 		glog.V(0).Infof("%s bootstrap from peers %+v", option.Host, existingNodes)
@@ -435,6 +459,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	}
 
 	fs.filer.LoadFilerConf()
+	fs.filer.LoadNotificationWebhooks()
 
 	fs.filer.LoadRemoteStorageConfAndMapping()
 
@@ -769,22 +794,98 @@ func (fs *FilerServer) leaveLockRing(removalTimeout time.Duration) {
 	time.Sleep(time.Until(until))
 }
 
+// loadBasicAuth reads [filer.basic_auth] from security.toml and the WEED_
+// environment alone: the shared viper merges every reload into what it held,
+// so it would keep a password the file no longer sets. Once a file is read,
+// later reads stay on it rather than search again, so a directory that turns
+// unsearchable cannot hand over a lower-priority security.toml. A non-nil
+// current is kept when the file cannot be read.
+func loadBasicAuth(current *security.BasicAuth, file string) (*security.BasicAuth, string) {
+	v, used := util.ReadConfiguration("security", file)
+	if used == "" {
+		if current != nil {
+			return current, file
+		}
+		used = file
+	}
+	return security.NewBasicAuth(v.GetString("filer.basic_auth.user"), v.GetString("filer.basic_auth.password")), used
+}
+
+// FilerGuard holds the filer's reloadable jwt.filer_signing keys.
+func (fs *FilerServer) FilerGuard() *security.Guard {
+	return fs.filerGuard
+}
+
 func (fs *FilerServer) Reload() {
 	glog.V(0).Infoln("Reload filer server...")
+	previousScopeKey, _ := fs.grpcScopeVerificationKeys()
 
 	util.LoadConfiguration("security", false)
 	v := util.GetViper()
-	fs.filerGuard.UpdateSigningKeys(
-		v.GetString("jwt.filer_signing.key"),
-		v.GetInt("jwt.filer_signing.expires_after_seconds"),
-		v.GetString("jwt.filer_signing.read.key"),
-		v.GetInt("jwt.filer_signing.read.expires_after_seconds"),
-	)
+	// Turn the new credential on before the old one goes off, so a switch
+	// between Basic Auth and JWT never leaves a window with neither. Basic Auth
+	// stays on when the new JWT keys were not applied.
+	basicAuth, basicAuthFile := loadBasicAuth(fs.basicAuth.Load(), fs.basicAuthFile)
+	fs.basicAuthFile = basicAuthFile
+	if basicAuth != nil {
+		fs.basicAuth.Store(basicAuth)
+	}
+	if fs.filerGuard.ReloadSigningKeys("jwt.filer_signing") {
+		fs.basicAuth.Store(basicAuth)
+	}
 	fs.volumeGuard.UpdateSigningKeys(
 		v.GetString("jwt.signing.key"),
 		v.GetInt("jwt.signing.expires_after_seconds"),
 		v.GetString("jwt.signing.read.key"),
 		v.GetInt("jwt.signing.read.expires_after_seconds"),
+		"",
+		"",
 	)
+	if fresh, used := util.ReadConfiguration("security", ""); used != "" {
+		fs.loadGrpcScopeConfig(fresh)
+	}
+	if key, _ := fs.grpcScopeVerificationKeys(); len(previousScopeKey) > 0 && len(key) == 0 {
+		glog.Warningf("filer gRPC reload: no verification key is configured; scope enforcement is now off")
+	}
 	util_http.ReloadJwtSigningReadConfig()
+}
+
+// grpcScopeSettings is replaced as one snapshot on configuration reload.
+type grpcScopeSettings struct {
+	key            security.SigningKey
+	previousKey    security.SigningKey
+	leeway         time.Duration
+	assignLifetime time.Duration
+}
+
+func (fs *FilerServer) loadGrpcScopeConfig(v *util.ViperProxy) {
+	v.SetDefault("jwt.filer_signing.assign_expires_after_seconds", int(security.DefaultAssignTokenLifetime/time.Second))
+	v.SetDefault("jwt.filer_signing.clock_leeway_seconds", 30)
+	key := security.SigningKey(v.GetString("jwt.filer_signing.grpc_key"))
+	previousKey := security.SigningKey(v.GetString("jwt.filer_signing.grpc_previous_key"))
+	lifetime := time.Duration(v.GetInt("jwt.filer_signing.assign_expires_after_seconds")) * time.Second
+	if lifetime <= 0 {
+		lifetime = security.DefaultAssignTokenLifetime
+	}
+	leeway := time.Duration(v.GetInt("jwt.filer_signing.clock_leeway_seconds")) * time.Second
+	if leeway < 0 {
+		leeway = 0
+	}
+	// An explicit gRPC key is a separate trust domain. The shared HTTP
+	// previous_key must not authenticate scoped gRPC calls under that key.
+	// When no gRPC key is configured, grpcScopeVerificationKeys falls back to
+	// filerGuard, which retains the shared current/previous rotation pair.
+	fs.grpcScopeSettings.Store(&grpcScopeSettings{
+		key:            key,
+		previousKey:    previousKey,
+		leeway:         leeway,
+		assignLifetime: lifetime,
+	})
+}
+
+func (fs *FilerServer) grpcScopeVerificationKeys() (security.SigningKey, security.SigningKey) {
+	if settings := fs.grpcScopeSettings.Load(); settings != nil && len(settings.key) > 0 {
+		return settings.key, settings.previousKey
+	}
+	return fs.filerGuard.VerificationKeys(true)
 }

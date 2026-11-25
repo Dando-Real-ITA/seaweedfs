@@ -158,7 +158,7 @@ pub async fn read_ec_shard_needle_or_miss(
         match cached_lookup_ec_shard_locations(state, vid).await {
             Ok(fresh) => {
                 // A complete reply merges into the cache; an incomplete one
-                // (< data_shards) is left unwritten — keep the prior cache.
+                // (< data_shards) only puts the holders it names first.
                 match write_back_shard_locations(
                     state,
                     vid,
@@ -167,8 +167,6 @@ pub async fn read_ec_shard_needle_or_miss(
                     snapshot.encode_ts_ns,
                 ) {
                     Some(merged) => shard_locations = merged,
-                    // An incomplete reply leaves the cache unwritten and its refresh
-                    // time unadvanced, so the mark this refresh consumed goes back.
                     None => mark_shard_locations_stale(state, vid),
                 }
             }
@@ -443,6 +441,95 @@ pub async fn delete_ec_shard_needle_distributed(
     )))
 }
 
+/// A delete whose read found the needle deleted, best effort. A holder's read
+/// checks one disk's deletion set, and a delete that failed part way can leave
+/// its other disks live, so the delete goes to the primary shard holders whose
+/// read answers deleted, which skip the disks already recording it. Normal
+/// routing could stop at another copy instead; it is used only when no holder
+/// answers deleted. `forwardEcDeleteOfDeletedNeedle` in Go.
+pub async fn forward_ec_delete_of_deleted_needle(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+    needle_id: NeedleId,
+) {
+    if let Err(e) = forward_ec_delete_to_holders_reading_deleted(state, vid, needle_id).await {
+        tracing::debug!(
+            "re-forward delete of deleted ec needle {}.{}: {}",
+            vid.0,
+            needle_id,
+            e
+        );
+    }
+}
+
+async fn forward_ec_delete_to_holders_reading_deleted(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+    needle_id: NeedleId,
+) -> io::Result<()> {
+    let (probe, holders, collection, version) = {
+        let store = state.store.read().unwrap();
+        let ecv = store.find_ec_volume(vid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("ec volume {} not mounted", vid.0),
+            )
+        })?;
+        let (_, _, intervals) = ecv.locate_needle(needle_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("needle {} not in ec volume {}", needle_id, vid.0),
+            )
+        })?;
+        let (shard_id, shard_offset) = intervals
+            .first()
+            .map(|i| ecv.interval_to_shard_id_and_offset(i))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no intervals for needle"))?;
+        let (locations, _) = ecv.shard_locations_snapshot();
+        (
+            EcInterval {
+                vid,
+                needle_id,
+                shard_id,
+                shard_offset,
+                size: 1,
+                expected_encode_ts_ns: ecv.encode_ts_ns,
+            },
+            locations.get(&shard_id).cloned().unwrap_or_default(),
+            ecv.collection.clone(),
+            ecv.version,
+        )
+    };
+    let target = EcDeleteTarget {
+        vid,
+        collection: &collection,
+        version,
+        needle_id,
+    };
+    let mut reported = false;
+    let mut last_err = None;
+    for addr in &holders {
+        if !matches!(
+            tokio::time::timeout(
+                EC_READ_HINT_TIMEOUT,
+                do_read_remote_ec_shard_interval(state, addr, probe),
+            )
+            .await,
+            Ok(Ok((_, true)))
+        ) {
+            continue;
+        }
+        reported = true;
+        if let Err(e) = delete_on_remote_ec_shard(state, addr, &target).await {
+            last_err = Some(e);
+        }
+    }
+    if !reported {
+        return delete_ec_shard_needle_distributed(state, vid, needle_id).await;
+    }
+    last_err.map_or(Ok(()), Err)
+}
+
 /// `doDeleteNeedleFromRemoteEcShardServers` in Go. `Ok(false)` is the
 /// shard-missing signal — no live holder anywhere — that triggers the
 /// caller's fallback walk over the remaining shards.
@@ -461,12 +548,12 @@ async fn delete_on_ec_shard_holders(
     let mut last_err = None;
     if local_shards.contains(&shard_id) {
         // A decode in its publishing tail must not miss this delete. The
-        // tail membership is verified again under the store write lock
-        // inside journal_delete_local — WouldBlock means the decode claimed
-        // it in the gap after this wait — so wait and retry.
+        // tail membership is verified again under the journal lock inside
+        // journal_delete_local — WouldBlock means the decode claimed it in
+        // the gap after this wait — so wait and retry.
         loop {
             crate::server::grpc_server::wait_ec_decode_tail(state, target.vid).await;
-            match journal_delete_local(state, target.vid, target.needle_id) {
+            match journal_delete_local(state, target.vid, target.needle_id).await {
                 Ok(()) => return Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 // Nothing was committed — the volume unmounted or remounted
@@ -533,38 +620,52 @@ async fn delete_on_remote_ec_shard(
 /// no-op: `journal_delete` would accept it silently, but here it means the
 /// volume remounted as a different generation mid-delete and the tombstone
 /// should go to a replica that still has the needle.
-fn journal_delete_local(
+pub(crate) async fn journal_delete_local(
     state: &Arc<VolumeServerState>,
     vid: VolumeId,
     needle_id: NeedleId,
 ) -> io::Result<()> {
-    let mut store = state.store.write().unwrap();
-    // Membership is read under the write lock: a decode can claim the
-    // publishing tail while this call waited for the decoder's read lock,
-    // so a check taken earlier would be stale by commit time.
-    if crate::server::grpc_server::ec_decode_tail_contains(state, vid) {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!("ec volume {} is in decode publishing tail", vid.0),
-        ));
-    }
-    let ecv = store.find_ec_volume_mut(vid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("ec volume {} unmounted", vid.0),
-        )
-    })?;
-    match ecv.find_needle_from_ecx(needle_id)? {
-        None => {
+    // Every local runtime records the delete, the first last, as in the
+    // VolumeEcBlobDelete handler.
+    let appenders = {
+        let store = state.store.read().unwrap();
+        let ec_vols = store.find_all_ec_volumes(vid);
+        if ec_vols.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("needle {} not in local ecx", needle_id),
+                format!("ec volume {} unmounted", vid.0),
             ));
         }
-        Some((_, size)) if size.is_deleted() => return Ok(()),
-        Some(_) => {}
-    }
-    ecv.journal_delete(needle_id)
+        let mut appenders = Vec::new();
+        for (i, ecv) in ec_vols.into_iter().enumerate() {
+            match ecv.find_needle_from_ecx(needle_id)? {
+                None if i > 0 => continue,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("needle {} not in local ecx", needle_id),
+                    ));
+                }
+                Some((_, size)) if size.is_deleted() => continue,
+                Some(_) => {}
+            }
+            appenders.push(ecv.journal_appender());
+        }
+        appenders
+    };
+    // Membership is read under the journal lock: a decode claims the
+    // publishing tail before it takes that lock for its catch-up, so a check
+    // taken earlier would be stale by commit time.
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        appenders.iter().rev().try_for_each(|appender| {
+            appender.journal_delete(needle_id, || {
+                crate::server::grpc_server::ec_decode_tail_contains(&state, vid)
+            })
+        })
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 fn local_shard_ids(ecv: &crate::storage::erasure_coding::EcVolume) -> HashSet<ShardId> {
@@ -710,8 +811,10 @@ pub async fn scrub_ec_volume_distributed(
     ) {
         match cached_lookup_ec_shard_locations(state, vid).await {
             Ok(fresh) => {
+                let partial = located_shard_count(&fresh) < data_shards;
                 if write_back_shard_locations(state, vid, fresh, data_shards, expected_encode_ts_ns)
                     .is_none()
+                    || partial
                 {
                     mark_shard_locations_stale(state, vid);
                     return (
@@ -1228,35 +1331,44 @@ async fn cached_lookup_ec_shard_locations(
         .lookup_ec_volume(Request::new(LookupEcVolumeRequest { volume_id: vid.0 }))
         .await
         .map_err(|e| io::Error::other(format!("lookup_ec_volume: {}", e)))?;
-    let resp = resp.into_inner();
+    Ok(shard_locations_from_reply(resp.into_inner()))
+}
 
+/// The shard slots of a `LookupEcVolume` reply. The master answers every slot
+/// it tracks, so a shard whose holders are all down comes back with no
+/// addresses: it does not count toward the reply's completeness, and a complete
+/// reply drops it from the cache, as Go's `cachedLookupEcShardLocations` does.
+fn shard_locations_from_reply(
+    resp: master_pb::LookupEcVolumeResponse,
+) -> HashMap<ShardId, Vec<String>> {
     let mut out = HashMap::new();
     for entry in resp.shard_id_locations {
+        let Ok(sid) = shard_id_try_from(entry.shard_id) else {
+            continue;
+        };
         let addrs: Vec<String> = entry
             .locations
             .iter()
             .map(format_location_as_server_address)
             .collect();
-        // Defensive: skip out-of-range shard ids from the master instead of
-        // truncating (256 would alias 0). Valid replies are unaffected.
-        let Ok(sid) = shard_id_try_from(entry.shard_id) else {
-            continue;
-        };
         out.insert(sid, addrs);
     }
-    Ok(out)
+    out
+}
+
+fn located_shard_count(locations: &HashMap<ShardId, Vec<String>>) -> usize {
+    locations.values().filter(|addrs| !addrs.is_empty()).count()
 }
 
 /// Merge a fresh `LookupEcVolume` reply into the per-EcVolume shard-location
-/// cache. Returns the merged map on success, or `None` when the reply is
-/// incomplete (and was therefore NOT written) or the volume is gone.
+/// cache. Returns the resulting map, or `None` when the volume is gone.
 ///
 /// Completeness guard (mirrors Go's `cachedLookupEcShardLocations`): a reply
 /// carrying fewer than `data_shards` shard locations is a master-mid-recovery
-/// partial, not ground truth — Go aborts the lookup with a retryable error and
-/// leaves the cache + refresh time untouched. Returning `None` without writing
-/// does the same, so a previously-complete cache is never clobbered with a
-/// partial map. On a complete reply the write is a per-shard MERGE (see
+/// partial, not ground truth. It only puts the holders it names ahead of the
+/// cached ones, and leaves the refresh time unadvanced with the map marked
+/// stale, so a previously-complete cache is never clobbered with a partial map.
+/// On a complete reply the write is a per-shard MERGE (see
 /// `merge_shard_locations`), not a full replace.
 fn write_back_shard_locations(
     state: &Arc<VolumeServerState>,
@@ -1265,11 +1377,11 @@ fn write_back_shard_locations(
     data_shards: usize,
     expected_encode_ts_ns: i64,
 ) -> Option<HashMap<ShardId, Vec<String>>> {
-    if locations.len() < data_shards {
-        return None;
-    }
     let store = state.store.read().unwrap();
     let ecv = find_ec_volume_for_scrub(&store, vid, expected_encode_ts_ns)?;
+    if located_shard_count(&locations) < data_shards {
+        return Some(ecv.merge_partial_shard_locations(locations));
+    }
     Some(ecv.merge_shard_locations(locations))
 }
 
@@ -1332,6 +1444,11 @@ struct EcShardMap<'a> {
     parity_shards: usize,
 }
 
+/// Bounds a one-byte probe of a holder that may have stopped answering: a
+/// delisted holder before the read reconstructs the shard, or a holder a
+/// delete retry asks (Go's `ecReadHintTimeout`).
+const EC_READ_HINT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Try direct peer read; on failure, reconstruct via Reed-Solomon
 /// from the other shards. Mirrors `readOneEcShardInterval`'s tail.
 async fn fetch_one_interval(
@@ -1340,6 +1457,12 @@ async fn fetch_one_interval(
     map: EcShardMap<'_>,
 ) -> io::Result<(Vec<u8>, bool)> {
     let EcInterval { vid, shard_id, .. } = iv;
+    if map.locations.get(&shard_id).is_none_or(Vec::is_empty)
+        && let Some((hints, revision)) = shard_read_hints(state, vid, shard_id)
+        && ask_ec_shard_read_hints(state, iv, &hints, revision).await
+    {
+        return Ok((Vec::new(), true));
+    }
     // Direct peer read against the cached locations for this shard.
     if let Some(sources) = map.locations.get(&shard_id)
         && !sources.is_empty()
@@ -1517,7 +1640,8 @@ async fn do_read_remote_ec_shard_interval(
 }
 
 /// Reads one `VolumeEcShardRead` reply into the interval's bytes, or the
-/// holder's deleted answer, which stands even if the stream fails after it.
+/// holder's deleted answer, taken as soon as it arrives so a stream that fails
+/// or stalls after it cannot lose it.
 async fn collect_ec_shard_read(
     mut stream: tonic::Streaming<VolumeEcShardReadResponse>,
     source: &str,
@@ -1531,12 +1655,11 @@ async fn collect_ec_shard_read(
         ..
     } = iv;
     let mut out = Vec::with_capacity(size);
-    let mut is_deleted = false;
-    // A deleted answer stands even if the stream fails after it.
-    while let Some(msg) = match stream.message().await {
-        Err(_) if is_deleted => None,
-        msg => msg.map_err(|e| io::Error::other(format!("recv: {}", e)))?,
-    } {
+    while let Some(msg) = stream
+        .message()
+        .await
+        .map_err(|e| io::Error::other(format!("recv: {}", e)))?
+    {
         // Validate the served shard's identity client-side, so the guard holds even
         // against a pre-upgrade server that ignored the request field (returns 0).
         // A mismatch fails the read; the caller recovers from parity.
@@ -1546,22 +1669,19 @@ async fn collect_ec_shard_read(
                 vid.0, shard_id, source, expected_encode_ts_ns, msg.encode_ts_ns
             )));
         }
+        // A runtime EC delete keeps the .ecx size positive; the holder masks the delete
+        // at read time and answers is_deleted with no payload. Signal the deletion to
+        // the caller (Go's `(bytes, is_deleted)` contract) instead of synthesizing bytes
+        // here: the scrub zero-fills the interval (so the assembled needle hits read_bytes
+        // -> SizeMismatch{found:0} -> suppression), the serving direct read short-circuits
+        // to "deleted", and reconstruction EXCLUDES the shard rather than feeding zeros
+        // into Reed-Solomon. Exempt from the short-read guard below.
         if msg.is_deleted {
-            is_deleted = true;
+            return Ok((Vec::new(), true));
         }
         if !msg.data.is_empty() {
             out.extend_from_slice(&msg.data);
         }
-    }
-    // A runtime EC delete keeps the .ecx size positive; the holder masks the delete
-    // at read time and answers is_deleted with no payload. Signal the deletion to
-    // the caller (Go's `(bytes, is_deleted)` contract) instead of synthesizing bytes
-    // here: the scrub zero-fills the interval (so the assembled needle hits read_bytes
-    // -> SizeMismatch{found:0} -> suppression), the serving direct read short-circuits
-    // to "deleted", and reconstruction EXCLUDES the shard rather than feeding zeros
-    // into Reed-Solomon. Exempt from the short-read guard below.
-    if is_deleted {
-        return Ok((Vec::new(), true));
     }
     if out.len() < size {
         return Err(io::Error::new(
@@ -1822,6 +1942,62 @@ async fn recover_one_remote_ec_shard_interval(
             vid.0, shard_id_to_recover
         ))),
     }
+}
+
+/// Reports whether a delisted holder of the shard journaled the needle's
+/// delete (Go's `askEcShardReadHints`). Each holder is asked, since any one of
+/// them may hold the delete; only a deleted answer is taken, so one byte is
+/// enough. Holders that failed are forgotten, even when a later one answers
+/// deleted, unless a lookup changed the hints meanwhile.
+async fn ask_ec_shard_read_hints(
+    state: &Arc<VolumeServerState>,
+    iv: EcInterval,
+    hints: &[String],
+    revision: u64,
+) -> bool {
+    let probe = EcInterval { size: 1, ..iv };
+    let mut failed = Vec::new();
+    let mut deleted = false;
+    for hint in hints {
+        let err = match tokio::time::timeout(
+            EC_READ_HINT_TIMEOUT,
+            do_read_remote_ec_shard_interval(state, hint, probe),
+        )
+        .await
+        {
+            Ok(Ok((_, true))) => {
+                deleted = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "timed out".to_string(),
+        };
+        tracing::debug!(
+            "read ec shard {}.{} from delisted holder {} failed: {}",
+            iv.vid.0,
+            iv.shard_id,
+            hint,
+            err
+        );
+        failed.push(hint.clone());
+    }
+    if !failed.is_empty() {
+        let store = state.store.read().unwrap();
+        if let Some(ecv) = store.find_ec_volume(iv.vid) {
+            ecv.forget_shard_read_hints(iv.shard_id, revision, &failed);
+        }
+    }
+    deleted
+}
+
+fn shard_read_hints(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+    shard_id: ShardId,
+) -> Option<(Vec<String>, u64)> {
+    let store = state.store.read().unwrap();
+    store.find_ec_volume(vid)?.shard_read_hints(shard_id)
 }
 
 /// Drop a confirmed-corrupt shard's cached location so later reads go straight
@@ -2384,23 +2560,45 @@ pub(crate) async fn recover_missing_ec_indexes(
                     "cannot look up peers to recover missing .ecx: {}",
                     e
                 );
-                continue;
+                Vec::new()
             }
         };
-        if peers.is_empty() {
-            tracing::warn!(
-                volume_id = m.vid.0,
-                "shards present locally but .ecx missing and no peer holds it; leaving shards unloaded"
-            );
-            continue;
+        // Under the volume's lifecycle lock, so an in-flight VolumeEcShardsCopy
+        // of it, which may unlink the shards it renamed in, never has them
+        // mounted from under it.
+        let _lifecycle = state.ec_lifecycle_lock(m.vid).lock_owned().await;
+        let current = state
+            .store
+            .read()
+            .unwrap()
+            .collect_ec_volumes_missing_index_only(Some(m.vid))
+            .into_iter()
+            .find(|x| x.vid == m.vid && x.collection == m.collection);
+        // A copy holding the lock may have installed the index meanwhile: skip
+        // the fetch, but its shards still need the mount.
+        if let Some(current) = &current {
+            if peers.is_empty() {
+                tracing::warn!(
+                    volume_id = m.vid.0,
+                    "shards present locally but .ecx missing and no peer holds it; leaving shards unloaded"
+                );
+                continue;
+            }
+            if !fetch_ec_index_from_peers(state, current, &peers).await {
+                continue;
+            }
         }
-        if fetch_ec_index_from_peers(state, m, &peers).await {
+        state
+            .store
+            .write()
+            .unwrap()
+            .mount_recovered_ec_shards_only(Some(m.vid));
+        if current.is_some() {
             recovered += 1;
         }
     }
 
     if recovered > 0 {
-        state.store.write().unwrap().mount_recovered_ec_shards();
         tracing::info!(
             "recovered missing EC index for {} volume(s) from peers and mounted their shards",
             recovered
@@ -2756,6 +2954,38 @@ mod tests {
         assert!(search(&shards, &metas, &n, dat_offset).is_none());
     }
 
+    // The master answers all 32 shard slots, located or not. While 7 of a 10+4
+    // volume's shards have a holder up, the reply must count as 7 shards, short
+    // of the data shards.
+    #[test]
+    fn a_lookup_reply_counts_only_located_shards() {
+        use master_pb::lookup_ec_volume_response::EcShardIdLocation;
+        let located = [0u32, 3, 4, 6, 7, 9, 12];
+        let reply = master_pb::LookupEcVolumeResponse {
+            volume_id: 136,
+            shard_id_locations: (0..32u32)
+                .map(|sid| EcShardIdLocation {
+                    shard_id: sid,
+                    locations: if located.contains(&sid) {
+                        vec![master_pb::Location {
+                            url: "10.0.0.5:8180".to_string(),
+                            grpc_port: 18180,
+                            ..Default::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let got = shard_locations_from_reply(reply);
+        assert_eq!(got.len(), 32);
+        assert_eq!(located_shard_count(&got), 7);
+        assert!(got[&1].is_empty());
+        assert_eq!(got[&3], vec!["10.0.0.5:8180.18180".to_string()]);
+    }
+
     fn locations(count: usize) -> HashMap<ShardId, Vec<String>> {
         (0..count)
             .map(|sid| (sid as ShardId, vec!["127.0.0.1:8080".to_string()]))
@@ -2782,9 +3012,10 @@ mod tests {
         assert!(needs_refresh(&locations(0), None, false, 10, 14));
     }
 
-    struct FailAfterFrame(Option<bytes::Bytes>);
+    /// Serves one frame, then fails the stream or, with `stall`, never ends it.
+    struct AfterFrame(Option<bytes::Bytes>, bool);
 
-    impl http_body::Body for FailAfterFrame {
+    impl http_body::Body for AfterFrame {
         type Data = bytes::Bytes;
         type Error = tonic::Status;
 
@@ -2793,46 +3024,54 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, tonic::Status>>>
         {
-            std::task::Poll::Ready(Some(match self.0.take() {
-                Some(frame) => Ok(http_body::Frame::data(frame)),
-                None => Err(tonic::Status::unavailable(
+            match self.0.take() {
+                Some(frame) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(frame)))),
+                None if self.1 => std::task::Poll::Pending,
+                None => std::task::Poll::Ready(Some(Err(tonic::Status::unavailable(
                     "stream failed after the deleted answer",
-                )),
-            }))
+                )))),
+            }
         }
     }
 
-    /// A holder's deleted answer stands even when its stream fails afterwards,
-    /// so a later source or the quarantined shard cannot answer for the needle.
+    /// A holder's deleted answer stands even when its stream fails or stalls
+    /// afterwards, so a later source or the quarantined shard cannot answer for
+    /// the needle.
     #[tokio::test]
     async fn test_collect_ec_shard_read_keeps_deletion_when_the_stream_fails() {
-        let message = prost::Message::encode_to_vec(&VolumeEcShardReadResponse {
-            is_deleted: true,
-            ..Default::default()
-        });
-        let mut frame = vec![0u8];
-        frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&message);
-        let stream = tonic::Streaming::new_response(
-            tonic_prost::ProstDecoder::<VolumeEcShardReadResponse>::default(),
-            FailAfterFrame(Some(frame.into())),
-            tonic::codegen::http::StatusCode::OK,
-            None,
-            None,
-        );
-        let iv = EcInterval {
-            vid: VolumeId(7),
-            needle_id: NeedleId(42),
-            shard_id: 0,
-            shard_offset: 0,
-            size: 64,
-            expected_encode_ts_ns: 0,
-        };
+        for stall in [false, true] {
+            let message = prost::Message::encode_to_vec(&VolumeEcShardReadResponse {
+                is_deleted: true,
+                ..Default::default()
+            });
+            let mut frame = vec![0u8];
+            frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&message);
+            let stream = tonic::Streaming::new_response(
+                tonic_prost::ProstDecoder::<VolumeEcShardReadResponse>::default(),
+                AfterFrame(Some(frame.into()), stall),
+                tonic::codegen::http::StatusCode::OK,
+                None,
+                None,
+            );
+            let iv = EcInterval {
+                vid: VolumeId(7),
+                needle_id: NeedleId(42),
+                shard_id: 0,
+                shard_offset: 0,
+                size: 64,
+                expected_encode_ts_ns: 0,
+            };
 
-        let (buf, is_deleted) = collect_ec_shard_read(stream, "peer:18080", iv)
+            let (buf, is_deleted) = tokio::time::timeout(
+                Duration::from_secs(5),
+                collect_ec_shard_read(stream, "peer:18080", iv),
+            )
             .await
+            .expect("the deleted answer waited for the stream to end")
             .unwrap();
-        assert!(is_deleted);
-        assert!(buf.is_empty());
+            assert!(is_deleted, "stall={stall}");
+            assert!(buf.is_empty());
+        }
     }
 }

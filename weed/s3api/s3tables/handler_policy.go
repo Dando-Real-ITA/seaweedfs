@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -167,6 +168,7 @@ func (h *S3TablesHandler) handlePutTableBucketPolicy(w http.ResponseWriter, r *h
 	identityActions := getIdentityActions(r)
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		TableBucketTags:  bucketTags,
@@ -233,6 +235,7 @@ func (h *S3TablesHandler) handleGetTableBucketPolicy(w http.ResponseWriter, r *h
 	bucketPath := GetTableBucketPath(bucketName)
 	var policy []byte
 	var bucketMetadata tableBucketMetadata
+	var bucketTags map[string]string
 
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		// Get metadata for ownership check
@@ -246,6 +249,10 @@ func (h *S3TablesHandler) handleGetTableBucketPolicy(w http.ResponseWriter, r *h
 
 		// Get policy
 		policy, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
+		if err != nil {
+			return err
+		}
+		bucketTags, err = h.readTags(r.Context(), client, bucketPath)
 		return err
 	})
 
@@ -267,8 +274,11 @@ func (h *S3TablesHandler) handleGetTableBucketPolicy(w http.ResponseWriter, r *h
 	identityActions := getIdentityActions(r)
 	if !CheckPermissionWithContext("GetTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, string(policy), bucketARN, &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
+		TableBucketTags:  bucketTags,
+		ResourceTags:     bucketTags,
 		IdentityActions:  identityActions,
 		DefaultAllow:     h.defaultAllowFor(r),
 	}) {
@@ -309,6 +319,7 @@ func (h *S3TablesHandler) handleDeleteTableBucketPolicy(w http.ResponseWriter, r
 	// Check if bucket exists and get metadata for ownership check
 	var bucketMetadata tableBucketMetadata
 	var bucketPolicy string
+	var bucketTags map[string]string
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		data, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
 		if err != nil {
@@ -328,6 +339,11 @@ func (h *S3TablesHandler) handleDeleteTableBucketPolicy(w http.ResponseWriter, r
 		} else {
 			bucketPolicy = string(policyData)
 		}
+		if bucketPolicy != "" {
+			if bucketTags, err = h.readTags(r.Context(), client, bucketPath); err != nil {
+				return err
+			}
+		}
 
 		return nil
 	})
@@ -345,8 +361,11 @@ func (h *S3TablesHandler) handleDeleteTableBucketPolicy(w http.ResponseWriter, r
 	identityActions := getIdentityActions(r)
 	if !CheckPermissionWithContext("DeleteTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
+		TableBucketTags:  bucketTags,
+		ResourceTags:     bucketTags,
 		IdentityActions:  identityActions,
 		DefaultAllow:     h.defaultAllowFor(r),
 	}) {
@@ -361,6 +380,17 @@ func (h *S3TablesHandler) handleDeleteTableBucketPolicy(w http.ResponseWriter, r
 			}
 			if !bytes.Equal(extended[ExtendedKeyPolicy], []byte(bucketPolicy)) {
 				return fmt.Errorf("%w: %s", ErrConcurrentUpdate, ExtendedKeyPolicy)
+			}
+			if bucketPolicy != "" {
+				var currentTags map[string]string
+				if data, ok := extended[ExtendedKeyTags]; ok {
+					if err := json.Unmarshal(data, &currentTags); err != nil {
+						return fmt.Errorf("failed to unmarshal tags: %w", err)
+					}
+				}
+				if !maps.Equal(currentTags, bucketTags) {
+					return fmt.Errorf("%w: %s", ErrConcurrentUpdate, ExtendedKeyTags)
+				}
 			}
 			delete(extended, ExtendedKeyPolicy)
 			return nil
@@ -466,6 +496,7 @@ func (h *S3TablesHandler) handlePutTablePolicy(w http.ResponseWriter, r *http.Re
 	identityActions := getIdentityActions(r)
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespaceName,
@@ -591,6 +622,7 @@ func (h *S3TablesHandler) handleGetTablePolicy(w http.ResponseWriter, r *http.Re
 	identityActions := getIdentityActions(r)
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespaceName,
@@ -687,6 +719,7 @@ func (h *S3TablesHandler) handleDeleteTablePolicy(w http.ResponseWriter, r *http
 	identityActions := getIdentityActions(r)
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespaceName,
@@ -825,6 +858,7 @@ func (h *S3TablesHandler) handleTagResource(w http.ResponseWriter, r *http.Reque
 		identityActions := getIdentityActions(r)
 		ctx := &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        tableNamespace,
@@ -988,6 +1022,7 @@ func (h *S3TablesHandler) handleListTagsForResource(w http.ResponseWriter, r *ht
 		identityActions := getIdentityActions(r)
 		ctx := &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        tableNamespace,
@@ -1117,6 +1152,7 @@ func (h *S3TablesHandler) handleUntagResource(w http.ResponseWriter, r *http.Req
 		identityActions := getIdentityActions(r)
 		ctx := &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        tableNamespace,

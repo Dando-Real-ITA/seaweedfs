@@ -3,13 +3,23 @@ package weed_server
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"errors"
+	"image"
+	"image/jpeg"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
@@ -79,7 +89,7 @@ func requireTakenBack(t *testing.T, store *storage.Store, written <-chan error, 
 
 // A replica delete that arrives while the write it undoes is in its fsync
 // finds nothing, yet the write must not land live afterwards. A plain delete
-// that finds nothing is not sent on to the replicas, so it leaves the write.
+// on an unreplicated volume that finds nothing leaves the write.
 func TestDeleteHandlerCancelsAWriteInItsFsyncWindow(t *testing.T) {
 	for _, tc := range []struct {
 		query string
@@ -91,11 +101,90 @@ func TestDeleteHandlerCancelsAWriteInItsFsyncWindow(t *testing.T) {
 		t.Run(tc.query, func(t *testing.T) {
 			store, fid, release, written := startHeldWrite(t)
 			resp := httptest.NewRecorder()
-			vs := &VolumeServer{store: store, guard: security.NewGuard(nil, "", 0, "", 0)}
+			vs := &VolumeServer{store: store, guard: security.NewGuard(nil, "", 0, "", 0, "", "")}
 			vs.DeleteHandler(resp, httptest.NewRequest(http.MethodDelete, "/"+fid+tc.query, nil))
 			require.Equal(t, http.StatusNotFound, resp.Code)
 			release()
 			requireTakenBack(t, store, written, !tc.live)
+		})
+	}
+}
+
+// failingReadBackend fails every read while fail is set.
+type failingReadBackend struct {
+	backend.BackendStorageFile
+	fail atomic.Bool
+}
+
+func (b *failingReadBackend) ReadAt(p []byte, off int64) (int, error) {
+	if b.fail.Load() {
+		return 0, errors.New("injected read error")
+	}
+	return b.BackendStorageFile.ReadAt(p, off)
+}
+
+// A delete whose fan-out failed was already applied here, so the client's
+// retry finds nothing locally; it must still reach the replica that kept the
+// needle, or the replicas stay different. The replica either refuses the
+// first forward outright or cannot read the needle, which is not "gone".
+func TestDeleteHandlerRetryReachesTheReplicaAfterAFailedFanOut(t *testing.T) {
+	for i, replicaFails := range []string{"refuses", "cannot read"} {
+		t.Run(replicaFails, func(t *testing.T) {
+			vid := needle.VolumeId(849300202 + i)
+			allocate := func(vs *VolumeServer) {
+				vs.store = newTraversalTestStore(t.TempDir())
+				t.Cleanup(vs.store.Close)
+				_, err := vs.AllocateVolume(context.Background(), &volume_server_pb.AllocateVolumeRequest{VolumeId: uint32(vid), Replication: "001", Version: uint32(needle.GetCurrentVersion())})
+				require.NoError(t, err)
+				vs.guard = security.NewGuard(nil, "", 0, "", 0, "", "")
+			}
+			replicaVs := &VolumeServer{}
+			allocate(replicaVs)
+			var refuseNext atomic.Bool
+			replica := newProxyTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if refuseNext.CompareAndSwap(true, false) {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				replicaVs.DeleteHandler(w, r)
+			}))
+
+			primary := &master_pb.Location{}
+			vs := newProxyTestVolumeServer(t, vid.String(), []*master_pb.Location{primary, {Url: strings.TrimPrefix(replica.URL, "http://")}}, nil)
+			allocate(vs)
+			primary.Url = util.JoinHostPort(vs.store.Ip, vs.store.Port)
+
+			fid := needle.NewFileId(vid, 1, 0x1234)
+			for _, s := range []*storage.Store{vs.store, replicaVs.store} {
+				n := &needle.Needle{Id: fid.Key, Cookie: fid.Cookie, Data: []byte("replicated delete")}
+				n.Checksum = needle.NewCRC(n.Data)
+				_, err := s.WriteVolumeNeedle(vid, n, true, false)
+				require.NoError(t, err)
+			}
+			replicaVolume := replicaVs.store.GetVolume(vid)
+			reads := &failingReadBackend{BackendStorageFile: replicaVolume.DataBackend}
+			replicaVolume.DataBackend = reads
+			live := func(s *storage.Store) bool {
+				_, err := s.ReadVolumeNeedle(vid, &needle.Needle{Id: fid.Key, Cookie: fid.Cookie}, nil, nil)
+				return err == nil
+			}
+
+			if replicaFails == "refuses" {
+				refuseNext.Store(true)
+			} else {
+				reads.fail.Store(true)
+			}
+			resp := httptest.NewRecorder()
+			vs.DeleteHandler(resp, httptest.NewRequest(http.MethodDelete, "/"+fid.String(), nil))
+			require.Equal(t, http.StatusInternalServerError, resp.Code, resp.Body.String())
+			reads.fail.Store(false)
+			require.False(t, live(vs.store))
+			require.True(t, live(replicaVs.store))
+
+			resp = httptest.NewRecorder()
+			vs.DeleteHandler(resp, httptest.NewRequest(http.MethodDelete, "/"+fid.String(), nil))
+			require.Equal(t, http.StatusNotFound, resp.Code, resp.Body.String())
+			require.False(t, live(replicaVs.store))
 		})
 	}
 }
@@ -136,6 +225,109 @@ func TestBatchDeleteCancelsAWriteInItsFsyncWindow(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+// A replica rejects a Content-MD5 or CRC32C that does not match the bytes it
+// is sent.
+func TestPostHandlerForwardsAContentMd5TheReplicaAccepts(t *testing.T) {
+	var encoded bytes.Buffer
+	require.NoError(t, jpeg.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 3, 2)), nil))
+	plain := encoded.Bytes()
+	exif := []byte("Exif\x00\x00MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01\x00\x03\x00\x00\x00\x00\x00\x00")
+	tagged := append([]byte{0xFF, 0xD8, 0xFF, 0xE1, 0, byte(len(exif) + 2)}, exif...)
+	tagged = append(tagged, plain[2:]...)
+
+	vid := needle.VolumeId(849300201)
+	allocate := func(vs *VolumeServer) {
+		vs.store = newTraversalTestStore(t.TempDir())
+		t.Cleanup(vs.store.Close)
+		_, err := vs.AllocateVolume(context.Background(), &volume_server_pb.AllocateVolumeRequest{VolumeId: uint32(vid), Replication: "001", Version: uint32(needle.GetCurrentVersion())})
+		require.NoError(t, err)
+	}
+	replicaVs := &VolumeServer{fileSizeLimitBytes: 1 << 20}
+	allocate(replicaVs)
+	replicaVs.guard = security.NewGuard(nil, "", 0, "", 0, "", "")
+	replicaResp := make(chan *httptest.ResponseRecorder, 1)
+	replicaCrc32c := make(chan string, 1)
+	replica := newProxyTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		replicaCrc32c <- r.Header.Get(needle.ContentCrc32cHeader)
+		rec := httptest.NewRecorder()
+		replicaVs.PostHandler(rec, r)
+		replicaResp <- rec
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	}))
+
+	primary := &master_pb.Location{}
+	vs := newProxyTestVolumeServer(t, vid.String(), []*master_pb.Location{primary, {Url: strings.TrimPrefix(replica.URL, "http://")}}, nil)
+	allocate(vs)
+	primary.Url = util.JoinHostPort(vs.store.Ip, vs.store.Port)
+	vs.guard = security.NewGuard(nil, "", 0, "", 0, "", "")
+	vs.fileSizeLimitBytes = 1 << 20
+
+	for i, tc := range []struct {
+		name      string
+		fix       bool
+		data      []byte
+		rewritten bool
+	}{
+		{"rotated", true, tagged, true},
+		{"unchanged jpeg", true, plain, false},
+		{"not a jpeg", true, []byte("plain text"), false},
+		{"fix off", false, tagged, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vs.FixJpgOrientation = tc.fix
+			sum := md5.Sum(tc.data)
+			clientMd5 := base64.StdEncoding.EncodeToString(sum[:])
+
+			var body bytes.Buffer
+			form := multipart.NewWriter(&body)
+			part, err := form.CreatePart(textproto.MIMEHeader{
+				"Content-Disposition": {`form-data; name="file"; filename="photo.jpg"`},
+				"Content-Type":        {"image/jpeg"},
+				"Content-Md5":         {clientMd5},
+			})
+			require.NoError(t, err)
+			_, err = part.Write(tc.data)
+			require.NoError(t, err)
+			require.NoError(t, form.Close())
+			fid := needle.NewFileId(vid, uint64(i+1), 0x1234)
+			req := httptest.NewRequest(http.MethodPost, "/"+fid.String(), &body)
+			req.Header.Set("Content-Type", form.FormDataContentType())
+			req.Header.Set(needle.ContentCrc32cHeader, needle.ContentCrc32c(tc.data))
+
+			resp := httptest.NewRecorder()
+			vs.PostHandler(resp, req)
+			var forwarded *httptest.ResponseRecorder
+			var forwardedCrc32c string
+			select {
+			case forwarded = <-replicaResp:
+				forwardedCrc32c = <-replicaCrc32c
+			default:
+				t.Fatalf("primary did not forward the write: %d %s", resp.Code, resp.Body.String())
+			}
+			require.Equal(t, http.StatusCreated, forwarded.Code, forwarded.Body.String())
+			require.Equal(t, http.StatusCreated, resp.Code, resp.Body.String())
+			require.Equal(t, clientMd5, resp.Header().Get("Content-MD5"))
+			if tc.rewritten {
+				require.Empty(t, forwarded.Header().Get("Content-MD5"))
+			} else {
+				require.Equal(t, clientMd5, forwarded.Header().Get("Content-MD5"))
+			}
+
+			stored := func(s *storage.Store) []byte {
+				n := &needle.Needle{Id: fid.Key, Cookie: fid.Cookie}
+				_, err := s.ReadVolumeNeedle(vid, n, nil, nil)
+				require.NoError(t, err)
+				return n.Data
+			}
+			replicaData := stored(replicaVs.store)
+			require.Equal(t, stored(vs.store), replicaData)
+			require.Equal(t, tc.rewritten, !bytes.Equal(replicaData, tc.data))
+			require.Equal(t, needle.ContentCrc32c(replicaData), forwardedCrc32c)
 		})
 	}
 }

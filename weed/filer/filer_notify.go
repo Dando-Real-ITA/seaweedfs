@@ -19,8 +19,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/notification"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 func (f *Filer) NotifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry, deleteChunks, isFromOtherCluster bool, signatures []int32) {
@@ -68,12 +70,15 @@ func (f *Filer) notifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 	defer f.metaLogInflight.done(event.TsNs)
 	eventNotification := event.EventNotification
 
-	if notification.Queue != nil {
-		glog.V(3).Infof("notifying entry update %v", fullpath)
-		if err := notification.Queue.SendMessage(fullpath, eventNotification); err != nil {
-			// throw message
-			glog.Error(err)
+	if !isNotificationWebhooksConf(oldEntry, newEntry) {
+		if notification.Queue != nil {
+			glog.V(3).Infof("notifying entry update %v", fullpath)
+			if err := notification.Queue.SendMessage(fullpath, eventNotification); err != nil {
+				// throw message
+				glog.Error(err)
+			}
 		}
+		f.sendToNotificationWebhooks(fullpath, eventNotification)
 	}
 
 	f.logMetaEvent(ctx, event)
@@ -204,11 +209,16 @@ func (f *Filer) LocalFlushedThroughTsNs(nowNs int64) int64 {
 }
 
 // LocalDeliveredThroughTsNs caps a delivery-freshness claim (an idle
-// heartbeat's timestamp) by the oldest in-flight stamp: a stamped-but-
-// unappended event has not been streamed to anyone, and a peer aggregator
-// turns the claim into its delivery low-watermark.
+// heartbeat's timestamp, a listing snapshot) by the oldest in-flight stamp: a
+// stamped-but-unappended event has not been streamed to anyone, nor is its
+// write certain to be visible yet, and a peer aggregator turns the claim into
+// its delivery low-watermark.
 func (f *Filer) LocalDeliveredThroughTsNs(nowNs int64) int64 {
-	return f.metaLogInflight.claimThrough(nowNs)
+	claim := f.metaLogInflight.claimThrough(nowNs)
+	// export how far this filer's delivery claim trails the clock (peer
+	// aggregators turn the claim into their delivery low-watermark)
+	stats.FilerMetaDeliveryClaimAgeSeconds.Set(float64(nowNs-claim) / 1e9)
+	return claim
 }
 
 // StampMetaLogInflightForTest and DoneMetaLogInflightForTest let tests in
@@ -287,6 +297,14 @@ func (f *Filer) newMetadataEvent(oldEntry, newEntry *Entry, deleteChunks, isFrom
 	}
 }
 
+// notifyRenameTarget wakes the subscribers of a move's destination directory,
+// which the partition key (the source directory) does not cover.
+func notifyRenameTarget(logBuffer *log_buffer.LogBuffer, event *filer_pb.SubscribeMetadataResponse) {
+	if target := filer_pb.MetadataEventTargetDirectory(event); target != event.Directory {
+		logBuffer.NotifySubscribers([]byte(target))
+	}
+}
+
 func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetadataResponse) {
 	data, err := proto.Marshal(event)
 	if err != nil {
@@ -299,6 +317,7 @@ func (f *Filer) logMetaEvent(ctx context.Context, event *filer_pb.SubscribeMetad
 		glog.Errorf("failed to add data to log buffer for %s: %v", event.Directory, err)
 		return
 	}
+	notifyRenameTarget(f.LocalMetaLogBuffer, event)
 	// The in-memory copy now carries the position the stream assigns it, the
 	// same value subscribers will see delivered.
 	event.TsNs = tsNs
@@ -419,6 +438,10 @@ var (
 // when reading persisted log files since the data is unrecoverable.
 func isChunkNotFoundError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// "volume N not found" without an answer says nothing about the volume.
+	if errors.Is(err, wdclient.ErrLookupUnanswered) {
 		return false
 	}
 	if errors.Is(err, util_http.ErrNotFound) || errors.Is(err, nethttp.ErrMissingFile) {

@@ -50,56 +50,45 @@ func (fs *FilerServer) AtomicRenameEntry(ctx context.Context, req *filer_pb.Atom
 	// a SQL store keeps the transaction in the context and refuses calls
 	// through it once committed; the work after the commit uses this one
 	afterCommitCtx := ctx
-	ctx, err := fs.filer.BeginTransaction(ctx)
+	effects, err := fs.runRenameTransaction(ctx, fmt.Sprintf("%s/%s", req.OldDirectory, req.OldName), func(ctx context.Context, effects *renameEffects) (bool, error) {
+		oldEntry, err := fs.filer.FindEntry(ctx, oldParent.Child(req.OldName))
+		if err != nil {
+			return false, fmt.Errorf("%s/%s not found: %v", req.OldDirectory, req.OldName, err)
+		}
+		if err := fs.checkScopeWorm(ctx, string(oldParent.Child(req.OldName))); err != nil {
+			return false, err
+		}
+		if err := fs.checkScopeWorm(ctx, string(newParent.Child(req.NewName))); err != nil {
+			return false, err
+		}
+		if oldEntry.IsDirectory() {
+			if err := fs.checkScopeWormDirectory(ctx, string(oldParent.Child(req.OldName))); err != nil {
+				return false, err
+			}
+			if err := fs.checkScopeWormDirectory(ctx, string(newParent.Child(req.NewName))); err != nil {
+				return false, err
+			}
+		}
+
+		// The check runs under the rename path locks, which CreateEntry on the same
+		// filer also takes, so a target created concurrently cannot slip through.
+		if req.FailIfTargetExists && newParent.Child(req.NewName) != oldParent.Child(req.OldName) {
+			if _, findErr := fs.filer.FindEntry(ctx, newParent.Child(req.NewName)); findErr == nil {
+				return false, fmt.Errorf("%s/%s: %w", req.NewDirectory, req.NewName, filer_pb.ErrEntryAlreadyExists)
+			} else if findErr != filer_pb.ErrNotFound {
+				return false, findErr
+			}
+		}
+
+		if moveErr := fs.moveEntry(ctx, nil, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &effects.metadataEvents, &effects.pendingChunkDeletes, &effects.pendingRemoteCopies); moveErr != nil {
+			return false, fmt.Errorf("%s/%s move error: %v", req.OldDirectory, req.OldName, moveErr)
+		}
+		return fs.filer.TransactionCovers(ctx, oldParent.Child(req.OldName), newParent.Child(req.NewName)) && retryableRename(oldEntry, effects), nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	oldEntry, err := fs.filer.FindEntry(ctx, oldParent.Child(req.OldName))
-	if err != nil {
-		fs.filer.RollbackTransaction(ctx)
-		return nil, fmt.Errorf("%s/%s not found: %v", req.OldDirectory, req.OldName, err)
-	}
-
-	// The check runs under the rename path locks, which CreateEntry on the same
-	// filer also takes, so a target created concurrently cannot slip through.
-	if req.FailIfTargetExists && newParent.Child(req.NewName) != oldParent.Child(req.OldName) {
-		if _, findErr := fs.filer.FindEntry(ctx, newParent.Child(req.NewName)); findErr == nil {
-			fs.filer.RollbackTransaction(ctx)
-			return nil, fmt.Errorf("%s/%s: %w", req.NewDirectory, req.NewName, filer_pb.ErrEntryAlreadyExists)
-		} else if findErr != filer_pb.ErrNotFound {
-			fs.filer.RollbackTransaction(ctx)
-			return nil, findErr
-		}
-	}
-
-	var metadataEvents []metadataEvent
-	var pendingChunkDeletes []*filer_pb.FileChunk
-	var pendingRemoteCopies []*pendingRemoteCopy
-	moveErr := fs.moveEntry(ctx, nil, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes, &pendingRemoteCopies)
-	if moveErr != nil {
-		releaseMetadataEventStamps(fs.filer, metadataEvents)
-		fs.filer.RollbackTransaction(ctx)
-		return nil, fmt.Errorf("%s/%s move error: %v", req.OldDirectory, req.OldName, moveErr)
-	} else {
-		if commitError := fs.filer.CommitTransaction(ctx); commitError != nil {
-			releaseMetadataEventStamps(fs.filer, metadataEvents)
-			fs.filer.RollbackTransaction(ctx)
-			return nil, fmt.Errorf("%s/%s move commit error: %v", req.OldDirectory, req.OldName, commitError)
-		}
-	}
-	// Chunks from an overwritten rename target are only deletable after the
-	// rename transaction has committed: anything that fails mid-rename (move,
-	// child moves, oldPath delete, CommitTransaction) would otherwise leave
-	// live metadata pointing at freshly-deleted chunks.
-	if len(pendingChunkDeletes) > 0 {
-		fs.filer.DeleteChunksNotRecursive(pendingChunkDeletes)
-	}
-	fs.finishRemoteCopies(afterCommitCtx, pendingRemoteCopies)
-	applyRemoteCopies(metadataEvents, pendingRemoteCopies)
-	for _, event := range metadataEvents {
-		event.notify(fs.filer, afterCommitCtx, req.Signatures)
-	}
+	fs.finishRename(afterCommitCtx, effects, req.Signatures)
 
 	return &filer_pb.AtomicRenameEntryResponse{}, nil
 }
@@ -117,59 +106,187 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 
 	defer fs.acquireRenamePathLocks("StreamRenameEntry", oldParent.Child(req.OldName), newParent.Child(req.NewName))()
 
-	ctx := context.Background()
+	afterCommitCtx := context.Background()
+	if scopeKeepOnly(stream.Context()) {
+		afterCommitCtx = withScopeKeepOnly(afterCommitCtx)
+	}
+	var held *renameResponseBuffer
+	effects, err := fs.runRenameTransaction(afterCommitCtx, fmt.Sprintf("%s/%s", req.OldDirectory, req.OldName), func(ctx context.Context, effects *renameEffects) (bool, error) {
+		held = nil
+		oldEntry, err := fs.filer.FindEntry(ctx, oldParent.Child(req.OldName))
+		if err != nil {
+			return false, fmt.Errorf("%s/%s not found: %v", req.OldDirectory, req.OldName, err)
+		}
+		if err := fs.checkScopeWorm(ctx, string(oldParent.Child(req.OldName))); err != nil {
+			return false, err
+		}
+		if err := fs.checkScopeWorm(ctx, string(newParent.Child(req.NewName))); err != nil {
+			return false, err
+		}
+		if oldEntry.IsDirectory() {
+			if err := fs.checkScopeWormDirectory(ctx, string(oldParent.Child(req.OldName))); err != nil {
+				return false, err
+			}
+			if err := fs.checkScopeWormDirectory(ctx, string(newParent.Child(req.NewName))); err != nil {
+				return false, err
+			}
+		}
 
-	afterCommitCtx := ctx
-	ctx, err = fs.filer.BeginTransaction(ctx)
+		if oldEntry.IsDirectory() {
+			// follow https://pubs.opengroup.org/onlinepubs/000095399/functions/rename.html
+			targetDir := newParent.Child(req.NewName)
+			newEntry, err := fs.filer.FindEntry(ctx, targetDir)
+			if err == nil {
+				if !newEntry.IsDirectory() {
+					return false, fmt.Errorf("%s is not directory", targetDir)
+				}
+				if entries, _, _ := fs.filer.ListDirectoryEntries(ctx, targetDir, "", false, 1, "", "", ""); len(entries) > 0 {
+					return false, fmt.Errorf("%s is not empty", targetDir)
+				}
+			}
+		}
+
+		// The client applies each response as it arrives. When the store's
+		// transaction covers the rename's writes, a file's responses wait for
+		// the commit: a rename the store refuses never reaches the client, and
+		// one that runs again sends them once. A directory sends its
+		// children's as it moves them, which keeps the client of a long rename
+		// from timing out; having sent them, it does not run again. Without
+		// such a transaction the writes show as they are made, and so do the
+		// responses.
+		responses := stream
+		if !oldEntry.IsDirectory() && fs.filer.TransactionCovers(ctx, oldParent.Child(req.OldName), newParent.Child(req.NewName)) {
+			held = &renameResponseBuffer{SeaweedFiler_StreamRenameEntryServer: stream}
+			responses = held
+		}
+		if moveErr := fs.moveEntry(ctx, responses, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &effects.metadataEvents, &effects.pendingChunkDeletes, &effects.pendingRemoteCopies); moveErr != nil {
+			return false, fmt.Errorf("%s/%s move error: %v", req.OldDirectory, req.OldName, moveErr)
+		}
+		return held != nil && retryableRename(oldEntry, effects), nil
+	})
 	if err != nil {
 		return err
 	}
-
-	oldEntry, err := fs.filer.FindEntry(ctx, oldParent.Child(req.OldName))
-	if err != nil {
-		fs.filer.RollbackTransaction(ctx)
-		return fmt.Errorf("%s/%s not found: %v", req.OldDirectory, req.OldName, err)
+	if held == nil {
+		fs.finishRename(afterCommitCtx, effects, req.Signatures)
+		return nil
 	}
+	// Committed. The held responses go out while the rename finishes what the
+	// commit leaves (events, chunk deletions, remote copies): a client that
+	// stopped reading cannot hold that work up, and a slow remote copy does
+	// not keep the client waiting for its responses. The call returns, and
+	// gives up the rename's path locks, once both are done.
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		fs.finishRename(afterCommitCtx, effects, req.Signatures)
+	}()
+	err = held.release()
+	<-finished
+	return err
+}
 
-	if oldEntry.IsDirectory() {
-		// follow https://pubs.opengroup.org/onlinepubs/000095399/functions/rename.html
-		targetDir := newParent.Child(req.NewName)
-		newEntry, err := fs.filer.FindEntry(ctx, targetDir)
-		if err == nil {
-			if !newEntry.IsDirectory() {
-				fs.filer.RollbackTransaction(ctx)
-				return fmt.Errorf("%s is not directory", targetDir)
-			}
-			if entries, _, _ := fs.filer.ListDirectoryEntries(context.Background(), targetDir, "", false, 1, "", "", ""); len(entries) > 0 {
-				return fmt.Errorf("%s is not empty", targetDir)
-			}
+// renameAttempts bounds how often a rename runs its transaction while the
+// store refuses the commit for a concurrent write to one of its keys.
+const renameAttempts = 5
+
+// renameEffects is what a rename's transaction leaves for after its commit.
+type renameEffects struct {
+	metadataEvents      []metadataEvent
+	pendingChunkDeletes []*filer_pb.FileChunk
+	pendingRemoteCopies []*pendingRemoteCopy
+}
+
+// runRenameTransaction runs attempt in a new store transaction and commits it.
+// A store with optimistic transactions (TiKV) refuses the commit when another
+// writer changed one of the transaction's keys after it began: a flush of the
+// file being renamed, say. While attempt reports that nothing it did has left
+// the transaction, it runs again in a new one, which reads that write and
+// moves it along instead of failing the rename.
+func (fs *FilerServer) runRenameTransaction(ctx context.Context, oldPath string, attempt func(ctx context.Context, effects *renameEffects) (retryable bool, err error)) (*renameEffects, error) {
+	for n := 1; ; n++ {
+		txCtx, err := fs.filer.BeginTransaction(ctx)
+		if err != nil {
+			return nil, err
+		}
+		effects := &renameEffects{}
+		retryable, err := attempt(txCtx, effects)
+		if err != nil {
+			releaseMetadataEventStamps(fs.filer, effects.metadataEvents)
+			fs.filer.RollbackTransaction(txCtx)
+			return nil, err
+		}
+		commitErr := fs.filer.CommitTransaction(txCtx)
+		if commitErr == nil {
+			return effects, nil
+		}
+		releaseMetadataEventStamps(fs.filer, effects.metadataEvents)
+		fs.filer.RollbackTransaction(txCtx)
+		if !retryable || n == renameAttempts || !errors.Is(commitErr, filer.ErrTransactionConflict) {
+			return nil, fmt.Errorf("%s move commit error: %v", oldPath, commitErr)
+		}
+		glog.V(0).Infof("rename %s: running it again (%d of %d) after a concurrent write: %v", oldPath, n+1, renameAttempts, commitErr)
+		time.Sleep(time.Duration(n) * 10 * time.Millisecond)
+	}
+}
+
+// retryableRename reports whether a rename's transaction may run again after
+// the store refused its commit: a file move that did nothing outside the
+// transaction. A remote object copied or deleted on the way, for the file or
+// for the target it replaced, would stay copied or deleted. The caller also
+// checks that the transaction covers the rename's writes (TransactionCovers).
+func retryableRename(oldEntry *filer.Entry, effects *renameEffects) bool {
+	if oldEntry.IsDirectory() || oldEntry.Remote != nil || len(effects.pendingRemoteCopies) > 0 {
+		return false
+	}
+	for _, event := range effects.metadataEvents {
+		if event.oldEntry != nil && event.oldEntry.Remote != nil {
+			return false
 		}
 	}
+	return true
+}
 
-	var metadataEvents []metadataEvent
-	var pendingChunkDeletes []*filer_pb.FileChunk
-	var pendingRemoteCopies []*pendingRemoteCopy
-	moveErr := fs.moveEntry(ctx, stream, oldParent, oldEntry, newParent, req.NewName, req.Signatures, false, &metadataEvents, &pendingChunkDeletes, &pendingRemoteCopies)
-	if moveErr != nil {
-		releaseMetadataEventStamps(fs.filer, metadataEvents)
-		fs.filer.RollbackTransaction(ctx)
-		return fmt.Errorf("%s/%s move error: %v", req.OldDirectory, req.OldName, moveErr)
-	} else {
-		if commitError := fs.filer.CommitTransaction(ctx); commitError != nil {
-			releaseMetadataEventStamps(fs.filer, metadataEvents)
-			fs.filer.RollbackTransaction(ctx)
-			return fmt.Errorf("%s/%s move commit error: %v", req.OldDirectory, req.OldName, commitError)
+// finishRename does what a committed rename leaves for after its commit.
+func (fs *FilerServer) finishRename(ctx context.Context, effects *renameEffects, signatures []int32) {
+	// Chunks from an overwritten rename target are only deletable after the
+	// rename transaction has committed: anything that fails mid-rename (move,
+	// child moves, oldPath delete, CommitTransaction) would otherwise leave
+	// live metadata pointing at freshly-deleted chunks.
+	if len(effects.pendingChunkDeletes) > 0 {
+		fs.filer.DeleteChunksNotRecursive(effects.pendingChunkDeletes)
+	}
+	fs.finishRemoteCopies(ctx, effects.pendingRemoteCopies)
+	applyRemoteCopies(effects.metadataEvents, effects.pendingRemoteCopies)
+	for _, event := range effects.metadataEvents {
+		event.notify(fs.filer, ctx, signatures)
+	}
+}
+
+// renameResponseBuffer holds a rename's responses for its client until the
+// transaction that produced them has committed.
+type renameResponseBuffer struct {
+	filer_pb.SeaweedFiler_StreamRenameEntryServer
+	held []*filer_pb.StreamRenameEntryResponse
+}
+
+// Send keeps resp for after the commit. It fails as the stream would once the
+// client has gone away, so a rename whose client canceled is rolled back, as
+// it is when the responses go out at once, instead of committed unseen.
+func (b *renameResponseBuffer) Send(resp *filer_pb.StreamRenameEntryResponse) error {
+	if err := b.Context().Err(); err != nil {
+		return err
+	}
+	b.held = append(b.held, resp)
+	return nil
+}
+
+func (b *renameResponseBuffer) release() error {
+	for _, resp := range b.held {
+		if err := b.SeaweedFiler_StreamRenameEntryServer.Send(resp); err != nil {
+			return err
 		}
 	}
-	if len(pendingChunkDeletes) > 0 {
-		fs.filer.DeleteChunksNotRecursive(pendingChunkDeletes)
-	}
-	fs.finishRemoteCopies(afterCommitCtx, pendingRemoteCopies)
-	applyRemoteCopies(metadataEvents, pendingRemoteCopies)
-	for _, event := range metadataEvents {
-		event.notify(fs.filer, afterCommitCtx, req.Signatures)
-	}
-
 	return nil
 }
 
@@ -177,8 +294,8 @@ type metadataEvent struct {
 	oldEntry     *filer.Entry
 	newEntry     *filer.Entry
 	deleteChunks bool
-	// the old entry's remote object is deleted once the rename has committed:
-	// it was copied to the new key, and a rename that fails must not lose it
+	// The old entry's remote object is deleted once the rename has committed:
+	// it was copied to the new key, or belonged to an overwritten target.
 	deleteOldRemote bool
 }
 
@@ -242,7 +359,7 @@ func applyRemoteCopies(events []metadataEvent, pendings []*pendingRemoteCopy) {
 	for i := range events {
 		event := &events[i]
 		for _, pending := range pendings {
-			if event.oldEntry.FullPath != pending.oldPath {
+			if event.oldEntry == nil || event.oldEntry.FullPath != pending.oldPath {
 				continue
 			}
 			if pending.failed {
@@ -351,7 +468,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 
 	var existingTarget *filer.Entry
 	if !skipTargetLookup {
-		if targetEntry, findErr := fs.filer.FindEntry(ctx, newPath); findErr == nil {
+		if targetEntry, findErr := fs.filer.FindEntryForOverwrite(ctx, newPath); findErr == nil {
 			existingTarget = targetEntry.ShallowClone()
 		} else if findErr != filer_pb.ErrNotFound {
 			return findErr
@@ -393,8 +510,26 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		remoteEntry = copiedRemote
 	}
 
-	if existingTarget != nil {
+	// A file renamed over a file is written over the target with one store
+	// write when the store says that its insert replaces an entry at once and
+	// whole (the Redis stores). Deleting the target first leaves its path empty
+	// there for anyone reading it through another filer until the new entry
+	// lands, since the rename's path locks fence this filer only. Everything
+	// else keeps delete-then-create: any other store, among them those with
+	// transactions, which hide the gap and fail cleanly if the target went
+	// meanwhile; a target in a path-specific store; directories; and entries
+	// with a remote object.
+	inPlace := existingTarget != nil && !entry.IsDirectory() && !existingTarget.IsDirectory() &&
+		entry.Remote == nil && existingTarget.Remote == nil && fs.filer.OverwritesAtOnce(newPath)
+
+	if existingTarget != nil && !inPlace {
 		targetCtx := filer.WithSuppressedMetadataEvents(ctx)
+		// A remote delete cannot be rolled back with the target's metadata.
+		// The queued target event performs it after commit unless a remote
+		// copy replaces that object (in which case it must be kept).
+		if existingTarget.Remote != nil {
+			targetCtx = filer.WithKeepRemoteObject(targetCtx)
+		}
 		if copiedRemote != nil || deferredCopy {
 			// the copy has replaced or still needs the target's object; keep it
 			targetCtx = filer.WithKeepRemoteObject(targetCtx)
@@ -450,7 +585,20 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		newEntry.Extended = maps.Clone(newEntry.Extended)
 		delete(newEntry.Extended, filer.ExtRemoteRenameSourceKey)
 	}
-	if skipTargetLookup {
+	if inPlace {
+		var createdParents []*filer.Entry
+		fs.filer.StampEntryCommitTsNs(newEntry)
+		replaceErr := fs.filer.ReplaceFileForRename(filer.WithCreatedParents(ctx, &createdParents), newEntry, fs.filer.MaxFilenameLength)
+		// as for a create below: a parent the write had to create again
+		// reaches peers through its own event, published before the move
+		for _, parent := range createdParents {
+			*metadataEvents = append(*metadataEvents, metadataEvent{newEntry: parent})
+		}
+		if replaceErr != nil {
+			fs.filer.ReleaseEntryCommitTsNs(newEntry.CommitTsNs)
+			return replaceErr
+		}
+	} else if skipTargetLookup {
 		if newEntry.FullPath.IsLongerFileName(fs.filer.MaxFilenameLength) {
 			return filer_pb.ErrEntryNameTooLong
 		}
@@ -460,7 +608,14 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 			return fmt.Errorf("insert entry %s: %v", newEntry.FullPath, createErr)
 		}
 	} else {
-		if createErr := fs.filer.CreateEntry(filer.WithSuppressedMetadataEvents(ctx), newEntry, nil, false, false, signatures, false, fs.filer.MaxFilenameLength); createErr != nil {
+		var createdParents []*filer.Entry
+		createErr := fs.filer.CreateEntry(filer.WithCreatedParents(ctx, &createdParents), newEntry, nil, false, false, signatures, false, fs.filer.MaxFilenameLength)
+		// Peers replay events into their own store, so a new parent only
+		// reaches them through its own create event, published before the move.
+		for _, parent := range createdParents {
+			*metadataEvents = append(*metadataEvents, metadataEvent{newEntry: parent})
+		}
+		if createErr != nil {
 			return createErr
 		}
 	}
@@ -468,12 +623,18 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		toDelete, err := filer.MinusChunks(ctx, fs.filer.MasterClient.GetLookupFileIdFunction(), existingTarget.GetChunks(), newEntry.GetChunks(), fs.filer.MasterClient)
 		if err != nil {
 			glog.ErrorfCtx(ctx, "Failed to resolve overwrite target chunks during rename. new: %v, old: %v", filer_pb.FileIdsString(newEntry.GetChunks()), filer_pb.FileIdsString(existingTarget.GetChunks()))
-		} else if len(toDelete) > 0 {
-			// Defer chunk deletion until after CommitTransaction so that a
-			// failure in any subsequent step (child moves, oldPath delete,
-			// stream send, or the commit itself) leaves the chunks intact for
-			// the rolled-back rename.
-			*pendingChunkDeletes = append(*pendingChunkDeletes, toDelete...)
+		} else {
+			// the target may be one of several hard links to its file: the
+			// rename unlinked that name only, and the other names still read
+			// the file's chunks
+			toDelete = fs.filer.KeepHardLinkedChunks(ctx, existingTarget, newEntry, toDelete)
+			if len(toDelete) > 0 {
+				// Defer chunk deletion until after CommitTransaction so that a
+				// failure in any subsequent step (child moves, oldPath delete,
+				// stream send, or the commit itself) leaves the chunks intact for
+				// the rolled-back rename.
+				*pendingChunkDeletes = append(*pendingChunkDeletes, toDelete...)
+			}
 		}
 	}
 	if stream != nil {
@@ -497,8 +658,9 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 
 	if existingTarget != nil {
 		*metadataEvents = append(*metadataEvents, metadataEvent{
-			oldEntry:     existingTarget,
-			deleteChunks: true,
+			oldEntry:        existingTarget,
+			deleteChunks:    true,
+			deleteOldRemote: existingTarget.Remote != nil && copiedRemote == nil && !deferredCopy,
 		})
 	}
 	*metadataEvents = append(*metadataEvents, metadataEvent{

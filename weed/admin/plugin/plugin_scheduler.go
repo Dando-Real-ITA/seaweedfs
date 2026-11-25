@@ -45,6 +45,9 @@ const (
 	maxEstimatedRuntimeCap           = 8 * time.Hour
 	// How long started jobs may drain past the run window close.
 	scheduledExecutionDrainGrace = 30 * time.Minute
+	// A run whose jobs were given up for want of an executor detects again
+	// this soon, instead of a whole detection interval later.
+	capacityGiveUpRedetectDelay = 10 * time.Minute
 )
 
 type schedulerPolicy struct {
@@ -140,6 +143,9 @@ func (r *Plugin) runLaneSchedulerIteration(ls *schedulerLaneState) bool {
 		return false
 	}
 
+	if hadJobs, handled := r.schedulerExt().runLane(ls, jobTypes); handled {
+		return hadJobs
+	}
 	if LaneRequiresLock(ls.lane) {
 		return r.runLaneSchedulerIterationSequential(ls, jobTypes)
 	}
@@ -831,9 +837,25 @@ func (r *Plugin) loadSchedulerClusterContext(ctx context.Context) (*plugin_pb.Cl
 	clusterCtx, cancel := context.WithTimeout(ctx, defaultClusterContextTimeout)
 	defer cancel()
 
-	clusterContext, err := r.clusterContextProvider(clusterCtx)
-	if err != nil {
-		return nil, err
+	// The provider may block on master discovery without watching its context.
+	type loaded struct {
+		clusterContext *plugin_pb.ClusterContext
+		err            error
+	}
+	done := make(chan loaded, 1)
+	go func() {
+		clusterContext, err := r.clusterContextProvider(clusterCtx)
+		done <- loaded{clusterContext, err}
+	}()
+	var clusterContext *plugin_pb.ClusterContext
+	select {
+	case result := <-done:
+		if result.err != nil {
+			return nil, result.err
+		}
+		clusterContext = result.clusterContext
+	case <-clusterCtx.Done():
+		return nil, fmt.Errorf("load cluster context: %w", clusterCtx.Err())
 	}
 	if clusterContext == nil {
 		return nil, fmt.Errorf("cluster context provider returned nil")
@@ -868,6 +890,9 @@ func (r *Plugin) dispatchScheduledProposals(
 		default:
 		}
 		job := buildScheduledJobSpec(jobType, proposal, index)
+		if !r.schedulerExt().admitJob(job) {
+			continue
+		}
 		r.trackExecutionQueued(job)
 		jobs = append(jobs, job)
 	}
@@ -944,8 +969,16 @@ func (r *Plugin) dispatchScheduledProposals(
 				}
 				blockedSince = time.Time{}
 
+				release, started := r.startScheduledJob(queues, item, executor, release)
+				if !started {
+					if !waitForShutdownOrTimerWithContext(r.shutdownCh, ctx, policy.ExecutorReserveBackoff) {
+						return
+					}
+					continue
+				}
+
 				var releaseJobLock func()
-				if jobsRequireLock {
+				if jobsRequireLock && r.schedulerExt().jobHoldsLock(item.job, executor) {
 					var lockErr error
 					releaseJobLock, lockErr = r.acquireAdminLock(fmt.Sprintf("plugin scheduler %s job %s", jobType, item.job.JobId))
 					if lockErr != nil {
@@ -1033,8 +1066,9 @@ func (r *Plugin) dispatchScheduledProposals(
 // clears on a schedule the lane has no view of, and a lane that serialises
 // its job types would idle every other type in it for the whole runtime
 // budget; those jobs are given up now, with the reason, and re-proposed by
-// the next detection. A missing worker, or a free one that the queue's pin
-// keeps off a busy home, is waited for only as long as the orphan grace.
+// a detection brought forward to capacityGiveUpRedetectDelay. A missing
+// worker, or a free one that the queue's pin keeps off a busy home, is
+// waited for only as long as the orphan grace.
 func (r *Plugin) executorCapacityOutlook(jobType string, policy schedulerPolicy, blockedFor time.Duration) (bool, string) {
 	executors, err := r.registry.ListExecutors(jobType)
 	if err != nil || len(executors) == 0 {
@@ -1093,7 +1127,20 @@ func (r *Plugin) giveUpQueuedJobs(queues *workerJobQueues, jobType, reason strin
 	for _, item := range items {
 		r.cancelQueuedJob(item.job, cause)
 	}
+	r.bringDetectionForward(jobType, capacityGiveUpRedetectDelay)
 	return len(items)
+}
+
+// bringDetectionForward schedules jobType's next detection within delay,
+// leaving an earlier one alone. A daily job given up because its worker
+// was briefly full would otherwise wait a day for its next chance.
+func (r *Plugin) bringDetectionForward(jobType string, delay time.Duration) {
+	at := time.Now().UTC().Add(delay)
+	r.schedulerMu.Lock()
+	if next, ok := r.nextDetectionAt[jobType]; !ok || next.After(at) {
+		r.nextDetectionAt[jobType] = at
+	}
+	r.schedulerMu.Unlock()
 }
 
 func (r *Plugin) reserveScheduledExecutor(

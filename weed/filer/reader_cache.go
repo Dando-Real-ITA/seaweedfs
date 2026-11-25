@@ -49,6 +49,9 @@ type SingleChunkCacher struct {
 	wg             sync.WaitGroup
 	cacheStartedCh chan struct{}
 	done           chan struct{} // signals when download is complete
+	// ctx is cancelled once no reader can use the download, or when it ends
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewReaderCache(limit int, chunkCache chunk_cache.ChunkCache, lookupFileIdFn wdclient.LookupFileIdFunctionType, cacheInvalidator CacheInvalidator, budgets ...*ReaderCacheBudget) *ReaderCache {
@@ -138,8 +141,16 @@ func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView], count int) {
 func (rc *ReaderCache) fetchChunkRange(ctx context.Context, buffer []byte, chunkView *ChunkView, offset int64) (int, error) {
 	urlStrings, err := rc.lookupFileIdFn(ctx, chunkView.FileId)
 	if err != nil {
-		glog.ErrorfCtx(ctx, "operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
+		if ctx.Err() == context.Canceled {
+			glog.V(3).InfofCtx(ctx, "operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
+		} else {
+			glog.ErrorfCtx(ctx, "operation LookupFileId %s failed, err: %v", chunkView.FileId, err)
+		}
 		return 0, err
+	}
+	if rc.budget != nil {
+		// the buffers of hedged requests count against the budget too
+		ctx = util_http.WithScratchBudget(ctx, rc.budget)
 	}
 	return rc.fetchChunkDataFn(ctx, buffer, urlStrings, chunkView.CipherKey, chunkView.IsGzipped, false, offset, chunkView.FileId,
 		refreshUrls(ctx, rc.cacheInvalidator, rc.lookupFileIdFn, chunkView.FileId))
@@ -184,13 +195,12 @@ retry:
 		rc.RUnlock()
 	}
 
-	if shouldCache || rc.lookupFileIdFn == nil {
-		n, err := rc.chunkCache.ReadChunkAt(buffer, fileId, uint64(offset))
-		if n > 0 {
-			// Served from the chunk cache: the stream has left its pinned chunk.
-			rc.unpin(stream.detach(nil))
-			return n, err
-		}
+	// shouldCache only admits new downloads: a chunk past the cutoff can still
+	// be cached (uploads on peer-sharing and read-auth mounts cache every chunk).
+	if n, err := rc.chunkCache.ReadChunkAt(buffer, fileId, uint64(offset)); n > 0 {
+		// Served from the chunk cache: the stream has left its pinned chunk.
+		rc.unpin(stream.detach(nil))
+		return n, err
 	}
 
 	rc.Lock()
@@ -348,21 +358,29 @@ func (rc *ReaderCache) remove(downloader *SingleChunkCacher) {
 	}
 }
 
-// removeUnpinned drops a cacher only while no stream is positioned in it.
-// Budget eviction picks its victim under the budget lock, so the pin check
-// and the map removal must happen together under the ReaderCache lock.
-func (rc *ReaderCache) removeUnpinned(downloader *SingleChunkCacher) (removed bool) {
+// evictForBudget destroys a finished chunk the budget picked to make room.
+// Unless force is set it keeps a chunk a stream is positioned in: the budget
+// picks its victim under the budget lock, so the pin check and the map removal
+// must happen together under the ReaderCache lock.
+//
+// A chunk no longer in the map was taken out by a removal that has not
+// destroyed it yet, such as ReaderCache.destroy(), which destroys a closed
+// file's chunks one at a time and can be waiting for a download that needs
+// this very budget. Such a chunk is destroyed here rather than skipped:
+// skipping it would leave both waiting forever. destroy() is safe to run twice.
+func (rc *ReaderCache) evictForBudget(downloader *SingleChunkCacher, force bool) (evicted bool) {
 	rc.Lock()
-	removed = rc.downloaders[downloader.chunkFileId] == downloader &&
-		atomic.LoadInt32(&downloader.pins) == 0
-	if removed {
+	inMap := rc.downloaders[downloader.chunkFileId] == downloader
+	if inMap && !force && atomic.LoadInt32(&downloader.pins) != 0 {
+		rc.Unlock()
+		return false
+	}
+	if inMap {
 		delete(rc.downloaders, downloader.chunkFileId)
 	}
 	rc.Unlock()
-	if removed {
-		downloader.destroy()
-	}
-	return
+	downloader.destroy()
+	return true
 }
 
 // consumable reports whether the cacher could be dropped: its buffer was
@@ -388,16 +406,36 @@ func (rc *ReaderCache) removeConsumed(downloader *SingleChunkCacher) {
 	removed := rc.removeConsumedLocked(downloader)
 	rc.Unlock()
 	if removed {
-		downloader.destroy()
+		downloader.destroyWhenDone()
 	}
 }
 
-func (rc *ReaderCache) removeConsumedLocked(downloader *SingleChunkCacher) (removed bool) {
-	if rc.downloaders[downloader.chunkFileId] == downloader && downloader.consumable() {
-		delete(rc.downloaders, downloader.chunkFileId)
-		return true
+// destroyWhenDone destroys a cacher dropped as consumed: at once when its
+// download has ended, otherwise once the download, cancelled when the cacher
+// was dropped, gives up. A read dropping the chunk its stream left must not
+// wait for that download while it holds its new chunk: the download can be in
+// a budget eviction of the new chunk, waiting for that very read to finish.
+func (s *SingleChunkCacher) destroyWhenDone() {
+	select {
+	case <-s.done:
+		s.destroy()
+	default:
+		go s.destroy()
 	}
-	return false
+}
+
+// removeConsumedLocked also cancels a running download, as no reader can attach to it any more,
+// including one destroy already dropped from the map.
+func (rc *ReaderCache) removeConsumedLocked(downloader *SingleChunkCacher) (removed bool) {
+	if !downloader.consumable() {
+		return false
+	}
+	downloader.cancel()
+	if rc.downloaders[downloader.chunkFileId] != downloader {
+		return false
+	}
+	delete(rc.downloaders, downloader.chunkFileId)
+	return true
 }
 
 func (rc *ReaderCache) destroy() {
@@ -405,13 +443,24 @@ func (rc *ReaderCache) destroy() {
 	downloaders := rc.downloaders
 	rc.downloaders = make(map[string]*SingleChunkCacher)
 	rc.Unlock()
+	// out of the map no stream can come back to a download, so it is cancelled
+	// now or once its last reader or stream leaves
+	for _, downloader := range downloaders {
+		atomic.StoreInt32(&downloader.left, 1)
+		if downloader.consumable() {
+			downloader.cancel()
+		}
+	}
 	for _, downloader := range downloaders {
 		downloader.destroy()
 	}
 }
 
 func newSingleChunkCacher(parent *ReaderCache, fileId string, cipherKey []byte, isGzipped bool, chunkSize int, shouldCache bool) *SingleChunkCacher {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &SingleChunkCacher{
+		ctx:            ctx,
+		cancel:         cancel,
 		parent:         parent,
 		chunkFileId:    fileId,
 		cipherKey:      cipherKey,
@@ -428,10 +477,17 @@ func newSingleChunkCacher(parent *ReaderCache, fileId string, cipherKey []byte, 
 // downloaders map, so a removal can never observe the fetch as absent.
 func (s *SingleChunkCacher) startCaching() {
 	defer func() {
+		s.cancel()
 		close(s.done)
 		s.wg.Done()
 		if s.hasCompletedError() {
 			s.parent.remove(s)
+			// remove() does nothing for a download no longer in the map:
+			// whoever took it out destroys it, possibly a ReaderCache.destroy()
+			// that waits for a download needing this very budget. A failed
+			// download holds no buffer, so give its reservation back now;
+			// release is idempotent.
+			s.parent.budget.release(s)
 		} else {
 			s.parent.budget.complete(s)
 		}
@@ -443,13 +499,7 @@ func (s *SingleChunkCacher) startCaching() {
 		return
 	}
 
-	// Intentionally use context.Background(), not a request-specific context.
-	// The downloaded chunk is a shared resource: multiple concurrent readers may
-	// wait on this same download via s.done. A request-scoped context that got
-	// cancelled would abort the download and error every other waiting reader.
-	// The download always runs to completion once started; readers that cancel
-	// individually drop out via readChunkAt's select on ctx.Done().
-	urlStrings, err := s.parent.lookupFileIdFn(context.Background(), s.chunkFileId)
+	urlStrings, err := s.lookupFileId(s.ctx, s.chunkFileId)
 	if err != nil {
 		s.setError(fmt.Errorf("operation LookupFileId %s failed, err: %v", s.chunkFileId, err))
 		return
@@ -459,9 +509,16 @@ func (s *SingleChunkCacher) startCaching() {
 		return
 	}
 
-	data, fetchErr := s.fetchChunkData(context.Background(), urlStrings)
+	// not a request's context: other readers may wait on this download via s.done
+	// and it is cancelled only when removeConsumedLocked drops the cacher
+	data, fetchErr := s.fetchChunkData(s.ctx, urlStrings)
 	if fetchErr != nil {
-		data, fetchErr = s.retryFetchAfterCacheInvalidation(context.Background(), urlStrings, fetchErr)
+		data, fetchErr = s.retryFetchAfterCacheInvalidation(s.ctx, urlStrings, fetchErr)
+	}
+	// a cancelled fetch can return a partly filled buffer without an error
+	if fetchErr == nil && s.ctx.Err() != nil {
+		mem.Free(data)
+		data, fetchErr = nil, s.ctx.Err()
 	}
 
 	// Now acquire lock to update state
@@ -498,7 +555,11 @@ func (s *SingleChunkCacher) fetchChunkData(ctx context.Context, urlStrings []str
 	// Allocate buffer and download without holding the lock.
 	// This allows multiple downloads to proceed in parallel.
 	data := mem.Allocate(s.chunkSize)
-	_, fetchErr := s.parent.fetchChunkDataFn(ctx, data, urlStrings, s.cipherKey, s.isGzipped, true, 0, s.chunkFileId, refreshUrls(ctx, s.parent.cacheInvalidator, s.parent.lookupFileIdFn, s.chunkFileId))
+	if s.parent.budget != nil {
+		// the buffers of hedged requests count against the budget too
+		ctx = util_http.WithScratchBudget(ctx, s.parent.budget)
+	}
+	_, fetchErr := s.parent.fetchChunkDataFn(ctx, data, urlStrings, s.cipherKey, s.isGzipped, true, 0, s.chunkFileId, refreshUrls(ctx, s.parent.cacheInvalidator, s.lookupFileId, s.chunkFileId))
 	if fetchErr != nil {
 		mem.Free(data)
 		return nil, fetchErr
@@ -508,7 +569,7 @@ func (s *SingleChunkCacher) fetchChunkData(ctx context.Context, urlStrings []str
 
 func (s *SingleChunkCacher) retryFetchAfterCacheInvalidation(ctx context.Context, oldUrlStrings []string, originalErr error) ([]byte, error) {
 	var data []byte
-	err := retryFetchWithFreshLocations(ctx, s.parent.cacheInvalidator, s.parent.lookupFileIdFn, s.chunkFileId, oldUrlStrings, originalErr, func(newUrls []string) error {
+	err := retryFetchWithFreshLocations(ctx, s.parent.cacheInvalidator, s.lookupFileId, s.chunkFileId, oldUrlStrings, originalErr, func(newUrls []string) error {
 		var fetchErr error
 		data, fetchErr = s.fetchChunkData(ctx, newUrls)
 		return fetchErr
@@ -517,6 +578,12 @@ func (s *SingleChunkCacher) retryFetchAfterCacheInvalidation(ctx context.Context
 		return nil, err
 	}
 	return data, nil
+}
+
+// lookupFileId ignores the download's context: FilerClient coalesces concurrent
+// lookups of a volume, so a cancelled download must not fail other readers' lookups.
+func (s *SingleChunkCacher) lookupFileId(_ context.Context, fileId string) ([]string, error) {
+	return s.parent.lookupFileIdFn(context.Background(), fileId)
 }
 
 func (s *SingleChunkCacher) destroy() {
@@ -533,8 +600,8 @@ func (s *SingleChunkCacher) destroy() {
 
 // readChunkAt reads data from the cached chunk.
 // It waits for the download to complete if it's still in progress.
-// The ctx parameter allows the reader to cancel its wait (but the download continues
-// for other readers - see comment in startCaching about shared resource semantics).
+// The ctx parameter allows the reader to cancel its wait; the download continues
+// for the other readers and streams that still wait on it.
 // The caller must s.wg.Add(1) under the ReaderCache lock before calling; this only releases it.
 func (s *SingleChunkCacher) readChunkAt(ctx context.Context, buf []byte, offset int64) (n int, err error) {
 	defer func() {

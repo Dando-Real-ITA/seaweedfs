@@ -115,6 +115,29 @@ func TestPutBucketRequestPaymentBucketOwner(t *testing.T) {
 	}
 }
 
+func TestGetBucketRequestPayment(t *testing.T) {
+	s3a := newMiscTestServer(t, "b")
+	s3a.bucketConfigCache.SetNegativeCache("missing")
+
+	rec := httptest.NewRecorder()
+	s3a.GetBucketRequestPaymentHandler(rec, newBucketRequest(http.MethodGet, "b", "requestPayment=", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if !strings.Contains(rec.Body.String(), "<Payer>BucketOwner</Payer>") {
+		t.Fatalf("missing BucketOwner payer: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s3a.GetBucketRequestPaymentHandler(rec, newBucketRequest(http.MethodGet, "missing", "requestPayment=", ""))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing bucket status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if !strings.Contains(rec.Body.String(), "NoSuchBucket") {
+		t.Fatalf("body = %s, want NoSuchBucket", rec.Body.String())
+	}
+}
+
 func TestPutBucketRequestPaymentRequesterRejected(t *testing.T) {
 	s3a := newMiscTestServer(t, "b")
 	body := `<RequestPaymentConfiguration><Payer>Requester</Payer></RequestPaymentConfiguration>`
@@ -181,6 +204,55 @@ func TestGetBucketOwnershipControlsDefaultsToBucketOwnerEnforced(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "<ObjectOwnership>"+s3_constants.OwnershipBucketOwnerEnforced+"</ObjectOwnership>") {
 		t.Fatalf("body missing default ownership: %s", rec.Body.String())
+	}
+}
+
+func TestGetBucketOwnershipControlsAfterDelete(t *testing.T) {
+	ownerID := AccountAdmin.Id
+	s3a := newMiscTestServer(t, "b")
+	s3a.bucketConfigCache.Set("b", &BucketConfig{Name: "b", OwnershipDeleted: true})
+	s3a.bucketRegistry = NewBucketRegistry(nil)
+	s3a.bucketRegistry.setMetadataCache(&BucketMetaData{
+		Name:  "b",
+		Owner: &s3.Owner{ID: &ownerID},
+	})
+	req := newBucketRequest(http.MethodGet, "b", "ownershipControls=", "")
+	req.Header.Set(s3_constants.AmzAccountId, AccountAdmin.Id)
+	req = req.WithContext(s3_constants.SetIdentityInContext(req.Context(), &Identity{
+		Name:    "admin",
+		Account: &AccountAdmin,
+		Actions: []Action{s3_constants.ACTION_ADMIN},
+	}))
+	rec := httptest.NewRecorder()
+
+	s3a.GetBucketOwnershipControls(rec, req)
+
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "OwnershipControlsNotFoundError") {
+		t.Fatalf("status = %d, body=%s, want 404 OwnershipControlsNotFoundError", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBucketConfigOwnershipDeletedRoundTrip(t *testing.T) {
+	s3a := &S3ApiServer{}
+	ext := map[string][]byte{s3_constants.ExtOwnershipKey: []byte(s3_constants.OwnershipObjectWriter)}
+
+	deleted := &BucketConfig{OwnershipDeleted: true}
+	if err := applyBucketConfigToExtended(deleted, ext); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ext[s3_constants.ExtOwnershipKey]; ok {
+		t.Fatalf("ownership still stored after delete: %v", ext)
+	}
+	if got := s3a.newBucketConfigFromEntry("b", &filer_pb.Entry{Extended: ext}); !got.OwnershipDeleted || got.Ownership != "" {
+		t.Fatalf("reloaded config = %+v, want deleted ownership", got)
+	}
+
+	put := &BucketConfig{Ownership: s3_constants.OwnershipBucketOwnerEnforced, OwnershipDeleted: true}
+	if err := applyBucketConfigToExtended(put, ext); err != nil {
+		t.Fatal(err)
+	}
+	if got := s3a.newBucketConfigFromEntry("b", &filer_pb.Entry{Extended: ext}); got.OwnershipDeleted || got.Ownership != s3_constants.OwnershipBucketOwnerEnforced {
+		t.Fatalf("reloaded config = %+v, want stored BucketOwnerEnforced", got)
 	}
 }
 
@@ -636,5 +708,55 @@ func TestPutBucketAclKeepsOwner(t *testing.T) {
 		var grants []*s3.Grant
 		require.NoError(t, json.Unmarshal(filer.txnSeen[0].Mutations[0].SetExtended[s3_constants.ExtAmzAclKey], &grants))
 		require.Equal(t, "team-a", aws.StringValue(grants[0].Grantee.ID))
+	}
+}
+
+func TestPutBucketAccelerateConfiguration(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"suspended", `<AccelerateConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Suspended</Status></AccelerateConfiguration>`, http.StatusOK},
+		{"enabled", `<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>`, http.StatusNotImplemented},
+		{"invalid status", `<AccelerateConfiguration><Status>On</Status></AccelerateConfiguration>`, http.StatusBadRequest},
+		{"malformed", `<AccelerateConfiguration>`, http.StatusBadRequest},
+		{"wrong root", `<NotAConfiguration><Status>Suspended</Status></NotAConfiguration>`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s3a := newMiscTestServer(t, "b")
+			rec := httptest.NewRecorder()
+			s3a.PutBucketAccelerateConfigurationHandler(rec, newBucketRequest(http.MethodPut, "b", "accelerate=", tc.body))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPutBucketNotificationConfiguration(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"empty", `<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`, http.StatusOK},
+		{"topic", `<NotificationConfiguration><TopicConfiguration><Topic>arn:aws:sns:us-east-1:1:t</Topic><Event>s3:ObjectCreated:*</Event></TopicConfiguration></NotificationConfiguration>`, http.StatusNotImplemented},
+		{"queue", `<NotificationConfiguration><QueueConfiguration><Queue>arn:aws:sqs:us-east-1:1:q</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>`, http.StatusNotImplemented},
+		{"eventbridge", `<NotificationConfiguration><EventBridgeConfiguration/></NotificationConfiguration>`, http.StatusNotImplemented},
+		{"malformed", `<NotificationConfiguration>`, http.StatusBadRequest},
+		{"unknown child", `<NotificationConfiguration><LambdaFunctionConfiguration/></NotificationConfiguration>`, http.StatusBadRequest},
+		{"wrong root", `<NotAConfiguration/>`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s3a := newMiscTestServer(t, "b")
+			rec := httptest.NewRecorder()
+			s3a.PutBucketNotificationConfigurationHandler(rec, newBucketRequest(http.MethodPut, "b", "notification=", tc.body))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
 	}
 }

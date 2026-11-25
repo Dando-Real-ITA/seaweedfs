@@ -1,8 +1,14 @@
 package filer
 
 import (
+	"fmt"
+	"net"
+	"strconv"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -33,6 +39,57 @@ func TestOnPeerUpdateRepeatedAdd(t *testing.T) {
 	ma.OnPeerUpdate(&master_pb.ClusterNodeUpdate{Address: string(peer)}, time.Now())
 	if _, found := ma.peerChans[peer]; found {
 		t.Fatal("expecting the subscription to be removed")
+	}
+}
+
+// A peer the subscription loop cannot connect to starts the unreachable
+// clock, so a peer that died without a removal notice stops being followed
+// as if it were alive.
+func TestPeerSubscribeLoopNotesUnreachablePeer(t *testing.T) {
+	// A listener that accepts then immediately closes every connection makes
+	// the gRPC dial fail fast and portably: a closed port behaves differently
+	// per OS (Linux sends RST at once, some stacks drop the SYN and make the
+	// dial wait out grpc's 20s connect timeout), which this test must not rely
+	// on. The filer HTTP address is the gRPC port minus 10000.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	_, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcPort, err := strconv.Atoi(portStr)
+	if err != nil || grpcPort <= 10000 {
+		t.Fatalf("unexpected listener port %q", portStr)
+	}
+	peer := pb.ServerAddress(fmt.Sprintf("127.0.0.1:%d", grpcPort-10000))
+	ma := NewMetaAggregator(nil, pb.ServerAddress("127.0.0.1:2"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	defer ma.Shutdown()
+
+	ma.OnPeerUpdate(&master_pb.ClusterNodeUpdate{Address: string(peer), IsAdd: true}, time.Now())
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ma.peerChansLock.Lock()
+		_, noted := ma.peerUnreachableSinceNs[peer]
+		ma.peerChansLock.Unlock()
+		if noted {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a refused connection never started the unreachable clock")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -99,6 +156,9 @@ func TestPeerResumeStartFromSurvivesRemoval(t *testing.T) {
 	if got := nextSubscribeStart(); got != firstStart.UnixNano() {
 		t.Fatalf("expecting first subscribe at %d, got %d", firstStart.UnixNano(), got)
 	}
+	if got := ma.NewPeerStartTsNs(); got != firstStart.UnixNano() {
+		t.Fatalf("expecting a first-seen peer to mark its start %d, got %d", firstStart.UnixNano(), got)
+	}
 
 	deliveredThrough := time.Now().Add(-time.Hour).UnixNano()
 	ma.advancePeerWatermark(peer, deliveredThrough)
@@ -117,6 +177,9 @@ func TestPeerResumeStartFromSurvivesRemoval(t *testing.T) {
 	if got := nextSubscribeStart(); got != deliveredThrough {
 		t.Fatalf("expecting re-added peer to resume at %d, got %d", deliveredThrough, got)
 	}
+	if got := ma.NewPeerStartTsNs(); got != firstStart.UnixNano() {
+		t.Fatalf("expecting a resumed peer to leave the new-peer start at %d, got %d", firstStart.UnixNano(), got)
+	}
 
 	// A peer gone past the retention is forgotten and starts afresh.
 	ma.OnPeerUpdate(&master_pb.ClusterNodeUpdate{Address: string(peer)}, time.Now())
@@ -132,6 +195,9 @@ func TestPeerResumeStartFromSurvivesRemoval(t *testing.T) {
 	ma.OnPeerUpdate(add, freshStart)
 	if got := nextSubscribeStart(); got != freshStart.UnixNano() {
 		t.Fatalf("expecting forgotten peer to start at %d, got %d", freshStart.UnixNano(), got)
+	}
+	if got := ma.NewPeerStartTsNs(); got != freshStart.UnixNano() {
+		t.Fatalf("expecting a forgotten peer to mark its start %d, got %d", freshStart.UnixNano(), got)
 	}
 
 	// A first-seen peer, or a caller start already behind the recorded

@@ -84,9 +84,9 @@ func TestRunShard_WalkerThrottle(t *testing.T) {
 			calls := 0
 			cfg := Config{
 				Persister: p,
-				Walker: func(_ context.Context, _ *engine.Snapshot, _ []int) error {
+				Walker: func(_ context.Context, _ *engine.Snapshot, _ []int) (time.Time, error) {
 					calls++
-					return nil
+					return time.Time{}, nil
 				},
 				RetentionWindow: -1, // negative sentinel: falls back to maxTTL — leaves walkView empty
 				WalkerInterval:  tc.interval,
@@ -136,13 +136,16 @@ func TestRunShard_WalkerThrottle(t *testing.T) {
 			runNow2 := runNow.Add(tc.secondPassAfter)
 			closedEvents2 := make(chan *readerEventAlias)
 			close(closedEvents2)
+			cfg.Stats = &RunStats{}
 			require.NoError(t, runShard(context.Background(), cfg, snap, runNow2, 0, closedEvents2, nil))
 			afterPass2, _, _ := p.Load(context.Background(), 0)
 			assert.Equal(t, tc.wantTotalCalls, calls, "walker calls after 2 passes")
 			if tc.wantSecondAdvNs {
 				assert.Equal(t, runNow2.UnixNano(), afterPass2.LastWalkedNs, "throttle allowed the second walk")
+				assert.Zero(t, cfg.Stats.Summary().WalksDeferred)
 			} else {
 				assert.Equal(t, runNow.UnixNano(), afterPass2.LastWalkedNs, "throttle suppressed the second walk; anchor unchanged")
+				assert.Equal(t, 1, cfg.Stats.Summary().WalksDeferred, "a throttled walk leaves its rules unevaluated")
 			}
 		})
 	}
@@ -221,9 +224,9 @@ func TestRunShard_ColdStartDoesNotDoubleWalk(t *testing.T) {
 	calls := 0
 	cfg := Config{
 		Persister: p,
-		Walker: func(_ context.Context, _ *engine.Snapshot, _ []int) error {
+		Walker: func(_ context.Context, _ *engine.Snapshot, _ []int) (time.Time, error) {
 			calls++
-			return nil
+			return time.Time{}, nil
 		},
 		WalkerInterval: 0,
 	}
@@ -256,9 +259,9 @@ func TestRunShard_RecoveryWalkerSetsLastWalkedAnchor(t *testing.T) {
 	calls := 0
 	cfg := Config{
 		Persister: p,
-		Walker: func(_ context.Context, _ *engine.Snapshot, _ []int) error {
+		Walker: func(_ context.Context, _ *engine.Snapshot, _ []int) (time.Time, error) {
 			calls++
-			return nil
+			return time.Time{}, nil
 		},
 		WalkerInterval: time.Hour,
 	}

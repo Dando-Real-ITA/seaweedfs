@@ -8,6 +8,8 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func newAssignTestServer(fc *filer.FilerConf, diskType string) *FilerServer {
@@ -92,5 +94,60 @@ func TestAssignVolumeReadOnlyReturnsErrorCode(t *testing.T) {
 	}
 	if err := filer_pb.AssignVolumeResponseError(resp); !errors.Is(err, ErrReadOnly) {
 		t.Fatalf("AssignVolumeResponseError = %v, want ErrReadOnly", err)
+	}
+}
+
+// A create on a read-only path must come back as a coded response, like
+// AssignVolume. A gRPC error reaches clients as codes.Unknown, and they retry
+// that like a filer outage.
+func TestCreateEntryReadOnlyReturnsErrorCode(t *testing.T) {
+	fc := filer.NewFilerConf()
+	if err := fc.SetLocationConf(&filer_pb.FilerConf_PathConf{
+		LocationPrefix: "/buckets/overquota",
+		ReadOnly:       true,
+	}); err != nil {
+		t.Fatalf("set location conf: %v", err)
+	}
+
+	fs := newAssignTestServer(fc, "")
+
+	resp, err := fs.CreateEntry(context.Background(), &filer_pb.CreateEntryRequest{
+		Directory: "/buckets/overquota/dir",
+		Entry: &filer_pb.Entry{
+			Name:       "x",
+			Attributes: &filer_pb.FuseAttributes{FileMode: 0644},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateEntry err = %v, want a response", err)
+	}
+	if resp.ErrorCode != filer_pb.FilerError_READ_ONLY {
+		t.Fatalf("CreateEntry error_code = %v, want %v", resp.ErrorCode, filer_pb.FilerError_READ_ONLY)
+	}
+	if want := "read only: /buckets/overquota"; !strings.HasPrefix(resp.Error, want) {
+		t.Fatalf("CreateEntry error = %q, want prefix %q", resp.Error, want)
+	}
+}
+
+func TestResolveAssignStorageOptionKeepsScopedCallerInPathCollection(t *testing.T) {
+	fs := newAssignTestServer(filer.NewFilerConf(), "hdd")
+	scoped := withScopeKeepOnly(context.Background())
+	path := "/buckets/zot/file.bin"
+
+	for _, collection := range []string{"", "zot"} {
+		so, err := fs.resolveAssignStorageOption(scoped, &filer_pb.AssignVolumeRequest{Path: path, Collection: collection})
+		if err != nil || so.Collection != "zot" {
+			t.Fatalf("scoped assign with collection %q: so=%+v err=%v, want collection zot", collection, so, err)
+		}
+	}
+	if _, err := fs.resolveAssignStorageOption(scoped, &filer_pb.AssignVolumeRequest{Path: path, Collection: "other"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("scoped assign into another collection: %v, want PermissionDenied", err)
+	}
+	if resp, err := fs.AssignVolume(scoped, &filer_pb.AssignVolumeRequest{Path: path, Collection: "other", Count: 1}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("scoped AssignVolume into another collection: resp=%v err=%v, want PermissionDenied", resp, err)
+	}
+	so, err := fs.resolveAssignStorageOption(context.Background(), &filer_pb.AssignVolumeRequest{Path: path, Collection: "other"})
+	if err != nil || so.Collection != "other" {
+		t.Fatalf("unscoped assign: so=%+v err=%v, want collection other", so, err)
 	}
 }

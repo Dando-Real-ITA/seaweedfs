@@ -2,9 +2,11 @@ package needle
 
 import (
 	"bytes"
+	"crypto/fips140"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"mime"
 	"net/http"
@@ -81,6 +83,8 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 
 	pu.OriginalDataSize = len(pu.Data)
 	pu.UncompressedData = pu.Data
+	expectedCrc32c := r.Header.Get(ContentCrc32cHeader)
+	var streamedCrc32c *CRC
 	// println("received data", len(pu.Data), "isGzipped", pu.IsGzipped, "mime", pu.MimeType, "name", pu.FileName)
 	if pu.IsGzipped {
 		// MD5 check needs the uncompressed bytes; otherwise just count
@@ -91,8 +95,12 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 				pu.OriginalDataSize = len(unzipped)
 				pu.UncompressedData = unzipped
 			}
-		} else if n, err := util.GunzipStream(io.Discard, bytes.NewReader(pu.Data)); err == nil {
-			pu.OriginalDataSize = int(n)
+		} else {
+			n, crc, err := gunzipCount(pu.Data, expectedCrc32c != "")
+			if err == nil {
+				pu.OriginalDataSize = int(n)
+				streamedCrc32c = crc
+			}
 		}
 	} else if r.FormValue("type") != "replicate" {
 		// replica writes must keep the source needle's compression state, not re-derive it
@@ -122,7 +130,10 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 	if expectedChecksum == "" {
 		expectedChecksum = pu.ContentMd5
 	}
-	if expectedChecksum != "" {
+	if expectedChecksum != "" && fips140.Enforced() {
+		// fips140=only refuses MD5: keep the client's digest unchecked.
+		pu.ContentMd5 = expectedChecksum
+	} else if expectedChecksum != "" {
 		h := md5.New()
 		h.Write(pu.UncompressedData)
 		pu.ContentMd5 = base64.StdEncoding.EncodeToString(h.Sum(nil))
@@ -132,6 +143,32 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 		}
 	}
 
+	if expectedCrc32c != "" {
+		var actual CRC
+		if streamedCrc32c != nil {
+			actual = *streamedCrc32c
+		} else {
+			actual = NewCRC(pu.UncompressedData)
+		}
+		e = checkContentCrc32c(expectedCrc32c, actual, pu.OriginalDataSize)
+	}
+
+	return
+}
+
+// gunzipCount counts the uncompressed bytes of a gzipped upload without
+// holding them, and checksums them on the way when withCrc is set, so a
+// ContentCrc32cHeader check costs no allocation (see #6541).
+func gunzipCount(data []byte, withCrc bool) (n int64, crc *CRC, err error) {
+	if !withCrc {
+		n, err = util.GunzipStream(io.Discard, bytes.NewReader(data))
+		return
+	}
+	h := crc32.New(table)
+	if n, err = util.GunzipStream(h, bytes.NewReader(data)); err == nil {
+		sum := CRC(h.Sum32())
+		crc = &sum
+	}
 	return
 }
 

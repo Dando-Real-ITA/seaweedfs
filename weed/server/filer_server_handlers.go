@@ -3,8 +3,11 @@ package weed_server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -15,6 +18,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
@@ -65,7 +69,7 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 
 	isReadHttpCall := r.Method == http.MethodGet || r.Method == http.MethodHead
 	if !fs.maybeCheckJwtAuthorization(r, !isReadHttpCall) {
-		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		fs.writeUnauthorized(w, r)
 		return
 	}
 
@@ -96,38 +100,19 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost, http.MethodPut:
 		// wait until in flight data is less than the limit
 		contentLength := getContentLength(r)
-		fs.inFlightDataLimitCond.L.Lock()
-		inFlightDataSize := atomic.LoadInt64(&fs.inFlightDataSize)
-		inFlightUploads := atomic.LoadInt64(&fs.inFlightUploads)
-
-		// Wait if either data size limit or file count limit is exceeded
-		for (fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit) || (fs.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= fs.option.ConcurrentFileUploadLimit) {
-			if fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit {
-				glog.V(4).Infof("wait because inflight data %d > %d", inFlightDataSize, fs.option.ConcurrentUploadLimit)
-			}
-			if fs.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= fs.option.ConcurrentFileUploadLimit {
-				glog.V(4).Infof("wait because inflight uploads %d >= %d", inFlightUploads, fs.option.ConcurrentFileUploadLimit)
-			}
-			fs.inFlightDataLimitCond.Wait()
-			inFlightDataSize = atomic.LoadInt64(&fs.inFlightDataSize)
-			inFlightUploads = atomic.LoadInt64(&fs.inFlightUploads)
+		if !fs.waitForUploadSlot(w, r, contentLength) {
+			return
 		}
-		fs.inFlightDataLimitCond.L.Unlock()
-
-		// Increment counters
-		newUploads := atomic.AddInt64(&fs.inFlightUploads, 1)
-		newSize := atomic.AddInt64(&fs.inFlightDataSize, contentLength)
-		// Update metrics
-		stats.FilerInFlightUploadCountGauge.Set(float64(newUploads))
-		stats.FilerInFlightUploadBytesGauge.Set(float64(newSize))
 		defer func() {
+			fs.inFlightDataLimitCond.L.Lock()
+			defer fs.inFlightDataLimitCond.L.Unlock()
 			// Decrement counters
 			newUploads := atomic.AddInt64(&fs.inFlightUploads, -1)
 			newSize := atomic.AddInt64(&fs.inFlightDataSize, -contentLength)
 			// Update metrics
 			stats.FilerInFlightUploadCountGauge.Set(float64(newUploads))
 			stats.FilerInFlightUploadBytesGauge.Set(float64(newSize))
-			fs.inFlightDataLimitCond.Signal()
+			fs.inFlightDataLimitCond.Broadcast()
 		}()
 
 		if r.Method == http.MethodPut {
@@ -143,6 +128,50 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		requestMethod = "INVALID"
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (fs *FilerServer) waitForUploadSlot(w http.ResponseWriter, r *http.Request, contentLength int64) bool {
+	fs.inFlightDataLimitCond.L.Lock()
+	err := util.WaitUntil(r.Context(), fs.inFlightDataLimitCond, fs.option.InflightUploadDataTimeout, func() bool {
+		inFlightDataSize := atomic.LoadInt64(&fs.inFlightDataSize)
+		if fs.option.ConcurrentUploadLimit != 0 && inFlightDataSize > fs.option.ConcurrentUploadLimit {
+			glog.V(4).Infof("wait because inflight data %d > %d", inFlightDataSize, fs.option.ConcurrentUploadLimit)
+			return false
+		}
+		inFlightUploads := atomic.LoadInt64(&fs.inFlightUploads)
+		if fs.option.ConcurrentFileUploadLimit != 0 && inFlightUploads >= fs.option.ConcurrentFileUploadLimit {
+			glog.V(4).Infof("wait because inflight uploads %d >= %d", inFlightUploads, fs.option.ConcurrentFileUploadLimit)
+			return false
+		}
+		return true
+	})
+	if err == nil {
+		// Increment counters
+		newUploads := atomic.AddInt64(&fs.inFlightUploads, 1)
+		newSize := atomic.AddInt64(&fs.inFlightDataSize, contentLength)
+		// Update metrics
+		stats.FilerInFlightUploadCountGauge.Set(float64(newUploads))
+		stats.FilerInFlightUploadBytesGauge.Set(float64(newSize))
+	}
+	fs.inFlightDataLimitCond.L.Unlock()
+
+	if err == nil {
+		return true
+	}
+	// Closing an HTTP/1 connection stops net/http from reading the unread
+	// body before the reply.
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+	}
+	if r.Context().Err() != nil {
+		glog.V(1).Infof("upload from %s cancelled while waiting for an upload slot: %v", r.RemoteAddr, err)
+		writeJsonError(w, r, util.HttpStatusCancelled, r.Context().Err())
+		return false
+	}
+	err = fmt.Errorf("reject because no upload slot freed within %v", fs.option.InflightUploadDataTimeout)
+	glog.V(1).Infof("too many requests from %s: %v", r.RemoteAddr, err)
+	writeJsonError(w, r, http.StatusTooManyRequests, err)
+	return false
 }
 
 func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Request) {
@@ -186,7 +215,7 @@ func (fs *FilerServer) readonlyFilerHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	if !fs.maybeCheckJwtAuthorization(r, false) {
-		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		fs.writeUnauthorized(w, r)
 		return
 	}
 
@@ -230,19 +259,23 @@ func (fs *FilerServer) checkJwtAuthorization(r *http.Request, isWrite bool, scop
 }
 
 // authenticateFilerJwt verifies the JWT signature and method claims. A nil claims
-// with ok true means authentication is disabled for this access level. Splitting
+// with ok true means authentication is disabled for this access level, or the
+// request passed Basic Auth, which grants every access level. With Basic Auth
+// on, an access level without a signing key is no longer open. Splitting
 // authentication from path authorization lets a handler load an indirect resource
 // (the TUS session target) only after the caller's credential is verified.
 func (fs *FilerServer) authenticateFilerJwt(r *http.Request, isWrite bool) (*security.SeaweedFilerClaims, bool) {
-
-	var signingKey security.SigningKey
-	if isWrite {
-		signingKey = fs.filerGuard.SigningKey()
-	} else {
-		signingKey = fs.filerGuard.ReadSigningKey()
-	}
-	if len(signingKey) == 0 {
+	basicAuth := fs.basicAuth.Load()
+	if basicAuth != nil && basicAuth.Allows(r) && fs.basicAuthOriginAllowed(r) {
 		return nil, true
+	}
+
+	signingKey, previousSigningKey := fs.filerGuard.VerificationKeys(isWrite)
+	if len(signingKey) == 0 {
+		// Reload turns the new credential on before the old one off, so
+		// loading Basic Auth on both sides of the key read never sees both off
+		// while a switch is in flight.
+		return nil, basicAuth == nil && fs.basicAuth.Load() == nil
 	}
 
 	tokenStr := security.GetJwt(r)
@@ -251,7 +284,7 @@ func (fs *FilerServer) authenticateFilerJwt(r *http.Request, isWrite bool) (*sec
 		return nil, false
 	}
 
-	token, err := security.DecodeJwt(signingKey, tokenStr, &security.SeaweedFilerClaims{})
+	token, err := security.DecodeJwt(signingKey, tokenStr, &security.SeaweedFilerClaims{}, previousSigningKey)
 	if err != nil {
 		glog.V(1).Infof("jwt verification error from %s: %v", r.RemoteAddr, err)
 		return nil, false
@@ -288,19 +321,61 @@ func (fs *FilerServer) authenticateFilerJwt(r *http.Request, isWrite bool) (*sec
 	return claims, true
 }
 
+// basicAuthOriginAllowed keeps other websites from riding on Basic credentials
+// a browser cached for the filer: a request with an Origin header must come
+// from the filer's own host or an origin listed in cors.allowed_origins.
+func (fs *FilerServer) basicAuthOriginAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if u, err := url.Parse(origin); err == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+	if fs.option != nil {
+		for _, allowed := range fs.option.AllowedOrigins {
+			if allowed != "*" && origin == allowed {
+				return true
+			}
+		}
+	}
+	glog.V(1).Infof("basic auth refused for origin %q from %s", origin, r.RemoteAddr)
+	return false
+}
+
+// writeUnauthorized answers a request that failed authentication. With Basic
+// Auth on, the challenge makes browsers prompt for the credentials.
+func (fs *FilerServer) writeUnauthorized(w http.ResponseWriter, r *http.Request) {
+	if fs.basicAuth.Load() != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="SeaweedFS Filer", charset="UTF-8"`)
+	}
+	writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+}
+
 // authorizeFilerJwtPaths checks the resource scope after authentication. A
 // prefix-restricted token must name at least one resource path; an empty list
 // fails closed, so a caller that cannot resolve its target never falls open.
 func authorizeFilerJwtPaths(r *http.Request, claims *security.SeaweedFilerClaims, scopedPaths []string) bool {
-	if claims == nil || len(claims.AllowedPrefixes) == 0 {
+	if !claims.IsScoped() {
 		return true
 	}
 	if len(scopedPaths) == 0 {
 		glog.V(1).Infof("jwt resource path missing from %s", r.RemoteAddr)
 		return false
 	}
+	// read_prefixes cover reads only; a write (or the source of a copy/move,
+	// which the write may delete) must be within allowed_prefixes.
+	prefixes := claims.AllowedPrefixes
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		// New read-only grants use the same canonical path contract as gRPC.
+		// In particular, relative "." must not normalize into a root grant.
+		if _, err := scopeGrantsFromClaims(nil, claims.ReadPrefixes); err != nil {
+			return false
+		}
+		prefixes = append(append([]string{}, prefixes...), claims.ReadPrefixes...)
+	}
 	for _, p := range scopedPaths {
-		if !anyComponentPrefixMatches(claims.AllowedPrefixes, p) {
+		if !anyComponentPrefixMatches(prefixes, p) {
 			glog.V(1).Infof("jwt path not allowed from %s: %v", r.RemoteAddr, p)
 			return false
 		}
@@ -364,12 +439,68 @@ func pathHasComponentPrefix(reqPath, prefix string) bool {
 	return strings.HasPrefix(cleanedPath, cleanedPrefix+"/")
 }
 
+// lockRingUnhealthyGracePeriod covers the first ring update after announcing
+// and the master's ring-change batching delay.
+const lockRingUnhealthyGracePeriod = 30 * time.Second
+
+// lockRingHealthy reports false once this filer has been missing from its own
+// lock ring past the grace period: locked writes cannot be routed to it, and
+// a restart re-registers it with the master.
+func (fs *FilerServer) lockRingHealthy() bool {
+	dlm := fs.filer.Dlm
+	if dlm == nil || dlm.LockRing == nil || dlm.LockRing.Ring == nil {
+		return true
+	}
+	if announce := fs.option.AnnounceCh; announce != nil {
+		select {
+		case <-announce:
+		default:
+			return true
+		}
+	}
+	absent := fs.lockRingAbsence(func() bool { return slices.Contains(dlm.LockRing.Ring.GetServers(), dlm.Host) })
+	if absent < lockRingUnhealthyGracePeriod {
+		return true
+	}
+	glog.Warningf("filerHealthz: %s absent from lock ring for %v (ring: %v)",
+		dlm.Host, absent.Round(time.Second), dlm.LockRing.Ring.GetServers())
+	return false
+}
+
+// lockRingAbsence returns how long inRing has reported this filer missing,
+// or 0 while it is in the ring.
+func (fs *FilerServer) lockRingAbsence(inRing func() bool) time.Duration {
+	since := fs.lockRingUnhealthySince.Load()
+	if inRing() {
+		fs.resetLockRingClock()
+		return 0
+	}
+	// A rejoin after the load has stored a new reset value, so the clock
+	// neither starts nor is read across it.
+	if since <= 0 {
+		fs.lockRingUnhealthySince.CompareAndSwap(since, time.Now().UnixNano())
+		return 0
+	}
+	if fs.lockRingUnhealthySince.Load() != since {
+		return 0
+	}
+	return time.Since(time.Unix(0, since))
+}
+
+func (fs *FilerServer) resetLockRingClock() {
+	fs.lockRingUnhealthySince.Store(-fs.lockRingResets.Add(1))
+}
+
 func (fs *FilerServer) filerHealthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Server", "SeaweedFS "+version.Version())
 	if _, err := fs.filer.Store.FindEntry(context.Background(), filer.TopicsDir); err != nil && err != filer_pb.ErrNotFound {
 		glog.Warningf("filerHealthzHandler FindEntry: %+v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
-	} else {
-		w.WriteHeader(http.StatusOK)
+		return
 	}
+	if !fs.lockRingHealthy() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }

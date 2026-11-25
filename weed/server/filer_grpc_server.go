@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -25,6 +26,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // fencedFindEntry reads an entry with an exact log-position fence: the stamp
@@ -78,7 +80,7 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 	includeLastFile := req.InclusiveStartFrom
 	snapshotTsNs := req.SnapshotTsNs
 	if snapshotTsNs == 0 {
-		snapshotTsNs = time.Now().UnixNano()
+		snapshotTsNs = fs.filer.LocalDeliveredThroughTsNs(time.Now().UnixNano())
 	}
 	sentSnapshot := false
 	var listErr error
@@ -86,6 +88,9 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 		var hasEntries bool
 		lastFileName, listErr = fs.filer.StreamListDirectoryEntries(stream.Context(), util.FullPath(req.Directory), lastFileName, includeLastFile, int64(paginationLimit), req.Prefix, "", "", func(entry *filer.Entry) (bool, error) {
 			hasEntries = true
+			if scopeHideListEntry(stream.Context(), req.Directory, entry.Name()) {
+				return true, nil
+			}
 			pbEntry := entry.ToProtoEntry()
 			if req.OmitChunks {
 				// Stamp the size before dropping the only other thing carrying
@@ -213,6 +218,9 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 		// a failed forward must not leave it nil.
 		var ownerResp *filer_pb.CreateEntryResponse
 		handled, forwardErr := fs.forwardToWriteOwner(ctx, entryRouteKey(fullpath), func(owner pb.ServerAddress) error {
+			if scopeKeepOnly(ctx) {
+				return status.Error(codes.PermissionDenied, "filer: scoped CreateEntry cannot be forwarded to the write owner")
+			}
 			glog.V(2).InfofCtx(ctx, "CreateEntry %s: forwarding to owner %s", fullpath, owner)
 			req.IsMoved = true
 			return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
@@ -231,7 +239,7 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 			return ownerResp, nil
 		}
 	} else if req.IsMoved && routed {
-		if err := fs.checkMovedMarker(ctx, req.IsMoved, fs.writeOwner(entryRouteKey(util.NewFullPath(req.Directory, req.Entry.Name)))); err != nil {
+		if err := fs.checkForwardedWrite(ctx, entryRouteKey(util.NewFullPath(req.Directory, req.Entry.Name))); err != nil {
 			return &filer_pb.CreateEntryResponse{}, err
 		}
 	}
@@ -245,6 +253,12 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	newEntry.Chunks = chunks
 	so, err := fs.applyStorageDefaultsToEntry(ctx, newEntry)
 	if err != nil {
+		if errors.Is(err, ErrReadOnly) {
+			// A verdict, reported like AssignVolume does. As a status-less error
+			// it reached clients as codes.Unknown, which they retry like a filer
+			// outage: a mount held every close() of a new file for 7 s.
+			return &filer_pb.CreateEntryResponse{Error: err.Error(), ErrorCode: filer_pb.FilerError_READ_ONLY}, nil
+		}
 		return nil, err
 	}
 
@@ -265,7 +279,7 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	// The fetched entry is then handed to CreateEntry below so it does not look
 	// the same path up again under the lock.
 	var existing *filer.Entry
-	if conditionIsSet(req.Condition) {
+	if conditionIsSet(req.Condition) || scopeKeepOnly(ctx) {
 		current, findErr := fs.filer.FindEntry(ctx, fullpath)
 		if findErr != nil && findErr != filer_pb.ErrNotFound {
 			return &filer_pb.CreateEntryResponse{}, fmt.Errorf("CreateEntry condition check %s: %w", fullpath, findErr)
@@ -273,7 +287,7 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 		if findErr == filer_pb.ErrNotFound {
 			current = nil
 		}
-		if !writeConditionSatisfied(req.Condition, current) {
+		if conditionIsSet(req.Condition) && !writeConditionSatisfied(req.Condition, current) {
 			glog.V(3).InfofCtx(ctx, "CreateEntry %s: precondition failed: %v", fullpath, req.Condition)
 			return &filer_pb.CreateEntryResponse{
 				Error:     "precondition failed",
@@ -282,13 +296,31 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 		}
 		existing = current
 	}
+	if err := fs.checkScopeWorm(ctx, string(fullpath)); err != nil {
+		return &filer_pb.CreateEntryResponse{}, err
+	}
+	if err := checkScopeHardLinkWrite(ctx, existing, req.Entry); err != nil {
+		return &filer_pb.CreateEntryResponse{}, err
+	}
+	if err := checkScopeRetainedData(ctx, string(fullpath), existing, req.Entry, req.GetChunkAuth(), false); err != nil {
+		return &filer_pb.CreateEntryResponse{}, err
+	}
 
+	if req.Fsync {
+		ctx = filer.WithSyncWrite(ctx)
+	}
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
 	createErr := fs.filer.CreateEntry(ctx, newEntry, existing, req.OExcl, req.IsFromOtherCluster, req.Signatures, req.SkipCheckParentDirectory, so.MaxFileNameLength)
 
 	if createErr == nil {
-		fs.filer.DeleteChunksNotRecursive(garbage)
 		resp.MetadataEvent = eventSink.Last()
+		// garbage holds chunks the request's own list covers; when the
+		// create replaced one name of a hard-linked file, the ones the file
+		// still has stay for its other names
+		if replaced := resp.MetadataEvent.GetEventNotification().GetOldEntry(); replaced != nil {
+			garbage = fs.filer.KeepHardLinkedChunks(ctx, filer.FromPbEntry(req.Directory, replaced), newEntry, garbage)
+		}
+		fs.filer.DeleteChunksNotRecursive(garbage)
 	} else {
 		glog.V(3).InfofCtx(ctx, "CreateEntry %s: %v", filepath.Join(req.Directory, req.Entry.Name), createErr)
 		resp.Error = createErr.Error()
@@ -332,10 +364,12 @@ func (fs *FilerServer) ObjectTransaction(ctx context.Context, req *filer_pb.Obje
 	// Route-by-key: if this filer is not the ring owner of route_key, forward the
 	// whole transaction to the owner so its per-path lock is the single
 	// serialization point — even when the caller's ring view was stale. is_moved
-	// bounds this to one hop: a forwarded transaction is applied locally, so two
-	// filers that disagree on the owner during a ring change cannot loop.
-	if req.RouteKey != "" {
-		if err := fs.checkMovedMarker(ctx, req.IsMoved, fs.writeOwner(req.RouteKey)); err != nil {
+	// bounds this to one hop: a forwarded transaction is applied only by the
+	// owner in this filer's ring, and refused with a status the sender retries.
+	if req.RouteKey != "" && req.IsMoved {
+		if err := fs.checkForwardedWrite(ctx, req.RouteKey); isNotWriteOwner(err) {
+			return &filer_pb.ObjectTransactionResponse{}, err
+		} else if err != nil {
 			return &filer_pb.ObjectTransactionResponse{Error: err.Error()}, nil
 		}
 	}
@@ -921,6 +955,9 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	if !req.IsMoved && routed {
 		var ownerResp *filer_pb.UpdateEntryResponse
 		handled, forwardErr := fs.forwardToWriteOwner(ctx, entryRouteKey(util.FullPath(fullpath)), func(owner pb.ServerAddress) error {
+			if scopeKeepOnly(ctx) {
+				return status.Error(codes.PermissionDenied, "filer: scoped UpdateEntry cannot be forwarded to the write owner")
+			}
 			glog.V(2).InfofCtx(ctx, "UpdateEntry %s: forwarding to owner %s", fullpath, owner)
 			req.IsMoved = true
 			return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
@@ -939,15 +976,18 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 			return ownerResp, nil
 		}
 	} else if req.IsMoved && routed {
-		if err := fs.checkMovedMarker(ctx, req.IsMoved, fs.writeOwner(entryRouteKey(util.FullPath(fullpath)))); err != nil {
+		if err := fs.checkForwardedWrite(ctx, entryRouteKey(util.FullPath(fullpath))); err != nil {
 			return &filer_pb.UpdateEntryResponse{}, err
 		}
 	}
 
-	// Serialize concurrent mutations to the same path on this filer so the
-	// read (preconditions, garbage diff) and the write are atomic. Callers
-	// route a key's writes to this owner filer, making this local lock
-	// sufficient.
+	return fs.updateEntry(ctx, req, fullpath, fs.cleanupChunks)
+}
+
+func (fs *FilerServer) updateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest, fullpath string,
+	prepareChunks func(context.Context, string, *filer.Entry, *filer_pb.Entry) (chunks, garbage []*filer_pb.FileChunk, err error),
+) (*filer_pb.UpdateEntryResponse, error) {
+	// Serialize concurrent mutations to the same path on this filer.
 	lockPath := util.FullPath(fullpath)
 	pathLock := fs.entryLockTable.AcquireLock("UpdateEntry", lockPath, util.ExclusiveLock)
 	defer fs.entryLockTable.ReleaseLock(lockPath, pathLock)
@@ -956,53 +996,164 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	// but the acknowledged state still reflects everything at or below this.
 	logTsNs := time.Now().UnixNano()
 
-	entry, err := fs.filer.FindEntry(ctx, lockPath)
-	if err != nil {
-		if errors.Is(err, filer_pb.ErrNotFound) {
-			return &filer_pb.UpdateEntryResponse{}, status.Errorf(codes.NotFound, "not found %s: %v", fullpath, err)
+	transactional := fs.filer.RefusesConflictingCommits(lockPath)
+	var entry *filer.Entry
+	var observed *filer_pb.WriteCondition_Clause
+	var refusal error
+	findEntry := fs.filer.FindEntry
+	read := func(ctx context.Context) error {
+		var err error
+		refusal = nil
+		entry, err = findEntry(ctx, lockPath)
+		// Only the initial lookup may import remote metadata. A rename can
+		// retain the old remote object after removing its filer entry.
+		findEntry = fs.filer.FindEntryWithoutRemoteFetch
+		if err != nil {
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				// A TTL lookup can remove the entry. Commit that removal.
+				refusal = status.Errorf(codes.NotFound, "not found %s: %v", fullpath, err)
+				return nil
+			}
+			return fmt.Errorf("not found %s: %w", fullpath, err)
 		}
-		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("not found %s: %v", fullpath, err)
+		if refusal = validateUpdateEntryPreconditions(entry, req.ExpectedExtended); refusal != nil {
+			return nil
+		}
+		if conditionIsSet(req.Condition) && !writeConditionSatisfied(req.Condition, entry) {
+			glog.V(3).InfofCtx(ctx, "UpdateEntry %s: precondition failed: %v", fullpath, req.Condition)
+			refusal = status.Errorf(codes.FailedPrecondition, "precondition failed: %s", fullpath)
+			return nil
+		}
+		if observed != nil && !clauseSatisfied(observed, entry) {
+			refusal = status.Errorf(codes.FailedPrecondition, "entry changed during update: %s", fullpath)
+		}
+		if transactional && observed == nil {
+			observed = &filer_pb.WriteCondition_Clause{
+				Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+				ExpectedEntry: proto.Clone(entry.ToProtoEntry()).(*filer_pb.Entry),
+			}
+		}
+		return nil
 	}
-	if err := validateUpdateEntryPreconditions(entry, req.ExpectedExtended); err != nil {
+
+	// Finish the lookup (including any expiry removal) before doing volume
+	// I/O. Fetching or uploading manifests can outlast a FoundationDB transaction.
+	if _, err := fs.runEntryTransaction(ctx, lockPath, read); err != nil {
 		return &filer_pb.UpdateEntryResponse{}, err
 	}
-	if conditionIsSet(req.Condition) && !writeConditionSatisfied(req.Condition, entry) {
-		glog.V(3).InfofCtx(ctx, "UpdateEntry %s: precondition failed: %v", fullpath, req.Condition)
-		return &filer_pb.UpdateEntryResponse{}, status.Errorf(codes.FailedPrecondition, "precondition failed: %s", fullpath)
+	if refusal != nil {
+		return &filer_pb.UpdateEntryResponse{}, refusal
+	}
+	if err := fs.checkScopeWorm(ctx, string(lockPath)); err != nil {
+		return &filer_pb.UpdateEntryResponse{}, err
 	}
 
-	chunks, garbage, err2 := fs.cleanupChunks(ctx, fullpath, entry, req.Entry)
-	if err2 != nil {
-		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("UpdateEntry cleanupChunks %s: %v", fullpath, err2)
+	if err := checkScopeHardLinkWrite(ctx, entry, req.Entry); err != nil {
+		return &filer_pb.UpdateEntryResponse{}, err
+	}
+	if err := checkScopeRetainedData(ctx, string(lockPath), entry, req.Entry, req.GetChunkAuth(), false); err != nil {
+		return &filer_pb.UpdateEntryResponse{}, err
 	}
 
-	newEntry := filer.FromPbEntry(req.Directory, req.Entry)
-	newEntry.Chunks = chunks
-
-	// Don't apply TTL to remote entries - they're managed by remote storage
-	if newEntry.Remote != nil {
-		newEntry.TtlSec = 0
+	chunks, garbage, err := prepareChunks(ctx, fullpath, entry, req.Entry)
+	if err != nil {
+		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("UpdateEntry cleanupChunks %s: %w", fullpath, err)
 	}
 
-	if filer.EqualEntry(entry, newEntry) {
-		return &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}, err
+	var newEntry *filer.Entry
+	var stamp int64
+	var unchanged bool
+	uncertain, err := fs.runEntryTransaction(ctx, lockPath, func(ctx context.Context) error {
+		fs.filer.ReleaseEntryCommitTsNs(stamp)
+		stamp = 0
+		if transactional {
+			// A writer may have retired chunks while we prepared or retried.
+			// The prepared update and garbage list are valid only for this snapshot.
+			if err := read(ctx); err != nil || refusal != nil {
+				return err
+			}
+		}
+		if err := fs.checkScopeWorm(ctx, string(lockPath)); err != nil {
+			return err
+		}
+		if err := checkScopeRetainedData(ctx, string(lockPath), entry, req.Entry, req.GetChunkAuth(), false); err != nil {
+			return err
+		}
+		newEntry = filer.FromPbEntry(req.Directory, req.Entry)
+		newEntry.Chunks = chunks
+		// Remote storage manages expiry for remote entries.
+		if newEntry.Remote != nil {
+			newEntry.TtlSec = 0
+		}
+		if unchanged = filer.EqualEntry(entry, newEntry); unchanged {
+			return nil
+		}
+		stamp = fs.filer.StampEntryCommitTsNs(newEntry)
+		return fs.filer.UpdateEntry(ctx, entry, newEntry, req.IsFromOtherCluster)
+	})
+	if err == nil {
+		err = refusal
 	}
+	if err != nil {
+		// A commit with unknown outcome may already reference these manifests.
+		if !uncertain || stamp == 0 {
+			fs.filer.DeleteChunksNotRecursive(filer.DoMinusChunks(chunks, req.Entry.GetChunks()))
+		}
+		fs.filer.ReleaseEntryCommitTsNs(stamp)
+		glog.V(3).InfofCtx(ctx, "UpdateEntry %s: %v", fullpath, err)
+		return &filer_pb.UpdateEntryResponse{}, err
+	}
+
+	resp := &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
+	if unchanged {
+		return resp, nil
+	}
+
+	// an update that is not the same hard link as entry dropped entry's
+	// link; the file's other names still read entry's chunks
+	garbage = fs.filer.KeepHardLinkedChunks(ctx, entry, newEntry, garbage)
+	fs.filer.DeleteChunksNotRecursive(garbage)
 
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
-	resp := &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
-	fs.filer.StampEntryCommitTsNs(newEntry)
-	if err = fs.filer.UpdateEntry(ctx, entry, newEntry, req.IsFromOtherCluster); err == nil {
-		fs.filer.DeleteChunksNotRecursive(garbage)
+	fs.filer.NotifyUpdateEvent(ctx, entry, newEntry, true, req.IsFromOtherCluster, req.Signatures)
+	resp.MetadataEvent = eventSink.Last()
 
-		fs.filer.NotifyUpdateEvent(ctx, entry, newEntry, true, req.IsFromOtherCluster, req.Signatures)
-		resp.MetadataEvent = eventSink.Last()
+	return resp, nil
+}
 
-	} else {
-		fs.filer.ReleaseEntryCommitTsNs(newEntry.CommitTsNs)
-		glog.V(3).InfofCtx(ctx, "UpdateEntry %s: %v", filepath.Join(req.Directory, req.Entry.Name), err)
+// entryUpdateAttempts bounds how often an entry update runs its transaction
+// while the store refuses the commit for a concurrent write to the entry.
+const entryUpdateAttempts = 5
+
+// runEntryTransaction retries known conflicts on capable stores and calls
+// attempt directly elsewhere. On error, uncertain is true if writes from
+// attempt may be visible, so the caller must retain chunks they could reference.
+func (fs *FilerServer) runEntryTransaction(ctx context.Context, path util.FullPath, attempt func(context.Context) error) (uncertain bool, err error) {
+	if !fs.filer.RefusesConflictingCommits(path) {
+		err := attempt(ctx)
+		return err != nil, err
 	}
-
-	return resp, err
+	for n := 1; ; n++ {
+		txCtx, err := fs.filer.BeginTransaction(ctx)
+		if err != nil {
+			return false, err
+		}
+		if err := attempt(txCtx); err != nil {
+			fs.filer.RollbackTransaction(txCtx)
+			return false, err
+		}
+		commitErr := fs.filer.CommitTransaction(txCtx)
+		if commitErr == nil {
+			return false, nil
+		}
+		fs.filer.RollbackTransaction(txCtx)
+		conflict := errors.Is(commitErr, filer.ErrTransactionConflict)
+		if !conflict || n == entryUpdateAttempts {
+			return !conflict, fmt.Errorf("%s commit error: %w", path, commitErr)
+		}
+		glog.V(0).InfofCtx(ctx, "update %s: running it again (%d of %d) after a concurrent write: %v", path, n+1, entryUpdateAttempts, commitErr)
+		time.Sleep(time.Duration(n) * 10 * time.Millisecond)
+	}
 }
 
 func validateUpdateEntryPreconditions(entry *filer.Entry, expectedExtended map[string][]byte) error {
@@ -1061,7 +1212,7 @@ func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, exist
 		) // ignore readonly error for capacity needed to manifestize
 		// A failed fold leaves a flat list, which is still a correct entry --
 		// and the store rejects it by name if it cannot hold one this size.
-		folded, manifestErr := filer.MaybeManifestize(fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, chunks)
+		folded, manifestErr := maybeManifestizeChunks(ctx, fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, chunks)
 		if manifestErr != nil {
 			glog.V(0).InfofCtx(ctx, "MaybeManifestize %s: %v", fullpath, manifestErr)
 		}
@@ -1079,11 +1230,12 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 	fullpath := util.NewFullPath(req.Directory, req.EntryName)
 
 	lockClient := cluster.NewLockClient(fs.grpcDialOption, fs.option.Host)
-	lock := lockClient.NewShortLivedLock(string(fullpath), string(fs.option.Host))
+	lock := lockClient.NewBlockingLongLivedLock(string(fullpath), string(fs.option.Host), 0)
 	if lock == nil {
 		return nil, fmt.Errorf("failed to acquire lock for %s", fullpath)
 	}
-	defer lock.StopShortLivedLock()
+	defer lock.Stop()
+	generation := lock.Generation()
 
 	// The cluster lock serializes appenders across filers; the path lock makes
 	// this read-modify-write atomic against conditional updates and deletes on
@@ -1104,9 +1256,24 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 				Gid:    OS_GID,
 			},
 		}
-	} else {
-		offset = int64(filer.TotalSize(entry.GetChunks()))
+	} else if err != nil {
+		return nil, err
 	}
+	if err := fs.checkScopeWorm(ctx, string(fullpath)); err != nil {
+		return &filer_pb.AppendToEntryResponse{}, err
+	}
+	if err := checkScopeHardLinkWrite(ctx, entry, &filer_pb.Entry{Chunks: req.Chunks, HardLinkId: entry.HardLinkId, HardLinkCounter: entry.HardLinkCounter}); err != nil {
+		return &filer_pb.AppendToEntryResponse{}, err
+	}
+	if err := checkScopeRetainedData(ctx, string(fullpath), entry, &filer_pb.Entry{Chunks: req.Chunks, HardLinkId: entry.HardLinkId, HardLinkCounter: entry.HardLinkCounter}, req.GetChunkAuth(), true); err != nil {
+		return &filer_pb.AppendToEntryResponse{}, err
+	}
+	if scopeKeepOnly(ctx) {
+		if err := scopeCheckAppendState(entry.ToProtoEntry(), req.GetChunks()); err != nil {
+			return &filer_pb.AppendToEntryResponse{}, status.Errorf(codes.PermissionDenied, "filer: scoped append refused: %v", err)
+		}
+	}
+	offset = int64(filer.TotalSize(entry.GetChunks()))
 
 	for _, chunk := range req.Chunks {
 		chunk.Offset = offset
@@ -1119,15 +1286,48 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 		glog.WarningfCtx(ctx, "applyStorageDefaultsToEntry: %v", err)
 		return &filer_pb.AppendToEntryResponse{}, err
 	}
-	entry.Chunks, err = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, entry.GetChunks())
+	appended := entry.GetChunks()
+	entry.Chunks, err = maybeManifestizeChunks(ctx, fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, appended)
 	if err != nil {
 		// the append is still correct with the flat list
 		glog.V(0).InfofCtx(ctx, "MaybeManifestize %s: %v", fullpath, err)
 	}
 
+	// Best effort: a lock lost, or lost and taken again, since the entry was
+	// read means another filer may have appended in between. The store write
+	// is not conditional, so a lapse after this check still goes unnoticed.
+	if !lock.IsLocked() || lock.Generation() != generation {
+		fs.filer.DeleteChunksNotRecursive(filer.DoMinusChunks(entry.GetChunks(), appended))
+		return &filer_pb.AppendToEntryResponse{}, fmt.Errorf("lost distributed lock for %s; retry the request", fullpath)
+	}
+
 	err = fs.filer.CreateEntry(context.Background(), entry, nil, false, false, nil, false, fs.filer.MaxFilenameLength)
 
 	return &filer_pb.AppendToEntryResponse{}, err
+}
+
+func scopeAppendChunkTotalFits(offset int64, chunks []*filer_pb.FileChunk) error {
+	if offset < 0 {
+		return errors.New("stored offset is negative")
+	}
+	end := uint64(offset)
+	for _, chunk := range chunks {
+		if chunk == nil {
+			return errors.New("request contains a nil chunk")
+		}
+		if chunk.Size > uint64(math.MaxInt64)-end {
+			return fmt.Errorf("chunk %s exceeds int64 file range", chunk.GetFileIdString())
+		}
+		end += chunk.Size
+	}
+	return nil
+}
+
+func maybeManifestizeChunks(ctx context.Context, save filer.SaveDataAsChunkFunctionType, deleteChunks func([]*filer_pb.FileChunk), chunks []*filer_pb.FileChunk) ([]*filer_pb.FileChunk, error) {
+	if scopeKeepOnly(ctx) {
+		return chunks, nil
+	}
+	return filer.MaybeManifestize(save, deleteChunks, chunks)
 }
 
 // deleteCutoff merges the conditional-delete guards into one cutoff:
@@ -1155,31 +1355,13 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 	// that the per-path lock below only makes atomic on this filer. Route it
 	// to the entry's ring owner so one filer's lock arbitrates every writer
 	// cluster-wide; is_moved bounds this to one hop.
-	if len(req.ExpectedExtended) > 0 {
-		if !req.IsMoved {
-			var ownerResp *filer_pb.DeleteEntryResponse
-			handled, forwardErr := fs.forwardToWriteOwner(ctx, entryRouteKey(fullpath), func(owner pb.ServerAddress) error {
-				glog.V(2).InfofCtx(ctx, "DeleteEntry %s: forwarding to owner %s", fullpath, owner)
-				req.IsMoved = true
-				return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-					forwarded, e := client.DeleteEntry(ctx, req)
-					if e != nil {
-						return e
-					}
-					ownerResp = forwarded
-					return nil
-				})
-			})
-			if handled {
-				if forwardErr != nil {
-					return &filer_pb.DeleteEntryResponse{}, forwardErr
-				}
-				return ownerResp, nil
-			}
-		} else {
-			if err := fs.checkMovedMarker(ctx, req.IsMoved, fs.writeOwner(entryRouteKey(fullpath))); err != nil {
-				return &filer_pb.DeleteEntryResponse{}, err
-			}
+	if req.IsMoved {
+		if err := fs.checkForwardedWrite(ctx, entryRouteKey(fullpath)); err != nil {
+			return &filer_pb.DeleteEntryResponse{}, err
+		}
+	} else if len(req.ExpectedExtended) > 0 {
+		if ownerResp, handled, forwardErr := fs.forwardDeleteEntry(ctx, req, fullpath); handled {
+			return ownerResp, forwardErr
 		}
 	}
 
@@ -1188,7 +1370,22 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 	// path: the update would pass its precondition and then resurrect fids
 	// that are already on the deletion queue.
 	pathLock := fs.entryLockTable.AcquireLock("DeleteEntry", fullpath, util.ExclusiveLock)
-	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+	unlockPath := sync.OnceFunc(func() { fs.entryLockTable.ReleaseLock(fullpath, pathLock) })
+	defer unlockPath()
+	if err := fs.checkScopeWorm(ctx, string(fullpath)); err != nil {
+		return &filer_pb.DeleteEntryResponse{}, err
+	}
+	if scopeKeepOnly(ctx) && req.IsRecursive {
+		entry, findErr := fs.filer.FindEntry(ctx, fullpath)
+		if findErr != nil && findErr != filer_pb.ErrNotFound {
+			return &filer_pb.DeleteEntryResponse{}, findErr
+		}
+		if findErr == nil && entry.IsDirectory() {
+			if err := fs.checkScopeWormDirectory(ctx, string(fullpath)); err != nil {
+				return &filer_pb.DeleteEntryResponse{}, err
+			}
+		}
+	}
 
 	// Extended-attribute preconditions run here, under the lock the delete
 	// runs under: an attribute write that keeps Mtime can no longer slip
@@ -1208,6 +1405,16 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 	}
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
 	err = fs.filer.DeleteEntryMetaAndData(ctx, fullpath, req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, deleteCutoff(req.IfNotModifiedAfter, req.IfNotModifiedAfterNs))
+	// Exclusive and conditional creates land on the write owner, and a store of
+	// its own reaches this one only through replication: a miss here is not
+	// authoritative until the owner misses too. A scoped delete stays local,
+	// since the owner would apply it without the scope's checks.
+	if err == filer_pb.ErrNotFound && !req.IsMoved && !scopeKeepOnly(ctx) && fs.ownerKeepsOwnStore(entryRouteKey(fullpath)) {
+		unlockPath()
+		if ownerResp, handled, forwardErr := fs.forwardDeleteEntry(ctx, req, fullpath); handled {
+			return ownerResp, forwardErr
+		}
+	}
 	resp = &filer_pb.DeleteEntryResponse{}
 	if err != nil && err != filer_pb.ErrNotFound {
 		resp.Error = err.Error()
@@ -1218,8 +1425,14 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 }
 
 func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVolumeRequest) (resp *filer_pb.AssignVolumeResponse, err error) {
+	if err := fs.checkScopeWorm(ctx, req.GetPath()); err != nil {
+		return nil, err
+	}
 
 	so, err := fs.resolveAssignStorageOption(ctx, req)
+	if status.Code(err) == codes.PermissionDenied {
+		return nil, err
+	}
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "AssignVolume: %v", err)
 		resp = &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume: %v", err)}
@@ -1272,9 +1485,17 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 }
 
 func (fs *FilerServer) resolveAssignStorageOption(ctx context.Context, req *filer_pb.AssignVolumeRequest) (*operation.StorageOption, error) {
-	so, err := fs.detectStorageOption(ctx, req.Path, req.Collection, req.Replication, req.TtlSec, req.DiskType, req.DataCenter, req.Rack, req.DataNode)
+	// A scoped caller writes into the collection of its path, never another's.
+	collection := req.Collection
+	if scopeKeepOnly(ctx) {
+		collection = ""
+	}
+	so, err := fs.detectStorageOption(ctx, req.Path, collection, req.Replication, req.TtlSec, req.DiskType, req.DataCenter, req.Rack, req.DataNode)
 	if err != nil {
 		return nil, err
+	}
+	if collection != req.Collection && req.Collection != so.Collection {
+		return nil, status.Errorf(codes.PermissionDenied, "filer: scoped assign: collection %q is not %q of %s", req.Collection, so.Collection, req.Path)
 	}
 
 	// Mirror the HTTP write path: only apply the filer's default disk when the

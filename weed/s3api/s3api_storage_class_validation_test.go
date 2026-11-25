@@ -51,7 +51,7 @@ func TestPutToFilerStorageClass(t *testing.T) {
 			}
 			filePath, object, dest := "/buckets/b/o", "o", ""
 			if tt.part {
-				r = withMultipartPart(r)
+				r = withMultipartPart(r, s3a.uploadFiler("b", "o"))
 				filePath, object, dest = "/buckets/b/.uploads/u/0001.part", "", "/buckets/b/o"
 			}
 			_, code, _ := s3a.putToFiler(r, filePath, strings.NewReader("hello world"), "b", object, 1, 0, nil, false, dest)
@@ -228,6 +228,23 @@ func TestPutObjectDirectoryMarkerStoresHeaders(t *testing.T) {
 	var tagging Tagging
 	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &tagging))
 	require.ElementsMatch(t, []Tag{{Key: "k1", Value: "v1"}, {Key: "k2", Value: "v2"}}, tagging.TagSet.Tag)
+}
+
+func TestPutObjectDirectoryMarkerChecksContentMd5(t *testing.T) {
+	s3a, filer, _ := newHeaderTestServer(t, "")
+	req, probe := newHeaderTestRequest("/b/dir/", "dir/", "marker", "Content-Md5", getMD5HashBase64([]byte("other")))
+
+	s3a.PutObjectHandler(probe, req)
+
+	require.Equal(t, http.StatusBadRequest, probe.Code, probe.Body.String())
+	require.Contains(t, probe.Body.String(), "BadDigest")
+	filer.mu.Lock()
+	require.Nil(t, filer.entries["/buckets/b/dir"], "directory marker created")
+	filer.mu.Unlock()
+
+	req, probe = newHeaderTestRequest("/b/dir/", "dir/", "marker", "Content-Md5", getMD5HashBase64([]byte("marker")))
+	s3a.PutObjectHandler(probe, req)
+	require.Equal(t, http.StatusOK, probe.Code, probe.Body.String())
 }
 
 // A valid storage class still stores, and the content type is still sniffed.

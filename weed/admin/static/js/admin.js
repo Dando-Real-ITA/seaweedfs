@@ -129,21 +129,6 @@ function setupSubmenuBehavior() {
         }
     }
 
-    // If we're on an object store page, expand the object store submenu
-    if (currentPathStartsWith('/object-store/')) {
-        const objectStoreSubmenu = document.getElementById('objectStoreSubmenu');
-        if (objectStoreSubmenu) {
-            objectStoreSubmenu.classList.add('show');
-
-            // Update the parent toggle button state
-            const toggleButton = document.querySelector('[data-bs-target="#objectStoreSubmenu"]');
-            if (toggleButton) {
-                toggleButton.classList.remove('collapsed');
-                toggleButton.setAttribute('aria-expanded', 'true');
-            }
-        }
-    }
-
     // Prevent submenu from collapsing when clicking on submenu items
     const clusterSubmenuLinks = document.querySelectorAll('#clusterSubmenu .nav-link');
     clusterSubmenuLinks.forEach(function (link) {
@@ -152,61 +137,6 @@ function setupSubmenuBehavior() {
             e.stopPropagation();
         });
     });
-
-    const objectStoreSubmenuLinks = document.querySelectorAll('#objectStoreSubmenu .nav-link');
-    objectStoreSubmenuLinks.forEach(function (link) {
-        link.addEventListener('click', function (e) {
-            // Don't prevent the navigation, just stop the collapse behavior
-            e.stopPropagation();
-        });
-    });
-
-    // Handle the main cluster toggle
-    const clusterToggle = document.querySelector('[data-bs-target="#clusterSubmenu"]');
-    if (clusterToggle) {
-        clusterToggle.addEventListener('click', function (e) {
-            e.preventDefault();
-
-            const submenu = document.getElementById('clusterSubmenu');
-            const isExpanded = submenu.classList.contains('show');
-
-            if (isExpanded) {
-                // Collapse
-                submenu.classList.remove('show');
-                this.classList.add('collapsed');
-                this.setAttribute('aria-expanded', 'false');
-            } else {
-                // Expand
-                submenu.classList.add('show');
-                this.classList.remove('collapsed');
-                this.setAttribute('aria-expanded', 'true');
-            }
-        });
-    }
-
-    // Handle the main object store toggle
-    const objectStoreToggle = document.querySelector('[data-bs-target="#objectStoreSubmenu"]');
-    if (objectStoreToggle) {
-        objectStoreToggle.addEventListener('click', function (e) {
-            e.preventDefault();
-
-            const submenu = document.getElementById('objectStoreSubmenu');
-            const isExpanded = submenu.classList.contains('show');
-
-            if (isExpanded) {
-                // Collapse
-                submenu.classList.remove('show');
-                this.classList.add('collapsed');
-                this.setAttribute('aria-expanded', 'false');
-            } else {
-                // Expand
-                submenu.classList.add('show');
-                this.classList.remove('collapsed');
-                this.setAttribute('aria-expanded', 'true');
-            }
-        });
-    }
-
 }
 
 // Mobile sidebar toggle and backdrop behavior
@@ -573,52 +503,6 @@ function refreshBuckets() {
     location.reload();
 }
 
-// Export bucket list
-function exportBucketList() {
-    // Get table data
-    const table = document.getElementById('bucketsTable');
-    if (!table) return;
-
-    const rows = Array.from(table.querySelectorAll('tbody tr'));
-    const data = rows.map(row => {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 5) return null; // Skip empty state row
-
-        return {
-            name: cells[0].textContent.trim(),
-            owner: cells[1].textContent.trim(),
-            created: cells[2].textContent.trim(),
-            logicalSize: cells[3].textContent.trim(),
-            physicalSize: cells[4].textContent.trim(),
-            quota: cells[5].textContent.trim()
-        };
-    }).filter(item => item !== null);
-
-    // Convert to CSV
-    const csv = [
-        ['Name', 'Owner', 'Created', 'Logical Size', 'Physical Size', 'Quota'].join(','),
-        ...data.map(row => [
-            row.name,
-            row.owner,
-            row.created,
-            row.logicalSize,
-            row.physicalSize,
-            row.quota
-        ].join(','))
-    ].join('\n');
-
-    // Download CSV
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `seaweedfs-buckets-${new Date().toISOString().split('T')[0]}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
-}
-
 // showAlert is provided by modal-alerts.js with signature: showAlert(message, type)
 
 // Format date for display
@@ -871,19 +755,18 @@ function exportUsers() {
         return;
     }
 
-    let csvContent = 'Username,Email,Access Key,Status,Created,Last Login\n';
+    let csvContent = 'Username,Email,Access Key\n';
 
     rows.forEach(row => {
         const cells = row.querySelectorAll('td');
-        if (cells.length >= 6) {
-            const username = cells[0].textContent.trim();
+        if (cells.length >= 3) {
+            const username = (cells[0].querySelector('strong') || cells[0]).textContent.trim();
             const email = cells[1].textContent.trim();
             const accessKey = cells[2].textContent.trim();
-            const status = cells[3].textContent.trim();
-            const created = cells[4].textContent.trim();
-            const lastLogin = cells[5].textContent.trim();
 
-            csvContent += `"${username}","${email}","${accessKey}","${status}","${created}","${lastLogin}"\n`;
+            csvContent += [username, email, accessKey]
+                .map(value => `"${value.replace(/"/g, '""')}"`)
+                .join(',') + '\n';
         }
     });
 

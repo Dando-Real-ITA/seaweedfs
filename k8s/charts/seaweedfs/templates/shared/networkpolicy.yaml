@@ -104,10 +104,22 @@
 {{-   if .Values.worker.metricsPort }}
 {{-     $ports = append $ports .Values.worker.metricsPort }}
 {{-   end }}
-{{-   if and .Values.worker.lanceMetricsPort (include "seaweedfs.worker.lanceNamespaceUrl" .) }}
+{{-   if and .Values.worker.lanceMetricsPort (include "seaweedfs.worker.lanceEnabled" .) }}
 {{-     $ports = append $ports .Values.worker.lanceMetricsPort }}
 {{-   end }}
 {{-   $targets = append $targets (dict "component" "worker" "ports" $ports) }}
+{{- end }}
+
+{{- if .Values.vector.enabled }}
+{{-   $ports := list .Values.vector.port }}
+{{-   if .Values.vector.metricsPort }}
+{{-     $ports = append $ports .Values.vector.metricsPort }}
+{{-   end }}
+{{-   $targets = append $targets (dict "component" "vector" "ports" $ports) }}
+{{- end }}
+
+{{- if and .Values.vector.enabled .Values.vector.createBuckets }}
+{{-   $targets = append $targets (dict "component" "vector-bucket-hook" "ports" (list)) }}
 {{- end }}
 
 {{- if .Values.cosi.enabled }}
@@ -143,7 +155,7 @@
        every component the chart can produce rather than the ones enabled here,
        so one values file can still carry overrides for a component this release
        leaves off. */}}
-{{- $known := list "master" "filer" "s3" "sftp" "admin" "worker" "volume" "bucket-hook" "volume-resize-hook" "objectstorage-provisioner" "seaweedfs-all-in-one" }}
+{{- $known := list "vector" "vector-bucket-hook" "master" "filer" "s3" "sftp" "admin" "worker" "volume" "bucket-hook" "volume-resize-hook" "objectstorage-provisioner" "seaweedfs-all-in-one" }}
 {{- range $vname, $_ := (.Values.volumes | default dict) }}
 {{-   $known = append $known (trimSuffix "-" (printf "volume-%s" $vname)) }}
 {{- end }}

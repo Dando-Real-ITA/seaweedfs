@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	awsarn "github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/google/uuid"
@@ -295,7 +296,11 @@ func (s *Server) handleCreateVectorBucket(w http.ResponseWriter, r *http.Request
 	// catalog does for CreateTableBucket.
 	principal := s.tables.PrincipalFor(r)
 	allowed := func(action, bucket string) bool {
-		return s3tables.CheckPermissionWithContext(action, principal, s.tables.PrincipalFor(nil), "", "", s.tables.PolicyContext(r, bucket))
+		resource := "*"
+		if bucket != "" {
+			resource = s.vectorBucketArn(bucket)
+		}
+		return s.checkPermission(r, action, principal, s.tables.PrincipalFor(nil), "", resource, s.policyContext(r, bucket, nil, nil, setTags(req.Tags)))
 	}
 	// Tagging names the new bucket, so a grant scoped to it applies.
 	if !allowed("s3vectors:CreateVectorBucket", "") ||
@@ -398,8 +403,8 @@ func (s *Server) handleListVectorBuckets(w http.ResponseWriter, r *http.Request)
 		}
 		arn := s.vectorBucketArn(b.Name)
 		pctx := s.policyContext(r, b.Name, tags, tags, tagRequest{})
-		if !s3tables.CheckPermissionWithContext("s3vectors:ListVectorBuckets", principal, owner, policy, arn, pctx) &&
-			!s3tables.CheckPermissionWithContext("s3vectors:GetVectorBucket", principal, owner, policy, arn, pctx) {
+		if !s.checkPermission(r, "s3vectors:ListVectorBuckets", principal, owner, policy, arn, pctx) &&
+			!s.checkPermission(r, "s3vectors:GetVectorBucket", principal, owner, policy, arn, pctx) {
 			continue
 		}
 		created, _ := time.Parse(time.RFC3339, b.CreatedAt)
@@ -923,7 +928,7 @@ func (s *Server) checkVectorPolicyDoc(r *http.Request, action, bucket string, re
 		return err
 	}
 	principal := s.tables.PrincipalFor(r)
-	if !s3tables.CheckPermissionWithContext(action, principal, record.OwnerAccountID,
+	if !s.checkPermission(r, action, principal, record.OwnerAccountID,
 		vectorPolicyFromExt(ext), s.vectorBucketArn(bucket), s.policyContext(r, bucket, tags, tags, tagRequest{})) {
 		return errVectorDenied
 	}
@@ -956,14 +961,14 @@ func (s *Server) authorizeVectorTags(ctx context.Context, r *http.Request, actio
 	resourceARN, resourceTags := s.vectorBucketArn(bucket), bucketTags
 	if index != "" {
 		resourceARN, resourceTags = s.indexArn(bucket, index), nil
-		if readsResourceTags(policy) {
+		if _, usesIAM := s.authenticator.(IAMAuthorizer); readsResourceTags(policy) || usesIAM {
 			if resourceTags, err = s.indexTags(ctx, bucket, index); err != nil {
 				return nil, err
 			}
 		}
 	}
 	principal := s.tables.PrincipalFor(r)
-	if !s3tables.CheckPermissionWithContext(action, principal, record.OwnerAccountID, policy, resourceARN,
+	if !s.checkPermission(r, action, principal, record.OwnerAccountID, policy, resourceARN,
 		s.policyContext(r, bucket, bucketTags, resourceTags, req)) {
 		return nil, &s3tables.S3TablesError{Type: s3tables.ErrCodeAccessDenied, Message: "access denied"}
 	}
@@ -1130,6 +1135,10 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ValidationException", "dimension must be 1..=4096")
 		return
 	}
+	if err := validateMetadataConfiguration(req.MetadataConfiguration); err != nil {
+		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
+		return
+	}
 	if err := s3tables.ValidateTagsWithLimit(req.Tags, maxResourceTags); err != nil {
 		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
@@ -1154,47 +1163,90 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
-	// Only a caller who passed the create check may learn an index exists.
+	metadata := map[string]interface{}{
+		"dimension":      fmt.Sprint(req.Dimension),
+		"distanceMetric": strings.ToLower(req.DistanceMetric),
+		"createNonce":    uuid.NewString(),
+		"initializing":   "true",
+	}
+	var nonFilterable []string
+	if req.MetadataConfiguration != nil {
+		nonFilterable = slices.Clone(req.MetadataConfiguration.NonFilterableMetadataKeys)
+		keys, _ := json.Marshal(nonFilterable)
+		metadata["nonFilterableMetadataKeys"] = string(keys)
+	}
 	var existing map[string]interface{}
 	getErr := s.internalCatalog(r.Context(), "GetTable", &s3tables.GetTableRequest{
 		TableBucketARN: s.s3tablesArn(arns.bucket),
 		Namespace:      []string{indexNamespace},
 		Name:           arns.index,
 	}, &existing)
+	created := false
+	versionToken := ""
 	switch {
 	case getErr == nil:
-		writeError(w, http.StatusConflict, "ConflictException",
-			fmt.Sprintf("index %s already exists", arns.index))
-		return
-	case catalogErrCode(getErr) != s3tables.ErrCodeNoSuchTable:
-		catalogErr(w, getErr)
-		return
-	}
-	metadata := map[string]string{
-		"dimension":      fmt.Sprint(req.Dimension),
-		"distanceMetric": strings.ToLower(req.DistanceMetric),
-		// The nonce marks the record this request created, so a rollback after
-		// an engine failure can never erase a pre-existing index.
-		"createNonce": uuid.NewString(),
-	}
-	var nonFilterable []string
-	if req.MetadataConfiguration != nil {
-		nonFilterable = req.MetadataConfiguration.NonFilterableMetadataKeys
-		if keys, err := json.Marshal(nonFilterable); err == nil {
-			metadata["nonFilterableMetadataKeys"] = string(keys)
+		index := indexFromRecord(s, arns.bucket, arns.index, existing)
+		storedMetric, _ := distanceMetric(index.DistanceMetric)
+		var storedKeys []string
+		if index.MetadataConfiguration != nil {
+			storedKeys = slices.Clone(index.MetadataConfiguration.NonFilterableMetadataKeys)
 		}
-	}
-	metadataJSON, _ := json.Marshal(metadata)
-	err = s.internalCatalog(bound, "CreateTable", &s3tables.CreateTableRequest{
-		TableBucketARN: s.s3tablesArn(arns.bucket),
-		Namespace:      []string{indexNamespace},
-		Name:           arns.index,
-		Format:         s3tables.FormatLance,
-		Metadata:       &s3tables.TableMetadata{FullMetadata: metadataJSON},
-		Tags:           req.Tags,
-	}, nil)
-	if err != nil {
-		catalogErr(w, err)
+		slices.Sort(storedKeys)
+		slices.Sort(nonFilterable)
+		meta, _ := existing["metadata"].(map[string]interface{})
+		full, _ := meta["fullMetadata"].(map[string]interface{})
+		if full["initializing"] != "true" || index.Dimension != req.Dimension ||
+			storedMetric != metric ||
+			!slices.Equal(storedKeys, nonFilterable) {
+			writeError(w, http.StatusConflict, "ConflictException", fmt.Sprintf("index %s already exists", arns.index))
+			return
+		}
+		metadata = full
+		metadataJSON, _ := json.Marshal(metadata)
+		var response s3tables.UpdateTableResponse
+		if err := s.internalCatalog(bound, "UpdateTable", &s3tables.UpdateTableRequest{
+			TableBucketARN: s.s3tablesArn(arns.bucket),
+			Namespace:      []string{indexNamespace},
+			Name:           arns.index,
+			VersionToken:   recordVersionToken(existing),
+			Metadata:       &s3tables.TableMetadata{FullMetadata: metadataJSON},
+		}, &response); err != nil {
+			catalogErr(w, err)
+			return
+		}
+		versionToken = response.VersionToken
+	case catalogErrCode(getErr) == s3tables.ErrCodeNoSuchTable:
+		metadataJSON, _ := json.Marshal(metadata)
+		var response s3tables.CreateTableResponse
+		err = s.internalCatalog(bound, "CreateTable", &s3tables.CreateTableRequest{
+			TableBucketARN: s.s3tablesArn(arns.bucket),
+			Namespace:      []string{indexNamespace},
+			Name:           arns.index,
+			Format:         s3tables.FormatLance,
+			Metadata:       &s3tables.TableMetadata{FullMetadata: metadataJSON},
+			Tags:           req.Tags,
+		}, &response)
+		if err != nil {
+			catalogErr(w, err)
+			return
+		}
+		var record map[string]interface{}
+		if err := s.internalCatalog(bound, "GetTable", &s3tables.GetTableRequest{
+			TableBucketARN: s.s3tablesArn(arns.bucket),
+			Namespace:      []string{indexNamespace},
+			Name:           arns.index,
+		}, &record); err != nil {
+			catalogErr(w, err)
+			return
+		}
+		if recordNonce(record) != metadata["createNonce"] || recordVersionToken(record) != response.VersionToken {
+			writeError(w, http.StatusConflict, "ConflictException", "index changed during creation; retry the request")
+			return
+		}
+		created = true
+		versionToken = response.VersionToken
+	default:
+		catalogErr(w, getErr)
 		return
 	}
 	_, err = s.vectors.CreateIndex(r.Context(), &vector_pb.CreateIndexRequest{
@@ -1204,17 +1256,27 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		NonFilterableMetadataKeys: nonFilterable,
 	})
 	if err != nil {
-		// Roll the index record back so a half-created index does not linger.
-		// The delete runs past a client disconnect and only removes the record
-		// this request created: the nonce must match, and the versionToken
-		// compare-and-swap keeps a racing create from being erased.
+		if !created {
+			vectorErr(w, r, arns, err)
+			return
+		}
+		if !errors.Is(err, errNoVectorServer) {
+			switch status.Code(err) {
+			case codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated, codes.FailedPrecondition, codes.AlreadyExists, codes.NotFound, codes.OutOfRange, codes.Unimplemented:
+			default:
+				vectorErr(w, r, arns, err)
+				return
+			}
+		}
+		// Only definite failures roll back; an unknown outcome may have committed.
+		// The nonce and version token protect a concurrent replacement.
 		ctx := context.WithoutCancel(r.Context())
 		var rec map[string]interface{}
 		if gerr := s.internalCatalog(ctx, "GetTable", &s3tables.GetTableRequest{
 			TableBucketARN: s.s3tablesArn(arns.bucket),
 			Namespace:      []string{indexNamespace},
 			Name:           arns.index,
-		}, &rec); gerr == nil && recordNonce(rec) == metadata["createNonce"] {
+		}, &rec); gerr == nil && recordNonce(rec) == metadata["createNonce"] && recordVersionToken(rec) == versionToken {
 			var delResp map[string]interface{}
 			if derr := s.internalCatalog(ctx, "DeleteTable", &s3tables.DeleteTableRequest{
 				TableBucketARN: s.s3tablesArn(arns.bucket),
@@ -1228,6 +1290,18 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			glog.Errorf("S3 Vectors: rollback lookup for %s/%s failed: %v", arns.bucket, arns.index, gerr)
 		}
 		vectorErr(w, r, arns, err)
+		return
+	}
+	delete(metadata, "initializing")
+	metadataJSON, _ := json.Marshal(metadata)
+	if err := s.internalCatalog(r.Context(), "UpdateTable", &s3tables.UpdateTableRequest{
+		TableBucketARN: s.s3tablesArn(arns.bucket),
+		Namespace:      []string{indexNamespace},
+		Name:           arns.index,
+		VersionToken:   versionToken,
+		Metadata:       &s3tables.TableMetadata{FullMetadata: metadataJSON},
+	}, nil); err != nil {
+		catalogErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, &CreateIndexResponse{IndexArn: s.indexArn(arns.bucket, arns.index)})
@@ -1467,10 +1541,10 @@ func (s *Server) handlePutVectors(w http.ResponseWriter, r *http.Request) {
 		catalogErr(w, err)
 		return
 	}
-	dimension := indexFromRecord(s, arns.bucket, arns.index, record).Dimension
+	index := indexFromRecord(s, arns.bucket, arns.index, record)
 	vectors := make([]*vector_pb.Vector, 0, len(req.Vectors))
 	for _, v := range req.Vectors {
-		pbVector, err := toPutVector(v, dimension)
+		pbVector, err := toPutVector(v, index.Dimension, index.MetadataConfiguration)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 			return
@@ -1488,12 +1562,18 @@ func (s *Server) handlePutVectors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &PutVectorsResponse{})
 }
 
-func toPutVector(v *PutInputVector, dimension int32) (*vector_pb.Vector, error) {
+func toPutVector(v *PutInputVector, dimension int32, cfg *MetadataConfiguration) (*vector_pb.Vector, error) {
 	if v == nil {
 		return nil, fmt.Errorf("vectors contains a null element")
 	}
 	if v.Key == "" {
 		return nil, fmt.Errorf("vector key must not be empty")
+	}
+	if n := utf8.RuneCountInString(v.Key); n > vectorKeyMaxLength {
+		return nil, fmt.Errorf("vector key is %d characters, the maximum is %d", n, vectorKeyMaxLength)
+	}
+	if err := checkVectorMetadata(v.Key, v.Metadata, cfg); err != nil {
+		return nil, err
 	}
 	metadata, err := metadataStruct(v.Metadata)
 	if err != nil {
@@ -2031,7 +2111,7 @@ func elementMatch(field string, operand interface{}) (string, error) {
 }
 
 // jsonbString renders s as the JSON text json_extract returns for a stored
-// string: quoted, with the same escapes the jsonb serializer emits.
+// string: quoted, with the escapes serde_json emits.
 func jsonbString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -2047,11 +2127,13 @@ func jsonbString(s string) string {
 			b.WriteString(`\r`)
 		case '\t':
 			b.WriteString(`\t`)
-		case 0:
-			b.WriteString(`\0`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
 		default:
-			if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-				fmt.Fprintf(&b, `\u{%x}`, r)
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, r)
 			} else {
 				b.WriteRune(r)
 			}
@@ -2077,6 +2159,11 @@ func sqlLiteral(v interface{}) (string, error) {
 }
 
 func (s *Server) handleQueryVectors(w http.ResponseWriter, r *http.Request) {
+	indexedOnly, err := searchMode(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
+		return
+	}
 	var req QueryVectorsRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
@@ -2098,6 +2185,10 @@ func (s *Server) handleQueryVectors(w http.ResponseWriter, r *http.Request) {
 	if req.TopK <= 0 || req.TopK > vectorsMaxTopK {
 		writeError(w, http.StatusBadRequest, "ValidationException",
 			fmt.Sprintf("topK must be between 1 and %d", vectorsMaxTopK))
+		return
+	}
+	if err := checkFilterConstraints(req.Filter); err != nil {
+		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
 	if _, err := s.authorizeVector(r.Context(), r, "s3vectors:QueryVectors", arns.bucket, arns.index); err != nil {
@@ -2126,14 +2217,14 @@ func (s *Server) handleQueryVectors(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ValidationException", err.Error())
 		return
 	}
-	resp, err := s.vectors.QueryVectors(r.Context(), &vector_pb.QueryVectorsRequest{
+	resp, err := s.queryVectors(w, r, &vector_pb.QueryVectorsRequest{
 		Table:          tableID(arns.bucket, arns.index),
 		QueryVector:    queryVector,
 		TopK:           uint32(req.TopK),
 		Filter:         filter,
 		ReturnMetadata: req.ReturnMetadata,
 		ReturnDistance: req.ReturnDistance,
-	})
+	}, indexedOnly)
 	if err != nil {
 		vectorErr(w, r, arns, err)
 		return

@@ -28,7 +28,7 @@ func isAnonymousObjectRead(r *http.Request) bool {
 // their normal authentication path; no-auth development mode is unchanged.
 func (s3a *S3ApiServer) deferAnonymousObjectRead(r *http.Request, action Action, bucket, object string) (*http.Request, bool) {
 	if s3a.iam == nil || !s3a.iam.isEnabled() || action != s3_constants.ACTION_READ ||
-		getRequestAuthType(r) != authTypeAnonymous || object == "" || object == "/" ||
+		!s3a.iam.isAnonymousRequest(r) || object == "" || object == "/" ||
 		(r.Method != http.MethodGet && r.Method != http.MethodHead) || isSOSAPIObject(strings.TrimPrefix(object, "/")) {
 		return r, false
 	}
@@ -52,16 +52,25 @@ func (s3a *S3ApiServer) deferAnonymousObjectRead(r *http.Request, action Action,
 	return r.WithContext(context.WithValue(ctx, anonymousObjectReadContextKey{}, true)), true
 }
 
+// isVersionFileKey reports whether object names a stored version's physical
+// filer path rather than a logical key: accepting it would bypass
+// GetObjectVersion policies and key-scoped denies on the logical key. Ordinary
+// user keys containing ".versions" without version metadata are unaffected.
+func (s3a *S3ApiServer) isVersionFileKey(object string, extended map[string][]byte) bool {
+	version := string(extended[s3_constants.ExtVersionIdKey])
+	return version != "" && s3a.hasVersionFileShape(object) && path.Base(s3_constants.NormalizeObjectKey(object)) == s3a.getVersionFileName(version)
+}
+
+func (s3a *S3ApiServer) hasVersionFileShape(object string) bool {
+	key := strings.TrimSuffix(s3_constants.NormalizeObjectKey(object), "/")
+	return strings.HasSuffix(path.Dir(key), s3_constants.VersionsFolder) && strings.HasPrefix(path.Base(key), s3a.getVersionFileName(""))
+}
+
 // authorizeAnonymousObjectRead evaluates policies and ACLs against the same
 // entry used for the response, including conditional and versioned reads.
 // Explicit policy denies take precedence over every public-access grant.
 func (s3a *S3ApiServer) authorizeAnonymousObjectRead(r *http.Request, bucket, object string, extended map[string][]byte) s3err.ErrorCode {
-	// A version's physical filer path is not another S3 key: accepting it would
-	// bypass GetObjectVersion policies on the logical key. Ordinary user keys
-	// containing ".versions" without internal version metadata are unaffected.
-	key := s3_constants.NormalizeObjectKey(object)
-	version := string(extended[s3_constants.ExtVersionIdKey])
-	if version != "" && strings.HasSuffix(path.Dir(key), s3_constants.VersionsFolder) && path.Base(key) == s3a.getVersionFileName(version) {
+	if s3a.isVersionFileKey(object, extended) {
 		return s3err.ErrAccessDenied
 	}
 	if string(extended[s3_constants.ExtDeleteMarkerKey]) == "true" {

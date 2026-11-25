@@ -20,18 +20,18 @@ var ecMirroredSidecars = []string{".ecx", ".ecj", ".vif"}
 // of reaching across to a sibling. Runs before
 // reconcileEcShardsAcrossDisks; the cross-disk virtual mount stays
 // as the fallback when mirroring fails.
-func (s *Store) mirrorEcMetadataToShardDisks() {
+func (s *Store) mirrorEcMetadataToShardDisks(only ...needle.VolumeId) {
 	if len(s.Locations) < 2 {
 		return
 	}
 
-	ecxOwners := s.indexEcxOwners()
+	ecxOwners := s.indexEcxOwners(only...)
 	if len(ecxOwners) == 0 {
 		return
 	}
 
 	for _, loc := range s.Locations {
-		orphans := loc.collectOrphanEcShards()
+		orphans := loc.collectOrphanEcShards(only...)
 		if len(orphans) == 0 {
 			continue
 		}
@@ -100,6 +100,15 @@ func (l *DiskLocation) ecSidecarDestPath(collection string, vid needle.VolumeId,
 func (l *DiskLocation) mirrorEcSidecarsFrom(owner ecxOwnerInfo, collection string, vid needle.VolumeId) (int, error) {
 	srcIdxBase := erasure_coding.EcShardFileName(collection, owner.idxDir, int(vid))
 	srcDataBase := erasure_coding.EcShardFileName(collection, owner.location.Directory, int(vid))
+
+	// A local .vif with no EC config (a source volume's own) would shadow the
+	// owner's once the index is copied next to it; keep mounting across disks.
+	if dstVif := l.ecSidecarDestPath(collection, vid, ".vif"); statRegular(dstVif) && !vifIsEcVolume(dstVif) &&
+		(vifIsEcVolume(srcIdxBase+".vif") || vifIsEcVolume(srcDataBase+".vif")) {
+		glog.V(0).Infof("ec volume %d (collection=%q): %s records no EC config; not mirroring sidecars from %s",
+			vid, collection, dstVif, owner.location.Directory)
+		return 0, nil
+	}
 
 	copied := 0
 	for _, ext := range ecMirroredSidecars {

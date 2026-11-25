@@ -8,9 +8,21 @@
 # living in this file: prefix the key with WEED_, upper-case it, and replace
 # "." with "_". This is the recommended way to inject the secrets in here from
 # a Kubernetes Secret (env valueFrom.secretKeyRef) rather than a ConfigMap.
-# The JWT signing keys map to:
-#   WEED_JWT_SIGNING_KEY, WEED_JWT_SIGNING_READ_KEY              (master <-> volume)
-#   WEED_JWT_FILER_SIGNING_KEY, WEED_JWT_FILER_SIGNING_READ_KEY  (s3/clients <-> filer)
+# The JWT signing keys map to these env vars. When each component gets its own
+# set, give it every key it signs or verifies with:
+#   WEED_JWT_SIGNING_KEY                  master, volume, filer, weed shell
+#   WEED_JWT_SIGNING_READ_KEY             master, volume, and every process that
+#                                         reads chunks from volume servers: filer,
+#                                         s3, mount, webdav, sftp, filer.sync,
+#                                         filer.backup, workers, admin, weed shell
+#   WEED_JWT_FILER_SIGNING_KEY            filer, s3, admin and workers (admin IAM and
+#                                         worker gRPC calls), and clients of the filer
+#                                         HTTP API
+#   WEED_JWT_FILER_SIGNING_READ_KEY       filer, s3, and clients of the filer HTTP API
+#   WEED_JWT_FILER_SIGNING_SUBSCRIBE_KEY  filer metadata subscriptions
+#   WEED_JWT_FILER_SIGNING_GRPC_KEY       filer filesystem gRPC scope and assignment proofs
+#   WEED_JWT_FILER_SIGNING_GRPC_PREVIOUS_KEY
+#                                         previous gRPC scope and assignment-proof key during rotation
 # A set env var wins over the file, so the file can stay empty (or absent).
 
 # comma separated origins allowed to make requests to the filer and s3 gateway.
@@ -18,13 +30,24 @@
 [cors.allowed_origins]
 values = "*"
 
-# this jwt signing key is read by master and volume server, and it is used for write operations:
+# this jwt signing key is used for write operations on volume servers:
 # - the Master server generates the JWT, which can be used to write a certain file on a volume server
+# - the Filer generates it for the chunk writes it proxies to volume servers,
+#   and weed shell for fs.merge_volumes and fs.distribute_chunks
 # - the Volume server validates the JWT on writing
 # the jwt defaults to expire after 10 seconds.
 [jwt.signing]
 key = ""
 expires_after_seconds = 10           # seconds
+# Optional. A key that is still accepted when verifying, but never used to
+# sign, so keys can rotate without rejected requests: set the new key as
+# previous_key everywhere, then swap key and previous_key everywhere, then,
+# once tokens signed with the old key have expired, clear previous_key.
+# Reload (SIGHUP) or restart after each step. [jwt.signing.read],
+# [jwt.filer_signing] and [jwt.filer_signing.read] take previous_key the same way.
+# Env: WEED_JWT_SIGNING_PREVIOUS_KEY, WEED_JWT_SIGNING_READ_PREVIOUS_KEY,
+# WEED_JWT_FILER_SIGNING_PREVIOUS_KEY, WEED_JWT_FILER_SIGNING_READ_PREVIOUS_KEY
+previous_key = ""
 
 # by default, if the signing key above is set, the Volume UI over HTTP is disabled.
 # by setting ui.access to true, you can re-enable the Volume UI. Despite
@@ -40,13 +63,41 @@ ui = false
 [filer.expose_directory_metadata]
 enabled = true
 
-# this jwt signing key is read by master and volume server, and it is used for read operations:
+# HTTP Basic Auth on the filer HTTP ports (-port and -port.readonly). Once the
+# password is set, every request needs these credentials or a valid filer JWT
+# (see [jwt.filer_signing]), and an access level without a JWT key is no longer
+# open. /healthz and /readyz stay open. A browser request from another website
+# (an Origin other than the filer's own host) can use these credentials only if
+# its origin is listed in cors.allowed_origins. Components that call the filer HTTP
+# port (mount, filer.sync and filer.backup with -filerProxy, sftp, volume.fsck)
+# authenticate with the filer JWT, so set jwt.filer_signing.key, and
+# jwt.filer_signing.read.key for their reads, if you run them.
+# Env: WEED_FILER_BASIC_AUTH_USER, WEED_FILER_BASIC_AUTH_PASSWORD
+[filer.basic_auth]
+user = ""
+password = ""
+
+# HTTP Basic Auth on the WebDAV gateway (weed webdav, weed server -webdav,
+# weed mini). Without a password, anyone who can reach the WebDAV port reads,
+# writes and deletes everything under its -filer.path, and weed mini binds
+# WebDAV to 127.0.0.1 unless -webdav.allowInsecureBind is set. Basic Auth
+# sends the password in every request, so serve WebDAV over TLS
+# (-webdav.cert.file, -webdav.key.file) on an untrusted network.
+# Env: WEED_WEBDAV_BASIC_AUTH_USER, WEED_WEBDAV_BASIC_AUTH_PASSWORD
+[webdav.basic_auth]
+user = ""
+password = ""
+
+# this jwt signing key is used for read operations on volume servers:
 # - the Master server generates the JWT, which can be used to read a certain file on a volume server
+# - every process that reads chunks straight from volume servers generates its
+#   own: filer, s3, mount, webdav, sftp, filer.sync, filer.backup, workers,
+#   admin and weed shell. Without the key, their reads fail with "wrong jwt".
 # - the Volume server validates the JWT on reading
-# NOTE: jwt for read is only supported with master+volume setup. Filer does not support this mode.
 [jwt.signing.read]
 key = ""
 expires_after_seconds = 10           # seconds
+previous_key = ""
 
 
 # If this JWT key is configured, Filer only accepts writes over HTTP if they are signed with this JWT:
@@ -63,9 +114,36 @@ expires_after_seconds = 10           # seconds
 #       write the IAM store under /etc/iam; if the filer gRPC port is reachable
 #       beyond a trusted network, enable [grpc.filer] mTLS below.
 # the jwt defaults to expire after 10 seconds.
+# Filesystem gRPC callers may send authorization: Bearer <token> signed with
+# this key. allowed_prefixes grant read/write paths; read_prefixes grant reads.
+# allowed_methods optionally restricts gRPC method names. Scoped tokens require
+# jti and exp, need assignment proofs for new chunk ids, and cannot call unruled
+# methods. New inline content is allowed within the token's writable paths.
+# Calls without a token retain their existing behavior. This is scope enforcement,
+# not mandatory authentication; restrict network access to the filer as before.
+# Rolling upgrades: enable scoped writers only after every filer runs this
+# version or newer. Scope-only filers refuse new chunk ids even with a proof;
+# older filers without scope enforcement treat scoped tokens as unscoped.
 [jwt.filer_signing]
 key = ""
 expires_after_seconds = 10           # seconds
+previous_key = ""
+# Optional filesystem gRPC signing key; when unset, key above is used. Setting
+# this alone enables gRPC scope checks without changing HTTP authentication.
+# When grpc_key is set, grpc_previous_key is also accepted for gRPC scope
+# tokens and assignment proofs. The HTTP previous_key remains excluded from
+# this separate trust domain. Keep grpc_previous_key configured for at least
+# assign_expires_after_seconds plus the scoped token lifetime after rotating.
+# When grpc_key is unset, the shared HTTP current/previous pair is used.
+# grpc_key = ""
+# grpc_previous_key = ""
+# AssignVolume returns a proof bound to the holder, chunk-ID range and resolved
+# collection in assign_auth. Return it under the chunk's file id in chunk_auth
+# when storing the entry. Auth remains the separate volume-upload credential.
+# Proofs always expire: zero or negative lifetime uses the default of 86400 seconds.
+# assign_expires_after_seconds = 86400
+# Clock-skew allowance for scope and proof validation; negative means zero.
+# clock_leeway_seconds = 30
 
 # If this JWT key is configured, Filer only accepts reads over HTTP if they are signed with this JWT:
 # - f.e. the S3 API Shim generates the JWT
@@ -74,11 +152,27 @@ expires_after_seconds = 10           # seconds
 [jwt.filer_signing.read]
 key = ""
 expires_after_seconds = 10           # seconds
+previous_key = ""
+
+# Optional. If this key is set, the filer's SubscribeMetadata and
+# SubscribeLocalMetadata gRPC calls require an mTLS-verified peer, an admin
+# token signed with jwt.filer_signing.key, or a read-only token signed with this
+# key. That token is an HS256 JWT with "exp", "allowed_methods" (a subset of
+# SubscribeMetadata and SubscribeLocalMetadata) and "allowed_prefixes"
+# (absolute paths); its holder only receives events whose paths are all under
+# one of the prefixes. Mint one with "fs.meta.token" in weed shell. Without
+# mTLS, set jwt.filer_signing.key and this key on every filer, S3 gateway,
+# mount and filer.sync too, so they keep full access.
+[jwt.filer_signing.subscribe]
+key = ""
 
 # gRPC mTLS configuration
 # All gRPC TLS authentications are mutual (mTLS)
 # The values for ca, cert, and key are paths to the certificate/key files
-# The host name is not checked, so the certificate files can be shared
+# The host name is not checked, so the certificate files can be shared.
+# Set verify_server_host = true under [grpc] or a [grpc.<component>] section to
+# require that a server certificate is valid for the host or IP that component
+# dials, as the Rust volume server always does.
 # Each [grpc.<component>] section also accepts optional client_cert/client_key,
 # presented when that component dials other servers. Set them when your CA
 # issues separate serverAuth-only and clientAuth-only certificates; when unset,
@@ -89,6 +183,7 @@ expires_after_seconds = 10           # seconds
 # fatal: the component never falls back to plaintext.
 [grpc]
 ca = ""
+verify_server_host = false
 # Set wildcard domain for enable TLS authentication by common names
 allowed_wildcard_domain = "" # .mycompany.com
 # Optional allowlist a client checks the dialed server's certificate against:
@@ -97,9 +192,10 @@ allowed_wildcard_domain = "" # .mycompany.com
 # With a per-workload CA, list the identities each server may present so one
 # workload cannot impersonate another component. Unset accepts any CA-signed
 # server certificate, as before. Any [grpc.<component>] section may set its own
-# allowed_server_commonNames to override this list, and scope it further per
-# dialed target, e.g. the filer reads [grpc.filer]
-# volume_allowed_server_commonNames for volume server calls.
+# allowed_server_commonNames to override this list. Only the filer scopes it
+# further per dialed target: [grpc.filer] master_, volume_ and
+# s3_allowed_server_commonNames. Other components dial every server with one
+# allowlist and refuse to start when per-target keys are their only allowlist.
 allowed_server_commonNames = ""      # comma-separated server identities
 allowed_server_wildcard_domain = ""  # .mycompany.com
 

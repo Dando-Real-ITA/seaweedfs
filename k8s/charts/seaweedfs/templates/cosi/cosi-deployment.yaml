@@ -39,6 +39,7 @@ spec:
       {{- with .Values.cosi.podAnnotations }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with include "seaweedfs.volumeHttpsAnnotation" $ }}{{ . | nindent 8 }}{{ end }}
     spec:
       restartPolicy: {{ default .Values.global.seaweedfs.restartPolicy .Values.cosi.restartPolicy }}
       {{- if .Values.cosi.affinity }}
@@ -195,8 +196,8 @@ spec:
         {{- end }}
         {{- if include "seaweedfs.securityConfigEnabled" . }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" . }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-security-config
         {{- end }}
         {{- if .Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert

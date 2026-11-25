@@ -20,6 +20,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_objectlock"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -44,6 +45,7 @@ type WebDavOption struct {
 	CacheDir       string
 	CacheSizeMB    int64
 	MaxMB          int
+	BasicAuth      *security.BasicAuth
 }
 
 type WebDavServer struct {
@@ -72,37 +74,72 @@ func NewWebDavServer(option *WebDavOption) (ws *WebDavServer, err error) {
 		fs = NewWrappedFs(fs, path.Clean(option.FilerRootPath))
 	}
 
+	var handler http.Handler = listedEntriesHandler{
+		next: copyMoveGuardHandler{
+			fs: fs,
+			next: &webdav.Handler{
+				FileSystem: fs,
+				LockSystem: webdav.NewMemLS(),
+			},
+		},
+	}
+	if option.BasicAuth != nil {
+		handler = basicAuthHandler{auth: option.BasicAuth, next: handler}
+	}
+
 	ws = &WebDavServer{
 		option:         option,
 		grpcDialOption: security.LoadClientTLS(util.GetViper(), "grpc.filer"),
-		Handler: listedEntriesHandler{
-			next: copyMoveGuardHandler{
-				fs: fs,
-				next: &webdav.Handler{
-					FileSystem: fs,
-					LockSystem: webdav.NewMemLS(),
-				},
-			},
-		},
+		Handler:        handler,
 	}
 
 	return ws, nil
 }
 
-// putOutcomeKey carries the flag WebDavFileSystem.OpenFile sets when a PUT
-// replaced an existing entry, so the PUT can answer 204 instead of 201
+type basicAuthHandler struct {
+	auth *security.BasicAuth
+	next http.Handler
+}
+
+func (h basicAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.auth.Allows(r) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="SeaweedFS WebDAV", charset="UTF-8"`)
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		return
+	}
+	h.next.ServeHTTP(w, r)
+}
+
+// putOutcomeKey carries the putOutcome a PUT's WebDavFileSystem calls fill
 type putOutcomeKey struct{}
 
-// putOutcomeWriter turns the 201 of a PUT that replaced a file into 204
-// and swallows the status text webdav.Handler writes after it
+// putOutcome records whether OpenFile replaced an existing entry, so the PUT
+// can answer 204 instead of 201, and the ETag of what Close committed:
+// webdav.Handler takes the ETag from a Stat made before Close
+type putOutcome struct {
+	replaced  bool
+	committed bool
+	etag      string
+}
+
+// putOutcomeWriter turns the 201 of a PUT that replaced a file into 204,
+// swallows the status text webdav.Handler writes after it, and sends the
+// committed content's ETag
 type putOutcomeWriter struct {
 	http.ResponseWriter
-	replaced  *bool
+	outcome   *putOutcome
 	noContent bool
 }
 
 func (w *putOutcomeWriter) WriteHeader(code int) {
-	if code == http.StatusCreated && *w.replaced {
+	if code == http.StatusCreated && w.outcome.committed {
+		if w.outcome.etag != "" {
+			w.Header().Set("ETag", `"`+w.outcome.etag+`"`)
+		} else {
+			w.Header().Del("ETag")
+		}
+	}
+	if code == http.StatusCreated && w.outcome.replaced {
 		code = http.StatusNoContent
 		w.noContent = true
 	}
@@ -250,9 +287,9 @@ func (h copyMoveGuardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// always answers 201, so OpenFile reports a replace on the request
 	// context and the writer rewrites the status it sends
 	if r.Method == "PUT" {
-		replaced := new(bool)
-		w = &putOutcomeWriter{ResponseWriter: w, replaced: replaced}
-		r = r.WithContext(context.WithValue(r.Context(), putOutcomeKey{}, replaced))
+		outcome := &putOutcome{}
+		w = &putOutcomeWriter{ResponseWriter: w, outcome: outcome}
+		r = r.WithContext(context.WithValue(r.Context(), putOutcomeKey{}, outcome))
 	}
 	// RFC 4918 10.6: a missing Overwrite header means T, but webdav.Handler
 	// only overwrites on MOVE when it is set (golang/go#66059)
@@ -355,7 +392,7 @@ func (fi *FileInfo) ETag(ctx context.Context) (string, error) {
 		// an empty DAV:getetag is not a valid entity-tag; let webdav derive one
 		return "", webdav.ErrNotImplemented
 	}
-	return fi.etag, nil
+	return `"` + fi.etag + `"`, nil
 }
 
 type WebDavFile struct {
@@ -507,6 +544,9 @@ func (fs *WebDavFileSystem) OpenFile(ctx context.Context, fullFilePath string, f
 		if err := fs.checkParentDir(ctx, dir); err != nil {
 			return nil, err
 		}
+		if err := fs.checkWritable(ctx, fullFilePath); err != nil {
+			return nil, err
+		}
 
 		var resp *filer_pb.CreateEntryResponse
 		err = fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
@@ -542,8 +582,8 @@ func (fs *WebDavFileSystem) OpenFile(ctx context.Context, fullFilePath string, f
 		// outcome matches what the write did even against racing writers: a
 		// PUT that landed on an entry answers 204, a fresh create answers 201
 		if resp.GetMetadataEvent().GetEventNotification().GetOldEntry() != nil {
-			if replaced, ok := ctx.Value(putOutcomeKey{}).(*bool); ok {
-				*replaced = true
+			if outcome, ok := ctx.Value(putOutcomeKey{}).(*putOutcome); ok {
+				outcome.replaced = true
 			}
 		}
 		return &WebDavFile{
@@ -586,9 +626,34 @@ func (fs *WebDavFileSystem) removeAll(ctx context.Context, fullFilePath string, 
 	if fullpath == "/" {
 		return os.ErrInvalid
 	}
+	entry, err := fs.getEntry(ctx, string(fullpath))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := fs.checkEntryProtected(ctx, string(fullpath), entry); err != nil {
+		return err
+	}
+	if entry.IsDirectory && recursive {
+		if err := fs.checkSubtreeProtected(ctx, string(fullpath)); err != nil {
+			return err
+		}
+	}
 	dir, name := fullpath.DirAndName()
 
-	return filer_pb.Remove(ctx, fs, dir, name, true, recursive, false, false, []int32{fs.signature})
+	return fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		_, err := filer_pb.DoRemoveRequest(ctx, client, &filer_pb.DeleteEntryRequest{
+			Directory:        dir,
+			Name:             name,
+			IsDeleteData:     true,
+			IsRecursive:      recursive,
+			Signatures:       []int32{fs.signature},
+			ExpectedExtended: s3_objectlock.ObjectLockState(entry),
+		})
+		return err
+	})
 
 }
 
@@ -626,7 +691,11 @@ func (fs *WebDavFileSystem) rename(ctx context.Context, oldName, newName string,
 
 	// an existing target is replaced inside the rename's transaction; a
 	// failed lookup aborts the move here
-	if _, err = fs.stat(ctx, newName); err != nil && err != os.ErrNotExist {
+	if oldName != newName {
+		if err := fs.checkRenameProtected(ctx, oldName, newName); err != nil {
+			return err
+		}
+	} else if _, err = fs.stat(ctx, newName); err != nil && err != os.ErrNotExist {
 		return err
 	}
 
@@ -683,6 +752,34 @@ func (fs *WebDavFileSystem) stat(ctx context.Context, fullFilePath string) (os.F
 	return toFileInfo(fullpath, entry), nil
 }
 
+// contentETag is the filer ETag when it tells contents apart: one built from
+// chunks stored without a digest is shared by every file with as many chunks,
+// and one for inline content by every inline file, so those are tagged by the
+// inline bytes or by where the chunks are stored.
+func contentETag(entry *filer_pb.Entry) string {
+	if entry.Attributes == nil || entry.Attributes.Md5 == nil {
+		if len(entry.Content) > 0 {
+			return util.Md5String(entry.Content)
+		}
+		for _, chunk := range entry.GetChunks() {
+			if chunk.ETag == "" {
+				return chunkLayoutETag(entry.GetChunks())
+			}
+		}
+	}
+	return filer.ETag(entry)
+}
+
+// chunkLayoutETag tags chunks by their file ids and placement: rewritten
+// content is stored in new chunks, and entries sharing chunks share content.
+func chunkLayoutETag(chunks []*filer_pb.FileChunk) string {
+	h := util.NewMd5()
+	for _, chunk := range chunks {
+		fmt.Fprintf(h, "%s,%d,%d,%d;", chunk.GetFileIdString(), chunk.Offset, chunk.Size, chunk.ModifiedTsNs)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
 func toFileInfo(fullpath util.FullPath, entry *filer_pb.Entry) *FileInfo {
 	// Name is what WebDAV publishes as DAV:displayname; clients that build a
 	// child URL from it reach nothing when it carries the whole path.
@@ -692,7 +789,7 @@ func toFileInfo(fullpath util.FullPath, entry *filer_pb.Entry) *FileInfo {
 		name:         fp.Name(),
 		mode:         os.FileMode(entry.Attributes.FileMode),
 		modifiedTime: time.Unix(entry.Attributes.Mtime, 0),
-		etag:         filer.ETag(entry),
+		etag:         contentETag(entry),
 		isDirectory:  entry.IsDirectory,
 	}
 
@@ -783,6 +880,9 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 				f.entry.Chunks = manifestedChunks
 			}
 
+			if err := f.fs.checkWritable(ctx, f.name); err != nil {
+				return err
+			}
 			flushErr := f.fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 				f.entry.Attributes.Mtime = time.Now().Unix()
 
@@ -825,6 +925,10 @@ func (f *WebDavFile) Close() error {
 	err := f.bufWriter.Close()
 
 	if f.entry != nil {
+		if outcome, ok := f.requestContext().Value(putOutcomeKey{}).(*putOutcome); ok && err == nil {
+			outcome.committed = true
+			outcome.etag = contentETag(f.entry)
+		}
 		f.entry = nil
 		f.visibleIntervals = nil
 	}

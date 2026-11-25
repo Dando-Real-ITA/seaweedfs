@@ -9,16 +9,20 @@ use lance::dataset::ProjectionRequest;
 use lance::dataset::WriteParams;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use lance::io::WrappingObjectStore;
+use lance::session::Session;
 use lance::table::format::Fragment;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 use weed_lance_worker::catalog::TableDescription;
 use weed_lance_worker::dataset;
 use weed_lance_worker::direct_read::{DirectReads, Wrappers};
 use weed_lance_worker::jobs::vector_index::is_vector_table;
+use weed_lance_worker::metadata_index;
 use weed_vector_core::index;
+use weed_vector_core::indexed_filter;
+use weed_vector_core::maintenance::SharedLeases;
 use weed_vector_core::query::{self, Query};
 use weed_vector_core::table::VectorTable;
 
@@ -55,7 +59,9 @@ const KEY_COLUMN: &str = "key";
 const METADATA_COLUMN: &str = "metadata";
 const VECTOR_COLUMN: &str = "vector";
 const ROW_ID_COLUMN: &str = "_rowid";
-fn schema_for(
+const DEFAULT_INDEX_CACHE_BYTES: usize = 1 << 30;
+const DEFAULT_METADATA_CACHE_BYTES: usize = 256 << 20;
+pub(crate) fn schema_for(
     dimension: usize,
     metric: pb::DistanceMetric,
     non_filterable: &[String],
@@ -95,6 +101,44 @@ fn schema_for(
     ]))
 }
 
+fn matches_index_schema(
+    dataset: &Dataset,
+    dimension: usize,
+    metric: pb::DistanceMetric,
+    non_filterable: &[String],
+) -> bool {
+    let Ok(layout) = VectorTable::resolve(dataset, Some(VECTOR_COLUMN), Some(KEY_COLUMN)) else {
+        return false;
+    };
+    let schema = Schema::from(dataset.schema());
+    let Ok(vector) = schema.field_with_name(VECTOR_COLUMN) else {
+        return false;
+    };
+    let Ok(metadata) = schema.field_with_name(METADATA_COLUMN) else {
+        return false;
+    };
+    let stored_keys = metadata
+        .metadata()
+        .get("non_filterable_metadata_keys")
+        .map(|keys| serde_json::from_str::<Vec<String>>(keys))
+        .transpose();
+    let Ok(stored_keys) = stored_keys else {
+        return false;
+    };
+    let mut stored_keys = stored_keys.unwrap_or_default();
+    let mut requested_keys = non_filterable.to_vec();
+    stored_keys.sort();
+    requested_keys.sort();
+    layout.dimension == dimension
+        && vector.metadata().get("distance_metric").map(String::as_str)
+            == Some(metric.as_str_name())
+        && stored_keys == requested_keys
+        && metadata
+            .metadata()
+            .get("ARROW:extension:name")
+            .is_some_and(|name| name == "lance.json")
+}
+
 fn batch_of(vectors: &[pb::Vector], dimension: usize, schema: Arc<Schema>) -> Result<RecordBatch> {
     let mut seen = std::collections::HashSet::new();
     for vector in vectors {
@@ -125,14 +169,13 @@ fn batch_of(vectors: &[pb::Vector], dimension: usize, schema: Arc<Schema>) -> Re
     };
     let vectors_array =
         FixedSizeListArray::try_new(item_field.clone(), dimension as i32, values, None)?;
-    let metas = vectors
+    let json: Vec<Option<serde_json::Value>> = vectors
         .iter()
-        .map(|v| {
-            v.metadata
-                .as_ref()
-                .map(|m| serde_json::to_string(&struct_to_json(m)))
-                .transpose()
-        })
+        .map(|v| v.metadata.as_ref().map(struct_to_json))
+        .collect();
+    let metas = json
+        .iter()
+        .map(|m| m.as_ref().map(serde_json::to_string).transpose())
         .collect::<Result<Vec<_>, _>>()?;
     // The stored column is lance's jsonb (LargeBinary) once the field carries
     // the arrow.json extension; encode the strings, else keep the Utf8 batch.
@@ -145,11 +188,188 @@ fn batch_of(vectors: &[pb::Vector], dimension: usize, schema: Arc<Schema>) -> Re
         }
         _ => Arc::new(StringArray::from(metas)),
     };
-    RecordBatch::try_new(
-        schema,
-        vec![Arc::new(keys), Arc::new(vectors_array), metadata_array],
+    let (keys, vectors_array): (ArrayRef, ArrayRef) = (Arc::new(keys), Arc::new(vectors_array));
+    // An indexed metadata key's column is derived from the row's metadata,
+    // whatever the key's state.
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            KEY_COLUMN => Ok(keys.clone()),
+            VECTOR_COLUMN => Ok(vectors_array.clone()),
+            METADATA_COLUMN => Ok(metadata_array.clone()),
+            name => match metadata_index::indexed_key(field) {
+                Some(indexed) => Ok(metadata_index::column_from_json(
+                    json.iter().map(Option::as_ref),
+                    &indexed.key,
+                )),
+                None => bail!("the table has a column {name} that PutVectors cannot fill"),
+            },
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema, columns).map_err(Into::into)
+}
+
+/// Upserts `vectors` by key into `dataset`, the version the request opened,
+/// then fills the indexed-key columns a concurrent column add left empty.
+pub(crate) async fn write_vectors(
+    dataset: Dataset,
+    vectors: &[pb::Vector],
+) -> Result<Dataset, Status> {
+    let written = Arc::new(Into::<arrow_schema::Schema>::into(dataset.schema()));
+    let dataset = merge_vectors(dataset, vectors).await?;
+    let keys: Vec<String> = vectors.iter().map(|v| v.key.clone()).collect();
+    heal_columns(dataset, &written, &keys)
+        .await
+        .map_err(internal)
+}
+
+/// The upsert itself, in the schema of the version `dataset` is at.
+pub(crate) async fn merge_vectors(
+    dataset: Dataset,
+    vectors: &[pb::Vector],
+) -> Result<Dataset, Status> {
+    let dimension = VectorTable::resolve(&dataset, None, Some(KEY_COLUMN))
+        .map_err(invalid)?
+        .dimension;
+    let batch = batch_of(
+        vectors,
+        dimension,
+        Arc::new(Into::<arrow_schema::Schema>::into(dataset.schema())),
     )
-    .map_err(Into::into)
+    .map_err(invalid)?;
+    // Upsert by key in one merge commit: no window where the old rows are
+    // already deleted, and a losing writer fails the request instead of
+    // leaving duplicate keys.
+    let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset), vec![KEY_COLUMN.to_string()])
+        .map_err(internal)?;
+    builder.when_matched(WhenMatched::UpdateAll);
+    builder.when_not_matched(WhenNotMatched::InsertAll);
+    let (dataset, _stats) = builder
+        .try_build()
+        .map_err(internal)?
+        .execute_batches(vec![batch])
+        .await
+        .map_err(internal)?;
+    Ok(Arc::unwrap_or_clone(dataset))
+}
+
+/// Attempts [`heal_columns`] makes against writes committing meanwhile.
+const HEAL_ATTEMPTS: usize = 10;
+
+/// Lance rebases a write onto a column add committed after the write opened
+/// its version: the rows it inserted hold NULL in the new column and the
+/// rows it updated keep the value derived from their old metadata. Derive
+/// such columns again for the rows of `keys` from their stored metadata.
+pub(crate) async fn heal_columns(
+    mut dataset: Dataset,
+    written: &Schema,
+    keys: &[String],
+) -> Result<Dataset> {
+    for _ in 0..HEAL_ATTEMPTS {
+        let schema: Schema = dataset.schema().into();
+        let missing: Vec<metadata_index::IndexedKey> = metadata_index::indexed_keys(&schema)
+            .into_iter()
+            .filter(|k| written.field_with_name(&k.column).is_err())
+            .collect();
+        if missing.is_empty() || keys.is_empty() {
+            return Ok(dataset);
+        }
+        let mut scanner = dataset.scan();
+        scanner
+            .filter(&key_list(keys))?
+            .project(&[KEY_COLUMN, METADATA_COLUMN])?;
+        let rows: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        let mut fields = vec![schema.field_with_name(KEY_COLUMN)?.clone()];
+        for k in &missing {
+            fields.push(schema.field_with_name(&k.column)?.clone());
+        }
+        let patch_schema = Arc::new(Schema::new(fields));
+        let mut patches = Vec::new();
+        for batch in rows.iter().filter(|b| b.num_rows() > 0) {
+            let (Some(keys), Some(metadata)) = (
+                batch.column_by_name(KEY_COLUMN),
+                batch.column_by_name(METADATA_COLUMN),
+            ) else {
+                bail!("the scan did not return keys and metadata");
+            };
+            let mut columns = vec![keys.clone()];
+            for k in &missing {
+                columns.push(metadata_index::column_from_metadata(
+                    metadata.as_ref(),
+                    &k.key,
+                )?);
+            }
+            patches.push(RecordBatch::try_new(patch_schema.clone(), columns)?);
+        }
+        if patches.is_empty() {
+            return Ok(dataset);
+        }
+        // Lance's own retry would join these values onto rows a later write
+        // replaced; derive them again from the version that write left.
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec![KEY_COLUMN.to_string()])?;
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .conflict_retries(0);
+        match builder.try_build()?.execute_batches(patches).await {
+            Ok((healed, _stats)) => {
+                tracing::info!(
+                    rows = rows.iter().map(|b| b.num_rows()).sum::<usize>(),
+                    "derived indexed metadata key columns a concurrent column add left stale"
+                );
+                return Ok(Arc::unwrap_or_clone(healed));
+            }
+            Err(lance::Error::TooMuchWriteContention { .. }) => dataset.checkout_latest().await?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("writes kept replacing the rows while their indexed key columns were derived")
+}
+
+/// The indexed metadata keys `dataset` records, requested ones first.
+async fn metadata_keys(dataset: &Dataset) -> Result<pb::MetadataKeysResponse> {
+    let rows: u64 = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.num_rows().unwrap_or(0) as u64)
+        .sum();
+    let mut keys: Vec<pb::MetadataKey> = metadata_index::requests(dataset)
+        .into_iter()
+        .map(|key| pb::MetadataKey {
+            key,
+            state: "requested".to_string(),
+            rows,
+            ..Default::default()
+        })
+        .collect();
+    for key in metadata_index::keys_of(dataset) {
+        let segments = metadata_index::segments(dataset, &key.column).await?;
+        keys.push(pb::MetadataKey {
+            state: key.state.map_or("unknown", |s| s.as_str()).to_string(),
+            indexed_rows: segments.iter().map(|s| s.rows).sum(),
+            index_bytes: segments.iter().map(|s| s.bytes).sum(),
+            segments: segments.len() as u32,
+            rows,
+            key: key.key,
+            column: key.column,
+        });
+    }
+    let vector_index = match index::index_names(dataset, VECTOR_COLUMN).await?.first() {
+        Some(name) => {
+            weed_lance_worker::vector_index::index_settings(dataset, name)
+                .await?
+                .index_type
+        }
+        None => String::new(),
+    };
+    Ok(pb::MetadataKeysResponse {
+        keys,
+        version: dataset.version().version,
+        rows,
+        vector_index,
+    })
 }
 
 fn struct_to_json(s: &Struct) -> serde_json::Value {
@@ -188,7 +408,7 @@ fn json_to_value(v: serde_json::Value) -> Value {
     Value { kind: Some(kind) }
 }
 
-fn json_to_struct(map: serde_json::Map<String, serde_json::Value>) -> Struct {
+pub(crate) fn json_to_struct(map: serde_json::Map<String, serde_json::Value>) -> Struct {
     Struct {
         fields: map
             .into_iter()
@@ -406,10 +626,87 @@ fn resolved(table: &pb::Table, schemes: &[&str]) -> Option<TableDescription> {
     })
 }
 
+/// Marks the table an index was created as, in its schema metadata, which
+/// every later version keeps.
+const TABLE_ID_KEY: &str = "weed_vector_table_id";
+
+/// The table a dataset was created as; empty for one created before tables
+/// were marked.
+pub(crate) fn table_id(dataset: &Dataset) -> &str {
+    dataset
+        .schema()
+        .metadata
+        .get(TABLE_ID_KEY)
+        .map_or("", String::as_str)
+}
+
+/// The session reads share, and the table each location held when this
+/// session first read it. Lance keys some of its caches by location and
+/// version alone, and an index dropped and created again at its location
+/// numbers its versions from 1 again, so a session that sees a location hold
+/// another table starts over.
+pub(crate) struct Reads {
+    pub(crate) session: Arc<Session>,
+    generation: u64,
+    tables: HashMap<String, String>,
+}
+
+/// Opened tables kept for the next read of them.
+const MAX_HANDLES: u64 = 1024;
+
+fn handle_key(table: &pb::Table) -> (String, bool) {
+    (table.location.clone(), table.sse_s3)
+}
+
+/// Locations a session remembers before it starts over.
+const MAX_READ_TABLES: usize = 100_000;
+
+impl Reads {
+    fn new(index_bytes: usize, metadata_bytes: usize) -> Self {
+        Self {
+            session: Arc::new(Session::new(
+                index_bytes,
+                metadata_bytes,
+                Default::default(),
+            )),
+            generation: 0,
+            tables: HashMap::new(),
+        }
+    }
+
+    /// Whether a dataset of `table_id` at `location`, opened in this session,
+    /// may be read. Otherwise the session was replaced and the caller opens
+    /// the table again.
+    fn admit(&mut self, location: &str, table_id: &str, (index, metadata): (usize, usize)) -> bool {
+        match self.tables.get(location) {
+            Some(seen) if seen == table_id => return true,
+            None if self.tables.len() < MAX_READ_TABLES => {
+                self.tables
+                    .insert(location.to_string(), table_id.to_string());
+                return true;
+            }
+            _ => {}
+        }
+        let generation = self.generation + 1;
+        *self = Self::new(index, metadata);
+        self.generation = generation;
+        false
+    }
+}
+
 pub struct VectorServer {
     storage: Option<DirectReads>,
     read_cache: Option<ReadCache>,
-    nprobes: Option<usize>,
+    /// Lance's index and metadata caches, shared by every request that only
+    /// reads. Writes open in a session of their own.
+    pub(crate) reads: Mutex<Reads>,
+    /// A table opened by an earlier read, by location and encryption, with
+    /// the generation of the session it was opened in.
+    pub(crate) handles: moka::sync::Cache<(String, bool), (u64, Dataset)>,
+    lance_cache_bytes: (usize, usize),
+    leases: SharedLeases,
+    exact_match_limit: Option<usize>,
+    filter_stats: crate::filter_stats::FilterStats,
     /// URI schemes a table's location may have.
     schemes: &'static [&'static str],
 }
@@ -425,7 +722,15 @@ impl VectorServer {
         Self {
             storage: None,
             read_cache: None,
-            nprobes: None,
+            reads: Mutex::new(Reads::new(
+                DEFAULT_INDEX_CACHE_BYTES,
+                DEFAULT_METADATA_CACHE_BYTES,
+            )),
+            lance_cache_bytes: (DEFAULT_INDEX_CACHE_BYTES, DEFAULT_METADATA_CACHE_BYTES),
+            handles: moka::sync::Cache::new(MAX_HANDLES),
+            leases: SharedLeases::default(),
+            exact_match_limit: None,
+            filter_stats: Default::default(),
             schemes: &["s3"],
         }
     }
@@ -437,9 +742,11 @@ impl VectorServer {
         self
     }
 
-    /// Partitions every query probes, instead of the index's own default.
-    pub fn with_nprobes(mut self, nprobes: Option<usize>) -> Self {
-        self.nprobes = nprobes;
+    /// Matches of a filter's indexed metadata keys scored exactly instead of
+    /// searched through the vector index, at most; None keeps the default.
+    #[cfg(test)]
+    pub(crate) fn with_exact_match_limit(mut self, limit: Option<usize>) -> Self {
+        self.exact_match_limit = limit;
         self
     }
 
@@ -447,6 +754,13 @@ impl VectorServer {
     /// Unset only for tests on an in-process store.
     pub fn with_storage(mut self, storage: DirectReads) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Bytes of loaded indexes and of table metadata kept across reads.
+    pub fn with_lance_caches(mut self, index_bytes: usize, metadata_bytes: usize) -> Self {
+        self.reads = Mutex::new(Reads::new(index_bytes, metadata_bytes));
+        self.lance_cache_bytes = (index_bytes, metadata_bytes);
         self
     }
 
@@ -491,9 +805,72 @@ impl VectorServer {
     }
 
     async fn open(&self, table: &pb::Table) -> Result<Dataset, Status> {
+        self.open_in(table, None).await
+    }
+
+    /// [`Self::open`] in the shared session, for a request that only reads.
+    async fn open_to_read(&self, table: &pb::Table) -> Result<Dataset, Status> {
+        loop {
+            let (session, generation) = {
+                let reads = self.reads.lock().unwrap();
+                (reads.session.clone(), reads.generation)
+            };
+            let dataset = match self.handle(table, generation).await? {
+                Some(dataset) => dataset,
+                None => {
+                    let dataset = self.open_in(table, Some(session)).await?;
+                    // Under the lock, so no handle of a replaced session
+                    // lands after the replacement cleared them.
+                    let reads = self.reads.lock().unwrap();
+                    if table.version == 0 && reads.generation == generation {
+                        self.handles
+                            .insert(handle_key(table), (generation, dataset.clone()));
+                    }
+                    dataset
+                }
+            };
+            let mut reads = self.reads.lock().unwrap();
+            if reads.generation != generation {
+                continue;
+            }
+            if reads.admit(&table.location, table_id(&dataset), self.lance_cache_bytes) {
+                return Ok(dataset);
+            }
+            // The handles hold the replaced session and its caches.
+            self.handles.invalidate_all();
+        }
+    }
+
+    /// The table from the handle an earlier read of it left in this session,
+    /// moved to the version asked for: the latest costs a listing of its
+    /// versions, not a new store and manifest read.
+    async fn handle(&self, table: &pb::Table, generation: u64) -> Result<Option<Dataset>, Status> {
+        self.describe(table)?;
+        let key = handle_key(table);
+        let Some((at, mut dataset)) = self.handles.get(&key) else {
+            return Ok(None);
+        };
+        if at != generation {
+            return Ok(None);
+        }
+        let moved = match table.version {
+            0 => dataset.checkout_latest().await.map(|()| dataset),
+            version => dataset.checkout_version(version).await,
+        };
+        moved.map(Some).map_err(|err| {
+            self.handles.invalidate(&key);
+            open_status(err.into())
+        })
+    }
+
+    async fn open_in(
+        &self,
+        table: &pb::Table,
+        session: Option<Arc<Session>>,
+    ) -> Result<Dataset, Status> {
         let description = self.describe(table)?;
         let wrapper = self.wrapper(table);
-        let mut dataset = dataset::open_at(&description, wrapper)
+        let mut dataset = dataset::open_at(&description, wrapper, session)
             .await
             .map_err(open_status)?;
         if table.version != 0 {
@@ -526,6 +903,13 @@ impl VectorService for VectorServer {
         // The gateway has already created the table through the catalog.
         let description = self.describe(&table)?;
         let schema = schema_for(dimension, metric, &req.non_filterable_metadata_keys);
+        let schema = Arc::new(Schema::new_with_metadata(
+            schema.fields().clone(),
+            HashMap::from([(
+                TABLE_ID_KEY.to_string(),
+                uuid::Uuid::new_v4().simple().to_string(),
+            )]),
+        ));
         let empty = RecordBatch::new_empty(schema.clone());
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema);
         let dataset = Dataset::write(
@@ -536,8 +920,32 @@ impl VectorService for VectorServer {
                 ..Default::default()
             }),
         )
-        .await
-        .map_err(internal)?;
+        .await;
+        let dataset = match dataset {
+            Ok(dataset) => {
+                self.filter_stats
+                    .forget(&table.id.join("/"), table_id(&dataset));
+                dataset
+            }
+            Err(error) => match self.open(&table).await {
+                Ok(existing)
+                    if matches_index_schema(
+                        &existing,
+                        dimension,
+                        metric,
+                        &req.non_filterable_metadata_keys,
+                    ) =>
+                {
+                    existing
+                }
+                Ok(_) => {
+                    return Err(Status::already_exists(
+                        "index exists with a different schema",
+                    ));
+                }
+                Err(_) => return Err(internal(error)),
+            },
+        };
         Ok(Response::new(pb::CreateIndexResponse {
             version: dataset.version().version,
         }))
@@ -569,6 +977,7 @@ impl VectorService for VectorServer {
                 store.remove_dir_all(path).await.map_err(internal)?;
             }
         }
+        self.filter_stats.forget(&table.id.join("/"), "");
         Ok(Response::new(pb::DropIndexResponse {}))
     }
 
@@ -580,35 +989,37 @@ impl VectorService for VectorServer {
         let table = req
             .table
             .ok_or_else(|| Status::invalid_argument("missing table"))?;
-        let dataset = self.open(&table).await?;
-        if req.vectors.is_empty() {
-            return Ok(Response::new(pb::PutVectorsResponse {
-                version: dataset.version().version,
-            }));
+        if table.version != 0 {
+            return Err(Status::invalid_argument("a write takes no table version"));
         }
-        let dimension = VectorTable::resolve(&dataset, None, Some(KEY_COLUMN))
-            .map_err(invalid)?
-            .dimension;
-        let batch = batch_of(
-            &req.vectors,
-            dimension,
-            Arc::new(Into::<arrow_schema::Schema>::into(dataset.schema())),
-        )
-        .map_err(invalid)?;
-        // Upsert by key in one merge commit: no window where the old rows are
-        // already deleted, and a losing writer fails the request instead of
-        // leaving duplicate keys.
-        let mut builder =
-            MergeInsertBuilder::try_new(Arc::new(dataset), vec![KEY_COLUMN.to_string()])
-                .map_err(internal)?;
-        builder.when_matched(WhenMatched::UpdateAll);
-        builder.when_not_matched(WhenNotMatched::InsertAll);
-        let (dataset, _stats) = builder
-            .try_build()
-            .map_err(internal)?
-            .execute_batches(vec![batch])
-            .await
-            .map_err(internal)?;
+        // A write commits within its deadline of opening the table or not
+        // at all: a key's column add waits longer than that before the key
+        // is ready, so a write that opened before the add has committed,
+        // and been derived again, before any query uses the key.
+        let merged = tokio::time::timeout(metadata_index::WRITE_DEADLINE, async {
+            let dataset = self.open(&table).await?;
+            if req.vectors.is_empty() {
+                return Ok::<_, Status>((dataset, None));
+            }
+            let written = Arc::new(Into::<arrow_schema::Schema>::into(dataset.schema()));
+            Ok((merge_vectors(dataset, &req.vectors).await?, Some(written)))
+        })
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "PutVectors took longer than {:?} to commit",
+                metadata_index::WRITE_DEADLINE
+            ))
+        })??;
+        let dataset = match merged {
+            (dataset, Some(written)) => {
+                let keys: Vec<String> = req.vectors.iter().map(|v| v.key.clone()).collect();
+                heal_columns(dataset, &written, &keys)
+                    .await
+                    .map_err(internal)?
+            }
+            (dataset, None) => dataset,
+        };
         Ok(Response::new(pb::PutVectorsResponse {
             version: dataset.version().version,
         }))
@@ -622,12 +1033,10 @@ impl VectorService for VectorServer {
         let table = req
             .table
             .ok_or_else(|| Status::invalid_argument("missing table"))?;
-        let dataset = self.open(&table).await?;
+        let dataset = self.open_to_read(&table).await?;
         // Lease the resolved version so maintenance cannot reclaim its files
         // while this query runs against it.
-        let _lease = weed_vector_core::maintenance::try_pin(&dataset)
-            .await
-            .map_err(internal)?;
+        let _lease = self.leases.try_pin(&dataset).await.map_err(internal)?;
         let resolved = VectorTable::resolve(&dataset, None, Some(KEY_COLUMN)).map_err(invalid)?;
         let columns = projection(req.return_data, req.return_metadata);
         let batches = query::get(&dataset, &resolved, &req.keys, Some(&columns))
@@ -672,7 +1081,7 @@ impl VectorService for VectorServer {
                 "segment_index must be below segment_count, which is at most {MAX_SEGMENTS}"
             )));
         }
-        let dataset = self.open(&table).await?;
+        let dataset = self.open_to_read(&table).await?;
         let offset: u64 = if req.next_token.is_empty() {
             0
         } else {
@@ -688,16 +1097,9 @@ impl VectorService for VectorServer {
             0 => DEFAULT_PAGE,
             n => n.min(MAX_PAGE),
         };
+        // A purge keeps only the latest version, so lease the one this page reads.
+        let _lease = self.leases.try_pin(&dataset).await.map_err(internal)?;
         if segments > 1 {
-            // Data and metadata come from a second read of this version, so
-            // lease it as get_vectors does.
-            let _lease = if columns.len() > 1 {
-                weed_vector_core::maintenance::try_pin(&dataset)
-                    .await
-                    .map_err(internal)?
-            } else {
-                None
-            };
             let (vectors, next) = list_segment(
                 &dataset,
                 &columns,
@@ -735,17 +1137,86 @@ impl VectorService for VectorServer {
         &self,
         request: Request<pb::QueryVectorsRequest>,
     ) -> Result<Response<pb::QueryVectorsResponse>, Status> {
+        self.query(request, false).await
+    }
+
+    async fn query_indexed_vectors(
+        &self,
+        request: Request<pb::QueryVectorsRequest>,
+    ) -> Result<Response<pb::QueryVectorsResponse>, Status> {
+        self.query(request, true).await
+    }
+
+    async fn metadata_keys(
+        &self,
+        request: Request<pb::MetadataKeysRequest>,
+    ) -> Result<Response<pb::MetadataKeysResponse>, Status> {
+        let table = request
+            .into_inner()
+            .table
+            .ok_or_else(|| Status::invalid_argument("missing table"))?;
+        let dataset = self.open_to_read(&table).await?;
+        let _lease = self.leases.try_pin(&dataset).await.map_err(internal)?;
+        Ok(Response::new(
+            metadata_keys(&dataset).await.map_err(internal)?,
+        ))
+    }
+
+    async fn update_metadata_key(
+        &self,
+        request: Request<pb::UpdateMetadataKeyRequest>,
+    ) -> Result<Response<pb::MetadataKeysResponse>, Status> {
         let req = request.into_inner();
         let table = req
             .table
             .ok_or_else(|| Status::invalid_argument("missing table"))?;
-        let dataset = self.open(&table).await?;
+        let mut dataset = self.open(&table).await?;
+        let updated = if req.remove {
+            metadata_index::request_removal(&mut dataset, &req.key).await
+        } else {
+            metadata_index::request(&mut dataset, &req.key).await
+        };
+        updated.map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+        Ok(Response::new(
+            metadata_keys(&dataset).await.map_err(internal)?,
+        ))
+    }
+
+    async fn filter_stats(
+        &self,
+        request: Request<pb::FilterStatsRequest>,
+    ) -> Result<Response<pb::FilterStatsResponse>, Status> {
+        let table = request
+            .into_inner()
+            .table
+            .ok_or_else(|| Status::invalid_argument("missing table"))?;
+        Ok(Response::new(
+            self.filter_stats.snapshot(&table.id.join("/")),
+        ))
+    }
+}
+
+impl VectorServer {
+    async fn query(
+        &self,
+        request: Request<pb::QueryVectorsRequest>,
+        indexed_only: bool,
+    ) -> Result<Response<pb::QueryVectorsResponse>, Status> {
+        let started = std::time::Instant::now();
+        let req = request.into_inner();
+        let table = req
+            .table
+            .ok_or_else(|| Status::invalid_argument("missing table"))?;
+        let dataset = self.open_to_read(&table).await?;
         // Lease the resolved version so maintenance cannot reclaim its files
         // while this query runs against it.
-        let _lease = weed_vector_core::maintenance::try_pin(&dataset)
-            .await
-            .map_err(internal)?;
+        let _lease = self.leases.try_pin(&dataset).await.map_err(internal)?;
         let resolved = VectorTable::resolve(&dataset, None, Some(KEY_COLUMN)).map_err(invalid)?;
+        let filter_keys = if req.filter.is_empty() {
+            Default::default()
+        } else {
+            indexed_filter::filter_keys(&dataset, &req.filter).unwrap_or_default()
+        };
         if req.query_vector.len() != resolved.dimension {
             return Err(Status::invalid_argument(format!(
                 "query vector carries {} floats, the index dimension is {}",
@@ -767,13 +1238,29 @@ impl VectorService for VectorServer {
             },
             postfilter: req.postfilter,
             distance,
-            nprobes: self.nprobes,
+            nprobes: None,
             index_segments: None,
             fragments: None,
+            exact_match_limit: self.exact_match_limit,
         };
-        let hits = query::ann(&dataset, &resolved, &query)
-            .await
-            .map_err(internal)?;
+        let (hits, excluded) = if indexed_only {
+            query::indexed_only(&dataset, &resolved, &query)
+                .await
+                .map_err(|err| {
+                    if err.is::<query::IndexedOnlyError>() {
+                        invalid(err)
+                    } else {
+                        internal(err)
+                    }
+                })?
+        } else {
+            (
+                query::ann(&dataset, &resolved, &query)
+                    .await
+                    .map_err(internal)?,
+                0,
+            )
+        };
         // One batched read for every hit's columns; keyed by the hit key so
         // row order does not matter.
         let mut metas: std::collections::HashMap<String, Option<Struct>> =
@@ -845,7 +1332,21 @@ impl VectorService for VectorServer {
                 data: data_map.remove(&hit.key).unwrap_or_default(),
             });
         }
-        Ok(Response::new(pb::QueryVectorsResponse { vectors }))
+        let index = table.id.join("/");
+        self.filter_stats
+            .record(&index, table_id(&dataset), &filter_keys, started.elapsed());
+        let mut response = Response::new(pb::QueryVectorsResponse { vectors });
+        if indexed_only {
+            response.metadata_mut().insert(
+                "x-seaweedfs-vector-search-mode",
+                "indexed-only".parse().unwrap(),
+            );
+            response.metadata_mut().insert(
+                "x-seaweedfs-vector-excluded-fragments",
+                excluded.to_string().parse().unwrap(),
+            );
+        }
+        Ok(response)
     }
 }
 

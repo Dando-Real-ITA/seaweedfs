@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -13,6 +14,7 @@ const (
 	VolumeServerType = "volumeServer"
 	FilerType        = "filer"
 	BrokerType       = "broker"
+	MountType        = "mount"
 	S3Type           = "s3"
 	VectorType       = "vector"
 )
@@ -24,6 +26,8 @@ type Rack string
 type ClusterNode struct {
 	Address    pb.ServerAddress
 	Version    string
+	LancePort  atomic.Uint32 // set after the node is listed, so read atomically
+	S3Endpoint atomic.Pointer[string]
 	counter    int
 	CreatedTs  time.Time
 	DataCenter DataCenter
@@ -201,4 +205,35 @@ func buildClusterNodeUpdateMessage(isAdd bool, filerGroup FilerGroupName, nodeTy
 		},
 	})
 	return
+}
+
+// SetLancePort records the Lance Namespace port a registered S3 gateway serves.
+func (cluster *Cluster) SetLancePort(ns string, address pb.ServerAddress, port uint32) {
+	g := cluster.s3Groups
+	g.RLock()
+	defer g.RUnlock()
+	if m := g.getGroupMembers(FilerGroupName(ns), false); m != nil {
+		if node, found := m.members[address]; found {
+			node.LancePort.Store(port)
+		}
+	}
+}
+
+// SetS3Endpoint records the URL a registered S3 gateway serves the S3 API on.
+func (cluster *Cluster) SetS3Endpoint(ns string, address pb.ServerAddress, endpoint string) {
+	g := cluster.s3Groups
+	g.RLock()
+	defer g.RUnlock()
+	if m := g.getGroupMembers(FilerGroupName(ns), false); m != nil {
+		if node, found := m.members[address]; found {
+			node.S3Endpoint.Store(&endpoint)
+		}
+	}
+}
+
+func (node *ClusterNode) GetS3Endpoint() string {
+	if endpoint := node.S3Endpoint.Load(); endpoint != nil {
+		return *endpoint
+	}
+	return ""
 }

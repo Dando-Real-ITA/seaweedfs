@@ -67,6 +67,8 @@ Download the latest binary from the [releases](https://github.com/seaweedfs/seaw
 curl -fsSL https://raw.githubusercontent.com/seaweedfs/seaweedfs/master/install.sh | bash
 ```
 
+For SeaweedFS Enterprise binaries, pass `--enterprise` to the script: `... | bash -s -- --enterprise`.
+
 Then start a ready-to-use S3 object store:
 
 ```bash
@@ -85,7 +87,7 @@ AWS_ACCESS_KEY_ID=admin AWS_SECRET_ACCESS_KEY=secret \
 
 The same process also runs the master, a volume server, the filer, WebDAV, the Iceberg REST catalog, and the Admin UI. Add `S3_TABLE_BUCKET=warehouse` to also create an Iceberg table bucket, or `warehouse:LANCE` for a Lance one. Drop the AWS keys to run without authentication for development.
 
-Without Admin authentication or mTLS, `weed mini` binds the Admin UI/API and its worker gRPC control plane to loopback rather than `-ip.bind`. Set `WEED_ADMIN_PASSWORD` or configure `https.admin` mTLS to keep the network bind. Remote workers must opt in with `-admin.worker.ip=<address>` and should configure `grpc.admin` mTLS. `-admin.allowInsecureBind` restores the legacy unauthenticated network bind and should only be used on an isolated network.
+`weed mini` binds the Admin UI/API and WebDAV to `-ip.bind` like its other components, even without authentication, so use it on a trusted network or set `WEED_ADMIN_PASSWORD` or `https.admin` mTLS. Pass `-admin.allowInsecureBind=false` or `-webdav.allowInsecureBind=false` to keep an unauthenticated Admin or WebDAV on loopback. The Admin worker gRPC control plane stays on loopback; remote workers must opt in with `-admin.worker.ip=<address>` and should configure `grpc.admin` mTLS.
 
 > macOS: if the binary is quarantined, run `xattr -d com.apple.quarantine ./weed` first.
 
@@ -244,7 +246,25 @@ Keep embeddings alongside your objects and tables in the same SeaweedFS cluster.
 * Find the nearest vectors with cosine or Euclidean distance, filter by metadata, and return distances and metadata with the results.
 * Control access with `s3vectors:*` IAM actions and vector bucket policies; tag buckets and indexes for organization and access control.
 
-Run the separate `weed-vector` binary alongside the cluster. For the local cluster started with `weed mini` above:
+Install the separate vector engine; the default installer installs only `weed`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seaweedfs/seaweedfs/master/install.sh | bash -s -- --component vector
+```
+
+Release 4.53 provides vector binaries for Linux amd64 and arm64. If your release has no binary for your platform, build from [source](seaweed-vector). From a directory where you want a new checkout:
+
+```bash
+git clone https://github.com/seaweedfs/seaweedfs.git
+cd seaweedfs
+(cd seaweed-vector && cargo build --release -p weed-vector-server)
+```
+
+If you already have a checkout, start at its root and skip the clone and `cd seaweedfs` steps.
+
+For Windows source builds, set `PROTOC` to a native `protoc.exe` before running Cargo; the [desktop build workflow](.github/workflows/rust-vector-platforms.yml) shows how to select the vendored executable.
+
+Run the installed `weed-vector` binary alongside the local cluster started with `weed mini` above (or use `seaweed-vector/target/release/weed-vector` after building from source):
 
 ```bash
 weed-vector --masters=localhost:9333

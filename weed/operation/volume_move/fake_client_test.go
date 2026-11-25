@@ -40,9 +40,12 @@ type fakeCluster struct {
 
 	lastAppendAtNs uint64
 
-	copyReqs   []*volume_server_pb.VolumeCopyRequest
-	deleteReqs []*volume_server_pb.VolumeDeleteRequest
-	ecCopyReqs []*volume_server_pb.VolumeEcShardsCopyRequest
+	copyReqs     []*volume_server_pb.VolumeCopyRequest
+	readonlyReqs []*volume_server_pb.VolumeMarkReadonlyRequest
+	deleteReqs   []*volume_server_pb.VolumeDeleteRequest
+	ecCopyReqs   []*volume_server_pb.VolumeEcShardsCopyRequest
+	// wrongTypeDisk is a disk of each server that refuses typed EC copies.
+	wrongTypeDisk map[string]uint32
 }
 
 func newFakeCluster() *fakeCluster {
@@ -94,6 +97,9 @@ func (f *fakeClient) VolumeMarkReadonly(ctx context.Context, req *volume_server_
 	if err := f.cluster.record(f.addr, "VolumeMarkReadonly"); err != nil {
 		return nil, err
 	}
+	f.cluster.mu.Lock()
+	f.cluster.readonlyReqs = append(f.cluster.readonlyReqs, req)
+	f.cluster.mu.Unlock()
 	return &volume_server_pb.VolumeMarkReadonlyResponse{}, nil
 }
 
@@ -182,7 +188,11 @@ func (f *fakeClient) VolumeEcShardsCopy(ctx context.Context, req *volume_server_
 	}
 	f.cluster.mu.Lock()
 	f.cluster.ecCopyReqs = append(f.cluster.ecCopyReqs, req)
+	wrongType, hasWrongType := f.cluster.wrongTypeDisk[f.addr]
 	f.cluster.mu.Unlock()
+	if hasWrongType && req.DiskType != "" && req.DiskId == wrongType {
+		return nil, status.Errorf(codes.InvalidArgument, "disk %d is hdd, not the requested disk type %s", req.DiskId, req.DiskType)
+	}
 	return &volume_server_pb.VolumeEcShardsCopyResponse{}, nil
 }
 

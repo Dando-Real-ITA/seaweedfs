@@ -9,6 +9,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::metrics::Metrics;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -42,6 +43,7 @@ pub struct ReadCache {
     /// Keeps entries apart from those of another [`Self::scoped`] view, for
     /// stores that share a prefix but not their bytes.
     scope: Arc<str>,
+    metrics: Option<Metrics>,
 }
 
 impl ReadCache {
@@ -54,7 +56,18 @@ impl ReadCache {
                 })
                 .build(),
             scope: "".into(),
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn size(&self) -> (u64, u64) {
+        self.cache.run_pending_tasks();
+        (self.cache.entry_count(), self.cache.weighted_size())
     }
 
     /// The same cache, keyed apart under `scope`.
@@ -62,6 +75,7 @@ impl ReadCache {
         Self {
             cache: self.cache.clone(),
             scope: scope.into(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -81,6 +95,7 @@ impl WrappingObjectStore for ReadCache {
             inner: original,
             store: format!("{}|{store_prefix}", self.scope).into(),
             cache: self.cache.clone(),
+            metrics: self.metrics.clone(),
         })
     }
 }
@@ -136,6 +151,7 @@ struct CachedStore {
     inner: Arc<dyn ObjectStore>,
     store: Arc<str>,
     cache: moka::sync::Cache<Key, Entry>,
+    metrics: Option<Metrics>,
 }
 
 impl CachedStore {
@@ -184,14 +200,47 @@ impl ObjectStore for CachedStore {
             object: Some(object),
         }) = self.cache.get(&key)
         {
+            if let Some(metrics) = &self.metrics {
+                metrics.cache_requests.with_label_values(&["hit"]).inc();
+            }
             return Ok(whole(bytes, &object));
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.cache_requests.with_label_values(&["miss"]).inc();
+        }
+        let _timer = self
+            .metrics
+            .as_ref()
+            .map(|m| m.storage_read_seconds.start_timer());
         let result = self.inner.get_opts(location, options).await?;
         if result.meta.size > MAX_WHOLE_OBJECT {
-            return Ok(result);
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let metrics = self.metrics.clone();
+            let timer = _timer;
+            let stream = result
+                .into_stream()
+                .map(move |chunk| {
+                    let _timer = &timer;
+                    if let (Some(metrics), Ok(bytes)) = (&metrics, &chunk) {
+                        metrics.storage_bytes.inc_by(bytes.len() as u64);
+                    }
+                    chunk
+                })
+                .boxed();
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(stream),
+                meta,
+                range,
+                attributes,
+            });
         }
         let object = Arc::new((result.meta.clone(), result.attributes.clone()));
         let bytes = owned(result.bytes().await?);
+        if let Some(metrics) = &self.metrics {
+            metrics.storage_bytes.inc_by(bytes.len() as u64);
+        }
         self.cache.insert(
             key,
             Entry {
@@ -220,7 +269,21 @@ impl ObjectStore for CachedStore {
             .filter(|(_, hit)| hit.is_none())
             .map(|(range, _)| range.clone())
             .collect();
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .cache_requests
+                .with_label_values(&["miss"])
+                .inc_by(missing.len() as u64);
+            metrics
+                .cache_requests
+                .with_label_values(&["hit"])
+                .inc_by((ranges.len() - missing.len()) as u64);
+        }
         if !missing.is_empty() {
+            let _timer = self
+                .metrics
+                .as_ref()
+                .map(|m| m.storage_read_seconds.start_timer());
             let mut fetched = self.inner.get_ranges(location, &missing).await?.into_iter();
             for (range, slot) in ranges.iter().zip(out.iter_mut()) {
                 if slot.is_some() {
@@ -230,6 +293,9 @@ impl ObjectStore for CachedStore {
                     break;
                 };
                 let bytes = owned(bytes);
+                if let Some(metrics) = &self.metrics {
+                    metrics.storage_bytes.inc_by(bytes.len() as u64);
+                }
                 self.cache.insert(
                     self.key(location, Some(range.clone())),
                     Entry {
@@ -287,7 +353,7 @@ mod tests {
     use super::*;
     use crate::pb::vector as pb;
     use crate::pb::vector::vector_service_server::VectorService;
-    use crate::service::VectorServer;
+    use crate::service::{VectorServer, schema_for, table_id};
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use tonic::Request;
@@ -491,6 +557,16 @@ mod tests {
         };
 
         create(&server, &table, 4).await;
+        create(&server, &table, 4).await;
+        let mismatch = server
+            .create_index(Request::new(pb::CreateIndexRequest {
+                table: Some(table.clone()),
+                dimension: 3,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::AlreadyExists);
         put(
             &server,
             &table,
@@ -538,6 +614,117 @@ mod tests {
             ("z", &[0.5, 0.5][..])
         );
         assert_eq!(query(&server, &table, vec![1.0, 0.0]).await, ["z"]);
+    }
+
+    /// A query loads the index once; the next one finds it in the session
+    /// every read shares.
+    #[tokio::test]
+    async fn queries_reuse_the_loaded_index() {
+        let bucket = format!("session-{}", uuid_like());
+        let location = format!("shared-memory://{bucket}/vector/x");
+        let server = VectorServer::new().with_schemes(&["shared-memory"]);
+        let table = pb::Table {
+            id: vec![bucket, "vector".into(), "x".into()],
+            location: location.clone(),
+            ..Default::default()
+        };
+        create(&server, &table, 2).await;
+        put(
+            &server,
+            &table,
+            (0..300)
+                .map(|i| vector(&format!("k{i}"), vec![i as f32, 1.0]))
+                .collect(),
+        )
+        .await;
+        let mut dataset = lance::Dataset::open(&location).await.unwrap();
+        weed_lance_worker::vector_index::build(&mut dataset, "vector", "idx", 2, false)
+            .await
+            .unwrap();
+
+        assert_eq!(query(&server, &table, vec![5.0, 1.0]).await[0], "k5");
+        let session = server.reads.lock().unwrap().session.clone();
+        let loaded = session.index_cache_stats().await;
+        assert!(session.approx_num_items() > 0);
+        assert_eq!(query(&server, &table, vec![7.0, 1.0]).await[0], "k7");
+        let again = session.index_cache_stats().await;
+        assert!(server.handles.contains_key(&(location, false)));
+        assert!(again.hits > loaded.hits, "{loaded:?} then {again:?}");
+        assert_eq!(again.misses, loaded.misses, "{loaded:?} then {again:?}");
+    }
+
+    /// An index dropped and created again at the same location reaches the
+    /// version numbers of the old one; the shared session must not answer
+    /// for them with the old index.
+    #[tokio::test]
+    async fn a_recreated_table_does_not_see_the_old_index() {
+        recreate_after(false).await;
+        recreate_after(true).await;
+    }
+
+    /// `unmarked`: the first table is written without a table id, as indexes
+    /// created before ids were are.
+    async fn recreate_after(unmarked: bool) {
+        let bucket = format!("recreate-{}", uuid_like());
+        let location = format!("shared-memory://{bucket}/vector/x");
+        let server = VectorServer::new().with_schemes(&["shared-memory"]);
+        let table = pb::Table {
+            id: vec![bucket, "vector".into(), "x".into()],
+            location: location.clone(),
+            ..Default::default()
+        };
+        let rows = |offset: usize| {
+            (0..300)
+                .map(|i| vector(&format!("k{}", i + offset), vec![(i + offset) as f32, 1.0]))
+                .collect::<Vec<_>>()
+        };
+        if unmarked {
+            let schema = schema_for(2, pb::DistanceMetric::L2, &[]);
+            let empty = arrow_array::RecordBatch::new_empty(schema.clone());
+            let reader = arrow_array::RecordBatchIterator::new(vec![Ok(empty)], schema);
+            lance::Dataset::write(reader, &location, None)
+                .await
+                .unwrap();
+        } else {
+            create(&server, &table, 2).await;
+        }
+        put(&server, &table, rows(0)).await;
+        let mut dataset = lance::Dataset::open(&location).await.unwrap();
+        assert_eq!(table_id(&dataset).is_empty(), unmarked);
+        weed_lance_worker::vector_index::build(&mut dataset, "vector", "idx", 2, false)
+            .await
+            .unwrap();
+        let indexed = dataset.version().version;
+        assert_eq!(query(&server, &table, vec![5.0, 1.0]).await[0], "k5");
+        let other = pb::Table {
+            id: vec![table.id[0].clone(), "vector".into(), "y".into()],
+            location: location.replace("/vector/x", "/vector/y"),
+            ..Default::default()
+        };
+        create(&server, &other, 2).await;
+        put(&server, &other, rows(0)).await;
+        assert_eq!(query(&server, &other, vec![5.0, 1.0]).await[0], "k5");
+
+        let (store, path) = lance::io::ObjectStore::from_uri(&location).await.unwrap();
+        store.remove_dir_all(path).await.unwrap();
+        create(&server, &table, 2).await;
+        let mut offset = 1000;
+        while lance::Dataset::open(&location)
+            .await
+            .unwrap()
+            .version()
+            .version
+            < indexed
+        {
+            put(&server, &table, rows(offset)).await;
+            offset += 1000;
+        }
+        assert_eq!(query(&server, &table, vec![1005.0, 1.0]).await[0], "k1005");
+        server.handles.run_pending_tasks();
+        let session = server.reads.lock().unwrap().session.clone();
+        for (_, (_, dataset)) in server.handles.iter() {
+            assert!(Arc::ptr_eq(&dataset.session(), &session));
+        }
     }
 
     fn uuid_like() -> String {

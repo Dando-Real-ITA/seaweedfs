@@ -155,7 +155,7 @@ type ambiguousPutFiler struct {
 	// beforeLookup runs inside LookupDirectoryEntry, letting a test delete a
 	// just-committed entry before recovery reads it.
 	beforeCreate func()
-	beforeLookup func()
+	beforeLookup func(key string)
 	beforeAssign func()
 	stores       int
 	conds        []*filer_pb.WriteCondition
@@ -232,11 +232,18 @@ func putConditionSatisfied(cond *filer_pb.WriteCondition, current *filer_pb.Entr
 	return true
 }
 
+func (f *ambiguousPutFiler) DeleteEntry(_ context.Context, req *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.entries, req.Directory+"/"+req.Name)
+	return &filer_pb.DeleteEntryResponse{}, nil
+}
+
 func (f *ambiguousPutFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.beforeLookup != nil {
-		f.beforeLookup()
+		f.beforeLookup(req.Directory + "/" + req.Name)
 	}
 	if f.lookupErr != nil && req.Directory+"/"+req.Name == f.lookupFailKey {
 		return nil, f.lookupErr
@@ -279,28 +286,23 @@ func (f *ambiguousPutFiler) ObjectTransaction(_ context.Context, req *filer_pb.O
 			}
 		}
 	}
-	for _, clause := range req.GetCondition().GetClauses() {
-		var md5Hex string
-		if current != nil && current.Attributes != nil {
-			md5Hex = fmt.Sprintf("%x", current.Attributes.Md5)
-		}
-		ok := true
-		switch clause.Kind {
-		case filer_pb.WriteCondition_IF_NOT_EXISTS:
-			ok = current == nil
-		case filer_pb.WriteCondition_IF_EXISTS:
-			ok = current != nil
-		case filer_pb.WriteCondition_IF_ETAG_MATCH:
-			ok = current != nil && etagCandidateMatch(clause.Etags, md5Hex)
-		case filer_pb.WriteCondition_IF_ETAG_NOT_MATCH:
-			ok = current == nil || !etagCandidateMatch(clause.Etags, md5Hex)
-		}
-		if !ok {
-			return &filer_pb.ObjectTransactionResponse{ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED}, nil
-		}
+	if !txnConditionHolds(req.GetCondition(), current) {
+		return &filer_pb.ObjectTransactionResponse{ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED}, nil
 	}
 	if !f.txnNoApply {
-		for _, m := range req.Mutations {
+		for i, m := range req.Mutations {
+			if m.Condition != nil {
+				target := m.ConditionKey
+				if target == "" && m.Type == filer_pb.ObjectMutation_PUT {
+					target = m.Directory + "/" + m.Entry.Name
+				} else if target == "" {
+					target = m.Directory + "/" + m.Name
+				}
+				if !txnConditionHolds(m.Condition, f.entries[target]) {
+					failed := int32(i)
+					return &filer_pb.ObjectTransactionResponse{ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED, FailedMutation: &failed}, nil
+				}
+			}
 			switch m.Type {
 			case filer_pb.ObjectMutation_PUT:
 				entry := proto.Clone(m.Entry).(*filer_pb.Entry)
@@ -319,6 +321,36 @@ func (f *ambiguousPutFiler) ObjectTransaction(_ context.Context, req *filer_pb.O
 		f.supersede = nil
 	}
 	return &filer_pb.ObjectTransactionResponse{}, f.txnErr
+}
+
+// txnConditionHolds evaluates an ObjectTransaction condition, request-level or
+// on one mutation, the way the filer does for the kinds the tests send.
+func txnConditionHolds(cond *filer_pb.WriteCondition, current *filer_pb.Entry) bool {
+	for _, clause := range cond.GetClauses() {
+		var etag string
+		if v := current.GetExtended()[s3_constants.ExtETagKey]; len(v) > 0 {
+			etag = strings.Trim(string(v), `"`)
+		} else if current != nil && current.Attributes != nil {
+			etag = fmt.Sprintf("%x", current.Attributes.Md5)
+		}
+		ok := true
+		switch clause.Kind {
+		case filer_pb.WriteCondition_IF_NOT_EXISTS:
+			ok = current == nil
+		case filer_pb.WriteCondition_IF_EXISTS:
+			ok = current != nil
+		case filer_pb.WriteCondition_IF_ETAG_MATCH:
+			ok = current != nil && etagCandidateMatch(clause.Etags, etag)
+		case filer_pb.WriteCondition_IF_ETAG_NOT_MATCH:
+			ok = current == nil || !etagCandidateMatch(clause.Etags, etag)
+		case filer_pb.WriteCondition_IF_ENTRY_EQUAL:
+			ok = (current == nil) == (clause.ExpectedEntry == nil) && (current == nil || proto.Equal(current, clause.ExpectedEntry))
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // etagCandidateMatch mirrors the filer's strong-comparison canonicalization:
@@ -909,7 +941,9 @@ func TestPutToFilerRoutedRecoveryCreateStaysOnOwner(t *testing.T) {
 }
 
 // When the owner cannot accept the recovery create, the outcome is uncertain —
-// not a failover create under a different filer's lock.
+// not a failover create under a different filer's lock. The owner may have
+// forwarded the conditional create to a filer the gateway cannot look up, so
+// the chunks stay.
 func TestPutToFilerRoutedRecoveryOwnerDownIsUncertain(t *testing.T) {
 	volume := startFakeVolumeServer(t)
 	filerA := &ambiguousPutFiler{
@@ -937,8 +971,8 @@ func TestPutToFilerRoutedRecoveryOwnerDownIsUncertain(t *testing.T) {
 	if filerB.stores != 0 || len(filerB.conds) != 0 {
 		t.Fatalf("the conditional create failed over to another filer: stores=%d conds=%d", filerB.stores, len(filerB.conds))
 	}
-	if deleted := volume.deleted(); len(deleted) == 0 {
-		t.Fatal("orphaned chunks were not deleted")
+	if deleted := volume.deleted(); len(deleted) != 0 {
+		t.Fatalf("chunks of a recovery create that may have committed were deleted: %v", deleted)
 	}
 }
 
@@ -953,7 +987,7 @@ func TestPutToFilerRoutedAmbiguousEmptyPutAbsentNotRecreated(t *testing.T) {
 		txnErr:  status.Error(codes.Unavailable, "response lost after commit"),
 	}
 	// The committed empty object is deleted before recovery looks it up.
-	filerImpl.beforeLookup = func() {
+	filerImpl.beforeLookup = func(string) {
 		delete(filerImpl.entries, "/buckets/b/o")
 	}
 	filerAddr := startFakeFiler(t, filerImpl)
@@ -1069,6 +1103,36 @@ func TestFetchChunkDataDecryptsVolumeCipher(t *testing.T) {
 	plain.Close()
 	if !bytes.Equal(got, plaintext[5:9]) {
 		t.Fatalf("ranged plain read = %q, want %q", got, plaintext[5:9])
+	}
+}
+
+// A truncated chunk keeps its longer needle; full-chunk reads stop at the
+// chunk's recorded size.
+func TestFetchChunkDataStopsAtChunkSize(t *testing.T) {
+	volume := startFakeVolumeServer(t)
+	filerImpl := &ambiguousPutFiler{volume: volume, entries: map[string]*filer_pb.Entry{}}
+	s3a := newPutTestServer(t, startFakeFiler(t, filerImpl))
+
+	stored := bytes.Repeat([]byte("t"), 300)
+	fid := "3,01637037d6"
+	volume.mu.Lock()
+	volume.stored[fid] = stored
+	volume.mu.Unlock()
+
+	view := &filer.ChunkView{FileId: fid, ViewSize: 100, ChunkSize: 100}
+	for name, fetch := range map[string]func(context.Context, *filer.ChunkView) (io.ReadCloser, error){
+		"full": s3a.fetchFullChunk,
+		"view": s3a.fetchChunkViewData,
+	} {
+		r, err := fetch(context.Background(), view)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(r)
+		r.Close()
+		if !bytes.Equal(got, stored[:100]) {
+			t.Fatalf("%s chunk read returned %d bytes, want 100", name, len(got))
+		}
 	}
 }
 
@@ -1245,5 +1309,14 @@ func TestSuspendedPutIfMatchRecheckedWhenAltKeyIgnored(t *testing.T) {
 	}
 	if len(conditionKeys) != 2 || conditionKeys[0] != "" || conditionKeys[1] != "/buckets/b/k.versions/v_v1" {
 		t.Fatalf("condition keys = %v, want [\"\" \"/buckets/b/k.versions/v_v1\"]", conditionKeys)
+	}
+}
+
+func TestTxnConditionHoldsQuotedStoredETag(t *testing.T) {
+	stored := &filer_pb.Entry{Extended: map[string][]byte{s3_constants.ExtETagKey: []byte(`"abc123"`)}}
+	match := &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{Kind: filer_pb.WriteCondition_IF_ETAG_MATCH, Etags: []string{`"abc123"`}}}}
+	notMatch := &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{Kind: filer_pb.WriteCondition_IF_ETAG_NOT_MATCH, Etags: []string{"abc123"}}}}
+	if !txnConditionHolds(match, stored) || txnConditionHolds(notMatch, stored) {
+		t.Fatalf("a quoted stored ETag must compare equal to the same ETag")
 	}
 }

@@ -94,6 +94,7 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 	// data, which ReadNeedleMeta relies on, so it is always read in full.
 	if readOption != nil && readOption.AttemptMetaOnly && v.Version() != needle.Version1 && (readOption.MustMetaOnly || readOption.HasRange || readSize > PagedReadLimit) {
 		readOption.VolumeRevision = v.SuperBlock.CompactionRevision
+		id := n.Id
 		err = n.ReadNeedleMeta(v.DataBackend, nv.Offset.ToActualOffset(), readSize, v.Version())
 		if err == needle.ErrorSizeMismatch && OffsetSize == 4 {
 			readOption.IsOutOfRange = true
@@ -102,6 +103,11 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 		if err != nil {
 			v.checkReadWriteError(err)
 			return 0, err
+		}
+		if n.Id != id {
+			glog.V(0).Infof("volume %d index entry for needle %x resolves to needle %x; reporting not-found",
+				v.Id, uint64(id), uint64(n.Id))
+			return -1, ErrorNotFound
 		}
 		if !n.IsCompressed() && !n.IsChunkedManifest() {
 			readOption.IsMetaOnly = true
@@ -122,20 +128,41 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 		}
 	}
 	count = int(n.DataSize)
-	if !n.HasTtl() {
-		return
-	}
-	ttlMinutes := n.Ttl.Minutes()
-	if ttlMinutes == 0 {
-		return
-	}
-	if !n.HasLastModifiedDate() {
-		return
-	}
-	if time.Now().Before(time.Unix(0, int64(n.AppendAtNs)).Add(time.Duration(ttlMinutes) * time.Minute)) {
+	if !isNeedleTtlExpired(n, time.Now()) {
 		return
 	}
 	return -1, ErrorNotFound
+}
+
+// isNeedleTtlExpired applies the needle's own TTL, counted from its append time.
+func isNeedleTtlExpired(n *needle.Needle, now time.Time) bool {
+	if !n.HasTtl() || n.Ttl == nil || !n.HasLastModifiedDate() {
+		return false
+	}
+	ttlMinutes := n.Ttl.Minutes()
+	if ttlMinutes == 0 {
+		return false
+	}
+	return !now.Before(time.Unix(0, int64(n.AppendAtNs)).Add(time.Duration(ttlMinutes) * time.Minute))
+}
+
+// LookupNeedle returns the needle map size of id without reading its record,
+// so a needle past its TTL still counts as present.
+func (v *Volume) LookupNeedle(id NeedleId) (size Size, found bool, err error) {
+	v.dataFileAccessLock.RLock()
+	defer v.dataFileAccessLock.RUnlock()
+
+	if err := v.UnavailableError(); err != nil {
+		return 0, false, err
+	}
+	if v.nm == nil {
+		return 0, false, nil
+	}
+	nv, ok := v.nm.Get(id)
+	if !ok || nv.Offset.IsZero() {
+		return 0, false, nil
+	}
+	return nv.Size, true, nil
 }
 
 // NoteMetaOnlySuccess records a request that ended at the metadata read
@@ -438,7 +465,11 @@ func (v *Volume) streamNeedleData(n *needle.Needle, readOption *ReadOption, writ
 		}
 		probe := new(needle.Needle)
 		probe.ParseNeedleHeader(header)
-		if probe.Id != n.Id && probe.Size != nv.Size {
+		recordSize := nv.Size
+		if recordSize < 0 {
+			recordSize = -recordSize
+		}
+		if probe.Id != n.Id || probe.Size != recordSize {
 			glog.V(0).Infof("volume %d index entry for needle %x resolves to needle %x; reporting not-found",
 				v.Id, uint64(n.Id), uint64(probe.Id))
 			return ErrorNotFound

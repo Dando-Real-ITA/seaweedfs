@@ -1,5 +1,13 @@
 {{- include "seaweedfs.compat" . -}}
 {{- if .Values.filer.enabled }}
+{{- $s3PreStopSeconds := 0 }}
+{{- if .Values.filer.s3.enabled }}
+{{- $s3PreStopSeconds = .Values.filer.s3.preStopSeconds | int }}
+{{- end }}
+{{- $s3ConfigReloader := (.Values.filer.s3.configReloader | default dict).enabled }}
+{{- if and $s3ConfigReloader (not (and .Values.filer.s3.enabled .Values.filer.s3.enableAuth)) }}
+{{- fail "filer.s3.configReloader.enabled needs filer.s3.enabled and filer.s3.enableAuth: it reloads the identities file they mount" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -46,13 +54,17 @@ spec:
       {{- end }}
       {{- $podAnnotations := mergeOverwrite (deepCopy (.Values.podAnnotations | default dict)) (.Values.filer.podAnnotations | default dict) }}
       {{- if .Values.filer.s3.existingConfigSecret }}
+      {{- /* With the config reloader, a change to the existing Secret is applied by SIGHUP, so nothing in it may restart the pod. */}}
+      {{- if not $s3ConfigReloader }}
       {{- $configSecret := (lookup "v1" "Secret" (include "seaweedfs.namespace" .) .Values.filer.s3.existingConfigSecret) | default dict }}
       {{- $_ := set $podAnnotations "checksum/s3config" ($configSecret | toYaml | sha256sum) }}
+      {{- end }}
       {{- else }}
       {{- $_ := set $podAnnotations "checksum/s3config" (include "seaweedfs.s3.configChecksum" .) }}
       {{- end }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
+      {{- with include "seaweedfs.volumeHttpsAnnotation" $ }}{{ . | nindent 8 }}{{ end }}
     spec:
       restartPolicy: {{ default .Values.global.seaweedfs.restartPolicy .Values.filer.restartPolicy }}
       {{- if .Values.filer.affinity }}
@@ -69,7 +81,7 @@ spec:
       {{- end }}
       {{- include "seaweedfs.imagePullSecrets" . | nindent 6 }}
       serviceAccountName: {{ .Values.filer.serviceAccountName | default (include "seaweedfs.serviceAccountName" .) | quote }} # for deleting statefulset pods after migration
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: {{ add 60 (max $s3PreStopSeconds 0) }}
       {{- if .Values.filer.priorityClassName }}
       priorityClassName: {{ .Values.filer.priorityClassName | quote }}
       {{- end }}
@@ -77,6 +89,9 @@ spec:
       schedulerName: {{ .Values.filer.schedulerName | quote }}
       {{- end }}
       enableServiceLinks: false
+      {{- if or .Values.filer.shareProcessNamespace $s3ConfigReloader }}
+      shareProcessNamespace: true
+      {{- end }}
       {{- if .Values.filer.initContainers }}
       initContainers:
         {{ tpl .Values.filer.initContainers . | nindent 8 | trim }}
@@ -278,6 +293,9 @@ spec:
               {{- if .Values.filer.s3.auditLogConfig }}
               -s3.auditLogConfig=/etc/sw/filer_s3_auditLogConfig.json \
               {{- end }}
+              {{- if gt $s3PreStopSeconds 0 }}
+              -s3.preStopSeconds={{ $s3PreStopSeconds }} \
+              {{- end }}
               {{- end }}
               -master={{ include "seaweedfs.masterServerArg" . }} \
               {{- range .Values.filer.extraArgs }}
@@ -389,6 +407,9 @@ spec:
           {{- if .Values.filer.containerSecurityContext.enabled }}
           securityContext: {{- omit .Values.filer.containerSecurityContext "enabled" | toYaml | nindent 12 }}
           {{- end }}
+        {{- if $s3ConfigReloader }}
+        {{- include "seaweedfs.s3.configReloaderContainer" (dict "root" $ "image" (include "seaweedfs.filer.image" .) "port" .Values.filer.s3.port "resources" .Values.filer.s3.configReloader.resources "securityContext" .Values.filer.containerSecurityContext) | nindent 8 }}
+        {{- end }}
         {{- if .Values.filer.sidecars }}
         {{- include "seaweedfs.tplvalues.render" (dict "value" .Values.filer.sidecars "context" $) | nindent 8 }}
         {{- end }}
@@ -445,8 +466,8 @@ spec:
         {{- end }}
         {{- if include "seaweedfs.securityConfigEnabled" . }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" . }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-security-config
         {{- end }}
         {{- if .Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert
@@ -489,6 +510,9 @@ spec:
       {{- if .Values.filer.storageClass }}
       storageClassName: {{ .Values.filer.storageClass }}
       {{- end }}
+      {{- with .Values.filer.volumeAttributesClassName }}
+      volumeAttributesClassName: {{ . | quote }}
+      {{- end }}
   {{- end }}
   {{- $pvc_exists := include "seaweedfs.filer.pvc_exists" . -}}
   {{- if $pvc_exists }}
@@ -505,6 +529,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.filer.data.storageClass }}
+        {{- with .Values.filer.data.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.filer.data.size }}
@@ -521,6 +548,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.filer.logs.storageClass }}
+        {{- with .Values.filer.logs.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.filer.logs.size }}

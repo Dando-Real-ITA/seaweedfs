@@ -26,7 +26,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -47,15 +46,14 @@ import (
 )
 
 func (iam *IdentityAccessManagement) reqSignatureV4Verify(r *http.Request) (*Identity, s3err.ErrorCode) {
-	switch {
-	case isRequestSignatureV4(r):
-		identity, _, errCode := iam.doesSignatureMatch(r)
-		return identity, errCode
-	case isRequestPresignedSignatureV4(r):
-		identity, _, errCode := iam.doesPresignedSignatureMatch(r)
+	if !isRequestSignatureV4(r) && !isRequestPresignedSignatureV4(r) {
+		return nil, s3err.ErrAccessDenied
+	}
+	identity, _, _, authInfo, errCode := iam.verifyV4Signature(r, false)
+	if errCode != s3err.ErrNone {
 		return identity, errCode
 	}
-	return nil, s3err.ErrAccessDenied
+	return identity, bindSignedPayload(r, authInfo.HashedPayload)
 }
 
 // Constants specific to this file
@@ -80,7 +78,7 @@ func streamHashRequestBody(r *http.Request, sizeLimit int64) (string, error) {
 		return "", err
 	}
 
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	(&signedPayloadBody{data: bytes.NewReader(body)}).wrap(&r.Body)
 
 	if len(body) == 0 {
 		return emptySHA256, nil
@@ -327,7 +325,7 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 		return nil, nil, "", nil, errCode
 	}
 
-	// 5a. Reject requests that carry x-amz-* headers outside of SignedHeaders.
+	// 5a. Reject requests with headers that require signing outside of SignedHeaders.
 	// Without this check a presigned-URL holder can inject unsigned headers
 	// (x-amz-tagging, x-amz-acl, x-amz-meta-*, x-amz-storage-class, x-amz-object-lock-*,
 	// x-amz-server-side-encryption*, etc.) that downstream handlers still persist.
@@ -337,6 +335,10 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 
 	// 6. Get the query string for the canonical request
 	queryStr := getCanonicalQueryString(r, authInfo.IsPresigned)
+
+	if errCode = refuseFips140ShortSecret(r.Context(), s3err.RemoteIP(r), identity, cred); errCode != s3err.ErrNone {
+		return nil, nil, "", nil, errCode
+	}
 
 	// 7. Define a closure for the core verification logic to avoid repetition
 	verify := func(urlPath string) (string, s3err.ErrorCode) {
@@ -531,6 +533,20 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 	claims := make(map[string]interface{}, len(sessionInfo.RequestContext))
 	for k, v := range sessionInfo.RequestContext {
 		claims[k] = v
+	}
+	// Token attributes reach the request context; only the bearer path asserts trusted issuers.
+	delete(claims, "seaweed:oidc-issuers")
+	// The session's user is the one it was issued to, never a claim the
+	// identity provider forwarded.
+	if sessionInfo.ExternalUserId != "" {
+		claims["aws:username"] = sessionInfo.ExternalUserId
+	} else {
+		delete(claims, "aws:username")
+	}
+	if sessionInfo.ParentUser != "" {
+		claims["aws:userid"] = sessionInfo.ParentUser
+	} else {
+		delete(claims, "aws:userid")
 	}
 
 	// Key the principal on the OIDC subject so a session resolves to the same
@@ -907,6 +923,10 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(ctx context.Cont
 		return nil, s3err.ErrAccessDenied
 	}
 
+	if errCode := refuseFips140ShortSecret(ctx, "", identity, cred); errCode != s3err.ErrNone {
+		return nil, errCode
+	}
+
 	// Get signing key.
 	signingKey := getSigningKey(cred.SecretKey, credHeader.scope.date.Format(yyyymmdd), credHeader.scope.region, credHeader.scope.service)
 
@@ -953,8 +973,8 @@ var presignedUnsignedSSECHeaders = map[string]struct{}{
 	strings.ToLower(s3_constants.AmzCopySourceServerSideEncryptionCustomerKeyMD5): {},
 }
 
-// verifySignedHeadersCoverage rejects requests that carry x-amz-* headers
-// outside of the SignedHeaders list. AWS SigV4 requires every x-amz-* header
+// verifySignedHeadersCoverage checks x-amz-* headers and the vector search
+// mode header against SignedHeaders. AWS SigV4 requires every x-amz-* header
 // present in the request to be covered by the signature; without this check a
 // presigned-URL holder can add unsigned headers (ACL, tagging, storage class,
 // user metadata, encryption options, object lock) that the server still
@@ -966,7 +986,7 @@ func verifySignedHeadersCoverage(r *http.Request, signedHeaders []string, isPres
 	}
 	for name := range r.Header {
 		lower := strings.ToLower(name)
-		if !strings.HasPrefix(lower, "x-amz-") {
+		if !strings.HasPrefix(lower, "x-amz-") && lower != s3_constants.SeaweedFSVectorSearchMode {
 			continue
 		}
 		if _, ok := signedSet[lower]; ok {
@@ -1121,19 +1141,29 @@ func bucketFromVirtualHost(host, domainConfig string) (string, bool) {
 	if domainConfig == "" {
 		return "", false
 	}
-	h := host
+	host = strings.ToLower(host)
+	hostWithoutPort := host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
-		h = hh
+		hostWithoutPort = hh
 	}
-	h = strings.ToLower(h)
+	// The router matches a domain that names a port against the full host:port.
+	hostFor := func(domain string) string {
+		if strings.Contains(domain, ":") {
+			return host
+		}
+		return hostWithoutPort
+	}
 	pathStyleDomains, virtualHostDomains := classifyDomainNames(strings.Split(domainConfig, ","))
 	for _, domain := range pathStyleDomains {
-		if h == strings.ToLower(strings.TrimSpace(domain)) {
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		if hostFor(domain) == domain {
 			return "", false
 		}
 	}
 	for _, domain := range virtualHostDomains {
-		suffix := "." + strings.ToLower(strings.TrimSpace(domain))
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		h := hostFor(domain)
+		suffix := "." + domain
 		if strings.HasSuffix(h, suffix) {
 			bucket := h[:len(h)-len(suffix)]
 			if bucket != "" {

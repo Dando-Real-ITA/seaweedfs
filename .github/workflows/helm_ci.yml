@@ -37,6 +37,13 @@ jobs:
         with:
           version: v3.18.4
 
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test vector chart resources
+        run: go test ./k8s/charts/seaweedfs/tests -count=1
+
       - uses: actions/setup-python@v7
         with:
           python-version: '3.10'
@@ -97,7 +104,127 @@ jobs:
           grep -A 4 "^  strategy:" /tmp/s3-rollout.yaml | grep -q "maxUnavailable: 0"
           grep -A 4 "^  strategy:" /tmp/s3-rollout.yaml | grep -q "type: RollingUpdate"
           grep -A 5 "^          lifecycle:" /tmp/s3-rollout.yaml | grep -q -- "- sleep"
+          test "$(grep -c -- '-preStopSeconds' /tmp/s3-rollout-defaults.yaml)" -eq 0
           echo "S3 rollout settings render correctly"
+
+          echo "=== Testing S3 preStopSeconds ==="
+          if helm template test $CHART_DIR --show-only templates/s3/s3-deployment.yaml \
+            --set s3.enabled=true --set s3.preStopSeconds=20 > /tmp/s3-prestop-short.yaml 2>&1; then
+            echo "FAIL: s3.preStopSeconds=20 rendered with the default 10s grace period"; exit 1
+          fi
+          grep -q "must be at least 35" /tmp/s3-prestop-short.yaml
+          helm template test $CHART_DIR --show-only templates/s3/s3-deployment.yaml \
+            --set s3.enabled=true --set s3.preStopSeconds=20 \
+            --set s3.terminationGracePeriodSeconds=35 > /tmp/s3-prestop.yaml
+          grep -q -- "-preStopSeconds=20 " /tmp/s3-prestop.yaml
+          grep -q "terminationGracePeriodSeconds: 35$" /tmp/s3-prestop.yaml
+
+          helm template test $CHART_DIR --show-only templates/filer/filer-statefulset.yaml \
+            --set filer.s3.enabled=true > /tmp/filer-s3-prestop-defaults.yaml
+          test "$(grep -c -- '-s3.preStopSeconds' /tmp/filer-s3-prestop-defaults.yaml)" -eq 0
+          grep -q "terminationGracePeriodSeconds: 60$" /tmp/filer-s3-prestop-defaults.yaml
+          helm template test $CHART_DIR --show-only templates/filer/filer-statefulset.yaml \
+            --set filer.s3.enabled=true --set filer.s3.preStopSeconds=20 > /tmp/filer-s3-prestop.yaml
+          grep -q -- "-s3.preStopSeconds=20 " /tmp/filer-s3-prestop.yaml
+          grep -q "terminationGracePeriodSeconds: 80$" /tmp/filer-s3-prestop.yaml
+
+          helm template test $CHART_DIR --show-only templates/all-in-one/all-in-one-deployment.yaml \
+            --set allInOne.enabled=true --set allInOne.s3.enabled=true > /tmp/aio-s3-prestop-defaults.yaml
+          test "$(grep -c -- '-s3.preStopSeconds' /tmp/aio-s3-prestop-defaults.yaml)" -eq 0
+          grep -q "terminationGracePeriodSeconds: 60$" /tmp/aio-s3-prestop-defaults.yaml
+          helm template test $CHART_DIR --show-only templates/all-in-one/all-in-one-deployment.yaml \
+            --set allInOne.enabled=true --set allInOne.s3.enabled=true \
+            --set s3.preStopSeconds=20 > /tmp/aio-s3-prestop.yaml
+          grep -q -- "-s3.preStopSeconds=20 " /tmp/aio-s3-prestop.yaml
+          grep -q "terminationGracePeriodSeconds: 80$" /tmp/aio-s3-prestop.yaml
+          helm template test $CHART_DIR --show-only templates/all-in-one/all-in-one-deployment.yaml \
+            --set allInOne.enabled=true --set allInOne.s3.enabled=true \
+            --set s3.preStopSeconds=20 --set allInOne.s3.preStopSeconds=0 > /tmp/aio-s3-prestop-off.yaml
+          test "$(grep -c -- '-s3.preStopSeconds' /tmp/aio-s3-prestop-off.yaml)" -eq 0
+          grep -q "terminationGracePeriodSeconds: 60$" /tmp/aio-s3-prestop-off.yaml
+          helm template test $CHART_DIR --show-only templates/all-in-one/all-in-one-deployment.yaml \
+            --set allInOne.enabled=true --set allInOne.s3.enabled=true \
+            --set s3.preStopSeconds=20 --set allInOne.s3.preStopSeconds=25 > /tmp/aio-s3-prestop-own.yaml
+          grep -q -- "-s3.preStopSeconds=25 " /tmp/aio-s3-prestop-own.yaml
+          grep -q "terminationGracePeriodSeconds: 85$" /tmp/aio-s3-prestop-own.yaml
+          echo "S3 preStopSeconds renders correctly"
+
+          echo "=== Testing shareProcessNamespace ==="
+          for workload in filer:templates/filer/filer-statefulset.yaml s3:templates/s3/s3-deployment.yaml; do
+            component=${workload%%:*}
+            template=${workload#*:}
+            helm template test $CHART_DIR --show-only "$template" \
+              --set "$component.enabled=true" > /tmp/spn-default.yaml
+            test "$(grep -c 'shareProcessNamespace' /tmp/spn-default.yaml)" -eq 0
+            helm template test $CHART_DIR --show-only "$template" \
+              --set "$component.enabled=true" --set "$component.shareProcessNamespace=true" > /tmp/spn.yaml
+            grep -q '^      shareProcessNamespace: true$' /tmp/spn.yaml
+          done
+          echo "shareProcessNamespace renders correctly"
+
+          echo "=== Testing volumeAttributesClassName ==="
+          pvc_args=(--set allInOne.enabled=true --set allInOne.data.type=persistentVolumeClaim
+            --set admin.enabled=true --set admin.allowInsecureBind=true --set volume.dataDirs[0].name=data1)
+          for claim in master.data master.logs filer.data filer.logs admin.data admin.logs \
+            volume.idx volume.logs volume.dataDirs[0]; do
+            pvc_args+=(--set "$claim.type=persistentVolumeClaim" --set "$claim.size=1Gi")
+          done
+          helm template test $CHART_DIR "${pvc_args[@]}" > /tmp/vac-default.yaml
+          test "$(grep -c 'volumeAttributesClassName' /tmp/vac-default.yaml)" -eq 0
+          for claim in master.data master.logs filer.data filer.logs admin.data admin.logs \
+            volume.idx volume.logs volume.dataDirs[0] allInOne.data; do
+            pvc_args+=(--set "$claim.volumeAttributesClassName=fast")
+          done
+          helm template test $CHART_DIR "${pvc_args[@]}" > /tmp/vac.yaml
+          test "$(grep -c '^ *volumeAttributesClassName: "fast"$' /tmp/vac.yaml)" -eq 10
+          helm template test $CHART_DIR --set master.data.type=persistentVolumeClaim \
+            --set-string master.data.volumeAttributesClassName=null > /tmp/vac-null.yaml
+          grep -q '^ *volumeAttributesClassName: "null"$' /tmp/vac-null.yaml
+          echo "volumeAttributesClassName renders correctly"
+
+          echo "=== Testing the S3 config reloader ==="
+          for workload in filer.s3:templates/filer/filer-statefulset.yaml s3:templates/s3/s3-deployment.yaml; do
+            prefix=${workload%%:*}
+            template=${workload#*:}
+            component=${prefix%%.*}
+            reloader_args=(--set "$prefix.enabled=true" --set "$prefix.enableAuth=true"
+              --set "$prefix.existingConfigSecret=s3-identities"
+              --set "$component.containerSecurityContext.enabled=true"
+              --set "$component.containerSecurityContext.runAsUser=1000")
+            helm template test $CHART_DIR --show-only "$template" "${reloader_args[@]}" > /tmp/reloader-off.yaml
+            test "$(grep -c 's3-config-reloader\|shareProcessNamespace' /tmp/reloader-off.yaml)" -eq 0
+            helm template test $CHART_DIR --show-only "$template" "${reloader_args[@]}" \
+              --set "$prefix.configReloader.enabled=true" \
+              --set "$prefix.configReloader.resources.limits.memory=32Mi" > /tmp/reloader-on.yaml
+            python3 - /tmp/reloader-off.yaml /tmp/reloader-on.yaml <<'PYEOF'
+          import sys, yaml
+          off, on = (yaml.safe_load(open(path)) for path in sys.argv[1:])
+          pod = on["spec"]["template"]["spec"]
+          main = pod["containers"][0]
+          reloader = next(c for c in pod["containers"] if c["name"] == "s3-config-reloader")
+          assert pod["shareProcessNamespace"] is True
+          assert reloader["image"] == main["image"]
+          # It must run as the same user as SeaweedFS to signal it.
+          assert reloader["securityContext"] == main["securityContext"], reloader.get("securityContext")
+          assert {"name": "config-users", "mountPath": "/etc/sw", "readOnly": True} in reloader["volumeMounts"]
+          assert reloader["resources"] == {"limits": {"memory": "32Mi"}}
+          # Without the reloader, the checksum hashes the existing Secret, so a change to it restarts the pod.
+          # With it, nothing may: not the Secret, and not the values of the Secret the chart generates.
+          annotations = lambda d: d["spec"]["template"]["metadata"].get("annotations") or {}
+          assert "checksum/s3config" in annotations(off)
+          assert "checksum/s3config" not in annotations(on), annotations(on)
+          PYEOF
+            # A release from a chart without configReloader, upgraded with --reuse-values, has no such map.
+            helm template test $CHART_DIR --show-only "$template" "${reloader_args[@]}" \
+              --set "$prefix.configReloader=null" > /tmp/reloader-old-values.yaml
+            test "$(grep -c 's3-config-reloader' /tmp/reloader-old-values.yaml)" -eq 0
+            if helm template test $CHART_DIR --show-only "$template" \
+              --set "$prefix.enabled=true" --set "$prefix.configReloader.enabled=true" > /tmp/reloader-noauth.yaml 2>&1; then
+              echo "FAIL: $prefix.configReloader rendered without $prefix.enableAuth"; exit 1
+            fi
+            grep -q "configReloader.enabled needs" /tmp/reloader-noauth.yaml
+          done
+          echo "S3 config reloader renders correctly"
 
           echo "=== Testing the S3 config checksum is stable across renders ==="
           # s3-secret.yaml keeps its generated keys with lookup. Hashing the rendered
@@ -209,6 +336,40 @@ jobs:
           grep -q "security-config" /tmp/security.yaml
           echo "Security configuration renders correctly"
 
+          echo "=== Testing volume server HTTPS ==="
+          awk '/^ *\[https.client\]$/{f=1;next} /^ *\[/{f=0} f' /tmp/security.yaml | grep -q 'enabled = false'
+          helm template test $CHART_DIR \
+            --set global.seaweedfs.enableSecurity=true \
+            --set global.seaweedfs.volumeHttps.enabled=true \
+            --set volumes.hot.replicas=1 \
+            > /tmp/volume-https.yaml
+          awk '/^ *\[https.client\]$/{f=1;next} /^ *\[/{f=0} f' /tmp/volume-https.yaml > /tmp/volume-https-client.txt
+          grep -q 'enabled = true' /tmp/volume-https-client.txt
+          grep -q 'cert = "/usr/local/share/ca-certificates/client/tls.crt"' /tmp/volume-https-client.txt
+          grep -q 'ca   = "/usr/local/share/ca-certificates/ca/tls.crt"' /tmp/volume-https-client.txt
+          awk '/^ *\[https.volume\]$/{f=1;next} /^ *\[/{f=0} f' /tmp/volume-https.yaml \
+            | grep -q 'cert = "/usr/local/share/ca-certificates/volume/tls.crt"'
+          grep -q "'\*.test-seaweedfs-volume.default'" /tmp/volume-https.yaml
+          grep -q "'\*.test-seaweedfs-volume-hot.default'" /tmp/volume-https.yaml
+          test "$(grep -c 'scheme: HTTPS' /tmp/volume-https.yaml)" -eq 4
+          test "$(grep -c 'checksum/volume-https:' /tmp/volume-https.yaml)" -eq 4
+          if grep -q 'checksum/volume-https' /tmp/security.yaml; then
+            echo "FAIL: the volume HTTPS rollout annotation should only render while the option is on"
+            exit 1
+          fi
+          if helm template test $CHART_DIR --set global.seaweedfs.volumeHttps.enabled=true > /dev/null 2>/tmp/volume-https-nosec.err; then
+            echo "FAIL: volumeHttps without enableSecurity should fail to render"
+            exit 1
+          fi
+          grep -q "requires global.seaweedfs.enableSecurity" /tmp/volume-https-nosec.err
+          if helm template test $CHART_DIR --set global.seaweedfs.enableSecurity=true \
+            --set global.seaweedfs.volumeHttps.enabled=true --set allInOne.enabled=true > /dev/null 2>/tmp/volume-https-aio.err; then
+            echo "FAIL: volumeHttps with allInOne should fail to render"
+            exit 1
+          fi
+          grep -q "not supported with allInOne" /tmp/volume-https-aio.err
+          echo "Volume server HTTPS renders [https.volume], [https.client], certificate names, HTTPS probes and rollout annotations"
+
           echo "=== Testing secure bucket-creation hook certificate mounts ==="
           helm template test $CHART_DIR \
             --show-only templates/shared/post-install-bucket-hook.yaml \
@@ -310,9 +471,9 @@ jobs:
           def docs(manifest):
               return [d for d in yaml.safe_load_all(manifest) if d]
 
-          def configmap(manifest, name):
+          def security_config(manifest, name):
               for d in docs(manifest):
-                  if d.get("kind") == "ConfigMap" and d["metadata"]["name"] == name:
+                  if d.get("kind") == "Secret" and d["metadata"]["name"] == name:
                       return d
               return None
 
@@ -337,13 +498,13 @@ jobs:
           # security-related; preserve that so this PR is non-breaking on
           # existing installs.
           out = render({})
-          if configmap(out, "test-seaweedfs-security-config") is not None:
-              failed.append("defaults: security ConfigMap should not render")
+          if security_config(out, "test-seaweedfs-security-config") is not None:
+              failed.append("defaults: security Secret should not render")
           else:
-              print("defaults: no security-config ConfigMap (unchanged)")
+              print("defaults: no security-config Secret (unchanged)")
 
           # Case 2: filerWrite=true alone is the documented opt-in for
-          # the Admin UI Users tab. Configmap must render with
+          # the Admin UI Users tab. The Secret must render with
           # [jwt.filer_signing] and NO [grpc.*] sections (cert paths
           # only exist with mTLS).
           out = render({
@@ -353,11 +514,11 @@ jobs:
               # refuses to bind without authentication.
               "admin.secret.adminPassword": "ci-admin-password",
           })
-          cm = configmap(out, "test-seaweedfs-security-config")
+          cm = security_config(out, "test-seaweedfs-security-config")
           if cm is None:
-              failed.append("filerWrite=true: security ConfigMap missing")
+              failed.append("filerWrite=true: security Secret missing")
           else:
-              toml = cm["data"]["security.toml"]
+              toml = cm["stringData"]["security.toml"]
               if "[jwt.filer_signing]" not in toml:
                   failed.append("filerWrite=true: security.toml missing [jwt.filer_signing]")
               if "[grpc" in toml:
@@ -365,7 +526,7 @@ jobs:
               if "[jwt.filer_signing]" in toml and "[grpc" not in toml:
                   print("filerWrite=true: security.toml has [jwt.filer_signing], no [grpc.*]")
 
-          # Case 3: filer + admin pods must MOUNT the security ConfigMap
+          # Case 3: filer + admin pods must MOUNT the security Secret
           # under filerWrite=true so the JWT key reaches both processes.
           # Cert volumes must NOT be present (no mTLS).
           for wl in ("test-seaweedfs-filer", "test-seaweedfs-admin"):
@@ -385,11 +546,11 @@ jobs:
           # with both [jwt.signing] and [grpc.*]. Guards against the
           # decoupling change accidentally regressing the mTLS path.
           out = render({"global.seaweedfs.enableSecurity": "true"})
-          cm = configmap(out, "test-seaweedfs-security-config")
+          cm = security_config(out, "test-seaweedfs-security-config")
           if cm is None:
-              failed.append("enableSecurity=true: security ConfigMap missing")
+              failed.append("enableSecurity=true: security Secret missing")
           else:
-              toml = cm["data"]["security.toml"]
+              toml = cm["stringData"]["security.toml"]
               missing = [s for s in ("[jwt.signing]", "[grpc.master]") if s not in toml]
               if missing:
                   failed.append(f"enableSecurity=true: security.toml missing {missing}")
@@ -406,8 +567,8 @@ jobs:
               except subprocess.CalledProcessError as e:
                   failed.append(f"{null_path}=null: render failed: {e.output[:200] if e.output else e}")
                   continue
-              if configmap(out, "test-seaweedfs-security-config") is not None:
-                  failed.append(f"{null_path}=null: should not render configmap")
+              if security_config(out, "test-seaweedfs-security-config") is not None:
+                  failed.append(f"{null_path}=null: should not render the security Secret")
               else:
                   print(f"{null_path}=null: render tolerates explicit null")
 
@@ -511,16 +672,16 @@ jobs:
               mount = next((m for m in pod["containers"][0].get("volumeMounts", []) if m["name"] == "security-config"), None)
               # The file has to land on one of weed's config search paths, so
               # the target matters as much as the volume itself - and a volume
-              # of that name backed by anything but the chart's ConfigMap
+              # of that name backed by anything but the chart's Secret
               # leaves `weed shell` without the signing key just the same.
               target = ("/etc/seaweedfs/security.toml", "security.toml")
-              configmap = "test-seaweedfs-security-config"
+              secret = "test-seaweedfs-security-config"
               if vol is None or mount is None:
                   failed.append("filerWrite=true: bucket hook does not mount security-config (s3.configure would fail)")
               elif (mount.get("mountPath"), mount.get("subPath")) != target:
                   failed.append(f"filerWrite=true: bucket hook mounts security-config as {mount}")
-              elif vol.get("configMap", {}).get("name") != configmap:
-                  failed.append(f"filerWrite=true: security-config is not backed by the {configmap} ConfigMap: {vol}")
+              elif vol.get("secret", {}).get("secretName") != secret:
+                  failed.append(f"filerWrite=true: security-config is not backed by the {secret} Secret: {vol}")
               else:
                   print("filerWrite=true: bucket hook mounts security-config at /etc/seaweedfs/security.toml")
 
@@ -1321,6 +1482,67 @@ jobs:
           echo "$BOOL_FALSE" | grep -q -- '-status Suspended' || { echo "FAIL: bool false versioning did not Suspend the bucket"; exit 1; }
           echo "Bucket versioning: YAML bool false suspends consistently with string \"false\""
 
+          echo "=== Testing bucket ttl, replication and disk in one fs.configure ==="
+          FS_CONFIGURE=$(helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=cfgbucket \
+            --set s3.createBuckets[0].ttl=7d \
+            --set-string s3.createBuckets[0].replication=001 \
+            --set s3.createBuckets[0].disk=ssd | grep 'fs.configure -locationPrefix=/buckets/cfgbucket/' || true)
+          echo "$FS_CONFIGURE" | grep -q -- '-ttl=7d -replication=001 -disk=ssd -apply' || { echo "FAIL: bucket fs.configure missing ttl/replication/disk: $FS_CONFIGURE"; exit 1; }
+          echo "Bucket fs.configure: ttl, replication and disk render together"
+
+          FS_CONFIGURE=$(helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=replbucket \
+            --set-string s3.createBuckets[0].replication=002 | grep 'fs.configure -locationPrefix=/buckets/replbucket/' || true)
+          echo "$FS_CONFIGURE" | grep -q -- '/buckets/replbucket/ -replication=002 -apply' || { echo "FAIL: replication-only bucket did not render fs.configure: $FS_CONFIGURE"; exit 1; }
+          echo "Bucket fs.configure: replication without ttl"
+
+          FS_CONFIGURE=$(helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=diskbucket \
+            --set s3.createBuckets[0].disk=ssd | grep 'fs.configure -locationPrefix=/buckets/diskbucket/' || true)
+          echo "$FS_CONFIGURE" | grep -q -- '/buckets/diskbucket/ -disk=ssd -apply' || { echo "FAIL: disk-only bucket did not render fs.configure: $FS_CONFIGURE"; exit 1; }
+          echo "Bucket fs.configure: disk without ttl"
+
+          if helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=numbucket \
+            --set s3.createBuckets[0].replication=0 >/dev/null 2>&1; then
+            echo "FAIL: a numeric replication should fail to render"; exit 1
+          fi
+          echo "Bucket fs.configure: numeric replication is rejected"
+
+          if helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=badbucket \
+            --set-string s3.createBuckets[0].replication=00O >/dev/null 2>&1; then
+            echo "FAIL: a non-digit replication should fail to render"; exit 1
+          fi
+          echo "Bucket fs.configure: non-digit replication is rejected"
+
+          if helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=bigbucket \
+            --set-string s3.createBuckets[0].replication=256 >/dev/null 2>&1; then
+            echo "FAIL: a replication above 255 should fail to render"; exit 1
+          fi
+          FS_CONFIGURE=$(helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=maxbucket \
+            --set-string s3.createBuckets[0].replication=255 | grep 'fs.configure -locationPrefix=/buckets/maxbucket/' || true)
+          echo "$FS_CONFIGURE" | grep -q -- '/buckets/maxbucket/ -replication=255 -apply' || { echo "FAIL: replication 255 should render: $FS_CONFIGURE"; exit 1; }
+          echo "Bucket fs.configure: replication is limited to 000-255"
+
+          FS_CONFIGURE=$(helm template test $CHART_DIR \
+            --set s3.enabled=true \
+            --set s3.createBuckets[0].name=nullbucket \
+            --set s3.createBuckets[0].ttl=7d \
+            --set s3.createBuckets[0].replication=null | grep 'fs.configure -locationPrefix=/buckets/nullbucket/' || true)
+          echo "$FS_CONFIGURE" | grep -q -- '/buckets/nullbucket/ -ttl=7d -apply' || { echo "FAIL: null replication should be treated as unset: $FS_CONFIGURE"; exit 1; }
+          echo "Bucket fs.configure: null replication is unset"
+
           echo ""
           echo "=== Testing hook Job labels ==="
           # The hook Jobs were the only pods in the chart without the standard
@@ -1965,7 +2187,7 @@ jobs:
               "--set", "admin.enabled=true", "--set", "admin.secret.adminPassword=ci",
               "--set", "cosi.enabled=true", "--set", "networkPolicy.enabled=true",
               "--set", "volumes.dc2.replicas=1",
-              # render the security ConfigMap without its generated jwt key
+              # render the security Secret without its generated jwt key
               "--set", "global.seaweedfs.enableSecurity=true",
               "--set", "global.seaweedfs.securityConfig.jwtSigning.volumeWrite=false",
           ]

@@ -18,7 +18,34 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// createRouteServer builds a filer whose ring holds two unreachable peers, so a
+// deadAddress returns a peer whose gRPC port this test holds and drops every
+// connection on, so a forward to it fails even on a host where a fixed port
+// could reach a live filer.
+func deadAddress(t *testing.T) pb.ServerAddress {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	address := pb.NewServerAddress("127.0.0.1", 1, lis.Addr().(*net.TCPAddr).Port)
+	pb.InvalidateGrpcConnection(address.ToGrpcAddress())
+	t.Cleanup(func() {
+		lis.Close()
+		pb.InvalidateGrpcConnection(address.ToGrpcAddress())
+	})
+	return address
+}
+
+// createRouteServer builds a filer whose ring holds an unreachable peer, so a
 // forwarded create fails at the dial and is distinguishable from a local apply.
 func createRouteServer(t *testing.T) (*FilerServer, *renameTestStore) {
 	t.Helper()
@@ -27,7 +54,7 @@ func createRouteServer(t *testing.T) (*FilerServer, *renameTestStore) {
 	f := newRenameTestFiler(t, store)
 	f.DirBucketsPath = "/buckets"
 	f.Dlm = lock_manager.NewDistributedLockManager(self)
-	f.Dlm.LockRing.SetSnapshot([]pb.ServerAddress{self, "127.0.0.1:18889"}, 1)
+	f.Dlm.LockRing.SetSnapshot([]pb.ServerAddress{self, deadAddress(t)}, 1)
 	return &FilerServer{
 		filer:          f,
 		option:         &FilerOption{Host: self},
@@ -48,6 +75,20 @@ func peerOwnedName(t *testing.T, fs *FilerServer) string {
 		}
 	}
 	t.Skip("no name owned by the peer")
+	return ""
+}
+
+// selfOwnedName returns a child name under /test whose entry the ring assigns
+// to this filer.
+func selfOwnedName(t *testing.T, fs *FilerServer) string {
+	t.Helper()
+	for i := 0; i < 4000; i++ {
+		name := fmt.Sprintf("obj-%d", i)
+		if fs.writeOwner(entryRouteKey(util.NewFullPath("/test", name))) == "" {
+			return name
+		}
+	}
+	t.Skip("no name owned by this filer")
 	return ""
 }
 
@@ -101,11 +142,10 @@ func ringPeerCtx() context.Context {
 	})
 }
 
-// is_moved bounds forwarding to one hop: the owner applies it even if its own
-// ring view says someone else owns the key.
+// A forwarded create is applied by the owner without forwarding it again.
 func TestCreateEntryMovedAppliesLocally(t *testing.T) {
 	fs, store := createRouteServer(t)
-	name := peerOwnedName(t, fs)
+	name := selfOwnedName(t, fs)
 
 	req := createReq(name, true)
 	req.IsMoved = true
@@ -115,6 +155,24 @@ func TestCreateEntryMovedAppliesLocally(t *testing.T) {
 	}
 	if _, found := store.entries[string(util.NewFullPath("/test", name))]; !found {
 		t.Fatal("forwarded create must reach the local store")
+	}
+}
+
+// A filer whose own ring names a peer as the owner refuses a forwarded create
+// rather than check it under its own lock: the sender's ring disagrees with
+// this one, and the peer's lock may be arbitrating the same entry.
+func TestCreateEntryMovedRefusedByNonOwner(t *testing.T) {
+	fs, store := createRouteServer(t)
+	name := peerOwnedName(t, fs)
+
+	req := createReq(name, true)
+	req.IsMoved = true
+	_, err := fs.CreateEntry(ringPeerCtx(), req)
+	if !isNotWriteOwner(err) {
+		t.Fatalf("a forwarded create on a non-owner must be refused as not the write owner, got err=%v", err)
+	}
+	if _, found := store.entries[string(util.NewFullPath("/test", name))]; found {
+		t.Fatal("a refused forward must not write locally")
 	}
 }
 
@@ -194,13 +252,13 @@ func TestCreateEntryExclusiveAppliedByOwner(t *testing.T) {
 // down, and applying here would be the second serialization point on the key.
 func TestCreateEntryFailsWhenPriorOwnerIsUnreachable(t *testing.T) {
 	const self = pb.ServerAddress("127.0.0.1:28888")
-	const peer = pb.ServerAddress("127.0.0.1:28889")
+	peer := deadAddress(t)
 	store := newRenameTestStore()
 	f := newRenameTestFiler(t, store)
 	f.DirBucketsPath = "/buckets"
 	f.Dlm = lock_manager.NewDistributedLockManager(self)
 	// Dropping the peer moves every key it owned to this filer, with the peer as
-	// their prior owner — and nothing is listening on it.
+	// their prior owner — and it answers no RPC.
 	f.Dlm.LockRing.SetSnapshot([]pb.ServerAddress{self, peer}, 1)
 	f.Dlm.LockRing.SetSnapshot([]pb.ServerAddress{self}, 2)
 	fs := &FilerServer{

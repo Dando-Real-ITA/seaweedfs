@@ -23,7 +23,7 @@ func TestAdminDashboardShowsDiskUsage(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 	got := buf.String()
-	for _, want := range []string{"Disk Usage", "348.0 TB", "of 1000.0 TB (34%)"} {
+	for _, want := range []string{"Disk usage", "348.0 TB", "of 1000.0 TB (34%)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("dashboard is missing %q", want)
 		}
@@ -33,9 +33,73 @@ func TestAdminDashboardShowsDiskUsage(t *testing.T) {
 	}
 }
 
+func TestS3BucketModalsEscapeDynamicHTMLText(t *testing.T) {
+	var buf bytes.Buffer
+	if err := S3Buckets(dash.S3BucketsData{}).Render(context.Background(), &buf); err != nil {
+		t.Fatalf("render bucket page: %v", err)
+	}
+
+	for _, want := range []string{
+		"Bucket Details - ' + escapeHtml(bucketName)",
+		"Lifecycle - ' + escapeHtml(bucketName)",
+		"Error loading bucket details: ' + escapeHtml(data.error)",
+		"Error loading bucket details: ' + escapeHtml(error.message)",
+		"Error loading lifecycle rules: ' + escapeHtml(data.error || 'unknown error')",
+		"Error loading lifecycle rules: ' + escapeHtml(error.message)",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("rendered bucket page is missing escaped text expression %q", want)
+		}
+	}
+}
+
 func TestCalculatePercent64PetabyteScale(t *testing.T) {
 	const pib = int64(1) << 50
 	if got := calculatePercent64(100*pib, 200*pib); got != 50 {
 		t.Errorf("100 of 200 PiB = %d%%, want 50%%", got)
+	}
+}
+
+func TestClusterHealthSummary(t *testing.T) {
+	healthy := dash.AdminData{
+		MasterNodes:   []dash.MasterNode{{Address: "m1:9333", IsLeader: true}},
+		VolumeServers: []dash.VolumeServer{{ID: "v1"}, {ID: "v2"}},
+		FilerNodes:    []dash.FilerNode{{Address: "f1:8888"}},
+		DiskUsage:     50,
+		DiskCapacity:  100,
+	}
+	if got, want := clusterHealthSummary(healthy), "Healthy. 2 volume servers and 1 filer reporting, 1 master configured."; got != want {
+		t.Errorf("healthy summary = %q, want %q", got, want)
+	}
+
+	degraded := healthy
+	degraded.MasterNodes = []dash.MasterNode{{Address: "m1:9333"}}
+	degraded.DiskUsage = 95
+	want := "Needs attention: no master leader, disks 95% full. 2 volume servers and 1 filer reporting, 1 master configured."
+	if got := clusterHealthSummary(degraded); got != want {
+		t.Errorf("degraded summary = %q, want %q", got, want)
+	}
+
+	if got := clusterHealthIssues(dash.AdminData{}); strings.Join(got, ", ") != "no master reachable, no volume servers" {
+		t.Errorf("empty cluster issues = %q", got)
+	}
+}
+
+func TestAdminDashboardListsVectorServers(t *testing.T) {
+	var out bytes.Buffer
+	data := dash.AdminData{VectorNodes: []dash.VectorNode{{Address: "10.0.0.6:18888", Version: "0.1.0", Status: "Ready"}}}
+	if err := Admin(data).Render(context.Background(), &out); err != nil {
+		t.Fatal(err)
+	}
+	page := out.String()
+	if !strings.Contains(page, "Vector servers") || !strings.Contains(page, "<td>10.0.0.6:18888</td>") || strings.Contains(page, "No vector servers found") {
+		t.Fatal("the dashboard does not list the vector engine")
+	}
+	out.Reset()
+	if err := Admin(dash.AdminData{}).Render(context.Background(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "No vector servers found") {
+		t.Fatal("no empty state without vector servers")
 	}
 }

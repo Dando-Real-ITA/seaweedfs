@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/dustin/go-humanize"
@@ -67,6 +68,10 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 	object := s3_constants.NormalizeObjectKey(rawObject)
 	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+	if errCode := s3a.checkVersionFileWrite(bucket, object, "PostPolicyBucketHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
@@ -144,6 +149,13 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 	}
 	r.Header.Set("Content-Type", contentType)
 
+	// acl and x-amz-acl both set the canned ACL; differing values are ambiguous.
+	_, hasAcl := formValues["Acl"]
+	_, hasAmzAcl := formValues[s3_constants.AmzCannedAcl]
+	if hasAcl && hasAmzAcl && formValues.Get("Acl") != formValues.Get(s3_constants.AmzCannedAcl) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+		return
+	}
 	// Forward validated POST form fields to the underlying PUT as headers.
 	applyPostPolicyFormHeaders(r, formValues)
 	if !validHeaderValues(r.Header) {
@@ -151,32 +163,22 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Authorize the object like the PUT path.
-	if errCode := s3a.iam.AuthorizeObjectWrite(r, identity, bucket, object); errCode != s3err.ErrNone {
+	// Authorize the object like the PUT path, with policies seeing the ACL as PutObject presents it.
+	policyReq, errCode := putObjectACLPolicyRequest(objectKeyPolicyRequest(r, http.MethodPut, bucket, object, ""), s3_constants.ACTION_WRITE, bucket, object)
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	if errCode := s3a.iam.AuthorizeObjectWrite(policyReq, identity, bucket, object); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, refineDenialForBucketName(r, identity, errCode))
 		return
 	}
 	// An acl or x-amz-grant-* form field rides onto the upload as ACL headers,
 	// which the PUT path only applies under s3:PutObjectAcl.
 	if postRequestsAcl(r) {
-		if errCode := s3a.iam.AuthorizeObjectAclWrite(r, identity, bucket, object); errCode != s3err.ErrNone {
+		if errCode := s3a.iam.AuthorizeObjectAclWrite(policyReq, identity, bucket, object); errCode != s3err.ErrNone {
 			s3err.WriteErrorResponse(w, r, refineDenialForBucketName(r, identity, errCode))
 			return
-		}
-		config, errCode := s3a.getBucketConfig(bucket)
-		if errCode != s3err.ErrNone && errCode != s3err.ErrNoSuchBucket {
-			s3err.WriteErrorResponse(w, r, errCode)
-			return
-		}
-		if errCode == s3err.ErrNone && config.PublicAccessBlock.blocksPublicAcls() {
-			_, grants, aclCode := ParseAclHeaders(r, config.Ownership, config.Owner, "", false)
-			if aclCode == s3err.ErrNone {
-				aclCode = rejectPublicGrants(config, grants)
-			}
-			if aclCode != s3err.ErrNone {
-				s3err.WriteErrorResponse(w, r, aclCode)
-				return
-			}
 		}
 	}
 
@@ -196,6 +198,22 @@ func (s3a *S3ApiServer) PostPolicyBucketHandler(w http.ResponseWriter, r *http.R
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 			return
 		}
+	}
+	// The bucket load above brings its policy into the engine.
+	if errCode := s3a.recheckTagConditionedPolicyWithLookup(policyReq, bucket, object, "", string(s3_constants.ACTION_WRITE), "PostPolicyBucketHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+	if !s3a.iam.isEnabled() && postRequestsAcl(r) {
+		if errCode := s3a.checkPutObjectACLPolicy(policyReq, bucket, object); errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
+	}
+	r, errCode = s3a.preparePostObjectACL(r, bucket)
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
 	}
 	objectLockEnabled, err := s3a.isObjectLockEnabled(bucket)
 	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
@@ -298,6 +316,12 @@ var postPolicyReservedFormFields = map[string]struct{}{
 // skipped. The acl form field is translated to the X-Amz-Acl header to match
 // how AWS promotes the form value to the underlying PUT.
 func applyPostPolicyFormHeaders(r *http.Request, formValues http.Header) {
+	// The policy signs form fields only, so object settings come from the form.
+	for k := range r.Header {
+		if ck := http.CanonicalHeaderKey(k); strings.HasPrefix(ck, "X-Amz-") || slices.Contains(postObjectHeaders, ck) || ck == "Response-Content-Disposition" {
+			delete(r.Header, k)
+		}
+	}
 	for k := range formValues {
 		if _, reserved := postPolicyReservedFormFields[k]; reserved {
 			continue
@@ -305,17 +329,14 @@ func applyPostPolicyFormHeaders(r *http.Request, formValues http.Header) {
 		switch {
 		case k == "Acl":
 			r.Header.Set(s3_constants.AmzCannedAcl, formValues.Get(k))
-		case k == "Cache-Control",
-			k == "Expires",
-			k == "Content-Disposition",
-			k == "Content-Encoding",
-			k == "Content-Language":
-			r.Header.Set(k, formValues.Get(k))
-		case strings.HasPrefix(k, "X-Amz-"):
+		case slices.Contains(postObjectHeaders, k), strings.HasPrefix(k, "X-Amz-"):
 			r.Header.Set(k, formValues.Get(k))
 		}
 	}
 }
+
+// postObjectHeaders are the standard headers the upload stores on the object.
+var postObjectHeaders = []string{"Cache-Control", "Expires", "Content-Disposition", "Content-Encoding", "Content-Language"}
 
 // validHeaderValues rejects form values carrying control characters, which a
 // real PUT could not send and which would corrupt the volume upload framing.
@@ -330,10 +351,11 @@ func validHeaderValues(h http.Header) bool {
 	return true
 }
 
-// postRequestsAcl reports whether the request carries ACL headers, whether
-// promoted from the POST form fields or supplied on the request itself.
+var postAclHeaders = []string{s3_constants.AmzCannedAcl, s3_constants.AmzAclFullControl, s3_constants.AmzAclRead, s3_constants.AmzAclReadAcp, s3_constants.AmzAclWrite, s3_constants.AmzAclWriteAcp}
+
+// postRequestsAcl reports whether the POST form fields promoted an ACL.
 func postRequestsAcl(r *http.Request) bool {
-	for _, header := range []string{s3_constants.AmzCannedAcl, s3_constants.AmzAclFullControl, s3_constants.AmzAclRead, s3_constants.AmzAclReadAcp, s3_constants.AmzAclWrite, s3_constants.AmzAclWriteAcp} {
+	for _, header := range postAclHeaders {
 		if r.Header.Get(header) != "" {
 			return true
 		}

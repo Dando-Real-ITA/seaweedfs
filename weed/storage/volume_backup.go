@@ -282,14 +282,27 @@ func (v *Volume) locateLastAppendEntry() (key NeedleId, offset Offset, size Size
 	return
 }
 
+// readNeedleAt skips the data, so its checksum is not verified here.
 func (v *Volume) readNeedleAt(offset Offset) (*needle.Needle, error) {
-	n, _, bodyLength, err := needle.ReadNeedleHeader(v.DataBackend, v.SuperBlock.Version, offset.ToActualOffset())
+	actualOffset := offset.ToActualOffset()
+	n, _, bodyLength, err := needle.ReadNeedleHeader(v.DataBackend, v.SuperBlock.Version, actualOffset)
 	if err != nil {
-		return nil, fmt.Errorf("ReadNeedleHeader %s [%d,%d): %v", v.DataBackend.Name(), offset.ToActualOffset(), offset.ToActualOffset()+NeedleHeaderSize, err)
+		return nil, fmt.Errorf("ReadNeedleHeader %s [%d,%d): %v", v.DataBackend.Name(), actualOffset, actualOffset+NeedleHeaderSize, err)
 	}
-	_, err = n.ReadNeedleBody(v.DataBackend, v.SuperBlock.Version, offset.ToActualOffset()+NeedleHeaderSize, bodyLength)
+	if n.Size < 0 {
+		return nil, fmt.Errorf("needle %v at offset %d has size %d: %w", n.Id, actualOffset, n.Size, needle.ErrorCorrupted)
+	}
+	trailer := make([]byte, bodyLength-int64(n.Size))
+	trailerOffset := actualOffset + NeedleHeaderSize + int64(n.Size)
+	readCount, err := v.DataBackend.ReadAt(trailer, trailerOffset)
+	if err == io.EOF && readCount == len(trailer) {
+		err = nil
+	}
+	if err == nil {
+		err = n.ParseNeedleTrailer(trailer, v.SuperBlock.Version)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("ReadNeedleBody offset %d, bodyLength %d: %v", offset.ToActualOffset(), bodyLength, err)
+		return nil, fmt.Errorf("needle trailer offset %d, length %d: %v", trailerOffset, len(trailer), err)
 	}
 	return n, nil
 }
@@ -382,10 +395,18 @@ func (v *Volume) ResumeByLastEntry(entryCount uint64, key NeedleId, cookie uint3
 	return
 }
 
-// on server side
+// on server side. The read lock is held for the whole search: it takes the
+// index size once and then probes .idx rows and .dat records, so a vacuum
+// commit (which swaps both files under the write lock) must not land
+// mid-search.
 func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast bool, err error) {
+	v.dataFileAccessLock.RLock()
+	defer v.dataFileAccessLock.RUnlock()
+	if v.nm == nil {
+		return Offset{}, false, io.EOF
+	}
 
-	fileSize := int64(v.IndexFileSize())
+	fileSize := int64(v.nm.IndexFileSize())
 	if fileSize%NeedleMapEntrySize != 0 {
 		err = fmt.Errorf("unexpected file %s.idx size: %d", v.IndexFileName(), fileSize)
 		return
@@ -404,7 +425,7 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 		}
 
 		// read the appendAtNs for entry m
-		offset, err = v.readOffsetFromIndex(m)
+		offset, err = v.readOffsetFromIndexLocked(m)
 		if err != nil {
 			err = fmt.Errorf("read entry %d: %v", m, err)
 			return
@@ -458,7 +479,7 @@ func (v *Volume) BinarySearchByAppendAtNs(sinceNs uint64) (offset Offset, isLast
 		return Offset{}, true, nil
 	}
 
-	offset, err = v.readOffsetFromIndex(l)
+	offset, err = v.readOffsetFromIndexLocked(l)
 
 	return offset, false, err
 
@@ -471,7 +492,7 @@ func (v *Volume) readRightNs(m, max int64) (index int64, offset Offset, ts uint6
 		if index >= max {
 			return
 		}
-		offset, err = v.readOffsetFromIndex(index)
+		offset, err = v.readOffsetFromIndexLocked(index)
 		if err != nil {
 			err = fmt.Errorf("read left entry at %d: %v", index, err)
 			return
@@ -490,7 +511,7 @@ func (v *Volume) readLeftNs(m int64) (index int64, offset Offset, ts uint64, err
 		if index < 0 {
 			return
 		}
-		offset, err = v.readOffsetFromIndex(index)
+		offset, err = v.readOffsetFromIndexLocked(index)
 		if err != nil {
 			err = fmt.Errorf("read right entry at %d: %v", index, err)
 			return
@@ -505,6 +526,11 @@ func (v *Volume) readLeftNs(m int64) (index int64, offset Offset, ts uint64, err
 func (v *Volume) readIndexEntry(m int64) (key NeedleId, offset Offset, size Size, err error) {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()
+	return v.readIndexEntryLocked(m)
+}
+
+// readIndexEntryLocked is readIndexEntry for a caller that holds dataFileAccessLock.
+func (v *Volume) readIndexEntryLocked(m int64) (key NeedleId, offset Offset, size Size, err error) {
 	if v.nm == nil {
 		return 0, Offset{}, 0, io.EOF
 	}
@@ -514,6 +540,12 @@ func (v *Volume) readIndexEntry(m int64) (key NeedleId, offset Offset, size Size
 // bytes is of size NeedleMapEntrySize
 func (v *Volume) readOffsetFromIndex(m int64) (Offset, error) {
 	_, offset, _, err := v.readIndexEntry(m)
+	return offset, err
+}
+
+// readOffsetFromIndexLocked is readOffsetFromIndex for a caller that holds dataFileAccessLock.
+func (v *Volume) readOffsetFromIndexLocked(m int64) (Offset, error) {
+	_, offset, _, err := v.readIndexEntryLocked(m)
 	return offset, err
 }
 

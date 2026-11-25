@@ -100,10 +100,10 @@ func (c *commandVolumeFsck) Help() string {
 		The default 5h cutoff provides sufficient buffer for metadata commits.
 
 	Step 2 reads the filer from one consistent snapshot when its store supports
-	that (the SQL stores do), so a file renamed while the filer is being read is
-	still counted and its chunks are not mistaken for orphans. Other stores are
-	walked directory by directory; there, avoid running with -reallyDeleteFromVolume
-	while files are being renamed or moved.
+	that (the SQL stores and etcd do), so a file renamed while the filer is being
+	read is still counted and its chunks are not mistaken for orphans. Other
+	stores are walked directory by directory; there, avoid running with
+	-reallyDeleteFromVolume while files are being renamed or moved.
 
 	With -findMissingChunksInFiler, -volumeId may name a volume the master no
 	longer lists, to find the filer entries that still reference it. A volume is
@@ -141,7 +141,7 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	c.verifyNeedle = fsckCommand.Bool("verifyNeedles", false, "check needles status from volume server")
 
 	if err = fsckCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 
 	// The command struct is a singleton registered in init(), so any state
@@ -1142,7 +1142,7 @@ func (c *commandVolumeFsck) purgeFileIdsForOneVolume(volumeId uint32, fileIds []
 		go func(server pb.ServerAddress, fidList []string) {
 			defer wg.Done()
 
-			deleteResults := operation.DeleteFileIdsAtOneVolumeServer(context.Background(), server, c.env.option.GrpcDialOption, fidList, false)
+			deleteResults := operation.DeleteFileIdsAtOneVolumeServer(context.Background(), server, c.env.option.GrpcDialOption, fidList, false, false)
 			if deleteResults != nil {
 				resultChan <- deleteResults
 			}

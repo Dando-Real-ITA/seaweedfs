@@ -3,7 +3,6 @@ package filer
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -178,6 +177,64 @@ func (fc *FilerConf) DeleteLocationConf(locationPrefix string) {
 		return true
 	})
 	fc.rules = rules
+}
+
+// ReadFilerConfFromClient reads filer.conf through filerClient, streaming it
+// from its chunks when it is not stored inline. A missing file is an empty conf.
+func ReadFilerConfFromClient(ctx context.Context, filerClient filer_pb.FilerClient, lookup wdclient.HasLookupFileIdFunction) (*FilerConf, error) {
+	fc := NewFilerConf()
+	confPath := util.NewFullPath(DirectoryEtcSeaweedFS, FilerConfName)
+	entry, _, _, err := filer_pb.GetEntry(ctx, filerClient, confPath)
+	if errors.Is(err, filer_pb.ErrNotFound) || err == nil && entry == nil {
+		return fc, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", confPath, err)
+	}
+	content := entry.Content
+	if len(content) == 0 && len(entry.GetChunks()) > 0 {
+		var buf bytes.Buffer
+		if err := StreamContent(lookup, &buf, entry.GetChunks(), 0, int64(FileSize(entry))); err != nil {
+			return nil, fmt.Errorf("read %s: %w", confPath, err)
+		}
+		content = buf.Bytes()
+	}
+	if len(content) > 0 {
+		if err := fc.LoadFromBytes(content); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", confPath, err)
+		}
+	}
+	return fc, nil
+}
+
+// WormEnforced reports whether a WORM rule still protects the entry at path
+// that became write-once at enforcedAtTsNs.
+func (fc *FilerConf) WormEnforced(path string, enforcedAtTsNs int64) bool {
+	if enforcedAtTsNs == 0 {
+		return false
+	}
+	rule := fc.MatchStorageRule(path)
+	if !rule.GetWorm() {
+		return false
+	}
+	if rule.WormRetentionTimeSeconds == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, enforcedAtTsNs)).Seconds() < float64(rule.WormRetentionTimeSeconds)
+}
+
+// IntersectsWorm reports whether a WORM rule covers dir or anything below it.
+func (fc *FilerConf) IntersectsWorm(dir string) bool {
+	prefix := strings.TrimRight(dir, "/") + "/"
+	if fc.MatchStorageRule(prefix).GetWorm() {
+		return true
+	}
+	for _, rule := range fc.ToProto().Locations {
+		if rule.GetWorm() && strings.HasPrefix(rule.LocationPrefix, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // emptyPathConf is a singleton for paths with no matching rules
@@ -375,7 +432,7 @@ func saveFilerConfConditionally(ctx context.Context, client filer_pb.SeaweedFile
 		return err
 	}
 	content := buf.Bytes()
-	contentMd5 := md5.Sum(content)
+	contentMd5 := util.Md5(content)
 
 	if snap.entry == nil {
 		err := filer_pb.CreateEntry(ctx, client, &filer_pb.CreateEntryRequest{
@@ -388,7 +445,7 @@ func saveFilerConfConditionally(ctx context.Context, client filer_pb.SeaweedFile
 					Crtime:   time.Now().Unix(),
 					FileMode: uint32(0644),
 					FileSize: uint64(len(content)),
-					Md5:      contentMd5[:],
+					Md5:      contentMd5,
 				},
 				Content: content,
 			},
@@ -423,7 +480,7 @@ func saveFilerConfConditionally(ctx context.Context, client filer_pb.SeaweedFile
 	entry.Content = content
 	entry.Attributes.Mtime = time.Now().Unix()
 	entry.Attributes.FileSize = uint64(len(content))
-	entry.Attributes.Md5 = contentMd5[:]
+	entry.Attributes.Md5 = contentMd5
 	err := filer_pb.UpdateEntry(ctx, client, &filer_pb.UpdateEntryRequest{
 		Directory: DirectoryEtcSeaweedFS,
 		Entry:     entry,

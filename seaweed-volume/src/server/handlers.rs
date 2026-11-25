@@ -17,11 +17,14 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use super::absolute_display_path;
-use super::grpc_client::{GrpcDialOptions, connect_channel, volume_server_client};
+use super::grpc_client::{
+    GrpcDialOptions, OutgoingGrpcTlsConfig, connect_channel, master_client, parse_grpc_address,
+    volume_server_client,
+};
 use super::volume_server::{VolumeServerState, normalize_outgoing_http_url, to_http_address};
 use crate::config::ReadMode;
 use crate::metrics;
-use crate::pb::volume_server_pb;
+use crate::pb::{master_pb, volume_server_pb};
 use crate::storage::needle::CRC;
 use crate::storage::needle::needle::Needle;
 use crate::storage::types::*;
@@ -165,8 +168,10 @@ impl SourceReadRequest {
     fn served_from_source(&self, n: &Needle) -> bool {
         if self.is_head {
             // HEAD is meta-only unless the payload is needed to expand a
-            // manifest or to answer an image transform's length.
-            return !self.has_image_ops && !(n.is_chunk_manifest() && !self.bypass_cm);
+            // manifest or to answer a decoded or transformed length.
+            return !self.has_image_ops
+                && !n.is_compressed()
+                && !(n.is_chunk_manifest() && !self.bypass_cm);
         }
         self.direct(n) && (self.has_range || n.data_size > STREAMING_THRESHOLD)
     }
@@ -483,6 +488,18 @@ fn extract_file_id(path: &str) -> String {
     format!("{},{}", parsed.vid, fid)
 }
 
+fn is_multipart_form_data(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("multipart/form-data")
+        })
+}
+
 fn streaming_chunk_size(read_buffer_size_bytes: usize, data_size: usize) -> usize {
     std::cmp::min(
         read_buffer_size_bytes.max(DEFAULT_STREAMING_CHUNK_SIZE),
@@ -505,17 +522,12 @@ fn parse_url_path(path: &str) -> Option<(VolumeId, NeedleId, Cookie)> {
 // ============================================================================
 
 /// A volume location returned by master lookup.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default)]
 struct VolumeLocation {
     url: String,
-    #[serde(rename = "readOnly", default)]
     read_only: bool,
-    #[serde(rename = "readOnlyCanDelete", default)]
     read_only_can_delete: bool,
-    // Master often omits publicUrl when it matches url (Go json omitempty).
-    #[serde(rename = "publicUrl", default)]
     public_url: String,
-    #[serde(rename = "grpcPort", default)]
     grpc_port: u32,
 }
 
@@ -529,56 +541,89 @@ impl VolumeLocation {
     }
 }
 
-/// Master /dir/lookup response.
-#[derive(Debug, Deserialize)]
-struct LookupResult {
-    #[serde(default)]
-    locations: Option<Vec<VolumeLocation>>,
-    #[serde(default)]
-    error: Option<String>,
+impl From<master_pb::Location> for VolumeLocation {
+    fn from(loc: master_pb::Location) -> Self {
+        Self {
+            url: loc.url,
+            read_only: loc.read_only,
+            read_only_can_delete: loc.read_only_can_delete,
+            public_url: loc.public_url,
+            grpc_port: loc.grpc_port,
+        }
+    }
 }
 
-/// Look up volume locations from the master via HTTP /dir/lookup.
+const LOOKUP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Lookups share one master channel, like Go's pooled master connection.
+static MASTER_LOOKUP_CHANNEL: std::sync::Mutex<Option<(String, tonic::transport::Channel)>> =
+    std::sync::Mutex::new(None);
+
+async fn master_lookup_once(
+    channel: tonic::transport::Channel,
+    volume_id: u32,
+) -> Result<master_pb::LookupVolumeResponse, tonic::Status> {
+    master_client(channel)
+        .lookup_volume(master_pb::LookupVolumeRequest {
+            volume_or_file_ids: vec![volume_id.to_string()],
+            ..Default::default()
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// Look up volume locations over the master's gRPC port, like Go's
+/// operation.LookupVolumeIds: the master's HTTP port need not speak the
+/// `[https.client]` scheme.
 async fn lookup_volume(
-    client: &reqwest::Client,
-    scheme: &str,
+    tls: Option<&OutgoingGrpcTlsConfig>,
     master_url: &str,
     volume_id: u32,
 ) -> Result<Vec<VolumeLocation>, String> {
-    // master_url may be in SeaweedFS's "host:httpPort.grpcPort" form (mirrors
-    // Go's pb.ServerAddress); strip the gRPC port before building the HTTP URL.
-    let master_http = to_http_address(master_url);
-    let url = normalize_outgoing_http_url(
-        scheme,
-        &format!("{}/dir/lookup?volumeId={}", master_http, volume_id),
-    )?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("lookup request failed: {}", e))?;
-    let status = resp.status();
-    let result: LookupResult = resp
-        .json()
-        .await
-        .map_err(|e| format!("lookup parse failed: {}", e))?;
-    if let Some(err) = result.error
-        && !err.is_empty()
-    {
-        // Mirror Go: a missing volume arrives as a per-volume error in an
-        // answered lookup (HTTP 404), meaning "no locations" — a real master
-        // failure (e.g. 503 while warming up) stays an error so proxy mode
-        // can tell missing data (404) from a failed lookup (500).
-        if status != StatusCode::NOT_FOUND {
-            return Err(err);
+    let grpc_addr = parse_grpc_address(master_url)?;
+    let cached = MASTER_LOOKUP_CHANNEL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(addr, _)| *addr == grpc_addr)
+        .map(|(_, channel)| channel.clone());
+    let cached_result = match cached {
+        Some(channel) => Some(master_lookup_once(channel, volume_id).await),
+        None => None,
+    };
+    let resp = match cached_result {
+        Some(Ok(resp)) => resp,
+        _ => {
+            // connect_channel bounds only the TCP connect; a master that
+            // stalls in the TLS handshake would hold the request forever.
+            let channel = tokio::time::timeout(
+                LOOKUP_DIAL_TIMEOUT,
+                connect_channel(&grpc_addr, tls, GrpcDialOptions::unary()),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "lookup connect to master {}: connection timeout",
+                    master_url
+                )
+            })?
+            .map_err(|e| format!("lookup connect to master {}: {}", master_url, e))?;
+            *MASTER_LOOKUP_CHANNEL.lock().unwrap() = Some((grpc_addr, channel.clone()));
+            master_lookup_once(channel, volume_id)
+                .await
+                .map_err(|e| format!("lookup request failed: {}", e.message()))?
         }
-        tracing::debug!("volume {} lookup: {}", volume_id, err);
-    } else if !status.is_success() && status != StatusCode::NOT_FOUND {
-        // A non-success answer without an error body (e.g. an intermediary's
-        // 503 as `{}`) is a failed lookup, not a missing volume.
-        return Err(format!("lookup failed: {}", status));
+    };
+    let mut locations = Vec::new();
+    for found in resp.volume_id_locations {
+        // Mirror Go: a per-volume error in an answered lookup (e.g. a missing
+        // volume) means "no locations"; only a failed call is an error.
+        if !found.error.is_empty() {
+            tracing::debug!("volume {} lookup: {}", volume_id, found.error);
+        }
+        locations.extend(found.locations.into_iter().map(VolumeLocation::from));
     }
-    Ok(result.locations.unwrap_or_default())
+    Ok(locations)
 }
 
 fn grpc_address_for_location(location: &VolumeLocation) -> Result<String, String> {
@@ -631,8 +676,7 @@ async fn batch_delete_file_ids(
             locations.clone()
         } else {
             let locations = lookup_volume(
-                &state.http_client,
-                &state.outgoing_http_scheme,
+                state.outgoing_grpc_tls.as_ref(),
                 &state.current_master().await,
                 volume_id,
             )
@@ -671,6 +715,7 @@ async fn batch_delete_file_ids(
             .batch_delete(volume_server_pb::BatchDeleteRequest {
                 file_ids: batch.clone(),
                 skip_cookie_check: true,
+                fsync: false,
             })
             .await
             .map_err(|e| format!("batch delete {}: {}", grpc_addr, e))?
@@ -754,8 +799,7 @@ async fn do_replicated_request(
     body: Option<bytes::Bytes>,
 ) -> Result<(), String> {
     let locations = lookup_volume(
-        &state.http_client,
-        &state.outgoing_http_scheme,
+        state.outgoing_grpc_tls.as_ref(),
         &state.current_master().await,
         vid,
     )
@@ -830,6 +874,9 @@ async fn do_replicated_request(
         if let Some(md5) = headers.get("Content-MD5") {
             req_builder = req_builder.header("Content-MD5", md5);
         }
+        if let Some(crc) = headers.get(CONTENT_CRC32C_HEADER) {
+            req_builder = req_builder.header(CONTENT_CRC32C_HEADER, crc);
+        }
         if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
             req_builder = req_builder.header(axum::http::header::AUTHORIZATION, auth);
         }
@@ -846,7 +893,12 @@ async fn do_replicated_request(
 
         futures.push(async move {
             match req_builder.send().await {
-                Ok(r) if r.status().is_success() => Ok(()),
+                Ok(r)
+                    if r.status().is_success()
+                        || (allow_delete && r.status() == StatusCode::NOT_FOUND) =>
+                {
+                    Ok(())
+                }
                 Ok(r) => {
                     crate::metrics::UPLOAD_ERROR_COUNTER
                         .with_label_values(&[&r.status().as_u16().to_string()])
@@ -913,12 +965,10 @@ async fn proxy_or_redirect_to_target(
     state: &VolumeServerState,
     info: ProxyRequestInfo,
     vid: VolumeId,
-    allow_local_redirect: bool,
 ) -> Response {
     // Look up volume locations from master
     let locations = match lookup_volume(
-        &state.http_client,
-        &state.outgoing_http_scheme,
+        state.outgoing_grpc_tls.as_ref(),
         &state.current_master().await,
         vid.0,
     )
@@ -961,10 +1011,7 @@ async fn proxy_or_redirect_to_target(
     match state.read_mode {
         ReadMode::Proxy => proxy_request(state, &info, target).await,
         ReadMode::Redirect => redirect_request(&info, target, &state.outgoing_http_scheme),
-        ReadMode::Local if allow_local_redirect => {
-            redirect_request(&info, target, &state.outgoing_http_scheme)
-        }
-        ReadMode::Local => unreachable!(),
+        ReadMode::Local => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1333,6 +1380,7 @@ async fn get_or_head_handler_inner(
         &query,
         &ext,
         request_kind.has_image_ops,
+        request_kind.has_range,
         &mut response_headers,
     ) {
         ControlFlow::Continue(data) => data,
@@ -1431,7 +1479,7 @@ async fn proxy_missing_volume(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    proxy_or_redirect_to_target(state, info, vid, false).await
+    proxy_or_redirect_to_target(state, info, vid).await
 }
 
 /// Go's `proxied` query param check (loop prevention).
@@ -1464,8 +1512,10 @@ async fn check_download_limit(
 
         // Go tries proxy to replica once before the wait loop
         // (checkDownloadLimit); it does not retry on each wakeup.
-        let should_try_replica =
-            !is_proxied_query(&query_string) && !state.current_master().await.is_empty() && {
+        let should_try_replica = state.read_mode != ReadMode::Local
+            && !is_proxied_query(&query_string)
+            && !state.current_master().await.is_empty()
+            && {
                 let store = state.store.read().unwrap();
                 store
                     .find_volume(vid)
@@ -1475,24 +1525,23 @@ async fn check_download_limit(
             && let Some(info) =
                 build_proxy_request_info(path, request_headers, &query_string, method)
         {
-            return ControlFlow::Break(proxy_or_redirect_to_target(state, info, vid, true).await);
+            return ControlFlow::Break(proxy_or_redirect_to_target(state, info, vid).await);
         }
 
         // Blocking wait loop (Go's waitForDownloadSlot)
         loop {
-            if tokio::time::timeout_at(deadline, state.download_notify.notified())
-                .await
-                .is_err()
+            let notified = state.download_notify.notified();
+            if state.inflight_download_bytes.load(Ordering::Relaxed)
+                <= state.concurrent_download_limit
             {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return ControlFlow::Break(json_error_with_query(
                     StatusCode::TOO_MANY_REQUESTS,
                     "download limit exceeded",
                     uri.query(),
                 ));
-            }
-            let current = state.inflight_download_bytes.load(Ordering::Relaxed);
-            if current <= state.concurrent_download_limit {
-                break;
             }
         }
     }
@@ -1633,8 +1682,8 @@ async fn read_volume_needle(
 
     let can_stream =
         can_direct_source_read && n.data_size > STREAMING_THRESHOLD && !has_range && !is_head;
-    // HEAD is meta-only when served_from_source loaded no payload. A chunk
-    // manifest without cm=false is read in full so expansion can run.
+    // HEAD is meta-only when served_from_source loaded no payload. A compressed
+    // needle, or a chunk manifest without cm=false, is read in full.
     let can_handle_head_from_meta = stream_info.is_some() && is_head;
     let can_handle_range_from_source = can_direct_source_read && has_range;
 
@@ -2029,6 +2078,7 @@ fn buffered_payload(
     query: &ReadQueryParams,
     ext: &str,
     needs_image_ops: bool,
+    has_range: bool,
     response_headers: &mut HeaderMap,
 ) -> ControlFlow<Response, Vec<u8>> {
     // Handle compressed data: if needle is compressed, either pass through or decompress
@@ -2057,7 +2107,9 @@ fn buffered_payload(
                 .get(header::ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            if accept_encoding.contains("gzip")
+            // A range is over the decoded bytes, so only a whole read passes gzip through.
+            if !has_range
+                && accept_encoding.contains("gzip")
                 && data.len() >= 2
                 && data[0] == 0x1f
                 && data[1] == 0x8b
@@ -2780,14 +2832,33 @@ pub async fn post_handler(
     // JWT check for writes
     let file_id = extract_file_id(&path);
     let token = extract_jwt(&headers, request.uri());
-    if state
-        .guard
-        .read()
-        .unwrap()
-        .check_jwt_for_file(token.as_deref(), &file_id, true)
-        .is_err()
-    {
-        return json_error_with_query(StatusCode::UNAUTHORIZED, "wrong jwt", Some(&query));
+    let expired_jwt = {
+        let guard = state.guard.read().unwrap();
+        match guard.check_jwt_for_file(token.as_deref(), &file_id, true) {
+            Ok(()) => None,
+            Err(_) => Some(
+                is_multipart_form_data(&headers)
+                    && token.as_deref().is_some_and(|token| {
+                        crate::security::is_expired_volume_jwt(
+                            &guard.signing_key,
+                            token,
+                            &file_id,
+                            &[&guard.previous_signing_key],
+                        )
+                    }),
+            ),
+        }
+    };
+    if let Some(expired_jwt) = expired_jwt {
+        let mut response =
+            json_error_with_query(StatusCode::UNAUTHORIZED, "wrong jwt", Some(&query));
+        if expired_jwt {
+            response.headers_mut().insert(
+                "x-seaweed-write-outcome",
+                header::HeaderValue::from_static("expired-jwt-before-append"),
+            );
+        }
+        return response;
     }
 
     // Upload throttling: check inflight bytes against limit
@@ -2873,6 +2944,11 @@ pub async fn post_handler(
         .get("Content-MD5")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // Go reads it with r.Header.Get, where an empty value means none.
+    let content_crc32c = headers
+        .get(CONTENT_CRC32C_HEADER)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .filter(|s| !s.is_empty());
 
     // Read body, bounded by the configured file-size limit so a single upload
     // cannot buffer unbounded memory and OOM-kill the server (mirrors Go's
@@ -2929,7 +3005,8 @@ pub async fn post_handler(
         );
 
         let mut file_data: Option<Vec<u8>> = None;
-        let mut first_part_data: Option<Vec<u8>> = None;
+        let mut first_part: Option<(Vec<u8>, Option<String>, Option<String>, Option<String>)> =
+            None;
         let mut file_name: Option<String> = None;
         let mut file_content_type: Option<String> = None;
         let mut file_content_encoding: Option<String> = None;
@@ -2938,7 +3015,7 @@ pub async fn post_handler(
 
         while let Ok(Some(field)) = multipart.next_field().await {
             let field_name = field.name().map(|s| s.to_string());
-            let fname = field.file_name().map(clean_windows_path_base);
+            let fname = part_file_name(&field).map(|name| clean_windows_path_base(&name));
             let field_headers = field.headers().clone();
             let fct = field_headers
                 .get(header::CONTENT_TYPE)
@@ -2957,9 +3034,9 @@ pub async fn post_handler(
             if let Ok(data) = field.bytes().await {
                 // Go reads the first part's data unconditionally, then looks for
                 // a part with a filename. If no part has a filename, Go uses the
-                // first part's data (with empty filename).
-                if first_part_data.is_none() {
-                    first_part_data = Some(data.to_vec());
+                // first part's data (with empty filename) and headers.
+                if first_part.is_none() {
+                    first_part = Some((data.to_vec(), fct.clone(), fce.clone(), fmd5.clone()));
                 }
                 if file_data.is_none() && fname.is_some() {
                     // Found a file field — use this part's data
@@ -2985,9 +3062,16 @@ pub async fn post_handler(
                 file_content_md5,
                 form_fields,
             )
-        } else if let Some(data) = first_part_data {
+        } else if let Some((data, content_type, content_encoding, content_md5)) = first_part {
             // No file field found, use first part's data (matching Go behavior)
-            (data, String::new(), None, None, None, form_fields)
+            (
+                data,
+                String::new(),
+                content_type,
+                content_encoding,
+                content_md5,
+                form_fields,
+            )
         } else {
             // No parts at all
             (Vec::new(), String::new(), None, None, None, form_fields)
@@ -3078,6 +3162,12 @@ pub async fn post_handler(
             ),
             Some(&query),
         );
+    }
+    // Go checks the CRC32C after Content-MD5, over the same bytes.
+    if let Some(expected_crc32c) = &content_crc32c
+        && let Err(msg) = check_content_crc32c(expected_crc32c, &uncompressed_data)
+    {
+        return json_error_with_query(StatusCode::BAD_REQUEST, msg, Some(&query));
     }
 
     let now = std::time::SystemTime::now()
@@ -3308,6 +3398,21 @@ pub async fn post_handler(
         let mut replica_headers = HeaderMap::new();
         if let Some(auth) = headers.get(header::AUTHORIZATION) {
             replica_headers.insert(header::AUTHORIZATION, auth.clone());
+        }
+        // Go's replicaContentCrc32c: once the orientation fix rewrote the
+        // bytes, the replica checks their CRC32C instead of the client's.
+        let replica_crc32c = content_crc32c.as_ref().and_then(|crc| {
+            if !body_rewritten {
+                Some(crc.clone())
+            } else if n.is_compressed() {
+                None
+            } else {
+                Some(encode_content_crc32c(crc32c::crc32c(&n.data)))
+            }
+        });
+        if let Some(value) = replica_crc32c.and_then(|crc| header::HeaderValue::from_str(&crc).ok())
+        {
+            replica_headers.insert(CONTENT_CRC32C_HEADER, value);
         }
         if n.has_pairs() {
             for (key, value) in &pair_map {
@@ -3601,6 +3706,10 @@ pub async fn delete_handler(
                     // distributed reader reports both as `Ok(None)`, and both
                     // mean the same thing to a deleter.
                     let result = DeleteResult { size: 0 };
+                    crate::server::store_ec::forward_ec_delete_of_deleted_needle(
+                        &state, vid, needle_id,
+                    )
+                    .await;
                     return json_response_with_params(
                         StatusCode::NOT_FOUND,
                         &result,
@@ -3657,22 +3766,30 @@ pub async fn delete_handler(
 
     // Read needle first to validate cookie (matching Go behavior)
     let original_cookie = cookie;
-    let is_replicate = serde_urlencoded::from_str::<Vec<(String, String)>>(&del_query)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|(name, _)| name == "type")
-        .is_some_and(|(_, value)| value == "replicate");
+    let del_fields =
+        serde_urlencoded::from_str::<Vec<(String, String)>>(&del_query).unwrap_or_default();
+    let del_field = |key: &str| {
+        del_fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    let is_replicate = del_field("type") == Some("replicate");
+    let fsync = del_field("fsync") == Some("true");
     {
         let vol = {
             let store = state.store.read().unwrap();
             store.find_volume(vid).map(|(_, vol)| vol)
         };
+        let replicated = vol
+            .as_ref()
+            .is_some_and(|v| v.super_block().replica_placement.get_copy_count() > 1);
         let mut found = vol
             .as_ref()
             .ok_or(crate::storage::volume::VolumeError::NotFound)
             .and_then(|vol| vol.read_needle_with_option(&mut n, &mut delete_read_option()));
         if found.is_err()
-            && is_replicate
+            && (is_replicate || replicated)
             && let Some(vol) = &vol
         {
             // the write this delete undoes can still be queued here
@@ -3681,7 +3798,42 @@ pub async fn delete_handler(
         }
         match found {
             Ok(_) => {}
-            Err(_) => {
+            Err(e) => {
+                // 404 tells the forwarding replica the needle is gone here, so a
+                // read that failed for any other reason must not answer it
+                if !matches!(
+                    e,
+                    crate::storage::volume::VolumeError::NotFound
+                        | crate::storage::volume::VolumeError::Deleted
+                ) {
+                    return json_error_with_query(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Deletion Failed: {}", e),
+                        Some(&del_query),
+                    );
+                }
+                // a retry of a delete whose replica fan-out failed finds nothing
+                // here, but the other replicas may still hold the needle
+                if !is_replicate
+                    && replicated
+                    && let Err(e) = do_replicated_request(
+                        &state,
+                        vid.0,
+                        Method::DELETE,
+                        &path,
+                        &del_query,
+                        &headers,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::error!("replicated delete failed: {}", e);
+                    return json_error_with_query(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("replication failed: {}", e),
+                        Some(&del_query),
+                    );
+                }
                 let result = DeleteResult { size: 0 };
                 return json_response_with_params(
                     StatusCode::NOT_FOUND,
@@ -3763,7 +3915,16 @@ pub async fn delete_handler(
             Ok(vol) if vol.is_no_write_or_delete() => {
                 Err(crate::storage::volume::VolumeError::ReadOnly(vid))
             }
-            Ok(vol) => vol.delete_needle(&mut n),
+            Ok(vol) if fsync => {
+                tokio::task::spawn_blocking(move || vol.delete_needle(&mut n, true))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(crate::storage::volume::VolumeError::Io(
+                            std::io::Error::other(e),
+                        ))
+                    })
+            }
+            Ok(vol) => vol.delete_needle(&mut n, false),
         }
     };
 
@@ -4639,8 +4800,7 @@ async fn read_remote_chunk_needle(
     how: RemoteRead,
 ) -> Result<ChunkBytes, String> {
     let locations = lookup_volume(
-        &state.http_client,
-        &state.outgoing_http_scheme,
+        state.outgoing_grpc_tls.as_ref(),
         &state.current_master().await,
         vid.0,
     )
@@ -4972,13 +5132,13 @@ fn try_gzip_data(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn maybe_decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GunzipError> {
-    use flate2::read::GzDecoder;
+    use flate2::read::MultiGzDecoder;
     use std::io::Read;
     // Cap the output so a crafted, highly-compressible (gzip-bomb) needle cannot
     // OOM the server when decompressed on read or upload. take(limit+1) lets us
     // tell "exactly at the limit" apart from "over it", which we reject as
     // TooLarge so callers fail the request instead of silently using raw bytes.
-    let mut decoder = GzDecoder::new(data).take(MAX_EXPANSION_BYTES + 1);
+    let mut decoder = MultiGzDecoder::new(data).take(MAX_EXPANSION_BYTES + 1);
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
@@ -4987,6 +5147,44 @@ fn maybe_decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GunzipError> {
         return Err(GunzipError::TooLarge);
     }
     Ok(decompressed)
+}
+
+/// Go's needle.ContentCrc32cHeader: the CRC32C of the file data an upload
+/// carries, over the bytes Content-MD5 covers (after undoing gzip), as the
+/// standard base64 of the big-endian checksum.
+const CONTENT_CRC32C_HEADER: &str = "X-Seaweed-Content-Crc32c";
+
+fn encode_content_crc32c(crc: u32) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+}
+
+/// Go's checkContentCrc32c (weed/storage/needle/content_crc32c.go): refuse a
+/// value that is not a base64 CRC32C or that differs from the data's.
+fn check_content_crc32c(expected: &str, data: &[u8]) -> Result<(), String> {
+    use base64::Engine;
+    let want = base64::engine::general_purpose::STANDARD
+        .decode(expected)
+        .ok()
+        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| {
+            format!(
+                "{} [{}] is not the base64 of a 4-byte crc32c",
+                CONTENT_CRC32C_HEADER, expected
+            )
+        })?;
+    let actual = crc32c::crc32c(data);
+    if want != actual {
+        return Err(format!(
+            "{} did not match crc32c of file data expected [{}] received [{}] size {}",
+            CONTENT_CRC32C_HEADER,
+            expected,
+            encode_content_crc32c(actual),
+            data.len()
+        ));
+    }
+    Ok(())
 }
 
 fn compute_md5_base64(data: &[u8]) -> String {
@@ -5000,6 +5198,69 @@ fn compute_md5_base64(data: &[u8]) -> String {
 fn clean_windows_path_base(value: &str) -> String {
     let cleaned = value.replace('\\', "/");
     cleaned.rsplit('/').next().unwrap_or(&cleaned).to_string()
+}
+
+/// Go's multipart Part.FileName(): the RFC 2231 `filename*` that
+/// mime.FormatMediaType writes for a non-ASCII name wins over `filename`,
+/// which is the only one multer reads.
+fn part_file_name(field: &multer::Field<'_>) -> Option<String> {
+    field
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extended_file_name)
+        .or_else(|| field.file_name().map(str::to_string))
+}
+
+/// Go's decode2231Enc for `filename*=charset'lang'percent-encoded`. A name
+/// with control characters is refused, as it would break the replica's part
+/// header.
+fn extended_file_name(disposition: &str) -> Option<String> {
+    let mut params = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in disposition.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                params.push(&disposition[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    params.push(&disposition[start..]);
+    let value = params.into_iter().skip(1).find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("filename*")
+            .then(|| value.trim())
+    })?;
+    let mut fields = value.splitn(3, '\'');
+    let (charset, _language, encoded) = (fields.next()?, fields.next()?, fields.next()?);
+    if !charset.eq_ignore_ascii_case("utf-8") && !charset.eq_ignore_ascii_case("us-ascii") {
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let hex = bytes.get(i + 1..i + 3)?;
+        if !hex.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        decoded.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+        i += 3;
+    }
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
 }
 
 fn parse_content_disposition_filename(value: &str) -> Option<String> {
@@ -5065,6 +5326,34 @@ mod tests {
             }
         });
         (addr, receipts)
+    }
+
+    /// A replica that no longer holds the needle answers a forwarded delete
+    /// with 404, which means it is gone there too.
+    #[tokio::test]
+    async fn test_replicated_delete_takes_a_replica_404_as_done() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = axum::Router::new().fallback(|| async { StatusCode::NOT_FOUND });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = remote_manifest_state(&tmp, spawn_lookup(peer).await);
+        for (method, done) in [
+            (axum::http::Method::DELETE, true),
+            (axum::http::Method::POST, false),
+        ] {
+            let sent = do_replicated_request(
+                &state,
+                1,
+                method.clone(),
+                "/1,01ab",
+                "",
+                &axum::http::HeaderMap::new(),
+                None,
+            )
+            .await;
+            assert_eq!(sent.is_ok(), done, "{method}: {sent:?}");
+        }
     }
 
     /// The whole replicated write path, not only the request builder: the
@@ -5468,6 +5757,83 @@ mod tests {
         assert_eq!(extract_jwt(&headers, &uri), None);
     }
 
+    #[tokio::test]
+    async fn http_expired_write_jwt_is_marked_before_append() {
+        use crate::security::SigningKey;
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let key = SigningKey(b"write-secret".to_vec());
+        state.guard.write().unwrap().signing_key = key.clone();
+        let volume = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1;
+        let before = volume.dat_file_size().unwrap();
+        let fid = format!("1,{:x}{TEST_COOKIE:08x}", 0x6e7a_0c09u64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sign = |key: &[u8]| {
+            encode(
+                &Header::new(Algorithm::HS256),
+                &serde_json::json!({"fid": fid, "exp": now - 10}),
+                &EncodingKey::from_secret(key),
+            )
+            .unwrap()
+        };
+        let boundary = "expiredjwtboundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a\"\r\n\r\nexpired-bytes\r\n--{boundary}--\r\n"
+        );
+        for (token, content_type, marked) in [
+            (
+                sign(&key.0),
+                format!("multipart/form-data; boundary={boundary}"),
+                true,
+            ),
+            (
+                sign(b"other-secret"),
+                format!("multipart/form-data; boundary={boundary}"),
+                false,
+            ),
+            (sign(&key.0), "application/octet-stream".to_string(), false),
+        ] {
+            let response = super::super::volume_server::build_admin_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/{fid}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, &content_type)
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{content_type}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-seaweed-write-outcome")
+                    .map(|value| value.to_str().unwrap()),
+                marked.then_some("expired-jwt-before-append"),
+                "{content_type}"
+            );
+        }
+        assert_eq!(volume.dat_file_size().unwrap(), before);
+    }
+
     #[test]
     fn test_handle_range_single() {
         let data = b"hello world";
@@ -5740,139 +6106,186 @@ mod tests {
         );
     }
 
-    /// Master /dir/lookup often omits publicUrl when empty (Go `json:"publicUrl,omitempty"`).
-    /// Replication must still parse locations or every cross-DC write fails.
-    #[test]
-    fn test_lookup_result_deserializes_without_public_url() {
-        let body = r#"{
-            "volumeOrFileId": "9",
-            "locations": [
-                {"url": "volume-a.example:8080", "dataCenter": "dc-a", "grpcPort": 18080},
-                {"url": "volume-b.example:8080", "dataCenter": "dc-b", "grpcPort": 18080}
-            ]
-        }"#;
-        let result: LookupResult = serde_json::from_str(body).expect("parse lookup JSON");
-        let locations = result.locations.expect("locations");
-        assert_eq!(locations.len(), 2);
-        assert_eq!(locations[0].url, "volume-a.example:8080");
-        assert!(locations[0].public_url.is_empty());
-        assert_eq!(locations[0].public_or_url(), "volume-a.example:8080");
-        assert_eq!(locations[0].grpc_port, 18080);
+    type LookupAnswer =
+        dyn Fn(&str) -> Result<master_pb::LookupVolumeResponse, tonic::Status> + Send + Sync;
+
+    /// A master that answers only LookupVolume.
+    #[derive(Clone)]
+    struct LookupMaster(Arc<LookupAnswer>);
+
+    impl tonic::server::NamedService for LookupMaster {
+        const NAME: &'static str = "master_pb.Seaweed";
     }
 
-    /// Regression test for issue #9274.
-    ///
-    /// SeaweedFS encodes a server's gRPC port by appending `.grpcPort` to
-    /// the HTTP port: e.g. `master.local:9333.19333` (mirrors Go's
-    /// `pb.ServerAddress`). When the volume server's `--mserver` flag is
-    /// configured this way, replication writes look up the peer locations
-    /// from the master over HTTP. Prior to the fix, the lookup URL became
-    /// `http://host:9333.19333/dir/lookup?volumeId=...` — an invalid port
-    /// that reqwest rejects with a "builder error", causing every
-    /// replicated write to fail.
-    #[tokio::test]
-    async fn test_lookup_volume_strips_grpc_port_from_master_url() {
-        use axum::{Router, routing::get};
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for LookupMaster {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
 
-        let app = Router::new().route(
-            "/dir/lookup",
-            get(
-                |axum::extract::Query(params): axum::extract::Query<
-                    std::collections::HashMap<String, String>,
-                >| async move {
-                    assert_eq!(params.get("volumeId").map(String::as_str), Some("31"));
-                    axum::Json(serde_json::json!({
-                        "volumeOrFileId": "31",
-                        "locations": [
-                            {"url": "10.0.0.2:5301", "publicUrl": "10.0.0.2:5301", "grpcPort": 5311}
-                        ]
-                    }))
-                },
-            ),
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+            let svc = self.clone();
+            Box::pin(async move {
+                if req.uri().path() != "/master_pb.Seaweed/LookupVolume" {
+                    return Ok(tonic::Status::unimplemented("").into_http());
+                }
+                let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+                Ok(grpc.unary(svc, req).await)
+            })
+        }
+    }
+
+    impl tonic::server::UnaryService<master_pb::LookupVolumeRequest> for LookupMaster {
+        type Response = master_pb::LookupVolumeResponse;
+        type Future = tonic::codegen::BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+
+        fn call(
+            &mut self,
+            request: tonic::Request<master_pb::LookupVolumeRequest>,
+        ) -> Self::Future {
+            let ids = request.into_inner().volume_or_file_ids;
+            let answer = (self.0)(&ids.join(","));
+            Box::pin(async move { answer.map(tonic::Response::new) })
+        }
+    }
+
+    /// Serve `answer` as the master's gRPC LookupVolume. The returned address
+    /// carries an unused HTTP port, so a lookup over HTTP would fail.
+    async fn spawn_lookup_master(
+        answer: impl Fn(&str) -> Result<master_pb::LookupVolumeResponse, tonic::Status>
+        + Send
+        + Sync
+        + 'static,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(LookupMaster(Arc::new(answer)))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
+        format!("127.0.0.1:1.{}", port)
+    }
 
+    fn lookup_answer(
+        volume_id: &str,
+        locations: Vec<master_pb::Location>,
+        error: &str,
+    ) -> master_pb::LookupVolumeResponse {
+        master_pb::LookupVolumeResponse {
+            volume_id_locations: vec![master_pb::lookup_volume_response::VolumeIdLocation {
+                volume_or_file_id: volume_id.to_string(),
+                locations,
+                error: error.to_string(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// A master that places every volume on this server and `peer`.
+    async fn spawn_replica_master(peer: std::net::SocketAddr) -> String {
+        spawn_lookup_master(move |vid| {
+            let location = |url: String| master_pb::Location {
+                url,
+                ..Default::default()
+            };
+            Ok(lookup_answer(
+                vid,
+                vec![
+                    location("127.0.0.1:8080".to_string()),
+                    location(peer.to_string()),
+                ],
+                "",
+            ))
+        })
+        .await
+    }
+
+    /// Lookups go to the master's gRPC port, like Go, so they work whatever
+    /// scheme the master's HTTP port speaks.
+    #[tokio::test]
+    async fn test_lookup_volume_asks_master_over_grpc() {
+        let master_url = spawn_lookup_master(|vid| {
+            assert_eq!(vid, "31");
+            Ok(lookup_answer(
+                vid,
+                vec![master_pb::Location {
+                    url: "10.0.0.2:5301".to_string(),
+                    grpc_port: 5311,
+                    ..Default::default()
+                }],
+                "",
+            ))
+        })
+        .await;
+
+        for _ in 0..2 {
+            let locations = super::lookup_volume(None, &master_url, 31)
+                .await
+                .expect("lookup over the master's gRPC port");
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0].url, "10.0.0.2:5301");
+            assert_eq!(locations[0].public_or_url(), "10.0.0.2:5301");
+            assert_eq!(locations[0].grpc_port, 5311);
+        }
+    }
+
+    /// A master that accepts the connection but never finishes the TLS
+    /// handshake fails the lookup at the dial bound.
+    #[tokio::test(start_paused = true)]
+    async fn test_lookup_volume_times_out_on_a_stalled_tls_master() {
+        crate::security::tls::install_default_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+        let _held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
         });
-
-        // Mirrors how main.rs receives masters: a `host:httpPort.grpcPort` token.
-        // The grpc-port part is fictitious here (the master is HTTP-only in
-        // this test) — what matters is that the volume server must not pass
-        // it through to reqwest.
-        let master_url = format!("127.0.0.1:{}.{}", addr.port(), 19999);
-        let client = reqwest::Client::new();
-
-        let locations = super::lookup_volume(&client, "http", &master_url, 31)
-            .await
-            .expect("lookup_volume should succeed even when master_url carries a .grpcPort suffix");
-
-        assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].url, "10.0.0.2:5301");
-        assert_eq!(locations[0].grpc_port, 5311);
-
-        server.abort();
+        let tls = crate::server::grpc_client::OutgoingGrpcTlsConfig::self_signed_for_test();
+        let master_url = format!("127.0.0.1:1.{}", addr.port());
+        let started = tokio::time::Instant::now();
+        let looked_up = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            super::lookup_volume(Some(&tls), &master_url, 9),
+        )
+        .await
+        .expect("lookup must not outlive its dial bound");
+        let err = looked_up.expect_err("a stalled master cannot answer");
+        assert!(err.contains("connection timeout"), "{err}");
+        assert!(started.elapsed() >= super::LOOKUP_DIAL_TIMEOUT);
     }
 
-    /// The master answers a missing volume with 404 and a per-volume `error`
-    /// in the lookup body. Go's LookupResult.Error never becomes the Go error
-    /// return — the volume server treats it as empty locations and replies
-    /// 404. Surfacing it as Err would make proxy-mode reads answer 500.
-    /// A lookup answered with any other failure status (e.g. 503 while the
-    /// master warms up) stays an error, like Go's transport-level failure.
+    /// The master answers a missing volume with a per-volume error. Go's
+    /// LookupResult.Error never becomes the Go error return — the volume
+    /// server treats it as empty locations and replies 404. Surfacing it as
+    /// Err would make proxy-mode reads answer 500. A failed call (e.g.
+    /// Unavailable while the master warms up) stays an error.
     #[tokio::test]
     async fn test_lookup_volume_missing_volume_returns_empty() {
-        use axum::{Router, routing::get};
+        let master_url = spawn_lookup_master(|vid| match vid {
+            "7" => Ok(lookup_answer(vid, Vec::new(), "volume id 7 not found")),
+            _ => Err(tonic::Status::unavailable(
+                "service warming up, please retry",
+            )),
+        })
+        .await;
 
-        let app = Router::new().route(
-            "/dir/lookup",
-            get(|axum::extract::Query(params): axum::extract::Query<
-                std::collections::HashMap<String, String>,
-            >| async move {
-                let (status, error) = match params.get("volumeId").map(String::as_str) {
-                    Some("7") => (StatusCode::NOT_FOUND, Some("volume id 7 not found")),
-                    Some("9") => (StatusCode::SERVICE_UNAVAILABLE, None),
-                    _ => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Some("service warming up, please retry"),
-                    ),
-                };
-                let mut body = serde_json::json!({
-                    "volumeOrFileId": params.get("volumeId")
-                });
-                if let Some(error) = error {
-                    body["error"] = serde_json::json!(error);
-                }
-                (status, axum::Json(body))
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let master_url = format!("127.0.0.1:{}", addr.port());
-        let client = reqwest::Client::new();
-
-        let locations = super::lookup_volume(&client, "http", &master_url, 7)
+        let locations = super::lookup_volume(None, &master_url, 7)
             .await
             .expect("missing volume is not a lookup failure");
         assert!(locations.is_empty());
 
-        let err = super::lookup_volume(&client, "http", &master_url, 8)
+        let err = super::lookup_volume(None, &master_url, 8)
             .await
             .expect_err("master failure is a lookup failure");
         assert!(err.contains("warming up"));
-
-        let err = super::lookup_volume(&client, "http", &master_url, 9)
-            .await
-            .expect_err("a failed lookup without an error body is still a failure");
-        assert!(err.contains("503"));
-
-        server.abort();
     }
 
     /// A body streaming `data_size` bytes of `file` from offset 0.
@@ -6281,6 +6694,7 @@ mod tests {
             security_file: String::new(),
             cli_white_list: vec![],
             state_file_path: String::new(),
+            ec_lifecycle_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             volume_copies_in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -6360,6 +6774,88 @@ mod tests {
             .add_volume(VolumeId(1), DiskType::HardDrive, &VolumeSpec::default())
             .unwrap();
         test_state_with_store(store)
+    }
+
+    #[tokio::test]
+    async fn download_limit_local_read_mode_waits_instead_of_proxying() {
+        use crate::storage::super_block::ReplicaPlacement;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        {
+            let s = Arc::get_mut(&mut state).unwrap();
+            s.read_mode = ReadMode::Local;
+            s.concurrent_download_limit = 1;
+            s.inflight_download_data_timeout = std::time::Duration::from_millis(50);
+        }
+        *state.current_master_url.write().await = "127.0.0.1:1".to_string();
+        state.inflight_download_bytes.store(2, Ordering::Relaxed);
+        state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1
+            .set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+            .unwrap();
+
+        let path = "/1,0123456789abcdef";
+        let uri: axum::http::Uri = path.parse().unwrap();
+        let flow = check_download_limit(
+            &state,
+            &uri,
+            &HeaderMap::new(),
+            path,
+            VolumeId(1),
+            &Method::GET,
+        )
+        .await;
+        match flow {
+            ControlFlow::Break(resp) => assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS),
+            ControlFlow::Continue(_) => panic!("read over the download limit must not proceed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_limit_wait_sees_release_before_waiting() {
+        let mut state = streaming_test_state();
+        {
+            let s = Arc::get_mut(&mut state).unwrap();
+            s.read_mode = ReadMode::Proxy;
+            s.concurrent_download_limit = 1;
+            s.inflight_download_data_timeout = std::time::Duration::from_secs(5);
+        }
+        *state.current_master_url.write().await = "127.0.0.1:1".to_string();
+        state.inflight_download_bytes.store(2, Ordering::Relaxed);
+
+        let master_guard = state.current_master_url.write().await;
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let path = "/1,0123456789abcdef";
+                let uri: axum::http::Uri = path.parse().unwrap();
+                check_download_limit(
+                    &state,
+                    &uri,
+                    &HeaderMap::new(),
+                    path,
+                    VolumeId(1),
+                    &Method::GET,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.inflight_download_bytes.store(0, Ordering::Relaxed);
+        state.download_notify.notify_waiters();
+        drop(master_guard);
+
+        let flow = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter missed the released download slot")
+            .unwrap();
+        assert!(matches!(flow, ControlFlow::Continue(true)));
     }
 
     /// Write a needle to volume 1 and return its URL path.
@@ -7231,6 +7727,28 @@ mod tests {
         }
     }
 
+    /// A needle of concatenated gzip members decodes to all of them, as Go's
+    /// gzip reader does, so a range spans the whole decoded content.
+    #[tokio::test]
+    async fn test_get_range_over_multi_member_gzip_needle() {
+        const ID: u64 = 0x6e7a_0503;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let mut gz = try_gzip_data(b"hello").unwrap();
+        gz.extend(try_gzip_data(b"world").unwrap());
+        let path = put_test_needle_with(&state, ID, &gz, |n| n.set_is_compressed());
+
+        let (status, headers, body) =
+            send_read(&state, Method::GET, &path, Some(b"bytes=3-7")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, b"lowor");
+        assert_eq!(headers["Content-Range"], "bytes 3-7/10");
+
+        let (status, _, body) = send_read(&state, Method::GET, &path, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"helloworld");
+    }
+
     /// An EC needle is served from memory: its GET parses Range like any
     /// other, and its HEAD ignores it as Go's writeResponseContent does.
     #[tokio::test]
@@ -8066,20 +8584,17 @@ mod tests {
     }
 
     async fn spawn_lookup(peer: std::net::SocketAddr) -> String {
-        use axum::routing::get;
-        let app = axum::Router::new().route(
-            "/dir/lookup",
-            get(move || async move {
-                axum::Json(serde_json::json!({
-                    "volumeOrFileId": "9",
-                    "locations": [{ "url": peer.to_string() }]
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("127.0.0.1:{}", addr.port())
+        spawn_lookup_master(move |vid| {
+            Ok(lookup_answer(
+                vid,
+                vec![master_pb::Location {
+                    url: peer.to_string(),
+                    ..Default::default()
+                }],
+                "",
+            ))
+        })
+        .await
     }
 
     fn remote_manifest_state(
@@ -8577,7 +9092,7 @@ mod tests {
             .store
             .write()
             .unwrap()
-            .delete_volume_needle(VolumeId(1), &mut filler)
+            .delete_volume_needle(VolumeId(1), &mut filler, false)
             .unwrap();
         let data_offset = || {
             let mut plan = crate::storage::store::Store::needle_read_plan(
@@ -8666,7 +9181,6 @@ mod tests {
     async fn http_local_refusal_after_replica_append_is_not_marked() {
         for local_read_only in [true, false] {
             use crate::storage::super_block::ReplicaPlacement;
-            use axum::{Json, Router, routing::get};
             use tower::ServiceExt;
 
             let tmp = tempfile::TempDir::new().unwrap();
@@ -8711,20 +9225,7 @@ mod tests {
             });
 
             // The master's writable view can lag behind the local seal.
-            let master = Router::new().route(
-                "/dir/lookup",
-                get(move || async move {
-                    Json(serde_json::json!({"locations": [
-                        {"url": "127.0.0.1:8080"},
-                        {"url": peer_addr.to_string()}
-                    ]}))
-                }),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            *state.current_master_url.write().await = listener.local_addr().unwrap().to_string();
-            let master_server = tokio::spawn(async move {
-                axum::serve(listener, master).await.unwrap();
-            });
+            *state.current_master_url.write().await = spawn_replica_master(peer_addr).await;
 
             let id = 0x6e7a_0c03u64;
             let payload = b"replicated bytes";
@@ -8763,8 +9264,107 @@ mod tests {
             };
             written.read_needle(&mut stored).unwrap();
             assert_eq!(stored.data, payload);
-            master_server.abort();
             peer_server.abort();
+        }
+    }
+
+    /// A delete whose fan-out failed was already applied here, so the
+    /// client's retry finds nothing locally; it must still reach the replica
+    /// that kept the needle, or the replicas stay different.
+    #[tokio::test]
+    async fn test_delete_retry_reaches_the_replica_after_a_failed_fan_out() {
+        use crate::storage::super_block::ReplicaPlacement;
+        use axum::middleware;
+        use axum::response::IntoResponse;
+
+        let replicated = |state: &Arc<VolumeServerState>| {
+            let vol = state
+                .store
+                .read()
+                .unwrap()
+                .find_volume(VolumeId(1))
+                .unwrap()
+                .1;
+            vol.set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+                .unwrap();
+            vol
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        Arc::get_mut(&mut state).unwrap().self_url = "127.0.0.1:8080".to_string();
+        let volume = replicated(&state);
+        let peer_tmp = tempfile::TempDir::new().unwrap();
+        let peer = volume_test_state(&peer_tmp);
+        let peer_volume = replicated(&peer);
+
+        let id = 0x6e7a_0c06u64;
+        let path = put_test_needle(&state, id, b"replicated delete");
+        put_test_needle(&peer, id, b"replicated delete");
+        let live = |vol: &Arc<crate::storage::volume::Volume>| {
+            vol.read_needle(&mut Needle {
+                id: NeedleId(id),
+                ..Needle::default()
+            })
+            .is_ok()
+        };
+
+        let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let app = super::super::volume_server::build_admin_router(peer).layer(middleware::from_fn(
+            move |request: Request<Body>, next: middleware::Next| {
+                let fail = fail_next.swap(false, Ordering::SeqCst);
+                async move {
+                    if fail {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        *state.current_master_url.write().await = spawn_replica_master(peer_addr).await;
+
+        assert_eq!(
+            send_delete(&state, &path).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!live(&volume));
+        assert!(live(&peer_volume));
+
+        assert_eq!(send_delete(&state, &path).await, StatusCode::NOT_FOUND);
+        assert!(!live(&peer_volume));
+        peer_server.abort();
+    }
+
+    /// A forwarding replica takes a 404 as the needle being gone here, so a
+    /// delete whose read fails for another reason answers 500.
+    #[tokio::test]
+    async fn test_delete_whose_read_fails_is_not_a_404() {
+        use std::io::{Seek, SeekFrom, Write};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let id = 0x6e7a_0c07u64;
+        let path = put_test_needle(&state, id, b"unreadable");
+        let dat = state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1
+            .dat_path();
+        let mut file = std::fs::OpenOptions::new().write(true).open(dat).unwrap();
+        // the needle's size field, right after the superblock, cookie and id
+        file.seek(SeekFrom::Start(8 + 4 + 8)).unwrap();
+        file.write_all(&u32::MAX.to_be_bytes()).unwrap();
+        file.sync_all().unwrap();
+        for query in ["", "?type=replicate"] {
+            assert_eq!(
+                send_delete(&state, &format!("{path}{query}")).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{query}"
+            );
         }
     }
 
@@ -8772,7 +9372,7 @@ mod tests {
     async fn http_replication_preserves_query_authentication() {
         use crate::security::{SigningKey, gen_jwt};
         use crate::storage::super_block::ReplicaPlacement;
-        use axum::{Json, Router, middleware, routing::get};
+        use axum::middleware;
         use tower::ServiceExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8815,19 +9415,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = listener.local_addr().unwrap();
         let peer_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let master = Router::new().route(
-            "/dir/lookup",
-            get(move || async move {
-                Json(serde_json::json!({"locations": [
-                    {"url": "127.0.0.1:8080"},
-                    {"url": peer_addr.to_string()}
-                ]}))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        *state.current_master_url.write().await = listener.local_addr().unwrap().to_string();
-        let master_server =
-            tokio::spawn(async move { axum::serve(listener, master).await.unwrap() });
+        *state.current_master_url.write().await = spawn_replica_master(peer_addr).await;
         let id = 0x6e7a_0c05u64;
         let fid = format!("1,{id:x}{TEST_COOKIE:08x}");
         let token = gen_jwt(&key, 60, &fid).unwrap();
@@ -8879,14 +9467,12 @@ mod tests {
             }
         }
         assert_eq!(*queries.lock().unwrap(), [expected_query, expected_query]);
-        master_server.abort();
         peer_server.abort();
     }
 
     #[tokio::test]
     async fn http_replica_stores_the_primary_needle() {
         use crate::storage::super_block::ReplicaPlacement;
-        use axum::{Json, Router, routing::get};
         use tower::ServiceExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8921,19 +9507,7 @@ mod tests {
             .await
             .unwrap();
         });
-        let master = Router::new().route(
-            "/dir/lookup",
-            get(move || async move {
-                Json(serde_json::json!({"locations": [
-                    {"url": "127.0.0.1:8080"},
-                    {"url": peer_addr.to_string()}
-                ]}))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        *state.current_master_url.write().await = listener.local_addr().unwrap().to_string();
-        let master_server =
-            tokio::spawn(async move { axum::serve(listener, master).await.unwrap() });
+        *state.current_master_url.write().await = spawn_replica_master(peer_addr).await;
 
         let payload = "compressible replica text ".repeat(64);
         let boundary = "replica-boundary";
@@ -9028,7 +9602,6 @@ mod tests {
             assert_eq!(replica.ttl, primary.ttl);
             assert_eq!(replica.last_modified, 1700000000);
         }
-        master_server.abort();
         peer_server.abort();
     }
 
@@ -9069,6 +9642,276 @@ mod tests {
             volume.read_needle(&mut stored).unwrap();
             assert_eq!(stored.is_compressed(), compressed, "query {query:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn http_upload_checks_content_crc32c() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let payload = "chunk bytes from the uploader ".repeat(64);
+        let gzipped = try_gzip_data(payload.as_bytes()).unwrap();
+        let right = encode_content_crc32c(crc32c::crc32c(payload.as_bytes()));
+        let wrong = encode_content_crc32c(crc32c::crc32c(b"other bytes"));
+        let (right, wrong) = (right.as_str(), wrong.as_str());
+        for (id, crc, gzip, want) in [
+            (0x6e7a_0c20u64, None, false, StatusCode::CREATED),
+            (0x6e7a_0c21, Some(right), false, StatusCode::CREATED),
+            (0x6e7a_0c22, Some(wrong), false, StatusCode::BAD_REQUEST),
+            (0x6e7a_0c23, Some("AAAA"), false, StatusCode::BAD_REQUEST),
+            (0x6e7a_0c24, Some(right), true, StatusCode::CREATED),
+            (0x6e7a_0c25, Some(wrong), true, StatusCode::BAD_REQUEST),
+        ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/1,{id:x}{TEST_COOKIE:08x}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream");
+            if gzip {
+                request = request.header(header::CONTENT_ENCODING, "gzip");
+            }
+            if let Some(crc) = crc {
+                request = request.header(CONTENT_CRC32C_HEADER, crc);
+            }
+            let body = if gzip {
+                gzipped.clone()
+            } else {
+                payload.as_bytes().to_vec()
+            };
+            let response = super::super::volume_server::build_admin_router(state.clone())
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), want, "{crc:?} gzip {gzip}");
+            if want == StatusCode::BAD_REQUEST {
+                let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&text).contains(CONTENT_CRC32C_HEADER),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    /// A multipart upload whose parts carry no filename uses the first part
+    /// with its headers, as Go does, so its gzip body is checked unzipped.
+    #[tokio::test]
+    async fn http_multipart_without_filename_keeps_the_part_headers() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let payload = "first part bytes ".repeat(64);
+        let gzipped = try_gzip_data(payload.as_bytes()).unwrap();
+        let mut body = b"--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\
+Content-Encoding: gzip\r\n\r\n"
+            .to_vec();
+        body.extend_from_slice(&gzipped);
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/1,6e7a0c28{TEST_COOKIE:08x}"))
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+            .header(
+                CONTENT_CRC32C_HEADER,
+                encode_content_crc32c(crc32c::crc32c(payload.as_bytes())),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = super::super::volume_server::build_admin_router(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[test]
+    fn test_extended_file_name() {
+        assert_eq!(
+            extended_file_name("form-data; filename*=utf-8''na%C3%AFve.txt; name=file"),
+            Some("naïve.txt".to_string())
+        );
+        assert_eq!(
+            extended_file_name("form-data; name=file; FILENAME*=US-ASCII'en'a%20b.txt"),
+            Some("a b.txt".to_string())
+        );
+        assert_eq!(
+            extended_file_name(r#"form-data; name="a\";b"; filename*=utf-8''x.txt"#),
+            Some("x.txt".to_string())
+        );
+        for value in [
+            "form-data; filename=\"a.txt\"; name=file",
+            "form-data; filename*=iso-8859-1''na%EFve.txt",
+            "form-data; filename*=utf-8''bad%G1",
+            "form-data; filename*=utf-8''cut%C",
+            "form-data; filename*=utf-8''%FF",
+            "form-data; filename*=na%C3%AFve.txt",
+            "form-data; name=\"note; filename*=utf-8''decoy\"",
+            "form-data; filename*=utf-8''a%0D%0A%0D%0Ab.txt",
+        ] {
+            assert_eq!(extended_file_name(value), None, "{value}");
+        }
+    }
+
+    /// Go's uploader names a non-ASCII file with `filename*`; the part is
+    /// still found as the file, after a part without a filename.
+    #[tokio::test]
+    async fn http_multipart_reads_the_extended_filename() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = volume_test_state(&tmp);
+        let payload = "na\u{ef}ve chunk bytes ".repeat(64);
+        let gzipped = try_gzip_data(payload.as_bytes()).unwrap();
+        let mut body = b"--b\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nx\r\n\
+--b\r\nContent-Disposition: form-data; filename*=utf-8''na%C3%AFve.txt; name=file\r\n\
+Content-Encoding: gzip\r\n\r\n"
+            .to_vec();
+        body.extend_from_slice(&gzipped);
+        body.extend_from_slice(b"\r\n--b--\r\n");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/1,6e7a0c29{TEST_COOKIE:08x}"))
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+            .header(
+                CONTENT_CRC32C_HEADER,
+                encode_content_crc32c(crc32c::crc32c(payload.as_bytes())),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = super::super::volume_server::build_admin_router(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// The primary forwards the client's CRC32C so the replica checks it too.
+    #[tokio::test]
+    async fn http_replica_gets_the_content_crc32c() {
+        use crate::storage::super_block::ReplicaPlacement;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        Arc::get_mut(&mut state).unwrap().self_url = "127.0.0.1:8080".to_string();
+        state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1
+            .set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+            .unwrap();
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = forwarded.clone();
+        let peer = axum::Router::new().fallback(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(
+                    headers
+                        .get(CONTENT_CRC32C_HEADER)
+                        .map(|v| v.to_str().unwrap().to_string()),
+                );
+                (StatusCode::CREATED, "{}")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
+        *state.current_master_url.write().await = spawn_replica_master(peer_addr).await;
+
+        let payload = "compressible replica text ".repeat(64);
+        let crc = encode_content_crc32c(crc32c::crc32c(payload.as_bytes()));
+        for (id, sent) in [(0x6e7a_0c26u64, Some(crc.as_str())), (0x6e7a_0c27, None)] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/1,{id:x}{TEST_COOKIE:08x}"))
+                .header(header::CONTENT_TYPE, "text/plain");
+            if let Some(crc) = sent {
+                request = request.header(CONTENT_CRC32C_HEADER, crc);
+            }
+            let response = super::super::volume_server::build_admin_router(state.clone())
+                .oneshot(request.body(Body::from(payload.clone())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        assert_eq!(*forwarded.lock().unwrap(), vec![Some(crc.clone()), None]);
+        peer_server.abort();
+    }
+
+    /// A rotated JPEG goes to the replica with the CRC32C of the rewritten
+    /// bytes, as Go's replicaContentCrc32c sends.
+    #[tokio::test]
+    async fn http_replica_gets_the_crc32c_of_a_rotated_jpeg() {
+        use crate::storage::super_block::ReplicaPlacement;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = volume_test_state(&tmp);
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.self_url = "127.0.0.1:8080".to_string();
+        s.fix_jpg_orientation = true;
+        state
+            .store
+            .read()
+            .unwrap()
+            .find_volume(VolumeId(1))
+            .unwrap()
+            .1
+            .set_replica_placement(ReplicaPlacement::from_string("001").unwrap())
+            .unwrap();
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = forwarded.clone();
+        let peer = axum::Router::new().fallback(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(
+                    headers
+                        .get(CONTENT_CRC32C_HEADER)
+                        .map(|v| v.to_str().unwrap().to_string()),
+                );
+                (StatusCode::CREATED, "{}")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
+        *state.current_master_url.write().await = spawn_replica_master(peer_addr).await;
+
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(3, 2))
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .unwrap();
+        let exif: &[u8] =
+            b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x03\0\0\0\0\0\0";
+        let mut tagged = vec![0xFF, 0xD8, 0xFF, 0xE1, 0, exif.len() as u8 + 2];
+        tagged.extend_from_slice(exif);
+        tagged.extend_from_slice(&encoded.into_inner()[2..]);
+        let rotated = crate::images::fix_jpg_orientation(&tagged);
+        assert_ne!(rotated, tagged);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/1,6e7a0c2a{TEST_COOKIE:08x}"))
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(
+                CONTENT_CRC32C_HEADER,
+                encode_content_crc32c(crc32c::crc32c(&tagged)),
+            )
+            .body(Body::from(tagged))
+            .unwrap();
+        let response = super::super::volume_server::build_admin_router(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            *forwarded.lock().unwrap(),
+            vec![Some(encode_content_crc32c(crc32c::crc32c(&rotated)))]
+        );
+        peer_server.abort();
     }
 
     #[tokio::test]
@@ -9241,8 +10084,8 @@ mod tests {
     /// replicate delete of it finds nothing. The delete cancels the write, so
     /// it is taken back when it lands instead of reviving the needle on this
     /// copy alone, even when its handler was dropped while it waited in the
-    /// durable queue. A plain delete that finds nothing is not sent on to the
-    /// replicas, so it leaves the write alone.
+    /// durable queue. A plain delete on an unreplicated volume that finds
+    /// nothing leaves the write alone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn test_replicate_delete_cancels_a_queued_write() {

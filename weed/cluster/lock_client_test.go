@@ -225,9 +225,8 @@ func (s *contendedLockFiler) DistributedLock(ctx context.Context, req *filer_pb.
 	return &filer_pb.LockResponse{Error: "lock already owned by someone"}, nil
 }
 
-// A lock held by another owner is ordinary contention: acquisition waits it
-// out rather than failing on the unavailability bound.
-func TestNewShortLivedLockWaitsOutContention(t *testing.T) {
+func newContendedLockClient(t *testing.T) *LockClient {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -235,14 +234,19 @@ func TestNewShortLivedLockWaitsOutContention(t *testing.T) {
 	grpcServer := grpc.NewServer()
 	filer_pb.RegisterSeaweedFilerServer(grpcServer, &contendedLockFiler{})
 	go grpcServer.Serve(listener)
-	defer grpcServer.Stop()
+	t.Cleanup(grpcServer.Stop)
 
-	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
 	host, port, err := net.SplitHostPort(listener.Addr().String())
 	if err != nil {
 		t.Fatalf("split host port: %v", err)
 	}
-	lc := NewLockClient(dialOption, pb.ServerAddress(fmt.Sprintf("%s:0.%s", host, port)))
+	return NewLockClient(grpc.WithTransportCredentials(insecure.NewCredentials()), pb.ServerAddress(fmt.Sprintf("%s:0.%s", host, port)))
+}
+
+// A lock held by another owner is ordinary contention: acquisition waits it
+// out rather than failing on the unavailability bound.
+func TestNewShortLivedLockWaitsOutContention(t *testing.T) {
+	lc := newContendedLockClient(t)
 	lc.noLockServerRetryPeriod = 200 * time.Millisecond
 
 	done := make(chan *LiveLock, 1)
@@ -253,6 +257,22 @@ func TestNewShortLivedLockWaitsOutContention(t *testing.T) {
 	case <-done:
 		t.Fatal("ordinary lock contention must not hit the unavailability bound")
 	case <-time.After(3 * lc.noLockServerRetryPeriod):
+	}
+}
+
+func TestNewBlockingLongLivedLockWithinGivesUpOnContention(t *testing.T) {
+	lc := newContendedLockClient(t)
+
+	maxWait := 1500 * time.Millisecond
+	start := time.Now()
+	lock, err := lc.NewBlockingLongLivedLockWithin("test-key", "test-owner", 15*time.Second, maxWait)
+	elapsed := time.Since(start)
+
+	if lock != nil || err == nil {
+		t.Fatalf("got lock %v err %v, want no lock and the contention error", lock, err)
+	}
+	if elapsed < maxWait || elapsed > maxWait+5*time.Second {
+		t.Fatalf("gave up after %v, want just past %v", elapsed, maxWait)
 	}
 }
 
@@ -519,27 +539,12 @@ func TestDoLockKeepsRenewTokenOnError(t *testing.T) {
 // A definitive rejection answers with an empty token, which clears the stale
 // one — only transport failures keep it.
 func TestDoLockClearsRenewTokenOnRejection(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	grpcServer := grpc.NewServer()
-	filer_pb.RegisterSeaweedFilerServer(grpcServer, &contendedLockFiler{})
-	go grpcServer.Serve(listener)
-	defer grpcServer.Stop()
-
-	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
-	host, port, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		t.Fatalf("split host port: %v", err)
-	}
-	filerAddr := pb.ServerAddress(fmt.Sprintf("%s:0.%s", host, port))
-	lc := NewLockClient(dialOption, filerAddr)
+	lc := newContendedLockClient(t)
 	lock := &LiveLock{
 		key:            "test-key",
 		renewToken:     "tok",
-		hostFiler:      filerAddr,
-		grpcDialOption: dialOption,
+		hostFiler:      lc.seedFiler,
+		grpcDialOption: lc.grpcDialOption,
 		lc:             lc,
 	}
 	errorMessage, _, err := lock.doLock(time.Second, time.Second)
@@ -598,5 +603,52 @@ func TestLiveLockGenerationIsAligned(t *testing.T) {
 	atomic.StoreInt64(&lock.generation, 42)
 	if got := lock.Generation(); got != 42 {
 		t.Fatalf("generation = %d, want 42", got)
+	}
+	atomic.StoreInt64(&lock.expireAtNs, 42)
+}
+
+func newGrantingLockClient(t *testing.T) *LockClient {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	filer_pb.RegisterSeaweedFilerServer(grpcServer, &grantingLockFiler{})
+	go grpcServer.Serve(listener)
+	t.Cleanup(grpcServer.Stop)
+
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+	return NewLockClient(grpc.WithTransportCredentials(insecure.NewCredentials()), pb.ServerAddress(fmt.Sprintf("%s:0.%s", host, port)))
+}
+
+// A holder whose renewal stalled past the lease is not locked anymore, even
+// before a failed renewal clears it: the server may have granted the key to
+// someone else by then.
+func TestLiveLockIsLockedOnlyWithinLease(t *testing.T) {
+	lock := newGrantingLockClient(t).NewShortLivedLock("test-key", "test-owner")
+	if lock == nil {
+		t.Fatal("lock not granted")
+	}
+	if !lock.IsLocked() {
+		t.Fatal("a fresh grant must read as locked")
+	}
+	if left := time.Until(time.Unix(0, atomic.LoadInt64(&lock.expireAtNs))); left <= 0 || left > 5*time.Second {
+		t.Fatalf("lease left after a 5s grant = %v", left)
+	}
+
+	if err := lock.AttemptToLock(15 * time.Second); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if left := time.Until(time.Unix(0, atomic.LoadInt64(&lock.expireAtNs))); left <= 5*time.Second || left > 15*time.Second {
+		t.Fatalf("lease left after a 15s renewal = %v", left)
+	}
+
+	atomic.StoreInt64(&lock.expireAtNs, time.Now().Add(-time.Millisecond).UnixNano())
+	if lock.IsLocked() {
+		t.Fatal("a lock whose lease ran out must not read as locked")
 	}
 }

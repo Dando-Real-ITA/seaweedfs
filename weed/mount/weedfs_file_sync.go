@@ -3,8 +3,10 @@ package mount
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
+	"math"
+	"sort"
 	"syscall"
 	"time"
 
@@ -16,11 +18,45 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// metadataFlushTimeout bounds a close()/fsync metadata flush so an overwhelmed
-// filer cannot wedge the calling process forever. It is deliberately generous:
-// a healthy CreateEntry completes in well under a second, so this only fires on
-// a genuinely stuck filer, never on a normal flush.
-const metadataFlushTimeout = 30 * time.Second
+// metadataFlushTimeout bounds the metadata commit of a close()/fsync flush
+// (CreateEntry and its retries) so an overwhelmed filer cannot wedge the
+// calling process forever. It is deliberately generous: a healthy CreateEntry
+// completes in well under a second, so this only fires on a genuinely stuck
+// filer, never on a normal flush. It is the flush's commitBudget, so it does
+// not cover the uploads that come first. A variable so tests can shorten it.
+var metadataFlushTimeout = 30 * time.Second
+
+// commitBudget is the time one flush may spend in the filer calls of its
+// metadata commit, added up over its attempts. Nothing else is charged to it:
+// the data upload, the wait for the handle's locks, the merge of bloated
+// chunks and the manifest upload can each outlast the whole budget. A deadline
+// that also ran through that work was spent by it; CreateEntry then failed at
+// once with "context deadline exceeded", and close() returned an error for
+// data that was already stored. A nil budget sets no bound. The attempts run
+// one after another, so it needs no lock.
+type commitBudget struct {
+	left time.Duration
+}
+
+// begin returns ctx limited to what is left of the budget, for one filer call.
+// The returned func ends the call and charges the budget the time it took.
+func (b *commitBudget) begin(ctx context.Context) (context.Context, func()) {
+	if b == nil {
+		return ctx, func() {}
+	}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, b.left)
+	return ctx, func() {
+		cancel()
+		b.left -= time.Since(start)
+	}
+}
+
+// spent reports whether the budget has run out, so that another attempt could
+// only fail.
+func (b *commitBudget) spent() bool {
+	return b != nil && b.left <= 0
+}
 
 /**
  * Flush method
@@ -78,17 +114,15 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	hasPosixLocks := wfs.hasPosixOwner(in.NodeId, in.LockOwner)
 	allowAsync := !hasPosixLocks
 
-	// Bound the flush with a deadline instead of tying it to the FUSE cancel
-	// channel. A FUSE interrupt is not a process kill: Go's async preemption
-	// (SIGURG) makes a close() under load emit an interrupt on nearly every
-	// flush (see go-fuse RawFileSystem docs), so cancelling the in-flight
+	// Bound the metadata commit with a deadline instead of tying it to the FUSE
+	// cancel channel. A FUSE interrupt is not a process kill: Go's async
+	// preemption (SIGURG) makes a close() under load emit an interrupt on nearly
+	// every flush (see go-fuse RawFileSystem docs), so cancelling the in-flight
 	// metadata CreateEntry on that interrupt turned healthy concurrent close()s
 	// into EIO. The deadline still keeps close() from hanging forever against an
-	// overwhelmed filer without failing benign flushes.
-	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancelFunc()
-
-	status := wfs.doFlush(ctx, fh, in.Uid, in.Gid, allowAsync)
+	// overwhelmed filer without failing benign flushes. doFlush charges it only
+	// for the commit's filer calls, so a slow upload cannot use it up.
+	status := wfs.doFlush(context.Background(), fh, in.Uid, in.Gid, allowAsync, metadataFlushTimeout)
 	if in.LockOwner != 0 && wfs.releasePosixOwner(in.NodeId, in.LockOwner) {
 		wfs.forgetLockOwner(in.NodeId, in.LockOwner)
 	}
@@ -121,15 +155,18 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 		return fuse.ENOENT
 	}
 
-	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancelFunc()
-
 	// Fsync is an explicit sync request — always flush synchronously
-	return wfs.doFlush(ctx, fh, in.Uid, in.Gid, false)
+	return wfs.doFlush(context.Background(), fh, in.Uid, in.Gid, false, metadataFlushTimeout)
 
 }
 
-func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
+// doFlush uploads the handle's dirty data, then commits its metadata to the
+// filer. metadataTimeout is the commitBudget of that commit: what its filer
+// calls may take over all attempts, whatever the uploads before and between
+// them took. 0 sets no overall bound, leaving only the per-call filer
+// timeouts. ctx should carry no deadline of its own: it would run through the
+// uploads as well.
+func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool, metadataTimeout time.Duration) fuse.Status {
 
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
@@ -155,6 +192,7 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 
 	// Synchronous flush path (normal mode, fsync, or no dirty data)
 	fh.asyncFlushPending = false
+	publication := &contentPublication{failure: fh.writebackContentError, writes: fh.pageWrites.Load()}
 
 	// Check quota including uncommitted writes for real-time enforcement
 	isOverQuota := wfs.IsOverQuotaWithUncommitted()
@@ -180,14 +218,25 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	if err := retryMetadataFlush(ctx, func() error {
-		return wfs.flushMetadataToFiler(ctx, fh, dir, name, uid, gid)
+	// The attempts share one budget, charged only for their filer calls.
+	var commit *commitBudget
+	if metadataTimeout > 0 {
+		commit = &commitBudget{left: metadataTimeout}
+	}
+
+	if err := retryMetadataFlushIf(ctx, func() error {
+		return wfs.flushMetadataToFiler(ctx, fh, dir, name, uid, gid, commit, publication)
+	}, func(err error) bool {
+		return !commit.spent() && !isPageUploadError(err) && isRetryableFilerError(err)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
 	}); err != nil {
+		if fh.dirtyContent {
+			publication.retire(err)
+		}
 		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
-		return grpcErrorToFuseStatus(err)
+		return flushErrorToFuseStatus(err)
 	}
 
 	if IsDebugFileReadWrite {
@@ -197,18 +246,49 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	return fuse.OK
 }
 
+// pageUploadError is a page upload failure a metadata flush found before it
+// published anything. doFlush reports it as a write error, as it does when its
+// own FlushData fails, instead of retrying it as a filer error.
+type pageUploadError struct{ err error }
+
+func (e *pageUploadError) Error() string { return e.err.Error() }
+func (e *pageUploadError) Unwrap() error { return e.err }
+
+func isPageUploadError(err error) bool {
+	var upload *pageUploadError
+	return errors.As(err, &upload)
+}
+
+// flushErrorToFuseStatus maps a failed metadata flush to a FUSE status.
+func flushErrorToFuseStatus(err error) fuse.Status {
+	var upload *pageUploadError
+	if errors.As(err, &upload) {
+		return writeErrorToFuseStatus(upload.err)
+	}
+	return grpcErrorToFuseStatus(err)
+}
+
 // flushMetadataToFiler sends the file's chunk references and attributes to the filer.
 // This is shared between the synchronous doFlush path and the async flush completion.
 //
 // When -dlm is enabled, the distributed lock is already held by the FileHandle
 // from open-for-write through close, so no additional distributed lock is
 // needed here. The local fhLockTable lock below serializes within this mount.
-func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
-	fileFullPath := fh.FullPath()
-	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
+//
+// commit bounds the filer calls made here, over all attempts of one flush; nil
+// leaves them to the per-call filer timeouts.
+func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32, commit *commitBudget, publications ...*contentPublication) error {
+	publication := &contentPublication{writes: fh.pageWrites.Load()}
+	if len(publications) > 0 {
+		publication = publications[0]
+	}
+	fileFullPath, dir, name, release, err := wfs.lockFlushTarget(fh, "doFlush", dir, name)
+	if err != nil {
+		return err
+	}
+	defer release()
 
-	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
-	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
 
 	// Re-check under the lock: Unlink sets the flag under it, so a flush that
 	// was already past the earlier check cannot write the entry back after
@@ -217,16 +297,31 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 		glog.V(3).Infof("flushMetadataToFiler %s fh %d: file was unlinked, skipping", fileFullPath, fh.fh)
 		return nil
 	}
+	// The callers look at the flag before they wait for these locks, so a
+	// flush queued behind another one finds its changes already published.
+	// Sending the entry again would rewrite the stored copy for nothing, and
+	// a rename moving the file at that moment fails on that write.
+	if !fh.dirtyMetadata {
+		return nil
+	}
+	if fh.linkRefresh != nil {
+		linkCtx, end := commit.begin(ctx)
+		err := wfs.adoptStoredLink(linkCtx, fh, util.NewFullPath(dir, name), fh.linkRefresh)
+		end()
+		if err != nil {
+			return err
+		}
+	}
 
 	entry := fh.GetEntry()
 	entry.Name = name // this flush may be just after a rename operation
 
 	if entry.Attributes != nil {
 		entry.Attributes.Mime = selectMimeTypeOnFlush(name, fh.contentType, entry.Attributes.Mime)
-		if entry.Attributes.Uid == 0 {
+		if entry.Attributes.Uid == 0 && uid != unknownCallerId {
 			entry.Attributes.Uid = uid
 		}
-		if entry.Attributes.Gid == 0 {
+		if entry.Attributes.Gid == 0 && gid != unknownCallerId {
 			entry.Attributes.Gid = gid
 		}
 		// Do not stamp mtime/ctime here. Write/SetAttr already maintain
@@ -236,18 +331,48 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 
 	glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))
 
-	manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.GetChunks())
+	snapshot := entry.GetChunks()
+	manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(snapshot)
 
-	chunks, _, err := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
+	chunks, covered, err := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
 	if err != nil {
 		return fmt.Errorf("compact chunks of %s: %w", fileFullPath, err)
 	}
 
-	if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
+	deferMerge := false
+	if _, _, bloated := shouldMergeChunks(chunks, manifestChunks); bloated {
+		// The merge replaces every chunk it reads. Uploads attach their chunks
+		// without the handle lock, and writes that landed after doFlush drained
+		// the pages may still be uploading. A writeback upload retries until
+		// storage recovers, so leave the merge to a later flush rather than
+		// wait for it under these locks. With none pending, the lock holds
+		// writes off and nothing attaches during the merge: take the chunks
+		// again. A failed upload fails the flush as a write error, before
+		// anything claims the bytes it did not store.
+		if fh.dirtyPages.HasPendingUploads() {
+			deferMerge = true
+		} else {
+			if err := fh.dirtyPages.FlushData(); err != nil {
+				return &pageUploadError{err: err}
+			}
+			snapshot = entry.GetChunks()
+			manifestChunks, nonManifestChunks = filer.SeparateManifestChunks(snapshot)
+			if chunks, covered, err = filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks); err != nil {
+				return fmt.Errorf("compact chunks of %s: %w", fileFullPath, err)
+			}
+		}
+	}
+
+	rewrote := false
+	if deferMerge {
+		glog.V(3).Infof("%s: uploads pending, leaving the chunk merge to a later flush", fileFullPath)
+	} else if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
 		glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)
 	} else if mergedChunks != nil {
 		chunks = mergedChunks
 		manifestChunks = nil
+		fh.noteRewrite()
+		rewrote = true
 	}
 
 	// no chunk deleter here: a failed fold reports the blobs it saved
@@ -256,13 +381,21 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 		// not good, but should be ok
 		glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
 	}
-	entry.Chunks = append(chunks, manifestChunks...)
+	if rewrote {
+		fh.installRewrittenChunks(snapshot, append(chunks, manifestChunks...))
+	} else {
+		fh.UpdateEntry(func(e *filer_pb.Entry) {
+			e.Chunks = withChunksAttachedSince(snapshot, append(chunks, manifestChunks...), e.Chunks)
+		})
+	}
 
 	// Clone the proto entry for the filer request so that mapPbIdFromLocalToFiler
 	// does not mutate the file handle's live entry. Without the clone, a concurrent
 	// Lookup can observe filer-side uid/gid on the file handle entry and return it
 	// to the kernel, which caches it and then rejects opens by the local user.
-	requestEntry := proto.Clone(entry.GetEntry()).(*filer_pb.Entry)
+	// Uploads attach chunks without the handle lock, so clone under the entry lock.
+	var requestEntry *filer_pb.Entry
+	fh.UpdateEntry(func(e *filer_pb.Entry) { requestEntry = proto.Clone(e).(*filer_pb.Entry) })
 	request := &filer_pb.CreateEntryRequest{
 		Directory:                string(dir),
 		Entry:                    requestEntry,
@@ -273,12 +406,24 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	// Snapshot with local ids before the request mapping mutates the clone:
 	// on ack this becomes the handle's base, judged against future events.
 	baseSnapshot := proto.Clone(requestEntry).(*filer_pb.Entry)
+	requestEntry.Chunks = append(requestEntry.Chunks, fh.unpublishedChunks(covered, requestEntry.Chunks)...)
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-	resp, err := wfs.streamCreateEntry(ctx, request)
+	// The chunk merge and the manifest above read and upload chunks, which can
+	// take longer than the whole commit budget. It is charged only from here.
+	// Writes that landed before the lock may still be uploading, so a merge onto a
+	// moved entry must keep room for them.
+	buffered := fh.dirtyPages.HasPendingUploads()
+	commitCtx, end := commit.begin(ctx)
+	resp, merged, err := wfs.createContentEntry(commitCtx, fh, request, baseSnapshot, buffered, publication)
+	end()
 	if err != nil {
 		glog.Errorf("fh flush create %s: %v", fileFullPath, err)
-		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
+		return &contentPublicationError{cause: fmt.Errorf("fh flush create %s: %w", fileFullPath, err), request: proto.Clone(request).(*filer_pb.CreateEntryRequest)}
+	}
+	if merged != nil {
+		fh.rebaseEntry(merged, requestEntry)
+		baseSnapshot = merged
 	}
 
 	event := resp.GetMetadataEvent()
@@ -291,18 +436,342 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	// The filer acknowledged this state at the event's log position (or, for
 	// a no-op create, at the response's log position); older queued
 	// subscription events must not roll the handle back.
-	fh.setAuthoritativeBase(baseSnapshot)
+	fh.setAuthoritativeBase(wfs.ackedBase(resp, baseSnapshot))
 	fh.advanceEntryVersion(ackVersionTsNs(resp), resp.GetLogSignature())
 	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 		glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))
 	}
 
-	if err == nil {
+	if err == nil && fh.pageWrites.Load() == publication.writes {
+		fh.pendingAppend = false
 		fh.dirtyMetadata = false
+		fh.dirtyContent = false
 	}
 
 	return err
+}
+
+// lockFlushTarget takes the publication lock of the name a flush of fh
+// publishes through, then the handle's lock, and returns that name once both
+// are held: an unlink or a rename can land while the flush waits for them.
+// Attribute acknowledgement, local retention and a rename's filer call hold
+// the publication lock, so it comes before the handle's active lock.
+func (wfs *WFS) lockFlushTarget(fh *FileHandle, intention, dir, name string) (util.FullPath, string, string, func(), error) {
+	fileFullPath, dir, name := wfs.flushTarget(fh, dir, name)
+	for attempt := 0; ; attempt++ {
+		unlock := wfs.lockMetadataPublication(fileFullPath)
+		fhActiveLock := wfs.fhLockTable.AcquireLock(intention, fh.fh, util.ExclusiveLock)
+		nowPath, nowDir, nowName := wfs.flushTarget(fh, dir, name)
+		if nowPath == fileFullPath && nowDir == dir && nowName == name {
+			return fileFullPath, dir, name, func() {
+				wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+				unlock()
+			}, nil
+		}
+		wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+		unlock()
+		if attempt == 3 {
+			return "", "", "", nil, fmt.Errorf("flush %s: name changed while waiting for its locks, now %s", fileFullPath, nowPath)
+		}
+		fileFullPath, dir, name = nowPath, nowDir, nowName
+	}
+}
+
+// flushTarget returns the lock path and the name a flush of fh publishes
+// through: the caller's name while it still names the file, else the name the
+// file has now.
+func (wfs *WFS) flushTarget(fh *FileHandle, dir, name string) (util.FullPath, string, string) {
+	fileFullPath := fh.FullPath()
+	if resolved := util.FullPath(dir).Child(name); fileFullPath != "" && fileFullPath != resolved {
+		if inode, found := wfs.inodeToPath.GetInode(resolved); !found || inode != fh.inode {
+			dir, name = fileFullPath.DirAndName()
+		}
+	}
+	return fileFullPath, dir, name
+}
+
+// createContentEntry publishes a handle's whole entry only over the filer
+// state the handle observed. Deferred creates expect no entry; existing
+// handles compare the full base, including inode identity. The unary call
+// keeps a refused condition apart from an I/O failure; the mutation stream
+// reduces it to EIO.
+//
+// When the stored entry moved on, the handle's own changes since its base are
+// replayed onto it and published against it, so a peer's acknowledged chunks
+// survive. merged is that entry in local ids; nil when the request went as is.
+// With writes still buffered, the merge must keep room for them.
+func (wfs *WFS) createContentEntry(ctx context.Context, fh *FileHandle, request *filer_pb.CreateEntryRequest, local *filer_pb.Entry, buffered bool, publication *contentPublication) (resp *filer_pb.CreateEntryResponse, merged *filer_pb.Entry, err error) {
+	base := fh.baseEntry.Load()
+	guard := &filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_NOT_EXISTS}
+	if base != nil {
+		expected := proto.Clone(base).(*filer_pb.Entry)
+		wfs.mapPbIdFromLocalToFiler(expected)
+		guard = &filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_ENTRY_EQUAL, ExpectedEntry: expected}
+	}
+	sent := request.Entry
+	for attempt := 0; ; attempt++ {
+		if guardErr := wfs.checkContentPublication(fh, guard.ExpectedEntry); guardErr != nil {
+			return nil, nil, guardErr
+		}
+		request.Condition = &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{guard}}
+		err = wfs.withFilerClient(ctx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+			var callErr error
+			resp, callErr = filer_pb.CreateEntryWithResponse(ctx, client, request)
+			if errors.Is(callErr, filer_pb.ErrPreconditionFailed) {
+				publication.refused = true
+			}
+			return callErr
+		})
+		if err == nil && request.Entry != sent {
+			merged = proto.Clone(request.Entry).(*filer_pb.Entry)
+			wfs.mapPbIdFromFilerToLocal(merged)
+		}
+		if err == nil || base == nil || attempt >= maxContentFlushMerges || !errors.Is(err, filer_pb.ErrPreconditionFailed) {
+			return resp, merged, err
+		}
+		stored := wfs.lookupRefusedEntry(ctx, request.Directory, request.Entry.Name)
+		if stored == nil {
+			return resp, nil, err
+		}
+		mark := fh.markSince(base)
+		next, ok := mergeContentEntry(stored, base, local, sent, mark.truncatedTo, mark.rewrote)
+		if !ok || buffered && !mergeKeepsBuffered(next, local) {
+			return resp, nil, err
+		}
+		glog.V(1).Infof("content flush %s/%s: entry changed since the handle's base, merging", request.Directory, request.Entry.Name)
+		request.Entry = next
+		guard = &filer_pb.WriteCondition_Clause{Kind: filer_pb.WriteCondition_IF_ENTRY_EQUAL, ExpectedEntry: stored}
+	}
+}
+
+// lookupRefusedEntry reads the entry a refused create ran into, within one
+// filer call: a read that stalls must not hold or replay the refusal.
+func (wfs *WFS) lookupRefusedEntry(ctx context.Context, dir, name string) (stored *filer_pb.Entry) {
+	ctx, cancel := context.WithTimeout(ctx, wfs.filerRPCWait())
+	defer cancel()
+	_ = wfs.withFilerClient(ctx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+		found, err := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{Directory: dir, Name: name})
+		if err == nil {
+			stored = found.Entry
+		}
+		return err
+	})
+	return stored
+}
+
+// maxContentFlushMerges bounds how often one flush rebases onto a moving entry.
+const maxContentFlushMerges = 3
+
+// mergeContentEntry replays what local changed since base onto stored: the
+// chunks it added or dropped, and the attributes, extended keys and inline
+// content it changed, taking those values from sent (local in stored's id
+// space). Everything else keeps the stored value. A local truncation keeps
+// the handle's size and clips stored chunks at the lowest size truncated to
+// (truncatedTo, or -1); otherwise the stored size stands unless the handle
+// changed its size or wrote past it.
+// A different file at the path, inline content changed on both sides,
+// inline content next to chunks (reads stop at the inline bytes), a manifest
+// across the truncate (its members keep their sizes), or a local
+// whole-file rewrite (rewrote) over a peer's chunk change cannot be merged:
+// the rewrite carries the handle's stale view.
+func mergeContentEntry(stored, base, local, sent *filer_pb.Entry, truncatedTo int64, rewrote bool) (*filer_pb.Entry, bool) {
+	if !sameContentFile(stored, base) {
+		return nil, false
+	}
+	merged := proto.Clone(stored).(*filer_pb.Entry)
+	merged.Name = sent.Name
+	if !bytes.Equal(local.Content, base.Content) {
+		if !bytes.Equal(stored.Content, base.Content) {
+			return nil, false
+		}
+		merged.Content = sent.Content
+	}
+
+	inBase := make(map[string]bool, len(base.Chunks))
+	for _, c := range base.Chunks {
+		inBase[contentChunkKey(c)] = true
+	}
+	inLocal := make(map[string]bool, len(local.Chunks))
+	for _, c := range local.Chunks {
+		inLocal[contentChunkKey(c)] = true
+	}
+	localSize := filer.FileSize(local)
+	if truncatedTo < 0 && localSize < filer.FileSize(base) {
+		truncatedTo = int64(localSize)
+	}
+	peerChanged := len(stored.Chunks) != len(base.Chunks)
+	merged.Chunks = merged.Chunks[:0]
+	for _, c := range stored.Chunks {
+		key := contentChunkKey(c)
+		peerChanged = peerChanged || !inBase[key]
+		if inBase[key] && !inLocal[key] || truncatedTo >= 0 && c.Offset >= truncatedTo {
+			continue
+		}
+		c = proto.Clone(c).(*filer_pb.FileChunk)
+		if truncatedTo >= 0 && c.Offset+int64(c.Size) > truncatedTo {
+			if c.IsChunkManifest {
+				return nil, false
+			}
+			c.Size = uint64(truncatedTo - c.Offset)
+		}
+		merged.Chunks = append(merged.Chunks, c)
+	}
+	if rewrote && peerChanged {
+		return nil, false
+	}
+	size := int64(filer.FileSize(stored))
+	if localSize != filer.FileSize(base) {
+		size = max(size, int64(localSize))
+	}
+	for _, c := range local.Chunks {
+		if !inBase[contentChunkKey(c)] {
+			merged.Chunks = append(merged.Chunks, proto.Clone(c).(*filer_pb.FileChunk))
+			size = max(size, c.Offset+int64(c.Size))
+		}
+	}
+	if len(merged.Content) > 0 && len(merged.Chunks) > 0 {
+		return nil, false
+	}
+
+	if merged.Attributes == nil {
+		merged.Attributes = &filer_pb.FuseAttributes{}
+	}
+	baseAttrs, localAttrs := base.GetAttributes(), local.GetAttributes()
+	if baseAttrs == nil {
+		baseAttrs = &filer_pb.FuseAttributes{}
+	}
+	if localAttrs == nil {
+		localAttrs = &filer_pb.FuseAttributes{}
+	}
+	m, b, l := merged.Attributes.ProtoReflect(), baseAttrs.ProtoReflect(), localAttrs.ProtoReflect()
+	s := proto.Clone(sent.GetAttributes()).(*filer_pb.FuseAttributes).ProtoReflect()
+	fields := m.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		if fd.Name() == "file_size" || l.Get(fd).Equal(b.Get(fd)) {
+			continue
+		}
+		if s.Has(fd) {
+			m.Set(fd, s.Get(fd))
+		} else {
+			m.Clear(fd)
+		}
+	}
+
+	for k, v := range local.Extended {
+		if old, found := base.Extended[k]; !found || !bytes.Equal(old, v) {
+			if merged.Extended == nil {
+				merged.Extended = make(map[string][]byte)
+			}
+			merged.Extended[k] = sent.Extended[k]
+		}
+	}
+	for k := range base.Extended {
+		if _, found := local.Extended[k]; !found {
+			delete(merged.Extended, k)
+		}
+	}
+
+	if truncatedTo >= 0 {
+		size = int64(localSize)
+	}
+	merged.Attributes.FileSize = uint64(size)
+	// A peer truncate must not turn local pending data into a successful hole.
+	if filer.FileSize(stored) < filer.FileSize(base) && contentGapAfter(merged, filer.FileSize(stored)) {
+		return nil, false
+	}
+	return merged, true
+}
+
+// sameContentFile reports whether stored is still the regular file base was:
+// the same inode, or for an entry without one, the same creation time. A
+// synthesized base with neither cannot tell.
+func sameContentFile(stored, base *filer_pb.Entry) bool {
+	if stored == nil || base == nil || stored.IsDirectory || !bytes.Equal(stored.HardLinkId, base.HardLinkId) {
+		return false
+	}
+	if inode := base.GetAttributes().GetInode(); inode != 0 {
+		return stored.GetAttributes().GetInode() == inode
+	}
+	crtime := base.GetAttributes().GetCrtime()
+	return crtime == 0 || stored.GetAttributes().GetCrtime() == crtime
+}
+
+// contentChunkKey identifies a chunk reference: truncation shrinks a chunk in
+// place, so the same file id at another size is a different reference. Both
+// file id encodings give one key, and the chunk is left as is.
+func contentChunkKey(c *filer_pb.FileChunk) string {
+	return fmt.Sprintf("%s@%d+%d", contentFileIdKey(c), c.Offset, c.Size)
+}
+
+func contentFileIdKey(c *filer_pb.FileChunk) string {
+	fid := c.Fid
+	if fid == nil {
+		if parsed, err := filer_pb.ToFileIdObject(c.FileId); err == nil {
+			fid = parsed
+		} else {
+			return c.FileId
+		}
+	}
+	return fmt.Sprintf("%d,%x,%x", fid.VolumeId, fid.FileKey, fid.Cookie)
+}
+
+// unpublishedChunks returns the chunks of dropped that the handle's base does
+// not name and that chunks still covers. A commit deletes what it leaves out
+// of the stored entry and what its own chunk list covers, so a covered chunk no
+// stored entry ever named is only deleted if the request carries it. The filer
+// compacts only plain chunks, so each one is sent only if newer plain chunks of
+// the request hide all of it.
+func (fh *FileHandle) unpublishedChunks(dropped, chunks []*filer_pb.FileChunk) (unpublished []*filer_pb.FileChunk) {
+	inBase := make(map[string]bool)
+	for _, c := range fh.baseEntry.Load().GetChunks() {
+		inBase[contentFileIdKey(c)] = true
+	}
+	var visibles []*filer.Interval[*filer.VisibleInterval]
+	resolved := false
+	for _, c := range dropped {
+		if inBase[contentFileIdKey(c)] {
+			continue
+		}
+		if !resolved {
+			resolved = true
+			_, plain := filer.SeparateManifestChunks(chunks)
+			list, err := filer.NonOverlappingVisibleIntervals(context.Background(), nil, plain, 0, math.MaxInt64)
+			if err != nil {
+				return nil
+			}
+			for x := list.Front(); x != nil; x = x.Next {
+				visibles = append(visibles, x)
+			}
+		}
+		start, stop := c.Offset, c.Offset+int64(c.Size)
+		i := sort.Search(len(visibles), func(i int) bool { return visibles[i].StopOffset > start })
+		for ; i < len(visibles) && start < stop; i++ {
+			if visibles[i].StartOffset > start || visibles[i].TsNs <= c.ModifiedTsNs {
+				break
+			}
+			start = visibles[i].StopOffset
+		}
+		if start >= stop {
+			unpublished = append(unpublished, c)
+		}
+	}
+	return unpublished
+}
+
+// ackedBase is the base an acknowledged create leaves: the entry the filer
+// stored, in local ids. The filer stamps commit_ts_ns, crtime, inode and atime
+// and may rewrite chunks, so the requested entry would never match it again.
+// A filer that sends no event leaves the requested entry.
+func (wfs *WFS) ackedBase(resp *filer_pb.CreateEntryResponse, requested *filer_pb.Entry) *filer_pb.Entry {
+	stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry()
+	if stored == nil {
+		return requested
+	}
+	base := proto.Clone(stored).(*filer_pb.Entry)
+	wfs.mapPbIdFromFilerToLocal(base)
+	return base
 }
 
 // shouldMergeChunks reports whether the non-manifest chunks are bloated
@@ -327,6 +796,25 @@ func shouldMergeChunks(compactedChunks []*filer_pb.FileChunk, manifestChunks []*
 	return
 }
 
+// oldestVisibleTsNs is the stamp of the oldest data in [start, stop), or 0 if
+// part of it is a hole. A merged chunk stamped so still yields to any write
+// newer than some byte it holds.
+func oldestVisibleTsNs(visibles []*filer.Interval[*filer.VisibleInterval], start, stop int64) int64 {
+	tsNs := int64(math.MaxInt64)
+	i := sort.Search(len(visibles), func(i int) bool { return visibles[i].StopOffset > start })
+	for ; i < len(visibles) && start < stop; i++ {
+		if visibles[i].StartOffset > start {
+			return 0
+		}
+		tsNs = min(tsNs, visibles[i].TsNs)
+		start = visibles[i].StopOffset
+	}
+	if start < stop {
+		return 0
+	}
+	return tsNs
+}
+
 // maybeMergeChunks re-reads and re-uploads file data as properly sized chunks
 // when the total stored chunk data significantly exceeds the logical file size,
 // which happens after many random writes create partially-overlapping small chunks.
@@ -346,31 +834,41 @@ func (wfs *WFS) maybeMergeChunks(fileFullPath util.FullPath, compactedChunks []*
 	reader := filer.NewChunkStreamReaderFromLookup(ctx, wfs.LookupFn(), allChunks)
 	defer reader.Close()
 
+	list, err := filer.NonOverlappingVisibleIntervals(ctx, wfs.LookupFn(), allChunks, 0, int64(fileSize))
+	if err != nil {
+		return nil, err
+	}
+	var visibles []*filer.Interval[*filer.VisibleInterval]
+	for x := list.Front(); x != nil; x = x.Next {
+		visibles = append(visibles, x)
+	}
+
 	saveFunc := wfs.saveDataAsChunk(fileFullPath)
 	chunkSize := wfs.option.ChunkSizeLimit
 	if int64(fileSize) < chunkSize {
 		chunkSize = int64(fileSize)
 	}
 
+	// The reader ends at a hole, so read each run of data on its own and
+	// leave the holes between runs unwritten.
 	var newChunks []*filer_pb.FileChunk
-	var offset int64
 	buf := make([]byte, chunkSize)
-
-	for {
-		n, readErr := io.ReadFull(reader, buf)
-		if n > 0 {
-			chunk, uploadErr := saveFunc(bytes.NewReader(buf[:n]), "", offset, 0, uint64(n))
+	for i := 0; i < len(visibles); {
+		start, stop := visibles[i].StartOffset, visibles[i].StopOffset
+		for i++; i < len(visibles) && visibles[i].StartOffset == stop; i++ {
+			stop = visibles[i].StopOffset
+		}
+		for offset := start; offset < stop; {
+			n := int(min(int64(len(buf)), stop-offset))
+			if _, readErr := reader.ReadAt(buf[:n], offset); readErr != nil {
+				return nil, fmt.Errorf("read [%d,%d): %w", offset, offset+int64(n), readErr)
+			}
+			chunk, uploadErr := saveFunc(bytes.NewReader(buf[:n]), "", offset, oldestVisibleTsNs(visibles, offset, offset+int64(n)), uint64(n))
 			if uploadErr != nil {
 				return nil, uploadErr
 			}
 			newChunks = append(newChunks, chunk)
 			offset += int64(n)
-		}
-		if readErr != nil {
-			if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
-				break
-			}
-			return nil, readErr
 		}
 	}
 

@@ -126,11 +126,13 @@ func (h *AdminHandlers) registerUIRoutes(r *mux.Router) {
 
 	// File browser routes
 	r.HandleFunc("/files", h.fileBrowserHandlers.ShowFileBrowser).Methods(http.MethodGet)
+	r.HandleFunc("/notifications/webhooks", h.ShowNotificationWebhooks).Methods(http.MethodGet)
 
 	// Cluster management routes
 	r.HandleFunc("/cluster/masters", h.clusterHandlers.ShowClusterMasters).Methods(http.MethodGet)
 	r.HandleFunc("/cluster/filers", h.clusterHandlers.ShowClusterFilers).Methods(http.MethodGet)
 	r.HandleFunc("/cluster/s3", h.clusterHandlers.ShowClusterS3Servers).Methods(http.MethodGet)
+	r.HandleFunc("/cluster/vector-servers", h.clusterHandlers.ShowClusterVectorServers).Methods(http.MethodGet)
 	r.HandleFunc("/cluster/volume-servers", h.clusterHandlers.ShowClusterVolumeServers).Methods(http.MethodGet)
 	r.HandleFunc("/cluster/mount-clients", h.clusterHandlers.ShowMountClients).Methods(http.MethodGet)
 
@@ -256,11 +258,13 @@ func (h *AdminHandlers) registerAPIRoutes(api *mux.Router, enforceWrite bool) {
 	s3TablesApi.Handle("/tags", wrapWrite(h.adminServer.UntagS3TablesResource)).Methods(http.MethodDelete)
 
 	s3VectorsApi := api.PathPrefix("/s3vectors").Subrouter()
+	s3VectorsApi.HandleFunc("/operations", h.adminServer.ExecuteS3VectorsOperationAPI).Methods(http.MethodPost)
 	s3VectorsApi.HandleFunc("/buckets", h.adminServer.ListS3VectorsBucketsAPI).Methods(http.MethodGet)
 	s3VectorsApi.Handle("/buckets", wrapWrite(h.adminServer.CreateS3VectorsBucket)).Methods(http.MethodPost)
 	s3VectorsApi.Handle("/buckets", wrapWrite(h.adminServer.DeleteS3VectorsBucket)).Methods(http.MethodDelete)
 	s3VectorsApi.HandleFunc("/indexes", h.adminServer.GetS3VectorsBucketAPI).Methods(http.MethodGet)
 	s3VectorsApi.Handle("/indexes", wrapWrite(h.adminServer.DeleteS3VectorsIndex)).Methods(http.MethodDelete)
+	s3VectorsApi.Handle("/metadata-keys", wrapWrite(h.adminServer.UpdateS3VectorsMetadataKeyAPI)).Methods(http.MethodPost, http.MethodDelete)
 
 	filesApi := api.PathPrefix("/files").Subrouter()
 	filesApi.Handle("/delete", wrapWrite(h.fileBrowserHandlers.DeleteFile)).Methods(http.MethodDelete)
@@ -272,6 +276,12 @@ func (h *AdminHandlers) registerAPIRoutes(api *mux.Router, enforceWrite bool) {
 	filesApi.HandleFunc("/properties", h.fileBrowserHandlers.GetFileProperties).Methods(http.MethodGet)
 	filesApi.HandleFunc("/metadata", h.fileBrowserHandlers.ExportMetadata).Methods(http.MethodGet)
 	filesApi.HandleFunc("/list-folders", h.fileBrowserHandlers.ListFolders).Methods(http.MethodGet)
+
+	webhooksApi := api.PathPrefix("/notifications/webhooks").Subrouter()
+	webhooksApi.HandleFunc("", h.adminServer.GetNotificationWebhooksAPI).Methods(http.MethodGet)
+	webhooksApi.Handle("", wrapWrite(h.adminServer.CreateNotificationWebhookAPI)).Methods(http.MethodPost)
+	webhooksApi.Handle("/{name}", wrapWrite(h.adminServer.UpdateNotificationWebhookAPI)).Methods(http.MethodPut)
+	webhooksApi.Handle("/{name}", wrapWrite(h.adminServer.DeleteNotificationWebhookAPI)).Methods(http.MethodDelete)
 
 	volumeApi := api.PathPrefix("/volumes").Subrouter()
 	volumeApi.HandleFunc("/export", h.clusterHandlers.ExportClusterVolumes).Methods(http.MethodGet)
@@ -292,7 +302,7 @@ func (h *AdminHandlers) registerAPIRoutes(api *mux.Router, enforceWrite bool) {
 	pluginApi.HandleFunc("/scheduler-status", h.adminServer.GetPluginSchedulerStatusAPI).Methods(http.MethodGet)
 	pluginApi.HandleFunc("/job-types/{jobType}/descriptor", h.adminServer.GetPluginJobTypeDescriptorAPI).Methods(http.MethodGet)
 	pluginApi.HandleFunc("/job-types/{jobType}/schema", h.adminServer.RequestPluginJobTypeSchemaAPI).Methods(http.MethodPost)
-	pluginApi.HandleFunc("/job-types/{jobType}/config", h.adminServer.GetPluginJobTypeConfigAPI).Methods(http.MethodGet)
+	pluginApi.Handle("/job-types/{jobType}/config", wrapWrite(h.adminServer.GetPluginJobTypeConfigAPI)).Methods(http.MethodGet)
 	pluginApi.Handle("/job-types/{jobType}/config", wrapWrite(h.adminServer.UpdatePluginJobTypeConfigAPI)).Methods(http.MethodPut)
 	pluginApi.HandleFunc("/job-types/{jobType}/runs", h.adminServer.GetPluginRunHistoryAPI).Methods(http.MethodGet)
 	pluginApi.Handle("/job-types/{jobType}/detect", wrapWrite(h.adminServer.TriggerPluginDetectionAPI)).Methods(http.MethodPost)
@@ -377,6 +387,24 @@ func (h *AdminHandlers) ShowS3TablesBuckets(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Content-Type", "text/html")
 	component := app.S3TablesBuckets(data)
+	viewCtx := layout.NewViewContext(r, username, dash.CSRFTokenFromContext(r.Context()))
+	layoutComponent := layout.Layout(viewCtx, component)
+	if err := layoutComponent.Render(r.Context(), w); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "Failed to render template: "+err.Error())
+	}
+}
+
+// ShowNotificationWebhooks renders the filer webhook targets page
+func (h *AdminHandlers) ShowNotificationWebhooks(w http.ResponseWriter, r *http.Request) {
+	username := h.getUsername(r)
+	data, err := h.adminServer.GetNotificationWebhooks(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "Failed to get webhook targets: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	component := app.NotificationWebhooks(*data)
 	viewCtx := layout.NewViewContext(r, username, dash.CSRFTokenFromContext(r.Context()))
 	layoutComponent := layout.Layout(viewCtx, component)
 	if err := layoutComponent.Render(r.Context(), w); err != nil {

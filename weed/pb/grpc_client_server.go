@@ -167,14 +167,58 @@ func ServeGrpcOnLocalSocket(grpcServer *grpc.Server, grpcPort int) {
 	if listener == nil {
 		return
 	}
-	listener = &localSocketListener{Listener: listener}
 	glog.V(0).Infof("gRPC also listening on Unix socket %s", socketPath)
-	go func() {
-		if err := grpcServer.Serve(listener); err != nil && err != grpc.ErrServerStopped {
-			glog.Errorf("gRPC Unix socket server error on %s: %v", socketPath, err)
+	go serveGrpcOnLocalListener(grpcServer, socketPath, listener)
+}
+
+// localSocketCheckInterval is how often a served socket path is checked for
+// removal by something else, such as a temp cleaner aging /tmp.
+var localSocketCheckInterval = time.Minute
+
+// serveGrpcOnLocalListener serves the socket until the gRPC server stops,
+// rebinding it when the socket file is removed underneath the listener.
+func serveGrpcOnLocalListener(grpcServer *grpc.Server, socketPath string, listener net.Listener) {
+	served := make(chan error, 1)
+	serve := func(l net.Listener) {
+		// A replaced listener must not unlink the path its successor binds;
+		// every exit below removes the socket file itself.
+		if unixListener, ok := l.(*net.UnixListener); ok {
+			unixListener.SetUnlinkOnClose(false)
 		}
-		os.Remove(socketPath)
-	}()
+		go func() { served <- grpcServer.Serve(&localSocketListener{Listener: l}) }()
+	}
+	serve(listener)
+	ticker := time.NewTicker(localSocketCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-served:
+			if err != nil && err != grpc.ErrServerStopped {
+				glog.Errorf("gRPC Unix socket server error on %s: %v", socketPath, err)
+			}
+			os.Remove(socketPath)
+			return
+		case <-ticker.C:
+			if _, err := os.Lstat(socketPath); !os.IsNotExist(err) {
+				continue
+			}
+			// Bind before closing the old listener, so a failed bind is
+			// retried on the next check and shutdown still ends this loop.
+			replacement := ListenOnLocalSocket(socketPath)
+			if replacement == nil {
+				continue
+			}
+			glog.Warningf("gRPC Unix socket %s was removed and has been recreated", socketPath)
+			listener.Close()
+			if err := <-served; err == nil || err == grpc.ErrServerStopped {
+				replacement.Close()
+				os.Remove(socketPath)
+				return
+			}
+			listener = replacement
+			serve(listener)
+		}
+	}
 }
 
 // localSocketListener re-applies the buffer sizes to every accepted connection.
@@ -233,25 +277,25 @@ func NewGrpcServer(opts ...grpc.ServerOption) *grpc.Server {
 func GrpcDial(ctx context.Context, address string, waitForReady bool, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	var options []grpc.DialOption
 
-	// Route through Unix socket if one is registered for this address's port
+	// Route through Unix socket if one is registered for this address's port.
+	// The socket file can vanish under a running server (temp cleaners age
+	// /tmp), so a failed socket dial falls back to TCP.
 	if socketPath := resolveLocalGrpcSocket(address); socketPath != "" {
-		options = append(options, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+		options = append(options, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			d := net.Dialer{Control: setLocalSocketBuffers}
-			return d.DialContext(ctx, "unix", socketPath)
+			conn, err := d.DialContext(ctx, "unix", socketPath)
+			if err != nil && ctx.Err() == nil {
+				glog.V(1).Infof("dial unix %s: %v, dialing %s over TCP", socketPath, err, addr)
+				return dialGrpcTcp(ctx, addr)
+			}
+			return conn, err
 		}))
 	} else {
-		// Always install so a conn cached before SetOutboundLocalIP binds once set;
-		// the stock net.Dialer until then preserves gRPC's default dial behavior.
-		options = append(options, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			if util.OutboundLocalAddr() == nil {
-				var d net.Dialer
-				return d.DialContext(ctx, "tcp", addr)
-			}
-			return util.OutboundDialContext(ctx, "tcp", addr)
-		}))
+		options = append(options, grpc.WithContextDialer(dialGrpcTcp))
 	}
 
 	options = append(options,
+		grpc.WithChainUnaryInterceptor(interceptClientUnary),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallSendMsgSize(Max_Message_Size),
 			grpc.MaxCallRecvMsgSize(Max_Message_Size),
@@ -270,6 +314,17 @@ func GrpcDial(ctx context.Context, address string, waitForReady bool, opts ...gr
 		}
 	}
 	return grpc.DialContext(ctx, address, options...)
+}
+
+// dialGrpcTcp is installed even before SetOutboundLocalIP so a cached conn
+// binds once it is set; the stock net.Dialer until then preserves gRPC's
+// default dial behavior.
+func dialGrpcTcp(ctx context.Context, addr string) (net.Conn, error) {
+	if util.OutboundLocalAddr() == nil {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
+	}
+	return util.OutboundDialContext(ctx, "tcp", addr)
 }
 
 func getOrCreateConnection(address string, waitForReady bool, opts ...grpc.DialOption) (*versionedGrpcClient, error) {
@@ -429,11 +484,30 @@ func shouldInvalidateConnection(ctx context.Context, err error) bool {
 		return false
 	}
 
+	// A filer verdict rebuilt from its response (a read-only path, an existing
+	// entry, a failed write condition) is the peer answering over a working
+	// channel. Its message names the path, which can contain "transport".
+	if filer_pb.IsFilerVerdict(err) {
+		return false
+	}
+
 	// Check gRPC status codes first (more reliable)
 	if s, ok := status.FromError(err); ok {
 		code := s.Code()
 		switch code {
-		case codes.Unavailable, codes.Aborted, codes.Internal:
+		case codes.Unknown:
+			// An older filer refuses a write to a read-only path with a
+			// status-less error, which arrives as Unknown. The rule it names
+			// can contain "transport" too.
+			if filer_pb.LegacyReadOnlyError(peerStatusMessage(err)) != nil {
+				return false
+			}
+		case codes.Unavailable:
+			// gRPC raises its own Unavailable without details, so one that
+			// carries details is the peer answering over a working channel,
+			// e.g. a master follower turning down an assign.
+			return len(s.Proto().GetDetails()) == 0
+		case codes.Aborted, codes.Internal:
 			return true
 		case codes.ResourceExhausted:
 			// Server-side backpressure on a healthy channel (e.g. the master's
@@ -441,6 +515,12 @@ func shouldInvalidateConnection(ctx context.Context, err error) bool {
 			// Invalidating would Close() the shared conn and cancel every other
 			// in-flight RPC with "the client connection is closing"; keep it and let
 			// the caller retry.
+			return false
+		case codes.InvalidArgument, codes.NotFound, codes.AlreadyExists,
+			codes.FailedPrecondition, codes.OutOfRange, codes.DataLoss:
+			// gRPC never raises these itself, so the peer answered. Its
+			// message can name a path such as /transport, which must not
+			// reach the string matching below.
 			return false
 		case codes.Canceled, codes.DeadlineExceeded:
 			// Ambiguous: a stale cached channel rejects RPCs this way (a peer
@@ -465,6 +545,19 @@ func shouldInvalidateConnection(ctx context.Context, err error) bool {
 		strings.Contains(errLower, "no route to host") ||
 		strings.Contains(errLower, "network is unreachable") ||
 		strings.Contains(errLower, "connection reset")
+}
+
+// peerStatusMessage returns the message of the gRPC status that err carries,
+// as the peer sent it. status.FromError reports a wrapped status with the text
+// of the whole chain instead.
+func peerStatusMessage(err error) string {
+	var carrier interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &carrier) {
+		if st := carrier.GRPCStatus(); st != nil {
+			return st.Message()
+		}
+	}
+	return ""
 }
 
 // WithGrpcClient In streamingMode, always use a fresh connection. Otherwise, try to reuse an existing connection.

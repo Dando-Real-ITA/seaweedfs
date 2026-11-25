@@ -110,6 +110,17 @@ func (fsw *FilerStoreWrapper) getActualStore(path util.FullPath) (store FilerSto
 	return
 }
 
+// listsInNameOrder reports whether a listing of dirPath can start at a file
+// name the store did not hand out itself.
+func (fsw *FilerStoreWrapper) listsInNameOrder(dirPath util.FullPath) bool {
+	store := fsw.getActualStore(dirPath + "/")
+	if t, ok := store.(*FilerStorePathTranslator); ok {
+		store = t.actualStore
+	}
+	u, ok := store.(UnorderedListingStore)
+	return !ok || !u.ListsUnordered()
+}
+
 // SameActualStore reports whether two paths resolve to the same underlying
 // store. When path-specific stores are configured, different subtrees may
 // be served by different backends.
@@ -150,11 +161,16 @@ func (fsw *FilerStoreWrapper) InsertEntry(ctx context.Context, entry *Entry) err
 			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
 	}
 
-	if err := fsw.handleUpdateToHardLinks(ctx, entry); err != nil {
+	replacedLink, err := fsw.handleUpdateToHardLinks(ctx, entry)
+	if err != nil {
 		return err
 	}
 
-	return actualStore.InsertEntry(ctx, entry)
+	if err := actualStore.InsertEntry(ctx, entry); err != nil {
+		return err
+	}
+	fsw.dropLink(ctx, entry.FullPath, replacedLink)
+	return nil
 }
 
 // InsertEntryKnownAbsent skips the pre-insert FindEntry path when the caller has
@@ -207,11 +223,16 @@ func (fsw *FilerStoreWrapper) UpdateEntry(ctx context.Context, entry *Entry) err
 			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
 	}
 
-	if err := fsw.handleUpdateToHardLinks(ctx, entry); err != nil {
+	replacedLink, err := fsw.handleUpdateToHardLinks(ctx, entry)
+	if err != nil {
 		return err
 	}
 
-	return actualStore.UpdateEntry(ctx, entry)
+	if err := actualStore.UpdateEntry(ctx, entry); err != nil {
+		return err
+	}
+	fsw.dropLink(ctx, entry.FullPath, replacedLink)
+	return nil
 }
 
 func normalizeEntryMimeForStore(entry *Entry) {
@@ -260,24 +281,20 @@ func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath)
 	}()
 
 	existingEntry, findErr := fsw.FindEntry(ctx, fp)
-	if findErr == filer_pb.ErrNotFound || existingEntry == nil {
+	if findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound) {
+		return findErr
+	}
+	if existingEntry == nil {
 		return nil
 	}
-	if len(existingEntry.HardLinkId) != 0 {
-		// remove hard link
-		op := ctx.Value("OP")
-		if op != "MV" {
-			glog.V(4).InfofCtx(ctx, "DeleteHardLink %s", existingEntry.FullPath)
-			if hlErr := fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); hlErr != nil {
-				// Log but continue: the directory entry must be removed
-				// even if hard link counter cleanup fails, otherwise the
-				// parent directory cannot be removed (rmdir ENOTEMPTY).
-				glog.Warningf("DeleteHardLink %s (id %x): %v", existingEntry.FullPath, existingEntry.HardLinkId, hlErr)
-			}
-		}
+	if err := actualStore.DeleteEntry(ctx, fp); err != nil {
+		return err
 	}
-
-	return actualStore.DeleteEntry(ctx, fp)
+	if ctx.Value("OP") != "MV" {
+		// a rename takes the name, link and all, elsewhere
+		fsw.dropLink(ctx, fp, existingEntry.HardLinkId)
+	}
+	return nil
 }
 
 func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry *Entry) (err error) {
@@ -292,22 +309,14 @@ func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry 
 		stats.FilerStoreHistogram.WithLabelValues(actualStore.GetName(), "delete").Observe(time.Since(start).Seconds())
 	}()
 
-	if len(existingEntry.HardLinkId) != 0 {
-		// remove hard link
-		op := ctx.Value("OP")
-		if op != "MV" {
-			glog.V(4).InfofCtx(ctx, "DeleteHardLink %s", existingEntry.FullPath)
-			if hlErr := fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); hlErr != nil {
-				// Log the hard link cleanup error but continue to delete
-				// the directory entry. If we return early here, the entry
-				// remains in the store and the parent directory cannot be
-				// removed (rmdir returns ENOTEMPTY).
-				glog.Warningf("DeleteHardLink %s (id %x): %v", existingEntry.FullPath, existingEntry.HardLinkId, hlErr)
-			}
-		}
+	if err := actualStore.DeleteEntry(ctx, existingEntry.FullPath); err != nil {
+		return err
 	}
-
-	return actualStore.DeleteEntry(ctx, existingEntry.FullPath)
+	if ctx.Value("OP") != "MV" {
+		// a rename takes the name, link and all, elsewhere
+		fsw.dropLink(ctx, existingEntry.FullPath, existingEntry.HardLinkId)
+	}
+	return nil
 }
 
 func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.FullPath) (err error) {
@@ -436,6 +445,41 @@ func (fsw *FilerStoreWrapper) prefixFilterEntries(ctx context.Context, dirPath u
 		}
 	}
 	return
+}
+
+// transactionCovers reports whether a transaction of the default store covers
+// the writes to the entries at paths: the store's transactions are real
+// (IsolatingTransactionStore) and it holds those entries. The writes of a
+// path-specific store bypass the default store's transaction. An entry in the
+// default store has its parents there too.
+func (fsw *FilerStoreWrapper) transactionCovers(paths ...util.FullPath) bool {
+	isolating, ok := fsw.defaultStore.(IsolatingTransactionStore)
+	if !ok || !isolating.IsolatesTransactions() {
+		return false
+	}
+	for _, p := range paths {
+		if fsw.getActualStore(p) != fsw.defaultStore {
+			return false
+		}
+	}
+	return true
+}
+
+// refusesConflictingCommits reports whether a transaction of the default store
+// that read and wrote the entry at path is refused when another writer
+// committed that entry meanwhile: the store's commits are (ConflictRefusingStore)
+// and it holds the entry.
+func (fsw *FilerStoreWrapper) refusesConflictingCommits(path util.FullPath) bool {
+	refusing, ok := fsw.defaultStore.(ConflictRefusingStore)
+	return ok && refusing.RefusesConflictingCommits() && fsw.getActualStore(path) == fsw.defaultStore
+}
+
+// overwritesAtOnce reports whether an entry inserted at path replaces what is
+// stored there at once and whole: the default store says that its inserts do
+// (OverwritingStore), and it holds the entry.
+func (fsw *FilerStoreWrapper) overwritesAtOnce(path util.FullPath) bool {
+	overwriting, ok := fsw.defaultStore.(OverwritingStore)
+	return ok && overwriting.OverwritesAtOnce() && fsw.getActualStore(path) == fsw.defaultStore
 }
 
 func (fsw *FilerStoreWrapper) BeginTransaction(ctx context.Context) (context.Context, error) {

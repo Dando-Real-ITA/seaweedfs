@@ -96,7 +96,7 @@ func (h *S3TablesHandler) handleCreateView(w http.ResponseWriter, r *http.Reques
 
 	// Reject if a table or view already exists at this name.
 	var existingMetadata tableMetadataInternal
-	var existingIsTable bool
+	var conflict string
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		entry, err := h.lookupEntry(r.Context(), client, viewPath)
 		if err != nil {
@@ -107,8 +107,12 @@ func (h *S3TablesHandler) handleCreateView(w http.ResponseWriter, r *http.Reques
 			// it is not an existing view; the claim below refuses the name.
 			return filer_pb.ErrNotFound
 		}
+		if _, ok := entry.Extended[ExtendedKeyMetadata]; !ok && EntryType(entry.Extended) != EntryTypeView {
+			conflict = fmt.Sprintf("%s already exists and is not a table or view", viewName)
+			return nil
+		}
 		if EntryType(entry.Extended) != EntryTypeView {
-			existingIsTable = true
+			conflict = fmt.Sprintf("a table named %s already exists", viewName)
 			return nil
 		}
 		data, ok := entry.Extended[ExtendedKeyMetadata]
@@ -118,9 +122,9 @@ func (h *S3TablesHandler) handleCreateView(w http.ResponseWriter, r *http.Reques
 		return json.Unmarshal(data, &existingMetadata)
 	})
 	if err == nil {
-		if existingIsTable {
-			h.writeError(w, http.StatusConflict, ErrCodeViewAlreadyExists, fmt.Sprintf("a table named %s already exists", viewName))
-			return fmt.Errorf("table name conflict: %s", viewName)
+		if conflict != "" {
+			h.writeError(w, http.StatusConflict, ErrCodeViewAlreadyExists, conflict)
+			return fmt.Errorf("view name conflict: %s", conflict)
 		}
 		viewARN := h.generateViewARN(existingMetadata.OwnerAccountID, bucketName, namespaceName+"/"+viewName)
 		h.writeJSON(w, http.StatusOK, &CreateViewResponse{
@@ -467,7 +471,8 @@ func (h *S3TablesHandler) authorizeUpdateView(w http.ResponseWriter, r *http.Req
 		return nil, err
 	}
 
-	if err := ValidateMetadataLocation(req.MetadataLocation, bucketName, namespaceName); err != nil {
+	// As for tables: the shape now, where it may point once authorized.
+	if _, err := validateMetadataLocationShape(req.MetadataLocation, bucketName); err != nil {
 		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
 		return nil, err
 	}
@@ -509,6 +514,10 @@ func (h *S3TablesHandler) authorizeUpdateView(w http.ResponseWriter, r *http.Req
 	if !h.authorizeViewOp(r, "UpdateView", accountID, metadata.OwnerAccountID, bucketMetadata.OwnerAccountID, viewPolicy, bucketPolicy, viewARN, bucketName, namespaceName, viewName, bucketTags) {
 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to update view")
 		return nil, NewAuthError("UpdateView", accountID, "not authorized to update view")
+	}
+
+	if err := h.refuseUpdatedMetadataLocation(w, r, filerClient, bucketName, namespaceName, viewPath, &metadata, req.MetadataLocation); err != nil {
+		return nil, err
 	}
 
 	return &updateViewTarget{
@@ -709,10 +718,17 @@ func (h *S3TablesHandler) handleDeleteView(w http.ResponseWriter, r *http.Reques
 		if current.VersionToken != metadata.VersionToken {
 			return ErrConcurrentUpdate
 		}
+		keepData, err := ViewHoldsFiles(r.Context(), client, viewPath, current.CreatedAt)
+		if err != nil {
+			return err
+		}
 		claimed := snapshotExtended(entry.Extended)
 		claimed[ExtendedKeyDeleting] = []byte("delete")
 		if err := h.claimCatalogRecord(r.Context(), client, viewPath, snapshotExtended(entry.Extended), "delete"); err != nil {
 			return err
+		}
+		if keepData {
+			return h.removeExtendedAttributesIf(context.WithoutCancel(r.Context()), client, viewPath, claimed, catalogRecordKeys...)
 		}
 		if err := h.deleteDirectoryIfMatches(r.Context(), client, viewPath, &filer_pb.Entry{Extended: claimed}); err != nil {
 			if relErr := h.releaseCatalogRecord(context.WithoutCancel(r.Context()), client, viewPath, claimed); relErr != nil {
@@ -802,6 +818,7 @@ func (h *S3TablesHandler) authorizeViewOp(r *http.Request, operation, principal,
 	identityActions := getIdentityActions(r)
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespace,
@@ -811,6 +828,9 @@ func (h *S3TablesHandler) authorizeViewOp(r *http.Request, operation, principal,
 		DefaultAllow:     h.defaultAllowFor(r),
 	}
 	bucketARN := h.generateTableBucketARN(bucketOwner, bucketName)
+	if resourceARN == bucketARN {
+		ctx.ResourceTags = bucketTags
+	}
 	return CheckTableOrBucketPermission(operation, principal,
 		resourceOwner, resourcePolicy, resourceARN,
 		bucketOwner, bucketPolicy, bucketARN, ctx)

@@ -102,7 +102,10 @@ type Store struct {
 	NewEcShardsChan     chan *master_pb.VolumeEcShardInformationMessage
 	DeletedEcShardsChan chan *master_pb.VolumeEcShardInformationMessage
 	isStopping          atomic.Bool
-	volumeReport        volumeReportState
+	// ecLifecycleLocks holds a per-vid *sync.Mutex serializing EC ops that
+	// install or remove a vid's files. Entries are never reaped.
+	ecLifecycleLocks sync.Map
+	volumeReport     volumeReportState
 	// One heartbeat at a time: the report state is marked in place as the scan
 	// runs, so two overlapping scans would each forget what the other marked
 	// and name every volume it holds as departed.
@@ -156,6 +159,10 @@ func NewStore(
 		DeletedEcShardsChan: make(chan *master_pb.VolumeEcShardInformationMessage, HEARTBEAT_CHAN_SIZE),
 	}
 
+	storeDirs := make([]string, len(dirnames))
+	for i, dir := range dirnames {
+		storeDirs[i] = util.ResolvePath(dir)
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < len(dirnames); i++ {
 		var tags []string
@@ -163,6 +170,7 @@ func NewStore(
 			tags = diskTags[i]
 		}
 		location := NewDiskLocation(dirnames[i], int32(maxVolumeCounts[i]), minFreeSpaces[i], idxFolder, diskTypes[i], tags, diskProbeConfig)
+		location.storeDirs = storeDirs
 		s.Locations = append(s.Locations, location)
 		stats.VolumeServerMaxVolumeCounter.Add(float64(maxVolumeCounts[i]))
 
@@ -412,16 +420,21 @@ func (s *Store) addVolume(vid needle.VolumeId, collection string, needleMapKind 
 		return fmt.Errorf("Volume Id %d already exists!", vid)
 	}
 
-	// Find location with lowest local volume count (load balancing)
+	// Find the location with the fewest writable volumes of this collection, so
+	// they do not share one disk's write bandwidth, then the lowest local
+	// volume count (load balancing)
 	var location *DiskLocation
 	var diskId uint32
-	var minVolCount int
+	var minWritable, minVolCount int
+	volumeSizeLimit := s.GetVolumeSizeLimit()
 	for i, loc := range s.Locations {
 		if loc.DiskType == diskType && s.hasFreeDiskLocation(loc) && hasRoomForNewVolume(loc, preallocate) {
+			writable := loc.WritableCollectionVolumesLen(collection, volumeSizeLimit)
 			volCount := loc.LocalVolumesLen()
-			if location == nil || volCount < minVolCount {
+			if location == nil || writable < minWritable || (writable == minWritable && volCount < minVolCount) {
 				location = loc
 				diskId = uint32(i)
+				minWritable = writable
 				minVolCount = volCount
 			}
 		}
@@ -990,7 +1003,7 @@ func (s *Store) WriteVolumeNeedle(i needle.VolumeId, n *needle.Needle, checkCook
 	return
 }
 
-func (s *Store) DeleteVolumeNeedle(i needle.VolumeId, n *needle.Needle) (Size, error) {
+func (s *Store) DeleteVolumeNeedle(i needle.VolumeId, n *needle.Needle, fsync bool) (Size, error) {
 	if v := s.findVolume(i); v != nil {
 		v.noWriteLock.RLock()
 		noWriteOrDelete := v.noWriteOrDelete
@@ -998,7 +1011,7 @@ func (s *Store) DeleteVolumeNeedle(i needle.VolumeId, n *needle.Needle) (Size, e
 		if noWriteOrDelete {
 			return 0, fmt.Errorf("volume %d is read only", i)
 		}
-		return v.deleteNeedle2(n)
+		return v.deleteNeedle2(n, fsync)
 	}
 	return 0, fmt.Errorf("volume %d not found on %s:%d", i, s.Ip, s.Port)
 }

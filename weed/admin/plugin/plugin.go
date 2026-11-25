@@ -15,7 +15,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -79,6 +78,8 @@ type Plugin struct {
 
 	lanes map[SchedulerLane]*schedulerLaneState
 
+	schedulerExtension schedulerExtension
+
 	// Execution slots this admin holds on workers, one entry per job in
 	// flight; see executorLoadLocked for how they meet the heartbeat.
 	execResMu            sync.Mutex
@@ -107,6 +108,12 @@ type Plugin struct {
 
 	pendingExecutionMu sync.Mutex
 	pendingExecution   map[string]*pendingExecutionState
+	// restoredExecutions are the active jobs loaded from the persisted
+	// state at startup, keyed by job id; see failRestoredJobsMissingFromHeartbeat.
+	restoredExecutionsMu sync.Mutex
+	restoredExecutions   map[string]*restoredExecutionState
+	// restoredExpiries counts the restored-job expiries still running.
+	restoredExpiries sync.WaitGroup
 
 	pendingPreviewMu sync.Mutex
 	pendingPreview   map[string]chan *plugin_pb.ObjectPreviewResponse
@@ -217,6 +224,7 @@ func New(options Options) (*Plugin, error) {
 		pendingSchema:             make(map[string]chan *plugin_pb.ConfigSchemaResponse),
 		pendingDetection:          make(map[string]*pendingDetectionState),
 		pendingExecution:          make(map[string]*pendingExecutionState),
+		restoredExecutions:        make(map[string]*restoredExecutionState),
 		pendingPreview:            make(map[string]chan *plugin_pb.ObjectPreviewResponse),
 		observations:              NewObservationStore(),
 		nextDetectionAt:           make(map[string]time.Time),
@@ -233,6 +241,7 @@ func New(options Options) (*Plugin, error) {
 		shutdownCh:                make(chan struct{}),
 	}
 	plugin.ctx, plugin.ctxCancel = context.WithCancel(context.Background())
+	plugin.schedulerExtension = newSchedulerExtension(plugin)
 
 	if err := plugin.loadPersistedMonitorState(); err != nil {
 		glog.Warningf("Plugin failed to load persisted monitoring state: %v", err)
@@ -299,7 +308,8 @@ func (r *Plugin) Shutdown() {
 }
 
 func (r *Plugin) WorkerStream(stream plugin_pb.PluginControlService_WorkerStreamServer) error {
-	if err := security.CheckGrpcAdminPeer(stream.Context(), security.SigningKey(util.GetViper().GetString("jwt.filer_signing.key"))); err != nil {
+	signingKey, previousKey := security.FilerAdminKeys()
+	if err := security.CheckGrpcAdminPeer(stream.Context(), signingKey, previousKey); err != nil {
 		return err
 	}
 
@@ -788,6 +798,10 @@ func (r *Plugin) executeJobWithExecutor(
 	if strings.TrimSpace(job.JobType) == "" {
 		return nil, fmt.Errorf("job_type is required")
 	}
+	// a dispatched record takes only its own request's reports once its attempt is set
+	if attempt < 1 {
+		attempt = 1
+	}
 
 	if strings.TrimSpace(job.JobId) == "" {
 		var err error
@@ -871,7 +885,7 @@ func (r *Plugin) executeJobWithExecutor(
 				RequestId:    requestID,
 				ErrorMessage: err.Error(),
 				CompletedAt:  timestamppb.Now(),
-			})
+			}, nil)
 		}
 		return nil, err
 	}
@@ -1187,6 +1201,7 @@ func (r *Plugin) handleWorkerMessage(session *streamSession, message *plugin_pb.
 		}
 		r.resendUndeliveredCancels(workerID, body.Heartbeat)
 		r.failExecutionsMissingFromHeartbeat(session, body.Heartbeat)
+		r.failRestoredJobsMissingFromHeartbeat(workerID, body.Heartbeat)
 	case *plugin_pb.WorkerToAdminMessage_ConfigSchemaResponse:
 		r.handleConfigSchemaResponse(body.ConfigSchemaResponse)
 	case *plugin_pb.WorkerToAdminMessage_DetectionProposals:
@@ -1196,7 +1211,7 @@ func (r *Plugin) handleWorkerMessage(session *streamSession, message *plugin_pb.
 	case *plugin_pb.WorkerToAdminMessage_JobProgressUpdate:
 		r.handleJobProgressUpdate(workerID, body.JobProgressUpdate)
 	case *plugin_pb.WorkerToAdminMessage_JobCompleted:
-		r.handleJobCompleted(body.JobCompleted)
+		r.handleJobCompleted(body.JobCompleted, nil)
 	case *plugin_pb.WorkerToAdminMessage_Observations:
 		r.observations.Record(workerID, body.Observations)
 	case *plugin_pb.WorkerToAdminMessage_ObjectPreviewResponse:
@@ -1471,22 +1486,28 @@ func (r *Plugin) safeSendDetectionComplete(requestID string, message *plugin_pb.
 	}
 }
 
-func (r *Plugin) handleJobCompleted(completed *plugin_pb.JobCompleted) {
+// handleJobCompleted records the completion only when accept, judged under
+// the jobs lock that applies it, takes the tracked record (nil when the job
+// is untracked). A nil accept takes every completion.
+func (r *Plugin) handleJobCompleted(completed *plugin_pb.JobCompleted, accept func(*TrackedJob) bool) bool {
 	if completed == nil || completed.JobType == "" {
-		return
+		return false
 	}
 
-	if completed.RequestId != "" {
+	if completed.RequestId != "" && accept == nil {
 		r.safeSendJobCompleted(completed.RequestId, completed)
 	}
 	r.jobsMu.RLock()
 	ended := attemptEnded(r.jobs[completed.JobId], completed.RequestId)
 	r.jobsMu.RUnlock()
 	if ended {
-		return
+		return false
 	}
 
-	tracked := r.trackExecutionCompletion(completed)
+	tracked, accepted := r.trackExecutionCompletion(completed, accept)
+	if !accepted {
+		return false
+	}
 	workerID := ""
 	if tracked != nil && tracked.WorkerID != "" {
 		workerID = tracked.WorkerID
@@ -1528,6 +1549,7 @@ func (r *Plugin) handleJobCompleted(completed *plugin_pb.JobCompleted) {
 	if err := r.store.AppendRunRecord(completed.JobType, record); err != nil {
 		glog.Warningf("Plugin failed to append run record for %s: %v", completed.JobType, err)
 	}
+	return true
 }
 
 func (r *Plugin) safeSendJobCompleted(requestID string, completed *plugin_pb.JobCompleted) {

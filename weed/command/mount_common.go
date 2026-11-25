@@ -4,6 +4,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -138,13 +140,14 @@ func peerStringOrEmpty(p *string) string {
 }
 
 // connectToFiler retries the filer handshake, returning the cluster's cipher
-// setting and bucket root.
+// setting and bucket root, and adopts the filer's digest.
 func connectToFiler(option *MountOptions) (filerAddresses []pb.ServerAddress, grpcDialOption grpc.DialOption, cipher bool, bucketRootPath string, ok bool) {
 	// try to connect to filer
 	filerAddresses = pb.ServerAddresses(*option.filer).ToAddresses()
 	util.LoadSecurityConfiguration()
 	grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 	var err error
+	var digest string
 	for i := 0; i < 10; i++ {
 		err = pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
@@ -153,6 +156,7 @@ func connectToFiler(option *MountOptions) (filerAddresses []pb.ServerAddress, gr
 			}
 			cipher = resp.Cipher
 			bucketRootPath = resp.DirBuckets
+			digest = resp.Digest
 			return nil
 		})
 		if err == nil {
@@ -166,6 +170,10 @@ func connectToFiler(option *MountOptions) (filerAddresses []pb.ServerAddress, gr
 		glog.Errorf("failed to talk to filer %v: %v", filerAddresses, err)
 		return nil, nil, false, "", false
 	}
+	if err = util.AdoptFilerDigest(*option.filer, digest); err != nil {
+		glog.Errorf("%v", err)
+		return nil, nil, false, "", false
+	}
 	if bucketRootPath == "" {
 		bucketRootPath = "/buckets"
 	}
@@ -175,6 +183,7 @@ func connectToFiler(option *MountOptions) (filerAddresses []pb.ServerAddress, gr
 // fileSystemParams are the pieces of a mount that each platform works out for
 // itself: where it is attached, and whose identity the entries carry.
 type fileSystemParams struct {
+	sseS3Reader      *mount.SSES3Reader
 	dir              string
 	mountRoot        string
 	filerAddresses   []pb.ServerAddress
@@ -203,12 +212,14 @@ func buildSeaweedFileSystem(option *MountOptions, p fileSystemParams) *mount.WFS
 		readerCacheSizeMB = *option.readerCacheSizeMB
 	}
 	return mount.NewSeaweedFileSystem(&mount.Option{
+		SSES3Reader:                 p.sseS3Reader,
 		MountDirectory:              p.dir,
 		FilerAddresses:              p.filerAddresses,
 		GrpcDialOption:              p.grpcDialOption,
 		FilerSigningKey:             security.SigningKey(util.GetViper().GetString("jwt.filer_signing.key")),
 		FilerSigningExpiresAfterSec: util.GetViper().GetInt("jwt.filer_signing.expires_after_seconds"),
 		FilerMountRootPath:          p.mountRoot,
+		VolumeReadAuth:              option.volumeReadAuth != nil && *option.volumeReadAuth,
 		Collection:                  *option.collection,
 		Replication:                 *option.replication,
 		TtlSec:                      int32(*option.ttlSec),
@@ -243,8 +254,11 @@ func buildSeaweedFileSystem(option *MountOptions, p fileSystemParams) *mount.WFS
 		DirIdleEvictSec:             *option.dirIdleEvictSec,
 		EnableDistributedLock:       option.distributedLock != nil && *option.distributedLock,
 		WritebackCache:              option.writebackCache != nil && *option.writebackCache,
+		NfsExport:                   option.nfsExport != nil && *option.nfsExport,
 		EagerFilerCreate:            p.eagerFilerCreate,
 		PosixDirNlink:               option.posixDirNlink != nil && *option.posixDirNlink,
+		AccessReport:                option.accessReport != nil && *option.accessReport,
+		AccessReportInterval:        *option.accessReportInterval,
 		// Peer chunk sharing
 		PeerEnabled:    option.peerEnabled != nil && *option.peerEnabled,
 		PeerListen:     peerStringOrEmpty(option.peerListen),
@@ -256,9 +270,7 @@ func buildSeaweedFileSystem(option *MountOptions, p fileSystemParams) *mount.WFS
 
 // createMountRoot makes the filer-side directory the mount is rooted at.
 func createMountRoot(wfs *mount.WFS, mountRoot, bucketRootPath string, filerAddresses []pb.ServerAddress) bool {
-	mountRootPath := util.FullPath(mountRoot)
-	mountRootParent, mountDir := mountRootPath.DirAndName()
-	if err := filer_pb.Mkdir(context.Background(), wfs, mountRootParent, mountDir, nil); err != nil {
+	if err := ensureMountRootDirectory(context.Background(), wfs, mountRoot); err != nil {
 		fmt.Printf("failed to create dir %s on filer %s: %v\n", mountRoot, filerAddresses, err)
 		return false
 	}
@@ -267,6 +279,69 @@ func createMountRoot(wfs *mount.WFS, mountRoot, bucketRootPath string, filerAddr
 		return false
 	}
 	return true
+}
+
+// ensureMountRootDirectory creates the mount root only when it is missing. The
+// filer answers a non-exclusive create of an existing path by replacing the
+// entry, keeping only its crtime and inode, so creating the root again at every
+// mount start would reset its mode and owner and drop what only the filer
+// holds: its extended attributes and, when the root is a bucket, the bucket's
+// quota and the settings S3 keeps on it.
+func ensureMountRootDirectory(ctx context.Context, filerClient filer_pb.FilerClient, mountRoot string) error {
+	mountRootPath := util.FullPath(mountRoot)
+	if mountRootPath == "/" {
+		return nil
+	}
+	entry, _, _, err := filer_pb.GetEntry(ctx, filerClient, mountRootPath)
+	if err == nil {
+		return mountRootMustBeDirectory(mountRoot, entry)
+	}
+	if !errors.Is(err, filer_pb.ErrNotFound) {
+		return err
+	}
+	parent, name := mountRootPath.DirAndName()
+	if err := filer_pb.MkdirExclusive(ctx, filerClient, parent, name, nil); err != nil {
+		// Another client may have created it since the lookup. A filer that
+		// predates error codes reports that only as text, so look again rather
+		// than match the error.
+		entry, _, _, lookupErr := filer_pb.GetEntry(ctx, filerClient, mountRootPath)
+		if lookupErr != nil {
+			if errors.Is(lookupErr, filer_pb.ErrNotFound) {
+				return fmt.Errorf("mount root %s does not exist and could not be created: %w", mountRoot, err)
+			}
+			return err
+		}
+		return mountRootMustBeDirectory(mountRoot, entry)
+	}
+	return nil
+}
+
+func mountRootMustBeDirectory(mountRoot string, entry *filer_pb.Entry) error {
+	if !entry.GetIsDirectory() {
+		return fmt.Errorf("%s: %w", mountRoot, filer_pb.ErrExistingIsFile)
+	}
+	return nil
+}
+
+// mountSocketCleanup returns a func that removes the control socket this mount
+// listens on, unless a later mount of the same directory has replaced it.
+func mountSocketCleanup(socketPath string) func() {
+	listened, err := os.Lstat(socketPath)
+	if err != nil {
+		return func() {}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			current, err := os.Lstat(socketPath)
+			if err != nil || !os.SameFile(current, listened) {
+				return
+			}
+			if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+				glog.Warningf("remove mount socket %s: %v", socketPath, err)
+			}
+		})
+	}
 }
 
 // serveMountGrpc exposes the local control socket used by "weed mount.stats".

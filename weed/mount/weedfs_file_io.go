@@ -70,13 +70,22 @@ func (wfs *WFS) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut)
 	defer cancelFunc()
 	fileHandle, openFh, status = wfs.AcquireHandle(ctx, in.NodeId, in.Flags, in.Uid, in.Gid)
 	if status == fuse.OK {
+		encrypted := openFlagsToAccessMask(in.Flags)&fuse.R_OK != 0 && fileHandle.GetEntry().hasSSES3Data()
+		if encrypted && wfs.option.SSES3Reader == nil {
+			wfs.ReleaseHandle(openFh)
+			return fuse.ENOTSUP
+		}
 		out.Fh = uint64(openFh)
 		out.OpenFlags = 0
+		wfs.reportOpen(in.Flags, in.NodeId, fileHandle.GetEntry().GetEntry())
 
 		// For read-only opens, set FOPEN_KEEP_CACHE when the file's mtime
 		// has not changed since the last open.  This tells the kernel to
 		// preserve its existing page cache, avoiding redundant reads.
-		if in.Flags&fuse.O_ANYWRITE == 0 {
+		if encrypted {
+			// Authorize each read with the gateway, including on a reopened inode.
+			out.OpenFlags = fuse.FOPEN_DIRECT_IO
+		} else if in.Flags&fuse.O_ANYWRITE == 0 {
 			if entry := fileHandle.GetEntry(); entry != nil && entry.Attributes != nil {
 				wfs.applyKeepCacheFlag(in.NodeId, entry, out)
 			}
@@ -160,8 +169,9 @@ func (wfs *WFS) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 	if fh := wfs.GetHandle(FileHandleId(in.Fh)); fh != nil {
 		allowAsync := in.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK == 0
 		// Release is the last chance to persist the handle, so it must finish
-		// even if the triggering syscall was interrupted: non-cancellable context.
-		if status := wfs.doFlush(context.Background(), fh, in.Uid, in.Gid, allowAsync); status != fuse.OK {
+		// even if the triggering syscall was interrupted: non-cancellable context
+		// and no commit deadline.
+		if status := wfs.doFlush(context.Background(), fh, in.Uid, in.Gid, allowAsync, 0); status != fuse.OK {
 			glog.Warningf("release fh %d inode %d: fallback flush failed: %v", in.Fh, in.NodeId, status)
 		}
 	}

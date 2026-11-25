@@ -30,10 +30,12 @@ so your deployment will be spread/HA.
 
 The chart's templates render with Helm 3.16.3 and newer versions tested in CI.
 Earlier Helm versions are not covered by this chart's compatibility checks.
-When JWT signing is enabled, a live upgrade reuses keys from the existing
-security ConfigMap (including the legacy ConfigMap name); a key absent from
-that ConfigMap is generated. Plain `helm template` does not read cluster state;
-use an install and upgrade against a cluster to check key persistence.
+When JWT signing is enabled, `security.toml` is kept in the
+`<fullname>-security-config` Secret. A live upgrade reuses keys from that
+Secret, or from the security ConfigMap of earlier chart versions (including
+the legacy ConfigMap name); a key absent from them is generated. Plain
+`helm template` does not read cluster state; use an install and upgrade
+against a cluster to check key persistence.
 
 The key reader supports single-line quoted TOML strings in JWT sections,
 including indented assignments, quoted key names, and bare or simply quoted
@@ -119,6 +121,18 @@ https://github.com/rancher/local-path-provisioner
 
 you can use ANY storage class you like, just update the correct storage-class
 for your deployment.
+
+Every claim the chart creates also takes an optional `volumeAttributesClassName`
+next to its `storageClass` (for example `master.data.volumeAttributesClassName`
+or `volume.dataDirs[].volumeAttributesClassName`), to set provisioned
+performance such as IOPS and throughput through a
+[VolumeAttributesClass](https://kubernetes.io/docs/concepts/storage/volume-attributes-classes/).
+It needs Kubernetes 1.34+, or 1.31+ with the `VolumeAttributesClass` feature gate.
+`volumeClaimTemplates` cannot be changed on an existing StatefulSet, and a new
+template only reaches claims created after it. To set it on a release that
+already exists, patch `spec.volumeAttributesClassName` on each existing claim,
+and delete the StatefulSet with `--cascade=orphan` before the upgrade so the
+upgrade can apply the new template.
 
 ### Master data: hostPath vs a claim
 
@@ -327,6 +341,47 @@ from the Secret. Nothing is read from the cluster at render time, so
 applies. Rotating a key in the Secret takes effect on the next pod restart, as
 with any other environment variable. The COSI driver parses the config itself
 and does not resolve these references.
+
+#### Reload identities without a restart
+
+The chart hashes `existingConfigSecret` into the filer and S3 pod templates when it renders,
+so the first Helm upgrade after the Secret's content changes restarts those pods, and every
+identity change briefly takes S3 down, completely so with a single filer. SeaweedFS also
+reloads the identities file on SIGHUP, which `configReloader` uses instead:
+
+```yaml
+filer:
+  s3:
+    enabled: true
+    enableAuth: true
+    existingConfigSecret: my-s3-identities
+    configReloader:
+      enabled: true
+```
+
+`s3.configReloader` does the same for the standalone S3 gateway. With it:
+
+- An `s3-config-reloader` sidecar checks the mounted identities file every second, and
+  sends SIGHUP to SeaweedFS when it changes and once when it starts. Kubelet updates the
+  file at its next sync of the pod. Secret volumes are eventually consistent, so there is no
+  fixed bound: with the kubelet's default settings (a one-minute sync period and the `Watch`
+  Secret change detection strategy) it typically takes up to about 90 seconds, and changing
+  an annotation on the pod usually brings it down to seconds. Other kubelet settings can make
+  it slower. Until the file is updated, a revoked identity keeps working.
+- Changes to the content of `existingConfigSecret` no longer restart the pod: the chart
+  leaves `checksum/s3config` off it. Adding, changing, disabling and deleting identities
+  apply without a restart. Other files in the Secret, such as an audit log config, still
+  need one, and so do changes to the values the chart generates its own Secret from, such
+  as `s3.credentials`.
+- Every reload also re-creates the KMS providers configured in the identities file. The
+  `local` provider keeps its keys in memory, so a reload replaces them, as a restart does;
+  use another provider for objects that must stay readable.
+- The pod shares its process namespace (see [Sharing the process namespace](#sharing-the-process-namespace)),
+  so the sidecar can see SeaweedFS. It uses the component's image and container security
+  context, because it must run as the same user as SeaweedFS to signal it. If it can't
+  signal SeaweedFS, it logs a warning.
+
+The all-in-one deployment does not have this option.
 
 ## Admin Component
 
@@ -569,6 +624,8 @@ s3:
 
 With `rules` left empty the route sends all traffic to the component's own Service and port. A rule may set `matches`, `filters`, `timeouts` and `backendRefs`, and a rule without `backendRefs` still routes to that Service. In all-in-one mode the master, volume, filer and s3 routes target the all-in-one Service. When S3 runs only on the filer (`filer.s3.enabled` without `s3.enabled`), the s3 route uses `filer.s3.port`.
 
+Outside all-in-one mode, the volume Ingress and the default volume route target the `client-volume` Service, which lists only Ready volume pods. The `volume` Service also publishes pods that are not Ready yet, so their DNS records can exist before readiness. An explicit `backendRefs` entry that names the `volume` Service can therefore reach a volume server before it is Ready. Name the `client-volume` Service instead, with `volume.port`, and copy its `metadata.name` from `helm template` because long release names are truncated.
+
 ## Network Policies
 
 In a namespace with a default-deny policy the install hangs: the components cannot resolve each other, and the post-install bucket hook waits on the master and filer until it gives up. `networkPolicy.enabled` renders one `NetworkPolicy` per component, selecting its pods by the standard `app.kubernetes.io/{name,instance,component}` labels and admitting traffic from the other pods of the release on the ports that component listens on.
@@ -610,9 +667,24 @@ Two things worth knowing before you turn this on:
 
 The DNS selectors default to CoreDNS as kubeadm, kind and the managed offerings from AWS, Google and Azure install it. On OpenShift, override `egress.dnsNamespaceSelector` and `egress.dnsPodSelector` to match `openshift-dns`; see the comment in `values.yaml`.
 
+## Volume server HTTPS
+
+With `global.seaweedfs.enableSecurity`, gRPC between components uses mutual TLS, but the volume servers' HTTP port, which carries the file data, stays plaintext. Set `global.seaweedfs.volumeHttps.enabled: true` to serve it over TLS:
+
+- `[https.volume]` points at the volume certificate, which then also names every volume group's service (`*.<fullname>-volume.<namespace>`), since volume servers register as `<pod>.<fullname>-volume.<namespace>`. With `certificates.externalCertificates`, the provided `<fullname>-volume-cert` needs those names.
+- `[https.client]` is enabled with the client certificate and the chart CA, so every chart pod that talks to the volume servers does it over HTTPS.
+- The volume probes use HTTPS.
+- Every pod that reads `security.toml` gets a `checksum/volume-https` annotation, so switching the option on or off restarts them together.
+
+The volume servers do not require client certificates, because kubelet probes cannot present one; enable JWT signing (`securityConfig.jwtSigning`) to authorize volume reads and writes. `[https.client]` also sends the admin UI's HTTP lookups on masters and S3 over HTTPS, which their plain listeners refuse, so the UI can miss volume public URLs and refuse SSE-S3 vector buckets. A volume Ingress or HTTPRoute needs its controller's HTTPS-backend setting. `weed mount`, the CSI driver and other clients outside the chart need their own `[https.client]` with the chart CA. The option is not supported with `allInOne`, whose volume server registers by pod IP.
+
 ## Common labels
 
 `commonLabels` adds labels to the metadata of every object the chart creates. It may be a map or a template string rendering to one. The chart's own labels cannot be overridden, and pods (see `podLabels`) and `volumeClaimTemplates` are left unchanged.
+
+## Sharing the process namespace
+
+`filer.shareProcessNamespace` and `s3.shareProcessNamespace` let the containers in the filer and S3 pods see each other's processes, so a sidecar can signal SeaweedFS, for example with SIGHUP to reload the S3 identities file. SeaweedFS is then no longer PID 1 in its container, and every container in the pod can read the other containers' processes and files through `/proc`. Both are off by default.
 
 ## Pod and container security contexts
 
@@ -687,3 +759,47 @@ generates a new UUID and the license stops matching. See
 [Master data](#master-data-hostpath-vs-a-claim). Check the binding with
 `kubectl exec <master-pod> -- curl -s localhost:9333/license/status`
 (`cluster_uuid` must equal `license_uuid`).
+
+
+## Vector buckets
+
+The S3 gateway serves the S3 Vectors API on its existing endpoint. Enable a vector engine and Lance maintenance worker alongside the cluster:
+
+```yaml
+s3:
+  enabled: true
+vector:
+  enabled: true
+  replicas: 1
+worker:
+  enabled: true
+admin:
+  enabled: true
+  secret:
+    adminPassword: change-me
+global:
+  seaweedfs:
+    securityConfig:
+      jwtSigning:
+        filerWrite: true
+```
+
+The engine registers its pod address with the masters and stores indexes through the filers and volume servers. Both Go and Rust volume servers use the same setup. The maintenance worker builds and updates ANN indexes; queries can scan data before indexing completes. Enabling filer write signing also requires clients writing directly to the filer HTTP API to supply a signed JWT.
+
+The bundled engine images support Linux amd64 and arm64. Use `vector.imageOverride` to select a compatible engine build, `vector.masters` for an external cluster, and `vector.resources` to set memory and CPU limits. The engine sizes its caches to a quarter of its memory limit.
+
+`global.seaweedfs.enableSecurity` provisions and mounts the vector certificate and shared security configuration. With external certificates, provide the `<fullname>-vector-cert` secret (`my-seaweedfs-vector-cert` for release `my`). `fullname` follows `seaweedfs.fullname`, including `fullnameOverride`, `nameOverride`, and DNS-name truncation. Provide this secret alongside the existing CA and client secrets.
+
+The default `vector.metricsPort: 0` keeps TCP probes. Set `vector.metricsPort: 9329` to serve `/metrics`, `/health`, and `/ready` from the engine; readiness then checks master registration. Images older than 4.54 do not accept the metrics flag, so leave metrics off when pinning `image.tag` or `vector.imageOverride` to one. Enabling `global.seaweedfs.monitoring.enabled` also creates the vector ServiceMonitor. NetworkPolicy includes the configured gRPC and metrics ports.
+
+
+To provision vector buckets during installation and upgrades, set:
+
+```yaml
+vector:
+  enabled: true
+  createBuckets:
+    - embeddings
+```
+
+The hook uses the AWS CLI's S3 Vectors API and works with existing SeaweedFS vector releases. It creates missing buckets, preserves existing vector buckets, and fails if the name belongs to an Iceberg bucket. It uses the chart's generated S3 admin credentials, including `s3.credentials.admin.existingSecret`. With a custom `s3.existingConfigSecret` or an external endpoint, set `vector.bucketHook.credentialsSecret` to a Secret containing `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`). Key names are configurable. `vector.bucketHook.endpoint` overrides the internal S3 service URL; `caBundleSecret` and `caBundleKey` configure a private HTTPS CA. The hook image and resource limits are configurable under `vector.bucketHook`. For restricted Pod Security, select a non-root-compatible image and configure `vector.bucketHook.podSecurityContext` and `containerSecurityContext`, including `runAsNonRoot` and the image user ID.

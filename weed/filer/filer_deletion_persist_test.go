@@ -8,8 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 // readPersistedLedger pulls the persisted ledger payload straight from the store
@@ -64,7 +69,7 @@ func TestDeletionLedgerSnapshotAndRecover(t *testing.T) {
 	store := newStubFilerStore()
 	f := newLedgerTestFiler(store)
 
-	f.queueDeletions("1,01", "1,02", "1,03")
+	f.queueDeletions(false, "1,01", "1,02", "1,03")
 	f.snapshotDeletionLedger()
 
 	persisted, ok := readPersistedLedger(t, f)
@@ -81,7 +86,7 @@ func TestDeletionLedgerSnapshotAndRecover(t *testing.T) {
 	}
 
 	// Confirmed-gone for one id, then snapshot again.
-	f.forgetDeletion("1,02")
+	f.forgetDeletion("1,02", false)
 	f.snapshotDeletionLedger()
 	persisted, _ = readPersistedLedger(t, f)
 	if len(persisted) != 2 {
@@ -130,7 +135,7 @@ func TestDeletionLedgerRetryKeepsEntry(t *testing.T) {
 	store := newStubFilerStore()
 	f := newLedgerTestFiler(store)
 
-	f.queueDeletions("9,01")
+	f.queueDeletions(false, "9,01")
 	f.snapshotDeletionLedger()
 
 	// A retryable outcome deliberately does NOT call forgetDeletion, so the id
@@ -152,7 +157,7 @@ func TestDeletionLedgerDisabled(t *testing.T) {
 	withPersistedConfig(t, true)
 	store := newStubFilerStore()
 	fOn := newLedgerTestFiler(store)
-	fOn.queueDeletions("5,01")
+	fOn.queueDeletions(false, "5,01")
 	fOn.snapshotDeletionLedger()
 	if _, ok := readPersistedLedger(t, fOn); !ok {
 		t.Fatalf("setup: expected a persisted ledger with persist enabled")
@@ -163,7 +168,7 @@ func TestDeletionLedgerDisabled(t *testing.T) {
 
 	// 1. Snapshot does not touch KV (no new writes, no clear).
 	f := newLedgerTestFiler(store)
-	f.queueDeletions("6,01") // in-memory only
+	f.queueDeletions(false, "6,01") // in-memory only
 	f.snapshotDeletionLedger()
 	persisted, ok := readPersistedLedger(t, f)
 	if !ok {
@@ -192,8 +197,8 @@ func TestDeletionLedgerScopedPerFiler(t *testing.T) {
 	fB := newLedgerTestFiler(store)
 	fB.Dlm = lock_manager.NewDistributedLockManager("filer-b:8888")
 
-	fA.queueDeletions("1,01")
-	fB.queueDeletions("2,02")
+	fA.queueDeletions(false, "1,01")
+	fB.queueDeletions(false, "2,02")
 	fA.snapshotDeletionLedger()
 	fB.snapshotDeletionLedger()
 
@@ -231,7 +236,7 @@ func TestDeletionLedgerChunked(t *testing.T) {
 	for i := 0; i < 4000; i++ {
 		ids = append(ids, fmt.Sprintf("7,%08xbeefcafe", i))
 	}
-	f.queueDeletions(ids...)
+	f.queueDeletions(false, ids...)
 	f.snapshotDeletionLedger()
 
 	raw, err := f.Store.KvGet(context.Background(), []byte(f.deletionLedgerKey()))
@@ -250,7 +255,7 @@ func TestDeletionLedgerChunked(t *testing.T) {
 	// Forget everything; the next snapshot is a single value again and the
 	// part keys are removed.
 	for _, id := range ids {
-		f2.forgetDeletion(id)
+		f2.forgetDeletion(id, false)
 	}
 	f2.snapshotDeletionLedger()
 	raw, err = f.Store.KvGet(context.Background(), []byte(f2.deletionLedgerKey()))
@@ -274,7 +279,7 @@ func TestDeletionLedgerReadFailureBlocksPersistence(t *testing.T) {
 		t.Fatalf("reload should report the ledger as unusable")
 	}
 
-	f.queueDeletions("1,01")
+	f.queueDeletions(false, "1,01")
 	f.snapshotDeletionLedger()
 	if len(store.kv) != 0 {
 		t.Fatalf("snapshot must not overwrite a ledger that was never read, wrote %v", store.kv)
@@ -297,7 +302,7 @@ func TestDeletionLedgerRecoveryKeepsIdsPending(t *testing.T) {
 	withPersistedConfig(t, true)
 	store := newStubFilerStore()
 	f := newLedgerTestFiler(store)
-	f.queueDeletions("1,01", "1,02")
+	f.queueDeletions(false, "1,01", "1,02")
 	f.snapshotDeletionLedger()
 
 	util.GetViper().Set("filer.deleteQueue.recoveryGrace", time.Hour)
@@ -326,11 +331,11 @@ func TestDeletionLedgerZeroValueFiler(t *testing.T) {
 		DeletionRetryQueue:  NewDeletionRetryQueue(),
 		deletionQuit:        make(chan struct{}),
 	}
-	f.queueDeletions("0,01")
+	f.queueDeletions(false, "0,01")
 	if f.pendingDeletionCount() != 1 {
 		t.Fatalf("zero-value filer should lazily init the ledger, got %d", f.pendingDeletionCount())
 	}
-	f.forgetDeletion("0,01")
+	f.forgetDeletion("0,01", false)
 	if f.pendingDeletionCount() != 0 {
 		t.Fatalf("forget on zero-value filer failed, got %d", f.pendingDeletionCount())
 	}
@@ -352,7 +357,7 @@ func TestDeletionLedgerMissingPartBlocks(t *testing.T) {
 	if f.reloadDeletionLedger() {
 		t.Fatalf("a manifest referencing a missing part is corrupt, not absent")
 	}
-	f.queueDeletions("9,99")
+	f.queueDeletions(false, "9,99")
 	f.snapshotDeletionLedger()
 	if got := string(store.kv[key]); got != `{"parts":2,"gen":4}` {
 		t.Fatalf("unread ledger must not be overwritten, got %q", got)
@@ -367,7 +372,7 @@ func TestDeletionLedgerAddressChangeClaim(t *testing.T) {
 	store := newStubFilerStore()
 	fOld := newLedgerTestFiler(store)
 	fOld.Dlm = lock_manager.NewDistributedLockManager("filer-old:8888")
-	fOld.queueDeletions("1,01", "1,02")
+	fOld.queueDeletions(false, "1,01", "1,02")
 	fOld.snapshotDeletionLedger()
 
 	fNew := newLedgerTestFiler(store)
@@ -403,14 +408,14 @@ func TestDeletionLedgerGenerationPublish(t *testing.T) {
 	for i := 0; i < 4000; i++ {
 		ids = append(ids, fmt.Sprintf("7,%08xbeefcafe", i))
 	}
-	f.queueDeletions(ids...)
+	f.queueDeletions(false, ids...)
 	f.snapshotDeletionLedger()
 	key := f.deletionLedgerKey()
 	if _, err := store.KvGet(context.Background(), deletionLedgerGenPartKey(key, 1, 0)); err != nil {
 		t.Fatalf("generation 1 part must exist, got %v", err)
 	}
 
-	f.queueDeletions("8,08")
+	f.queueDeletions(false, "8,08")
 	f.snapshotDeletionLedger()
 	if _, err := store.KvGet(context.Background(), deletionLedgerGenPartKey(key, 2, 0)); err != nil {
 		t.Fatalf("generation 2 part must exist, got %v", err)
@@ -439,18 +444,18 @@ func TestDeletionLedgerStalePartsRetried(t *testing.T) {
 	for i := 0; i < 4000; i++ {
 		ids = append(ids, fmt.Sprintf("7,%08xbeefcafe", i))
 	}
-	f.queueDeletions(ids...)
+	f.queueDeletions(false, ids...)
 	f.snapshotDeletionLedger()
 	key := f.deletionLedgerKey()
 
 	store.kvDeleteErr = errors.New("delete down")
-	f.queueDeletions("8,08")
+	f.queueDeletions(false, "8,08")
 	f.snapshotDeletionLedger()
 	if len(f.deletionLedgerStale) == 0 {
 		t.Fatalf("failed part deletes must be tracked for retry")
 	}
 	store.kvDeleteErr = nil
-	f.queueDeletions("8,09")
+	f.queueDeletions(false, "8,09")
 	f.snapshotDeletionLedger()
 	if len(f.deletionLedgerStale) != 0 {
 		t.Fatalf("stale parts must flush once deletes work, got %v", f.deletionLedgerStale)
@@ -556,9 +561,9 @@ func TestForgetDeletionEpochSkipsNewer(t *testing.T) {
 	withPersistedConfig(t, true)
 	f := newLedgerTestFiler(newStubFilerStore())
 
-	f.queueDeletions("1,01")
+	f.queueDeletions(false, "1,01")
 	oldEpoch := f.deletionEpoch("1,01")
-	f.queueDeletions("1,01") // re-enqueue bumps the epoch
+	f.queueDeletions(false, "1,01") // re-enqueue bumps the epoch
 	newEpoch := f.deletionEpoch("1,01")
 	if oldEpoch == newEpoch {
 		t.Fatalf("re-enqueue must bump the epoch")
@@ -581,4 +586,67 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// A pending deletion on a volume the master no longer knows leaves the ledger
+// only once the master's "not found" has held for VolumeGoneGrace over
+// VolumeGoneMinAnswers retries: before that (a volume server away for a while,
+// a follower's cold cache) and whenever the master cannot answer, it stays.
+// Without this, the ledger reloaded such ids on every restart and retried them
+// forever.
+func TestDeletionLedgerVolumeGoneConfirmed(t *testing.T) {
+	withPersistedConfig(t, true)
+	noCache := func(vid string) ([]wdclient.Location, error) { return nil, fmt.Errorf("volume %s not cached", vid) }
+	gone := lookupWithMasterFallback(noCache, func(vids []string) (*master_pb.LookupVolumeResponse, error) {
+		resp := &master_pb.LookupVolumeResponse{}
+		for _, v := range vids {
+			resp.VolumeIdLocations = append(resp.VolumeIdLocations, &master_pb.LookupVolumeResponse_VolumeIdLocation{
+				VolumeOrFileId: v, Error: "volume id " + v + " not found"})
+		}
+		return resp, nil
+	})
+	unavailable := lookupWithMasterFallback(noCache, func(vids []string) (*master_pb.LookupVolumeResponse, error) {
+		return nil, fmt.Errorf("rpc error: code = Unavailable desc = master is warming up, topology is still loading")
+	})
+
+	f := newLedgerTestFiler(newStubFilerStore())
+	f.GrpcDialOption = grpc.WithTransportCredentials(insecure.NewCredentials())
+	f.queueDeletions(false, "274,01")
+	pending := func() bool { return f.deletionEpoch("274,01") != 0 }
+	item := &DeletionRetryItem{FileId: "274,01", ledgerEpoch: f.deletionEpoch("274,01")}
+
+	// first answers: kept
+	f.processRetryBatch([]*DeletionRetryItem{item}, gone)
+	f.processRetryBatch([]*DeletionRetryItem{item}, gone)
+	if !pending() || item.goneSeen != 2 {
+		t.Fatalf("after two answers: pending=%v goneSeen=%d, want kept with a streak of 2", pending(), item.goneSeen)
+	}
+	// the master cannot answer: kept, and the streak starts over
+	item.goneSince = time.Now().Add(-VolumeGoneGrace - time.Minute)
+	f.processRetryBatch([]*DeletionRetryItem{item}, unavailable)
+	if !pending() || item.goneSeen != 0 {
+		t.Fatalf("master unavailable: pending=%v goneSeen=%d, want kept with the streak reset", pending(), item.goneSeen)
+	}
+	// enough answers, but not for long enough: kept
+	for i := 0; i < VolumeGoneMinAnswers+2; i++ {
+		f.processRetryBatch([]*DeletionRetryItem{item}, gone)
+	}
+	if !pending() {
+		t.Fatalf("answers within a few seconds dropped the deletion; want kept until VolumeGoneGrace")
+	}
+	// held for longer than the grace, but over too few answers: kept
+	f.processRetryBatch([]*DeletionRetryItem{item}, unavailable)
+	f.processRetryBatch([]*DeletionRetryItem{item}, gone)
+	item.goneSince = time.Now().Add(-VolumeGoneGrace - time.Minute)
+	for i := 1; i < VolumeGoneMinAnswers-1; i++ {
+		f.processRetryBatch([]*DeletionRetryItem{item}, gone)
+	}
+	if !pending() {
+		t.Fatalf("%d answers over the grace dropped the deletion; want kept until %d", item.goneSeen, VolumeGoneMinAnswers)
+	}
+	// enough answers over the grace: dropped from the ledger
+	f.processRetryBatch([]*DeletionRetryItem{item}, gone)
+	if pending() {
+		t.Fatalf("volume unknown to the master for %v: the deletion is still pending", VolumeGoneGrace)
+	}
 }

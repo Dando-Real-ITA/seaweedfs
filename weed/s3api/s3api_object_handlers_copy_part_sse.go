@@ -2,7 +2,6 @@ package s3api
 
 import (
 	"context"
-	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // errCopySourceSSEUnsupported is returned by openSourcePlaintextReader when
@@ -374,7 +374,7 @@ func (s3a *S3ApiServer) copyObjectPartViaReencryption(
 	uploadEntry *filer_pb.Entry,
 ) (etag string, sseMetadata SSEResponseMetadata, errCode s3err.ErrorCode) {
 	if endOffset < startOffset && !uploadEntryHasChecksum(uploadEntry) {
-		tag, code := s3a.writeEmptyCopyPart(dstBucket, uploadID, partID)
+		tag, code := s3a.writeEmptyCopyPart(dstBucket, dstObject, uploadID, partID)
 		return tag, SSEResponseMetadata{}, code
 	}
 	sliceLen := int64(0)
@@ -404,7 +404,7 @@ func (s3a *S3ApiServer) copyObjectPartViaReencryption(
 	applyDestChecksumHeaderToCopyRequest(cloned, uploadEntry)
 
 	filePath := s3a.genPartUploadPath(dstBucket, uploadID, partID)
-	tag, code, putSSE := s3a.putToFiler(withMultipartPart(cloned), filePath, srcReader, dstBucket, "", partID, 0, nil, false, s3a.toFilerPath(dstBucket, dstObject))
+	tag, code, putSSE := s3a.putToFiler(withMultipartPart(cloned, s3a.uploadFiler(dstBucket, dstObject)), filePath, srcReader, dstBucket, "", partID, 0, nil, false, s3a.toFilerPath(dstBucket, dstObject))
 	if code != s3err.ErrNone {
 		return "", SSEResponseMetadata{}, code
 	}
@@ -413,26 +413,28 @@ func (s3a *S3ApiServer) copyObjectPartViaReencryption(
 
 // writeEmptyCopyPart writes a 0-byte part entry for an empty UploadPartCopy
 // range, mirroring the legacy fast path's handling of endOffset < startOffset.
-func (s3a *S3ApiServer) writeEmptyCopyPart(dstBucket, uploadID string, partID int) (string, s3err.ErrorCode) {
+func (s3a *S3ApiServer) writeEmptyCopyPart(dstBucket, dstObject, uploadID string, partID int) (string, s3err.ErrorCode) {
 	uploadDir, partName := s3a.copyPartLocation(dstBucket, uploadID, partID)
-	if exists, _ := s3a.exists(uploadDir, partName, false); exists {
-		if err := s3a.rm(context.Background(), uploadDir, partName, false, false); err != nil {
+	upload := s3a.uploadFiler(dstBucket, dstObject)
+	if exists, _ := upload.exists(uploadDir, partName, false); exists {
+		if err := upload.rm(context.Background(), uploadDir, partName, false, false); err != nil {
 			return "", s3err.ErrInternalError
 		}
 	}
-	const emptyMD5Hex = "d41d8cd98f00b204e9800998ecf8427e"
-	if err := s3a.mkFile(uploadDir, partName, nil, func(e *filer_pb.Entry) {
+	emptyMd5 := util.Md5(nil)
+	emptyETag := fmt.Sprintf("%x", emptyMd5)
+	if err := upload.mkFile(uploadDir, partName, nil, func(e *filer_pb.Entry) {
 		if e.Attributes == nil {
 			e.Attributes = &filer_pb.FuseAttributes{}
 		}
 		e.Attributes.FileSize = 0
-		e.Attributes.Md5 = md5.New().Sum(nil)
+		e.Attributes.Md5 = emptyMd5
 		if e.Extended == nil {
 			e.Extended = map[string][]byte{}
 		}
-		e.Extended[s3_constants.ExtETagKey] = []byte(emptyMD5Hex)
+		e.Extended[s3_constants.ExtETagKey] = []byte(emptyETag)
 	}); err != nil {
 		return "", s3err.ErrInternalError
 	}
-	return emptyMD5Hex, s3err.ErrNone
+	return emptyETag, s3err.ErrNone
 }

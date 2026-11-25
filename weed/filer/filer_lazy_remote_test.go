@@ -42,6 +42,8 @@ type stubFilerStore struct {
 	kvDeleteErr     error
 	kvGetHook       func(key []byte)
 	deleteErrByPath map[string]error
+	updateErr       error
+	deleteFolderErr error
 }
 
 func newStubFilerStore() *stubFilerStore {
@@ -102,6 +104,9 @@ func (s *stubFilerStore) KvDelete(_ context.Context, key []byte) error {
 func (s *stubFilerStore) DeleteFolderChildren(_ context.Context, dirPath util.FullPath) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deleteFolderErr != nil {
+		return s.deleteFolderErr
+	}
 	prefix := string(dirPath) + "/"
 	for k := range s.entries {
 		if strings.HasPrefix(k, prefix) {
@@ -113,7 +118,7 @@ func (s *stubFilerStore) DeleteFolderChildren(_ context.Context, dirPath util.Fu
 func (s *stubFilerStore) listDirectoryChildNames(dirPath util.FullPath, startFileName string, includeStartFile bool, namePrefix string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dirPrefix := string(dirPath) + "/"
+	dirPrefix := strings.TrimSuffix(string(dirPath), "/") + "/"
 	var names []string
 	for k := range s.entries {
 		if !strings.HasPrefix(k, dirPrefix) {
@@ -140,7 +145,7 @@ func (s *stubFilerStore) getEntry(path string) *Entry {
 }
 func (s *stubFilerStore) ListDirectoryEntries(_ context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc ListEachEntryFunc) (string, error) {
 	names := s.listDirectoryChildNames(dirPath, startFileName, includeStartFile, "")
-	dirPrefix := string(dirPath) + "/"
+	dirPrefix := strings.TrimSuffix(string(dirPath), "/") + "/"
 	lastFileName := ""
 	for i, name := range names {
 		if int64(i) >= limit {
@@ -160,7 +165,7 @@ func (s *stubFilerStore) ListDirectoryEntries(_ context.Context, dirPath util.Fu
 }
 func (s *stubFilerStore) ListDirectoryPrefixedEntries(_ context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, eachEntryFunc ListEachEntryFunc) (string, error) {
 	names := s.listDirectoryChildNames(dirPath, startFileName, includeStartFile, prefix)
-	dirPrefix := string(dirPath) + "/"
+	dirPrefix := strings.TrimSuffix(string(dirPath), "/") + "/"
 	lastFileName := ""
 	for i, name := range names {
 		if int64(i) >= limit {
@@ -192,6 +197,9 @@ func (s *stubFilerStore) InsertEntry(_ context.Context, entry *Entry) error {
 func (s *stubFilerStore) UpdateEntry(_ context.Context, entry *Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.updateErr != nil {
+		return s.updateErr
+	}
 	s.entries[string(entry.FullPath)] = entry
 	return nil
 }
@@ -206,7 +214,7 @@ func (s *stubFilerStore) FindEntry(_ context.Context, p util.FullPath) (*Entry, 
 		return nil, err
 	}
 	if e, ok := s.entries[string(p)]; ok {
-		return e, nil
+		return e.ShallowClone(), nil
 	}
 	return nil, filer_pb.ErrNotFound
 }
@@ -340,8 +348,11 @@ func newTestFiler(t *testing.T, store *stubFilerStore, rs *FilerRemoteStorage) *
 
 // registerStubMaker registers a stub RemoteStorageClientMaker for the given
 // type string and returns a cleanup function that restores the previous maker.
+// Both empty the client cache, so a rerun with the same configuration builds
+// a client from this stub instead of reusing the previous run's.
 func registerStubMaker(t *testing.T, storageType string, client remote_storage.RemoteStorageClient) func() {
 	t.Helper()
+	remote_storage.ResetRemoteStorageClients()
 	prev := remote_storage.RemoteStorageClientMakers[storageType]
 	remote_storage.RemoteStorageClientMakers[storageType] = &stubClientMaker{client: client}
 	return func() {
@@ -350,6 +361,7 @@ func registerStubMaker(t *testing.T, storageType string, client remote_storage.R
 		} else {
 			delete(remote_storage.RemoteStorageClientMakers, storageType)
 		}
+		remote_storage.ResetRemoteStorageClients()
 	}
 }
 

@@ -19,6 +19,8 @@ func (ms *MasterServer) ListClusterNodes(ctx context.Context, req *master_pb.Lis
 		resp.ClusterNodes = append(resp.ClusterNodes, &master_pb.ListClusterNodesResponse_ClusterNode{
 			Address:     string(node.Address),
 			Version:     node.Version,
+			LancePort:   node.LancePort.Load(),
+			S3Endpoint:  node.GetS3Endpoint(),
 			CreatedAtNs: node.CreatedTs.UnixNano(),
 			DataCenter:  string(node.DataCenter),
 			Rack:        string(node.Rack),

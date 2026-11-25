@@ -45,6 +45,11 @@ func (b *ReaderCacheBudget) reserve(s *SingleChunkCacher) error {
 		return fmt.Errorf("chunk buffer needs %d bytes, exceeding reader cache budget %d; increase the readerCacheSizeMB budget", size, b.limit)
 	}
 	for {
+		// a cancelled download must not evict a chunk for itself
+		if err := s.ctx.Err(); err != nil {
+			return err
+		}
+
 		b.Lock()
 		if size <= b.limit-b.used {
 			b.used += size
@@ -73,9 +78,7 @@ func (b *ReaderCacheBudget) reserve(s *SingleChunkCacher) error {
 			b.idle.Remove(entry)
 			delete(b.idleEntries, victim)
 			b.Unlock()
-			if pinnedVictim {
-				victim.parent.remove(victim)
-			} else if !victim.parent.removeUnpinned(victim) {
+			if !victim.parent.evictForBudget(victim, pinnedVictim) {
 				// The victim was pinned between selection and removal: keep it
 				// evictable so a pin abandoned in that gap cannot wedge the
 				// budget, then retry the selection.
@@ -89,7 +92,11 @@ func (b *ReaderCacheBudget) reserve(s *SingleChunkCacher) error {
 		}
 		changed := b.changed
 		b.Unlock()
-		<-changed
+		select {
+		case <-changed:
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
 	}
 }
 
@@ -98,6 +105,65 @@ func (b *ReaderCacheBudget) reserve(s *SingleChunkCacher) error {
 // whole-chunk path at all, so callers must fall back to range fetches.
 func (b *ReaderCacheBudget) canFit(size int) bool {
 	return b == nil || int64(mem.AllocationSize(size)) <= b.limit
+}
+
+// TryReserveScratch takes size bytes for a buffer that a hedged chunk read
+// borrows while it races the download holding the chunk's own reservation.
+// Like a download it evicts idle chunks no stream is positioned in, but it
+// never waits and never evicts a pinned chunk: a hedge that does not fit is
+// simply not sent. A nil budget has room for anything.
+func (b *ReaderCacheBudget) TryReserveScratch(size int) bool {
+	if b == nil {
+		return true
+	}
+	n := int64(mem.AllocationSize(size))
+	if n > b.limit {
+		return false
+	}
+	for {
+		b.Lock()
+		if n <= b.limit-b.used {
+			b.used += n
+			b.Unlock()
+			return true
+		}
+		var victim *SingleChunkCacher
+		var entry *list.Element
+		for e := b.idle.Front(); e != nil; e = e.Next() {
+			if c := e.Value.(*SingleChunkCacher); atomic.LoadInt32(&c.pins) == 0 {
+				victim, entry = c, e
+				break
+			}
+		}
+		if entry == nil {
+			b.Unlock()
+			return false
+		}
+		b.idle.Remove(entry)
+		delete(b.idleEntries, victim)
+		b.Unlock()
+		if !victim.parent.evictForBudget(victim, false) {
+			// pinned meanwhile: keep it evictable, as reserve does, and give up
+			b.Lock()
+			if _, ok := b.reservations[victim]; ok && b.idleEntries[victim] == nil {
+				b.idleEntries[victim] = b.idle.PushBack(victim)
+			}
+			b.Unlock()
+			return false
+		}
+	}
+}
+
+// ReleaseScratch returns what TryReserveScratch took.
+func (b *ReaderCacheBudget) ReleaseScratch(size int) {
+	if b == nil {
+		return
+	}
+	b.Lock()
+	defer b.Unlock()
+	b.used -= int64(mem.AllocationSize(size))
+	close(b.changed)
+	b.changed = make(chan struct{})
 }
 
 func (b *ReaderCacheBudget) complete(s *SingleChunkCacher) {

@@ -289,8 +289,45 @@ func isCanceledStreamingError(err error) bool {
 	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
 }
 
-func shouldWriteStreamingErrorResponse(err error) bool {
-	return err != nil && !isCanceledStreamingError(err)
+// streamCanceled reports whether a stream failed because its request was
+// canceled. net/http cancels the request context once a write to the client
+// fails, so a client hanging up mid-body surfaces in err as a broken pipe or a
+// connection reset rather than as context.Canceled.
+func streamCanceled(ctx context.Context, err error) bool {
+	return isCanceledStreamingError(err) || ctx.Err() == context.Canceled
+}
+
+// writeStreamErrorResponse answers a stream failure unless the stream already
+// wrote a response. A canceled error is answered too: the idle timeout and a
+// shared lookup canceled by another request both cancel it while the client is
+// still connected, and returning silently would send that client an empty 200.
+// A client that has gone away never sees the write; it is answered
+// ClientDisconnected so that an aborted download does not count as a 5xx.
+func writeStreamErrorResponse(w http.ResponseWriter, r *http.Request, err error) {
+	var streamErr *StreamError
+	if errors.As(err, &streamErr) && streamErr.ResponseWritten {
+		return
+	}
+	if errors.Is(err, util_http.ErrTooManyRequests) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
+		return
+	}
+	if isCanceledStreamingError(err) && util.ClientGone(r.Context()) {
+		s3err.WriteErrorResponse(w, r, s3err.ErrClientDisconnected)
+		return
+	}
+	s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+}
+
+// logCanceledStream logs a canceled stream at V(3) when the request context is
+// canceled too, since that is usually the client leaving, and as a warning when
+// only shared work was canceled under a live request.
+func logCanceledStream(r *http.Request, caller, bucket, object string, err error) {
+	if r.Context().Err() != nil {
+		glog.V(3).Infof("%s: request canceled while streaming %s/%s: %v", caller, bucket, object, err)
+		return
+	}
+	glog.Warningf("%s: streaming %s/%s canceled under a live request: %v", caller, bucket, object, err)
 }
 
 func mimeDetect(r *http.Request, dataReader io.Reader) io.ReadCloser {
@@ -340,6 +377,8 @@ func removeDuplicateSlashes(object string) string {
 
 // hasChildren checks if a path has any child objects (is a directory with contents).
 // On unexpected errors, it logs and conservatively returns true to avoid hiding entries.
+// It answers the listing, where keeping an entry is the safe side; HEAD of a 0-byte
+// file asks zeroByteFileHasChildren instead, which fails the other way.
 //
 // This helper function is used to distinguish implicit directories from regular files or empty directories.
 // An implicit directory is one that exists only because it has children, not because it was explicitly created.
@@ -349,10 +388,6 @@ func removeDuplicateSlashes(object string) string {
 //   - Returns true if any child exists, false otherwise
 //   - Efficient: only fetches one entry to minimize overhead
 //
-// Used by HeadObjectHandler to implement AWS S3-compatible implicit directory behavior:
-//   - If a 0-byte object or directory has children → it's an implicit directory → HEAD returns 404
-//   - If a 0-byte object or directory has no children → it's empty → HEAD returns 200
-//
 // Examples:
 //
 //	hasChildren("bucket", "dataset") where "dataset/file.txt" exists → true
@@ -360,6 +395,46 @@ func removeDuplicateSlashes(object string) string {
 //
 // Performance: ~1-5ms per call (one gRPC LIST request with Limit=1)
 func (s3a *S3ApiServer) hasChildren(ctx context.Context, bucket, prefix string) bool {
+	found, err := s3a.probeChildren(ctx, bucket, prefix)
+	if err != nil {
+		glog.V(1).Infof("hasChildren: list entries failed for %s/%s: %v", bucket, strings.TrimPrefix(prefix, "/"), err)
+		return true
+	}
+	return found
+}
+
+// zeroByteFileHasChildren reports whether a regular 0-byte file has children, which
+// makes HEAD answer it as an implicit directory (404) so clients like s3fs fall back
+// to LIST:
+//   - If the 0-byte file has children → it's an implicit directory → HEAD returns 404
+//   - If it has no children → it's an empty file → HEAD returns 200
+//
+// The file was just found, so a probe that fails is no evidence of children, and a
+// 404 would tell the client an existing object is gone: a copy tool that HEADs the
+// key it just wrote then reports the copy as failed. A failed probe therefore
+// answers false and HEAD serves the file. One way the probe fails is a request
+// context canceled while the client still waits for the answer: net/http cancels
+// a connection's context when its background read fails, and a keep-alive
+// connection whose read deadline expired during a long, silent request goes on
+// serving later requests with that canceled context.
+func (s3a *S3ApiServer) zeroByteFileHasChildren(ctx context.Context, bucket, object string) bool {
+	found, err := s3a.probeChildren(ctx, bucket, object)
+	if err != nil {
+		glog.V(1).Infof("HEAD %s/%s: child probe failed, serving the 0-byte file: %v", bucket, strings.TrimPrefix(object, "/"), err)
+		return false
+	}
+	return found
+}
+
+// probeChildren lists at most one child of prefix. A prefix the filer does not
+// know has no children.
+func (s3a *S3ApiServer) probeChildren(ctx context.Context, bucket, prefix string) (bool, error) {
+	// With the context already ended every filer of the failover walk would fail
+	// at once and be counted as a failed filer; there is nothing to ask.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	// Clean up prefix: remove leading slashes
 	cleanPrefix := strings.TrimPrefix(prefix, "/")
 
@@ -378,13 +453,12 @@ func (s3a *S3ApiServer) hasChildren(ctx context.Context, bucket, prefix string) 
 	}, "", true, 1)
 
 	if err == nil {
-		return found
+		return found, nil
 	}
 	if errors.Is(err, filer_pb.ErrNotFound) {
-		return false
+		return false, nil
 	}
-	glog.V(1).Infof("hasChildren: list entries failed for %s/%s: %v", bucket, cleanPrefix, err)
-	return true
+	return false, err
 }
 
 // isBareDirectory reports whether entry is a directory carrying no object data of its own.
@@ -445,7 +519,12 @@ func (s3a *S3ApiServer) checkDirectoryObject(bucket, object string) (*filer_pb.E
 func (s3a *S3ApiServer) resolveObjectEntry(bucket, object, versionId string) (*filer_pb.Entry, error) {
 	// Check if versioning is configured
 	versioningConfigured, err := s3a.isVersioningConfigured(bucket)
-	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			// Keep filer_pb.ErrNotFound in the error chain so callers that only
+			// check not-found do not misclassify a missing bucket as internal error.
+			return nil, fmt.Errorf("%w: %w", ErrBucketNotFound, err)
+		}
 		glog.Errorf("resolveObjectEntry: error checking versioning config for %s: %v", bucket, err)
 		return nil, err
 	}
@@ -480,20 +559,12 @@ func (s3a *S3ApiServer) serveDirectoryContent(w http.ResponseWriter, r *http.Req
 	if r.Method != http.MethodHead && len(entry.Content) == 0 && len(entry.Chunks) > 0 {
 		sseType := s3a.detectPrimarySSEType(entry)
 		if err := s3a.streamFromVolumeServersWithSSE(w, r, entry, sseType, bucket, object, ""); err != nil {
-			var streamErr *StreamError
-			if errors.As(err, &streamErr) && streamErr.ResponseWritten {
-				return
+			if streamCanceled(r.Context(), err) {
+				logCanceledStream(r, "serveDirectoryContent", bucket, object, err)
+			} else {
+				glog.Errorf("serveDirectoryContent: failed to stream %s/%s: %v", bucket, object, err)
 			}
-			if isCanceledStreamingError(err) {
-				glog.V(3).Infof("serveDirectoryContent: client disconnected while streaming %s/%s: %v", bucket, object, err)
-				return
-			}
-			glog.Errorf("serveDirectoryContent: failed to stream %s/%s: %v", bucket, object, err)
-			if errors.Is(err, util_http.ErrTooManyRequests) {
-				s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
-			} else if shouldWriteStreamingErrorResponse(err) {
-				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			}
+			writeStreamErrorResponse(w, r, err)
 		}
 		return
 	}
@@ -773,7 +844,7 @@ func (s3a *S3ApiServer) processConditionalHeaders(w http.ResponseWriter, r *http
 	}
 
 	result := s3a.checkConditionalHeadersForReads(r, bucket, object)
-	if isAnonymousObjectRead(r) && result.Entry != nil {
+	if result.Entry != nil && (isAnonymousObjectRead(r) || s3a.isVersionFileKey(object, result.Entry.Extended)) {
 		// 304/412 are responses too: authorize before exposing the ETag or the
 		// outcome of a condition on an entry the caller cannot read.
 		if code := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), result.Entry.Extended, handlerName); code != s3err.ErrNone {
@@ -1126,28 +1197,14 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 	streamTime = time.Since(tStream)
 	if err != nil {
 		switch {
-		case isCanceledStreamingError(err):
-			glog.V(3).Infof("GetObjectHandler: client disconnected while streaming %s/%s: %v", bucket, object, err)
-			return
+		case streamCanceled(r.Context(), err):
+			logCanceledStream(r, "GetObjectHandler", bucket, object, err)
 		case errors.Is(err, context.DeadlineExceeded):
 			glog.Warningf("GetObjectHandler: deadline exceeded while streaming %s/%s: %v", bucket, object, err)
 		default:
 			glog.Errorf("GetObjectHandler: failed to stream %s/%s from volume servers: %v", bucket, object, err)
 		}
-		// Check if the streaming function already wrote an HTTP response
-		var streamErr *StreamError
-		if errors.As(err, &streamErr) && streamErr.ResponseWritten {
-			// Response already written (headers + status code), don't write again
-			// to avoid "superfluous response.WriteHeader call" and malformed S3 error bodies
-			return
-		}
-		// Response not yet written - safe to write S3 error response
-		// Check if error is due to volume server rate limiting (HTTP 429)
-		if errors.Is(err, util_http.ErrTooManyRequests) {
-			s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
-		} else if shouldWriteStreamingErrorResponse(err) {
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		}
+		writeStreamErrorResponse(w, r, err)
 		return
 	}
 }
@@ -1216,7 +1273,10 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 			if written > 0 {
 				BucketTrafficSent(int64(written), r)
 			}
-			return err
+			if err != nil {
+				return newStreamErrorWithResponse(err)
+			}
+			return nil
 		}
 		// Non-range request for inline content
 		s3a.setResponseHeaders(w, r, entry, totalSize)
@@ -1225,7 +1285,10 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		if written > 0 {
 			BucketTrafficSent(int64(written), r)
 		}
-		return err
+		if err != nil {
+			return newStreamErrorWithResponse(err)
+		}
+		return nil
 	}
 
 	// Get chunks and validate BEFORE setting headers
@@ -1262,8 +1325,8 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 				// Authoritative: the entry vanished or its remote object is gone
 				return respondObjectGone(w, r, bucket, object, cacheErr)
 			} else {
-				// Client disconnected during the cache wait: report cancellation, not an
-				// error response, so we don't write to a closed connection.
+				// Request canceled during the cache wait: skip the origin and let the
+				// caller answer the cancellation.
 				if ctxErr := r.Context().Err(); ctxErr != nil {
 					return ctxErr
 				}
@@ -1435,7 +1498,7 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 			return newStreamErrorWithResponse(err)
 		}
 		switch {
-		case isCanceledStreamingError(err):
+		case streamCanceled(r.Context(), err):
 			// Client disconnected mid-stream (e.g. Nginx upstream timeout, browser cancel) - expected
 			glog.V(3).Infof("streamFromVolumeServers: client disconnected after writing %d bytes: %v", written, err)
 		case errors.Is(err, context.DeadlineExceeded):
@@ -1866,7 +1929,9 @@ func (s3a *S3ApiServer) streamFromVolumeServersWithSSE(w http.ResponseWriter, r 
 		BucketTrafficSent(copied, r)
 	}
 	if copyErr != nil {
-		glog.Errorf("Failed to copy full object: copied %d bytes: %v", copied, copyErr)
+		if !streamCanceled(r.Context(), copyErr) {
+			glog.Errorf("Failed to copy full object: copied %d bytes: %v", copied, copyErr)
+		}
 		if !body.committed {
 			// nothing written yet -- the caller writes the S3 error response
 			return copyErr
@@ -1951,7 +2016,9 @@ func (s3a *S3ApiServer) streamDecryptedRangeFromChunks(ctx context.Context, w io
 			}
 		}
 		if copyErr != nil {
-			glog.Errorf("streamDecryptedRangeFromChunks: copy error after writing %d bytes (expected %d): %v", written, chunkView.ViewSize, copyErr)
+			if !streamCanceled(ctx, copyErr) {
+				glog.Errorf("streamDecryptedRangeFromChunks: copy error after writing %d bytes (expected %d): %v", written, chunkView.ViewSize, copyErr)
+			}
 			return totalWritten, fmt.Errorf("failed to copy decrypted chunk data: %w", copyErr)
 		}
 
@@ -2317,7 +2384,7 @@ func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offse
 		return nil, err
 	}
 
-	return resp.Body, nil
+	return &rc{Reader: io.LimitReader(resp.Body, size), Closer: resp.Body}, nil
 }
 
 // getEncryptedStreamFromVolumes gets a raw encrypted data stream from volume
@@ -2799,6 +2866,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 	//
 	// Edge Cases Handled:
 	//   - Empty files (0-byte, no children) → 200 OK (legitimate empty file)
+	//   - Empty files whose child probe fails → 200 OK (the file exists; a failed probe is no evidence of children)
 	//   - Empty directories (no children) → 404 Not Found (directories are not objects)
 	//   - Explicit directory requests (trailing slash) → 200 OK (handled earlier)
 	//   - Versioned objects → Skip this check (different semantics)
@@ -2819,7 +2887,7 @@ func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request
 			}
 			if isZeroByteFile {
 				// Check if it has children (making it an implicit directory)
-				if s3a.hasChildren(r.Context(), bucket, object) {
+				if s3a.zeroByteFileHasChildren(r.Context(), bucket, object) {
 					// This is an implicit directory with children
 					// Return 404 to force clients (like s3fs) to use LIST-based discovery
 					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)

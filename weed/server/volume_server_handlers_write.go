@@ -1,9 +1,14 @@
 package weed_server
 
 import (
+	"bytes"
 	"context"
+	"crypto/fips140"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -12,12 +17,41 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
+
+var jpegStart = []byte{0xFF, 0xD8, 0xFF}
+
+// replicaContentMd5 drops the client's digest once the orientation fix has
+// rewritten the JPEG: replicas check it against the bytes they are sent.
+func (vs *VolumeServer) replicaContentMd5(n *needle.Needle, contentMd5 string) string {
+	if !vs.FixJpgOrientation || contentMd5 == "" || !bytes.HasPrefix(n.Data, jpegStart) {
+		return contentMd5
+	}
+	if fips140.Enforced() {
+		return ""
+	}
+	if sum := md5.Sum(n.Data); base64.StdEncoding.EncodeToString(sum[:]) != contentMd5 {
+		return ""
+	}
+	return contentMd5
+}
+
+// replicaContentCrc32c is the client's needle.ContentCrc32cHeader, or once
+// the orientation fix may have rewritten the JPEG, the checksum of the bytes
+// replicas are sent.
+func (vs *VolumeServer) replicaContentCrc32c(n *needle.Needle, contentCrc32c string) string {
+	if !vs.FixJpgOrientation || contentCrc32c == "" || !bytes.HasPrefix(n.Data, jpegStart) {
+		return contentCrc32c
+	}
+	return needle.ContentCrc32c(n.Data)
+}
 
 func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -36,7 +70,22 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !vs.maybeCheckJwtAuthorization(r, vid, fid, true) {
+	// Snapshot the write signing keys once, so the authorization check and the
+	// expired-JWT classification below read the same keys even if they rotate.
+	writeSigningKey, previousWriteSigningKey := vs.guard.VerificationKeys(true)
+	if !vs.checkJwtAuthorizationWithKey(r, vid, fid, writeSigningKey, previousWriteSigningKey) {
+		// ParseForm does not read multipart bodies. Preserve its existing placement
+		// and status precedence for other content types, which get no retry marker.
+		contentType, _, typeErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if typeErr == nil && contentType == "multipart/form-data" {
+			baseFid := fid
+			if sep := strings.LastIndex(baseFid, "_"); sep > 0 {
+				baseFid = baseFid[:sep]
+			}
+			if security.IsExpiredVolumeJwt(writeSigningKey, security.GetJwt(r), vid+","+baseFid, previousWriteSigningKey) {
+				w.Header().Set(util_http.WriteOutcomeHeader, util_http.WriteOutcomeExpiredJwtBeforeAppend)
+			}
+		}
 		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
 		return
 	}
@@ -53,7 +102,7 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 
 	ret := operation.UploadResult{}
 	// use context.WithoutCancel to avoid context cancellation when the client connection is closed
-	isUnchanged, writeError := topology.ReplicatedWrite(context.WithoutCancel(ctx), vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r, contentMd5)
+	isUnchanged, writeError := topology.ReplicatedWrite(context.WithoutCancel(ctx), vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r, vs.replicaContentMd5(reqNeedle, contentMd5), vs.replicaContentCrc32c(reqNeedle, r.Header.Get(needle.ContentCrc32cHeader)))
 	if writeError != nil {
 		stats.VolumeServerFileWriteFailures.Inc()
 		status := http.StatusInternalServerError
@@ -61,7 +110,7 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusConflict
 		}
 		if errors.Is(writeError, topology.ErrorWriteRefused) {
-			w.Header().Set("X-Seaweed-Write-Outcome", "refused-before-append")
+			w.Header().Set(util_http.WriteOutcomeHeader, util_http.WriteOutcomeRefusedBeforeAppend)
 		}
 		writeJsonError(w, r, status, writeError)
 		return
@@ -123,15 +172,30 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	isReplicate := r.FormValue("type") == "replicate"
+	v := vs.store.GetVolume(volumeId)
+	replicated := v != nil && v.ReplicaPlacement.GetCopyCount() > 1
 	_, ok := vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
-	if ok != nil && r.FormValue("type") == "replicate" {
+	if ok != nil && v != nil && (isReplicate || replicated) {
 		// the write this delete undoes can still be queued here
-		if v := vs.store.GetVolume(volumeId); v != nil {
-			v.CancelPendingWrites(n.Id, cookie)
-			_, ok = vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
-		}
+		v.CancelPendingWrites(n.Id, cookie)
+		_, ok = vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
 	}
 	if ok != nil {
+		// 404 tells the forwarding replica the needle is gone here, so a read
+		// that failed for any other reason must not answer it
+		if v != nil && !errors.Is(ok, storage.ErrorNotFound) && !errors.Is(ok, storage.ErrorDeleted) {
+			writeDeleteResult(ok, 0, w, r)
+			return
+		}
+		// a retry of a delete whose replica fan-out failed finds nothing here,
+		// but the other replicas may still hold the needle
+		if !isReplicate && replicated {
+			if _, err := topology.ReplicatedDelete(vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, n, r, true); err != nil {
+				writeDeleteResult(err, 0, w, r)
+				return
+			}
+		}
 		m := make(map[string]uint32)
 		m["size"] = 0
 		writeJsonQuiet(w, r, http.StatusNotFound, m)
@@ -170,7 +234,7 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err := topology.ReplicatedDelete(vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, n, r)
+	_, err := topology.ReplicatedDelete(vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, n, r, false)
 
 	writeDeleteResult(err, count, w, r)
 

@@ -48,6 +48,7 @@ spec:
       {{- $_ := set $podAnnotations "checksum/master-config" (include "seaweedfs.master.configChecksum" .) }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
+      {{- with include "seaweedfs.volumeHttpsAnnotation" $ }}{{ . | nindent 8 }}{{ end }}
     spec:
       restartPolicy: {{ default .Values.global.seaweedfs.restartPolicy .Values.master.restartPolicy }}
       {{- if .Values.master.affinity }}
@@ -299,8 +300,8 @@ spec:
             name: {{ include "seaweedfs.fullname" . }}-master-config
         {{- if include "seaweedfs.securityConfigEnabled" . }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" . }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-security-config
         {{- end }}
         {{- if .Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert
@@ -339,6 +340,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.master.data.storageClass }}
+        {{- with .Values.master.data.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.master.data.size }}
@@ -355,6 +359,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.master.logs.storageClass }}
+        {{- with .Values.master.logs.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.master.logs.size }}

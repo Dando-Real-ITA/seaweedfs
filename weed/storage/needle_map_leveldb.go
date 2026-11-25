@@ -470,6 +470,9 @@ func reloadLdb(m *LevelDbNeedleMap) (err error) {
 				time.Sleep(time.Millisecond*5000 + time.Duration(1127*tryNum)*time.Millisecond)
 			}
 		}
+		if err == nil {
+			return nil
+		}
 	}
 	return nil
 }

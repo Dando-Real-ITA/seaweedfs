@@ -11,6 +11,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
+// unknownCallerId is the uid and gid (FUSE_INVALID_UIDGID) the kernel sends
+// with -idmap on every request except create, mknod, mkdir, symlink and a
+// whiteout rename. The kernel has then already checked the caller's
+// permissions itself (default_permissions).
+const unknownCallerId = 0xFFFFFFFF
+
 type cachedGroupIDs struct {
 	groups    []string
 	expiresAt time.Time
@@ -91,13 +97,7 @@ func (wfs *WFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) (code fuse.
 	if entry == nil || entry.Attributes == nil {
 		return fuse.EIO
 	}
-	// Map entry uid/gid from filer-space to local-space so the permission
-	// check compares like with like (caller uid/gid from FUSE are local).
-	fileUid, fileGid := entry.Attributes.Uid, entry.Attributes.Gid
-	if wfs.option.UidGidMapper != nil {
-		fileUid, fileGid = wfs.option.UidGidMapper.FilerToLocal(fileUid, fileGid)
-	}
-	if hasAccess(input.Uid, input.Gid, fileUid, fileGid, entry.Attributes.FileMode, input.Mask) {
+	if hasAccess(input.Uid, input.Gid, entry.Attributes.Uid, entry.Attributes.Gid, entry.Attributes.FileMode, input.Mask) {
 		return fuse.OK
 	}
 	return fuse.EACCES
@@ -144,12 +144,13 @@ func hasAccess(callerUid, callerGid, fileUid, fileGid uint32, perm uint32, mask 
 
 // checkStickyBit enforces the POSIX sticky-bit rule: when a directory has the
 // sticky bit set, only the file owner, the directory owner, or root may
-// delete or rename entries within it.
+// delete or rename entries within it. An unknown caller passes, because the
+// kernel has already enforced the rule.
 func checkStickyBit(dirMode, dirUid, targetUid, callerUid uint32) fuse.Status {
 	if dirMode&0o1000 == 0 {
 		return fuse.OK
 	}
-	if callerUid == 0 || callerUid == dirUid || callerUid == targetUid {
+	if callerUid == 0 || callerUid == unknownCallerId || callerUid == dirUid || callerUid == targetUid {
 		return fuse.OK
 	}
 	return fuse.EPERM

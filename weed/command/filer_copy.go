@@ -1,6 +1,7 @@
 package command
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,9 +106,13 @@ func runCopy(cmd *Command, args []string) bool {
 
 	copyOptions.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 
-	masters, collection, replication, dirBuckets, maxMB, cipher, err := readFilerConfiguration(copyOptions.grpcDialOption, filerAddress)
+	masters, collection, replication, dirBuckets, maxMB, cipher, digest, err := readFilerConfiguration(copyOptions.grpcDialOption, filerAddress)
 	if err != nil {
 		fmt.Printf("read from filer %s: %v\n", filerAddress, err)
+		return false
+	}
+	if err := util.AdoptFilerDigest(string(filerAddress), digest); err != nil {
+		fmt.Printf("%v\n", err)
 		return false
 	}
 	if strings.HasPrefix(urlPath, dirBuckets+"/") {
@@ -182,7 +188,7 @@ func runCopy(cmd *Command, args []string) bool {
 	return true
 }
 
-func readFilerConfiguration(grpcDialOption grpc.DialOption, filerGrpcAddress pb.ServerAddress) (masters []string, collection, replication string, dirBuckets string, maxMB uint32, cipher bool, err error) {
+func readFilerConfiguration(grpcDialOption grpc.DialOption, filerGrpcAddress pb.ServerAddress) (masters []string, collection, replication string, dirBuckets string, maxMB uint32, cipher bool, digest string, err error) {
 	err = pb.WithGrpcFilerClient(false, 0, filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 		if err != nil {
@@ -191,6 +197,7 @@ func readFilerConfiguration(grpcDialOption grpc.DialOption, filerGrpcAddress pb.
 		masters, collection, replication, maxMB = resp.Masters, resp.Collection, resp.Replication, resp.MaxMb
 		dirBuckets = resp.DirBuckets
 		cipher = resp.Cipher
+		digest = resp.Digest
 		return nil
 	})
 	return
@@ -369,6 +376,7 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 			},
 			&operation.UploadOption{
 				Filename:          fileName,
+				WantMd5:           true,
 				Cipher:            worker.options.cipher,
 				IsInputCompressed: false,
 				MimeType:          mimeType,
@@ -451,6 +459,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 				},
 				&operation.UploadOption{
 					Filename:          fileName + "-" + strconv.FormatInt(i+1, 10),
+					WantMd5:           true,
 					Cipher:            worker.options.cipher,
 					IsInputCompressed: false,
 					MimeType:          "",
@@ -479,6 +488,10 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 	for chunk := range chunksChan {
 		chunks = append(chunks, chunk)
 	}
+	// Chunks arrive in completion order, and the ETag hashes them in stored order.
+	slices.SortFunc(chunks, func(a, b *filer_pb.FileChunk) int {
+		return cmp.Compare(a.Offset, b.Offset)
+	})
 
 	if uploadError != nil {
 		var fileIds []string
@@ -611,6 +624,7 @@ func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, off
 		},
 		&operation.UploadOption{
 			Filename:          name,
+			WantMd5:           true,
 			Cipher:            worker.options.cipher,
 			IsInputCompressed: false,
 			MimeType:          "",

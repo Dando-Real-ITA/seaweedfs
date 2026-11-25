@@ -6,6 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use seaweed_worker_core::{Metrics, Registry, TlsOptions, WorkerOptions};
+use weed_lance_worker::admin_cluster::AdminCluster;
 use weed_lance_worker::handlers;
 use weed_lance_worker::metrics::LanceMetrics;
 
@@ -22,34 +23,14 @@ struct Args {
     #[arg(long, default_value = "lance-worker", env = "WEED_WORKER_ID")]
     id: String,
 
-    /// Lance namespace the worker lists tables from.
-    #[arg(
-        long,
-        default_value = "http://localhost:9101",
-        env = "WEED_LANCE_NAMESPACE"
-    )]
-    namespace: String,
-
     #[arg(long, default_value = "10", env = "WEED_HEARTBEAT_SECONDS")]
     heartbeat_seconds: u64,
 
     #[arg(long, default_value = "1")]
     max_concurrency: i32,
 
-    /// Comma-separated master addresses: the worker asks them for the filers
-    /// it keeps tables through.
-    #[arg(long, alias = "master", env = "WEED_MASTERS")]
-    masters: String,
-    /// The filer group whose filers the worker uses.
-    #[arg(
-        long,
-        alias = "filer.group",
-        env = "WEED_FILER_GROUP",
-        default_value = ""
-    )]
-    filer_group: String,
     /// The cluster's security.toml; by default the file weed processes find
-    /// in -config_dir, ., ~/.seaweedfs and /etc/seaweedfs.
+    /// in ., ~/.seaweedfs and /etc/seaweedfs.
     #[arg(long, env = "WEED_WORKER_SECURITY_TOML")]
     security_toml: Option<std::path::PathBuf>,
 
@@ -150,8 +131,7 @@ async fn main() -> Result<()> {
     let tls = args.tls()?;
     // One security.toml for everything: the admin stream's and the catalog's
     // signing key, and the cluster connection.
-    let security =
-        weed_lance_worker::security::Security::load(args.security_toml.as_deref(), None)?;
+    let security = weed_lance_worker::security::Security::load(args.security_toml.as_deref())?;
     let filer_signing = match args.filer_signing_key.filter(|key| !key.is_empty()) {
         Some(key) => Some((key, 0)),
         None => security
@@ -185,9 +165,10 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let cluster =
-        weed_lance_worker::cluster::Cluster::new(&args.masters, &args.filer_group, &security)?;
-    let storage = weed_lance_worker::dataset::Storage(Some(cluster.storage(&security).await?));
+    let cluster = Arc::new(AdminCluster::new(
+        weed_lance_worker::cluster::connection(&security, String::new())?,
+        signing_key,
+    ));
 
     let metrics = Metrics::new(&options.worker_id, &options.worker_version)?;
     let lance_metrics = LanceMetrics::new(&metrics)?;
@@ -198,11 +179,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    let mut registry = Registry::new().with_preview(Arc::new(
-        weed_lance_worker::preview::LancePreview::new(args.namespace.clone(), storage.clone())
-            .with_signing_key(signing_key.clone()),
-    ));
-    for handler in handlers(args.namespace, storage, signing_key, Some(lance_metrics)) {
+    let mut registry = Registry::new()
+        .with_cluster_observer(cluster.clone())
+        .with_preview(Arc::new(weed_lance_worker::preview::LancePreview::new(
+            cluster.clone(),
+        )));
+    for handler in handlers(cluster, Some(lance_metrics)) {
         registry = registry.register(handler);
     }
 

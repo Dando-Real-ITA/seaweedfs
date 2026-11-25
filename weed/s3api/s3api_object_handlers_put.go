@@ -3,7 +3,6 @@ package s3api
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,6 +30,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/constants"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc/codes"
@@ -123,10 +123,26 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Check bucket policy
+	if errCode := s3a.checkVersionFileWrite(bucket, object, "PutObjectHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// The bucket's policy reaches the engine when the bucket loads; a missing
+	// bucket passes so auto-create below still applies.
+	if _, errCode := s3a.getBucketConfig(bucket); errCode != s3err.ErrNone && errCode != s3err.ErrNoSuchBucket {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
 	if errCode, _ := s3a.checkPolicyWithEntry(r, bucket, object, string(s3_constants.ACTION_WRITE), "", nil); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
+	}
+	if !isExtractZip(r) {
+		if errCode := s3a.recheckTagConditionedPolicyWithLookup(r, bucket, object, "", string(s3_constants.ACTION_WRITE), "PutObjectHandler"); errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
 	}
 
 	if errCode := ValidateRequestEncryption(r.Header); errCode != s3err.ErrNone {
@@ -142,7 +158,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 	if r.Header.Get("Cache-Control") != "" {
 		if _, err = cacheobject.ParseRequestCacheControl(r.Header.Get("Cache-Control")); err != nil {
-			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidDigest)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
 			return
 		}
 	}
@@ -229,8 +245,12 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			}
 		}
 
-		// Compute MD5 for ETag (md5.Sum of nil/empty = MD5 of empty content)
-		dirMd5 := md5.Sum(dirContent)
+		// ETag of the marker content, empty or not
+		dirMd5 := util.Md5(dirContent)
+		if expectedMd5, _ := validateContentMd5(r.Header); len(expectedMd5) > 0 && !contentMd5Matches(util.BodyMd5Of(dirMd5, dirContent), expectedMd5) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrBadDigest)
+			return
+		}
 		dirEtag := fmt.Sprintf("%x", dirMd5)
 
 		// SSE applies to marker content too — it is stored in entry.Content
@@ -278,7 +298,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 						entry.Content = dirContent
 					}
 					entry.Attributes.Mime = objectContentType
-					entry.Attributes.Md5 = dirMd5[:]
+					entry.Attributes.Md5 = dirMd5
 
 					// Store ETag in extended attributes for consistency with regular objects
 					if entry.Extended == nil {
@@ -531,13 +551,14 @@ func (s3a *S3ApiServer) uploadChunkSize() int32 {
 }
 
 // multipartPartContextKey marks a putToFiler request as writing a staged
-// multipart part. Encryption for the upload is decided at
-// CreateMultipartUpload and replayed through request headers, so bucket
-// default encryption must not be re-evaluated for part writes.
+// multipart part, carrying the filer the upload's directory lives on.
+// Encryption for the upload is decided at CreateMultipartUpload and replayed
+// through request headers, so bucket default encryption must not be
+// re-evaluated for part writes.
 type multipartPartContextKey struct{}
 
-func withMultipartPart(r *http.Request) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), multipartPartContextKey{}, true))
+func withMultipartPart(r *http.Request, upload uploadFilerClient) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), multipartPartContextKey{}, upload))
 }
 
 // validatePutHeaders checks x-amz-storage-class and x-amz-tagging, so the
@@ -563,8 +584,13 @@ func validatePutHeaders(r *http.Request) (map[string]string, s3err.ErrorCode) {
 }
 
 func isMultipartPartRequest(r *http.Request) bool {
-	marked, _ := r.Context().Value(multipartPartContextKey{}).(bool)
+	_, marked := multipartPartUpload(r)
 	return marked
+}
+
+func multipartPartUpload(r *http.Request) (uploadFilerClient, bool) {
+	upload, marked := r.Context().Value(multipartPartContextKey{}).(uploadFilerClient)
+	return upload, marked
 }
 
 // putToFiler writes one chunk of object bytes (a full PutObject body, a
@@ -583,6 +609,8 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	if !s3_constants.IsValidBucketName(bucket) || (object != "" && !s3_constants.IsValidObjectKey(object)) {
 		return "", s3err.ErrInvalidRequest, SSEResponseMetadata{}
 	}
+	stages := newPutStages(r)
+	defer stages.record()
 
 	tagSet, headerCode := validatePutHeaders(r)
 	if headerCode != s3err.ErrNone {
@@ -596,8 +624,14 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	// Each part is encrypted independently, then decrypted using metadata during GET
 	partOffset := int64(0)
 
-	plaintextHash := md5.New()
+	plaintextHash := util.NewMd5()
 	dataReader = io.TeeReader(dataReader, plaintextHash)
+	var contentMd5Hash hash.Hash
+	if r.Header.Get("Content-Md5") != "" {
+		if contentMd5Hash = util.NewContentMd5(); contentMd5Hash != nil {
+			dataReader = io.TeeReader(dataReader, contentMd5Hash)
+		}
+	}
 
 	// Parse the request's query string once. AWS SDK presigners hoist signed
 	// headers such as x-amz-sdk-checksum-algorithm into the URL's query string,
@@ -749,7 +783,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	// Upload with auto-chunking
 	// Use context.Background() to ensure chunk uploads complete even if HTTP request is cancelled
 	// This prevents partial uploads and data corruption
-	chunkResult, err := operation.UploadReaderInChunks(context.Background(), dataReader, &operation.ChunkedUploadOption{
+	chunkResult, err := stages.upload(context.Background(), dataReader, &operation.ChunkedUploadOption{
 		ChunkSize:       chunkSize,
 		SmallFileLimit:  smallFileLimit,
 		Collection:      collection,
@@ -785,7 +819,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
 			return "", s3err.ErrInvalidDigest, SSEResponseMetadata{}
 		}
-		if !bytes.Equal(md5Sum, expectedMd5) {
+		if !contentMd5Matches(util.BodyMd5(md5Sum, contentMd5Hash), expectedMd5) {
 			glog.Warningf("putToFiler: Checksum verification failed, attempting to cleanup %d orphaned chunks", len(chunkResult.FileChunks))
 			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
 			return "", s3err.ErrBadDigest, SSEResponseMetadata{}
@@ -1018,6 +1052,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	glog.V(3).Infof("putToFiler: About to create entry - dir=%s, name=%s, chunks=%d, extended keys=%d",
 		path.Dir(filePath), path.Base(filePath), len(entry.Chunks), len(entry.Extended))
 	var createErr error
+	var createCond *filer_pb.WriteCondition
 	var rollbackErr error
 	entryCreated := false
 	var owner pb.ServerAddress
@@ -1028,6 +1063,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		return s3a.checkConditionalHeaders(r, bucket, object)
 	}
 	createUnderLock := func(cond *filer_pb.WriteCondition) s3err.ErrorCode {
+		createCond = cond
 		create := func(client filer_pb.SeaweedFilerClient) error {
 			req := &filer_pb.CreateEntryRequest{
 				Directory: path.Dir(filePath),
@@ -1067,6 +1103,8 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
 				s3a.markOwnerUnreachable(owner)
 			}
+		} else if upload, ok := multipartPartUpload(r); ok && cond == nil {
+			createErr = upload.WithFilerClient(false, create)
 		} else if s3a.filerClient != nil {
 			createErr = s3a.withFilerClientFailover(context.Background(), "", false, cond == nil, create)
 		} else {
@@ -1152,10 +1190,17 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			}
 		}
 	}
+	var lockCond *filer_pb.WriteCondition
 	if !routed {
+		// The lock is a lease, so the filer re-checks the condition under its
+		// path lock. A suspended write's condition names the latest version,
+		// which the create's own path cannot express.
+		if object != "" && condAltKey == "" && !routedAmbiguous {
+			lockCond, _ = routeWriteCondition(r, uniqueWritePath)
+		}
 		createFn := func() s3err.ErrorCode {
 			remintVersion()
-			return createUnderLock(nil)
+			return createUnderLock(lockCond)
 		}
 		if routedAmbiguous {
 			createFn = func() s3err.ErrorCode {
@@ -1175,11 +1220,19 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			// can hide a commit (issue #11366) and the filer can fail after
 			// inserting the entry (issue #11387), so the entry's presence — not
 			// the error class — decides the chunks' fate.
-			landed, absent := s3a.confirmCreateLanded(filePath, bucket, object, entry, chunkResult.FileChunks, finalize)
+			routeObject := object
+			if upload, ok := multipartPartUpload(r); ok {
+				routeObject = upload.object
+			}
+			landed, absent := s3a.confirmCreateLanded(filePath, bucket, object, routeObject, entry, chunkResult.FileChunks, finalize)
 			if landed {
 				createCode = s3err.ErrNone
 			}
-			if createCode != s3err.ErrNone && absent {
+			// The filer forwards a conditional create to its ring owner, which
+			// the lookups may not reach; only a refusal proves it never committed.
+			refused := lockCond != nil && errors.Is(createErr, filer_pb.ErrPreconditionFailed)
+			reclaim := createCond == nil || createErr == nil || refused
+			if createCode != s3err.ErrNone && (refused || absent && reclaim) {
 				orphaned := chunkResult.FileChunks
 				if manifestChunks, _ := filer.SeparateManifestChunks(entry.GetChunks()); len(manifestChunks) > 0 {
 					orphaned = append(manifestChunks, orphaned...)
@@ -1286,6 +1339,10 @@ func (s3a *S3ApiServer) createAfterAmbiguousRoute(filePath, bucket, object strin
 				glog.Warningf("putToFiler: ambiguous routed PUT for %s cannot prove an empty stored entry is its own; not claiming it", filePath)
 				return s3err.ErrServiceUnavailable
 			}
+			if err := s3a.ensureObjectParent(lookupCtx, bucket, dir); err != nil {
+				glog.Errorf("putToFiler: ambiguous routed PUT for %s stored the entry but its directory is still missing: %v", filePath, err)
+				return s3err.ErrInternalError
+			}
 			*entryCreated = true
 			if finalize != nil && finalize.afterCreate != nil {
 				if code := finalize.afterCreate(entry); code != s3err.ErrNone {
@@ -1388,16 +1445,17 @@ func chunkNeedleExists(ctx context.Context, fileUrl, jwt string) bool {
 // finalization the error skipped then runs under the object write lock, and
 // landed reports success — while absent requires every filer the create could
 // have committed on to lack the entry, the only outcome where the uploaded
-// chunks are orphaned.
-func (s3a *S3ApiServer) confirmCreateLanded(filePath, bucket, object string, entry *filer_pb.Entry, uploaded []*filer_pb.FileChunk, finalize *putFinalize) (landed, absent bool) {
+// chunks are orphaned. routeObject picks the owner filers to check: the object
+// itself, or for a staged part the object its upload completes into.
+func (s3a *S3ApiServer) confirmCreateLanded(filePath, bucket, object, routeObject string, entry *filer_pb.Entry, uploaded []*filer_pb.FileChunk, finalize *putFinalize) (landed, absent bool) {
 	dir, name := path.Dir(filePath), path.Base(filePath)
-	owner := s3a.routableWriteOwner(bucket, object)
+	owner := s3a.routableWriteOwner(bucket, routeObject)
 	lookupCtx, cancel := context.WithTimeout(context.Background(), createLookupTimeout)
 	defer cancel()
 	// Verify, finalize, and roll back inside one critical section: a concurrent
 	// write to the same key must not slip in between them.
 	s3a.withObjectWriteLock(bucket, object, nil, func() s3err.ErrorCode {
-		targets := s3a.createTargetFilers(owner, bucket, object)
+		targets := s3a.createTargetFilers(owner, bucket, routeObject)
 		existing, uncertain := s3a.lookupCommittedEntry(lookupCtx, targets, dir, name)
 		if existing == nil {
 			absent = len(targets) > 0 && !uncertain
@@ -1419,6 +1477,10 @@ func (s3a *S3ApiServer) confirmCreateLanded(filePath, bucket, object string, ent
 			if resolveErr != nil || !sameFileChunks(resolved, uploaded) {
 				return s3err.ErrNone
 			}
+		}
+		if err := s3a.ensureObjectParent(lookupCtx, bucket, dir); err != nil {
+			glog.Errorf("putToFiler: create entry for %s failed and its directory is still missing: %v", filePath, err)
+			return s3err.ErrNone
 		}
 		glog.Warningf("putToFiler: create entry for %s failed but the entry exists, treating the write as successful", filePath)
 		if finalize == nil || finalize.afterCreate == nil {
@@ -1640,8 +1702,19 @@ func detectRequestedChecksumAlgorithm(r *http.Request) (ChecksumAlgorithm, strin
 
 // detectRequestedChecksumAlgorithmQ is the pre-parsed-query variant of
 // detectRequestedChecksumAlgorithm. Pass nil for `query` when the caller has
-// no parsed query to reuse.
+// no parsed query to reuse. SHA-1 is refused under fips140=only.
 func detectRequestedChecksumAlgorithmQ(r *http.Request, query url.Values) (ChecksumAlgorithm, string, s3err.ErrorCode) {
+	alg, name, code := detectAnyChecksumAlgorithm(r, query)
+	if alg == ChecksumAlgorithmSHA1 && fips140Enforced() {
+		return ChecksumAlgorithmNone, "", s3err.ErrNotImplemented
+	}
+	return alg, name, code
+}
+
+// detectAnyChecksumAlgorithm reads the requested checksum algorithm from the
+// SDK algorithm header, the algorithm header, x-amz-trailer or a checksum
+// value header, in that order.
+func detectAnyChecksumAlgorithm(r *http.Request, query url.Values) (ChecksumAlgorithm, string, s3err.ErrorCode) {
 	// Check x-amz-sdk-checksum-algorithm (set by AWS SDKs; hoisted to query for presigned URLs)
 	if algo := lookupHeaderOrQuery(r, query, s3_constants.AmzSdkChecksumAlgorithm); algo != "" {
 		if m, ok := checksumAlgorithmMapping[strings.ToUpper(algo)]; ok {
@@ -2585,11 +2658,8 @@ func (s3a *S3ApiServer) validateObjectLockHeaders(r *http.Request, bucket, objec
 		}
 	}
 
-	// Check for governance bypass header - only valid for buckets with Object Lock enabled
-	bypassGovernance := r.Header.Get("x-amz-bypass-governance-retention") == "true"
-
 	// Governance bypass headers are only valid for buckets with Object Lock enabled
-	if bypassGovernance && !objectLockEnabled {
+	if governanceBypassRequested(r) && !objectLockEnabled {
 		return ErrGovernanceBypassVersioningRequired
 	}
 
@@ -2943,7 +3013,12 @@ func (s3a *S3ApiServer) checkConditionalHeaders(r *http.Request, bucket, object 
 	// This ensures we check conditions against the LATEST version, not a null version.
 	entry, err := s3a.resolveObjectEntry(bucket, object, "")
 	if err != nil {
-		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrDeleteMarker) {
+		if errors.Is(err, ErrBucketNotFound) {
+			if headers.ifMatch != "" {
+				return s3err.ErrNoSuchBucket
+			}
+			entry = nil
+		} else if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrDeleteMarker) {
 			entry = nil
 		} else {
 			glog.Errorf("checkConditionalHeaders: error resolving object entry for %s/%s: %v", bucket, object, err)
@@ -3061,7 +3136,9 @@ func (s3a *S3ApiServer) checkConditionalHeadersForReads(r *http.Request, bucket,
 	versionId := r.URL.Query().Get("versionId")
 	entry, err := s3a.resolveObjectEntry(bucket, object, versionId)
 	if err != nil {
-		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrDeleteMarker) {
+		if errors.Is(err, ErrBucketNotFound) {
+			return ConditionalHeaderResult{ErrorCode: s3err.ErrNoSuchBucket, Entry: nil}
+		} else if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrDeleteMarker) {
 			entry = nil
 		} else {
 			glog.Errorf("checkConditionalHeadersForReads: error resolving object entry for %s/%s: %v", bucket, object, err)
@@ -3149,7 +3226,7 @@ func (s3a *S3ApiServer) deleteOrphanedChunks(chunks []*filer_pb.FileChunk) {
 	}
 
 	// Attempt deletion using the operation package's batch delete with custom lookup
-	deleteResults := operation.DeleteFileIdsWithLookupVolumeId(context.Background(), s3a.option.GrpcDialOption, fileIds, lookupFunc)
+	deleteResults := operation.DeleteFileIdsWithLookupVolumeId(context.Background(), s3a.option.GrpcDialOption, fileIds, false, lookupFunc)
 
 	// Log results - track successes and failures
 	successCount := 0

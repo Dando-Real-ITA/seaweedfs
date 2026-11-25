@@ -129,13 +129,17 @@ func (h *S3TablesHandler) handleCreateTable(w http.ResponseWriter, r *http.Reque
 
 	// Create the table
 	now := time.Now()
+	createdAt := now
+	if stagedAt, ok := r.Context().Value(tableStagedAtKey{}).(time.Time); ok && stagedAt.Before(now) {
+		createdAt = stagedAt
+	}
 	versionToken := generateVersionToken()
 
 	metadata := &tableMetadataInternal{
 		Name:              tableName,
 		Namespace:         namespaceName,
 		Format:            req.Format,
-		CreatedAt:         now,
+		CreatedAt:         createdAt,
 		ModifiedAt:        now,
 		OwnerAccountID:    target.ownerAccountID, // Inherit namespace owner for consistency
 		VersionToken:      versionToken,
@@ -501,6 +505,7 @@ func (h *S3TablesHandler) handleGetTable(w http.ResponseWriter, r *http.Request,
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        namespace,
@@ -652,10 +657,12 @@ func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Reques
 				nsMeta.OwnerAccountID, namespacePolicy, bucketARN,
 				bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 					TrustedIssuers:   h.trustedIssuers(r),
+					Subject:          callerSubject(r),
 					IsLocalAccountID: h.localAccountIDs,
 					TableBucketName:  bucketName,
 					Namespace:        namespaceName,
 					TableBucketTags:  bucketTags,
+					ResourceTags:     bucketTags,
 					IdentityActions:  identityActions,
 					DefaultAllow:     h.defaultAllowFor(r),
 				}) {
@@ -705,9 +712,11 @@ func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Reques
 			identityActions := getIdentityActions(r)
 			if !CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 				TrustedIssuers:   h.trustedIssuers(r),
+				Subject:          callerSubject(r),
 				IsLocalAccountID: h.localAccountIDs,
 				TableBucketName:  bucketName,
 				TableBucketTags:  bucketTags,
+				ResourceTags:     bucketTags,
 				IdentityActions:  identityActions,
 				DefaultAllow:     h.defaultAllowFor(r),
 			}) {
@@ -1059,6 +1068,7 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        namespaceName,
@@ -1129,7 +1139,12 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 			// Decoupled table (renamed, or created over a leftover): its data
 			// lives elsewhere. Purge the data, then clear the catalog marker
 			// without deleting the name path -- it may still hold another
-			// table's data that was left when this name was reused.
+			// table's data that was left when this name was reused. Files
+			// older than the table were not written for it and stay.
+			keepData, err := DirHoldsFiles(r.Context(), client, dataPath, metadata.CreatedAt)
+			if err != nil {
+				return err
+			}
 			if req.VersionToken != "" && tableEntry != nil {
 				// A token caller owns exactly the record it read. Claim it
 				// under the captured attributes before any data is removed:
@@ -1147,15 +1162,16 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 				}
 				claimed := snapshotExtended(tableEntry.Extended)
 				claimed[ExtendedKeyDeleting] = []byte("delete")
-				if err := h.deleteDirectory(r.Context(), client, dataPath); err != nil {
-					if relErr := h.releaseCatalogRecord(context.WithoutCancel(r.Context()), client, tablePath, claimed); relErr != nil {
-						glog.Warningf("delete table %s: release claim: %v", tablePath, relErr)
+				if !keepData {
+					if err := h.deleteDirectory(r.Context(), client, dataPath); err != nil {
+						if relErr := h.releaseCatalogRecord(context.WithoutCancel(r.Context()), client, tablePath, claimed); relErr != nil {
+							glog.Warningf("delete table %s: release claim: %v", tablePath, relErr)
+						}
+						return err
 					}
-					return err
 				}
 				err := h.removeExtendedAttributesIf(context.WithoutCancel(r.Context()), client, tablePath, claimed,
-					ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags, ExtendedKeyEntryType,
-					ExtendedKeyMaintenance, ExtendedKeyMaintenanceStatus, ExtendedKeyDeleting, ExtendedKeyMoving)
+					catalogRecordKeys...)
 				if err != nil {
 					if errors.Is(err, ErrConcurrentUpdate) {
 						return ErrVersionTokenMismatch
@@ -1190,25 +1206,37 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 			}
 			claimed := snapshotExtended(entry.Extended)
 			claimed[ExtendedKeyDeleting] = []byte("delete")
-			if err := h.deleteDirectory(r.Context(), client, dataPath); err != nil {
-				if relErr := h.releaseCatalogRecord(context.WithoutCancel(r.Context()), client, tablePath, claimed); relErr != nil {
-					glog.Warningf("delete table %s: release claim: %v", tablePath, relErr)
+			if !keepData {
+				if err := h.deleteDirectory(r.Context(), client, dataPath); err != nil {
+					if relErr := h.releaseCatalogRecord(context.WithoutCancel(r.Context()), client, tablePath, claimed); relErr != nil {
+						glog.Warningf("delete table %s: release claim: %v", tablePath, relErr)
+					}
+					return err
 				}
-				return err
 			}
 			return h.removeExtendedAttributesIf(context.WithoutCancel(r.Context()), client, tablePath, claimed,
-				ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags, ExtendedKeyEntryType,
-				ExtendedKeyMaintenance, ExtendedKeyMaintenanceStatus, ExtendedKeyDeleting, ExtendedKeyMoving)
+				catalogRecordKeys...)
 		}
 		// Colocated table: the name path holds the data. A token caller's
 		// delete carries the captured attributes as a filer precondition, so
 		// compare and removal are one operation under the path lock: an xattr
 		// write that keeps Mtime, or a delete+recreate in between, refuses it.
+		// Files older than the table were not written for it, so they stay
+		// and only the catalog record goes.
+		keepData, err := DirHoldsFiles(r.Context(), client, tablePath, metadata.CreatedAt)
+		if err != nil {
+			return err
+		}
 		if req.VersionToken != "" && tableEntry != nil {
 			if claim := string(tableEntry.Extended[ExtendedKeyDeleting]); claim != "" && claim != "delete" {
 				return ErrVersionTokenMismatch
 			}
-			if err := h.deleteDirectoryIfMatches(r.Context(), client, tablePath, tableEntry); err != nil {
+			if keepData {
+				err = h.removeExtendedAttributesIf(r.Context(), client, tablePath, snapshotExtended(tableEntry.Extended), catalogRecordKeys...)
+			} else {
+				err = h.deleteDirectoryIfMatches(r.Context(), client, tablePath, tableEntry)
+			}
+			if err != nil {
 				if errors.Is(err, ErrConcurrentUpdate) {
 					return ErrVersionTokenMismatch
 				}
@@ -1238,6 +1266,9 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 		claimed[ExtendedKeyDeleting] = []byte("delete")
 		if err := h.claimCatalogRecord(r.Context(), client, tablePath, snapshotExtended(entry.Extended), "delete"); err != nil {
 			return err
+		}
+		if keepData {
+			return h.removeExtendedAttributesIf(context.WithoutCancel(r.Context()), client, tablePath, claimed, catalogRecordKeys...)
 		}
 		if err := h.deleteDirectoryIfMatches(r.Context(), client, tablePath, &filer_pb.Entry{Extended: claimed}); err != nil {
 			if relErr := h.releaseCatalogRecord(context.WithoutCancel(r.Context()), client, tablePath, claimed); relErr != nil {
@@ -1409,6 +1440,7 @@ func tablePurgeDir(entry *filer_pb.Entry, tablePath, bucketName string) (string,
 func (h *S3TablesHandler) canReadEntry(readOp, principal, tableOwner, bucketOwner, tablePolicy, bucketPolicy, tableARN, bucketARN, bucketName, namespace, name string, bucketTags, tableTags map[string]string, identityActions []string, r *http.Request) bool {
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespace,
@@ -1617,6 +1649,7 @@ func (h *S3TablesHandler) renameCatalogEntry(w http.ResponseWriter, r *http.Requ
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        srcNamespace,
@@ -1686,11 +1719,13 @@ func (h *S3TablesHandler) renameCatalogEntry(w http.ResponseWriter, r *http.Requ
 		destNamespaceMetadata.OwnerAccountID, destNamespacePolicy, bucketARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        destNamespace,
 			TableName:        destName,
 			TableBucketTags:  bucketTags,
+			ResourceTags:     bucketTags,
 			IdentityActions:  identityActions,
 			DefaultAllow:     h.defaultAllowFor(r),
 		}) {
@@ -2004,7 +2039,9 @@ func (h *S3TablesHandler) authorizeUpdateTable(w http.ResponseWriter, r *http.Re
 		return nil, err
 	}
 
-	if err := ValidateMetadataLocation(req.MetadataLocation, bucketName, namespaceName); err != nil {
+	// Where the location may point depends on the stored record, so only its
+	// shape is checked here; the rest waits for authorization below.
+	if _, err := validateMetadataLocationShape(req.MetadataLocation, bucketName); err != nil {
 		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
 		return nil, err
 	}
@@ -2088,6 +2125,7 @@ func (h *S3TablesHandler) authorizeUpdateTable(w http.ResponseWriter, r *http.Re
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        namespaceName,
@@ -2105,6 +2143,12 @@ func (h *S3TablesHandler) authorizeUpdateTable(w http.ResponseWriter, r *http.Re
 			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, "table not found")
 		}
 		return nil, NewAuthError("UpdateTable", principal, "not authorized to update table")
+	}
+
+	// After authorization, so a caller who may not update the table learns
+	// nothing about where its files live.
+	if err := h.refuseUpdatedMetadataLocation(w, r, filerClient, bucketName, namespaceName, tablePath, &metadata, req.MetadataLocation); err != nil {
+		return nil, err
 	}
 
 	return &updateTableTarget{
@@ -2359,6 +2403,7 @@ func (h *S3TablesHandler) authorizeCreateTable(w http.ResponseWriter, r *http.Re
 	identityActions := getIdentityActions(r)
 	policyContext := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespaceName,
@@ -2366,6 +2411,7 @@ func (h *S3TablesHandler) authorizeCreateTable(w http.ResponseWriter, r *http.Re
 		RequestTags:      requestTags,
 		TagKeys:          mapKeys(requestTags),
 		TableBucketTags:  bucketTags,
+		ResourceTags:     bucketTags,
 		IdentityActions:  identityActions,
 		DefaultAllow:     h.defaultAllowFor(r),
 	}

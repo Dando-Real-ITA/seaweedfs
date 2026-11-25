@@ -56,6 +56,7 @@ spec:
       {{- with .Values.admin.podAnnotations }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with include "seaweedfs.volumeHttpsAnnotation" $ }}{{ . | nindent 8 }}{{ end }}
     spec:
       restartPolicy: {{ default .Values.global.seaweedfs.restartPolicy .Values.admin.restartPolicy }}
       {{- if .Values.admin.affinity }}
@@ -188,6 +189,10 @@ spec:
               {{- else }}
               -masters={{ range $index := until (.Values.master.replicas | int) }}${SEAWEEDFS_FULLNAME}-master-{{ $index }}.${SEAWEEDFS_FULLNAME}-master.{{ include "seaweedfs.namespace" $ }}:{{ $.Values.master.port }}{{ if lt $index (sub ($.Values.master.replicas | int) 1) }},{{ end }}{{ end }} \
               {{- end }}
+              {{- /* admin lists the filers and S3 gateways the workers use from this group */}}
+              {{- if .Values.filer.filerGroup }}
+              -filerGroup={{ .Values.filer.filerGroup }} \
+              {{- end }}
               {{- if $urlPrefix }}
               -urlPrefix={{ $urlPrefix }} \
               {{- end }}
@@ -313,8 +318,8 @@ spec:
         {{- end }}
         {{- if include "seaweedfs.securityConfigEnabled" . }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" . }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" . }}-security-config
         {{- end }}
         {{- if .Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert
@@ -354,6 +359,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.admin.data.storageClass }}
+        {{- with .Values.admin.data.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.admin.data.size }}
@@ -368,6 +376,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.admin.logs.storageClass }}
+        {{- with .Values.admin.logs.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.admin.logs.size }}

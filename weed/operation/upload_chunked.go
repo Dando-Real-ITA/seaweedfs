@@ -3,7 +3,6 @@ package operation
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
@@ -47,6 +47,10 @@ type ChunkedUploadOption struct {
 	AssignFunc      func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error)
 	UploadFunc      func(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) // Optional: for testing
 	LookupJwtFunc   func(ctx context.Context, fileId string) security.EncodedJwt                        // Optional: renews the volume JWT for a cleanup delete
+
+	// Digest names the target filer's digest, so the content and chunk
+	// digests match what that filer holds; empty uses this process's mode.
+	Digest string
 }
 
 var chunkBufferPool = sync.Pool{
@@ -59,8 +63,12 @@ var chunkBufferPool = sync.Pool{
 // This prevents OOM by processing the stream in fixed-size chunks
 // Returns file chunks, MD5 hash, total size, and any small content stored inline
 func UploadReaderInChunks(ctx context.Context, reader io.Reader, opt *ChunkedUploadOption) (*ChunkedUploadResult, error) {
+	return uploadReaderInChunks(ctx, reader, opt, prepareUploadData)
+}
 
-	md5Hash := md5.New()
+func uploadReaderInChunks(ctx context.Context, reader io.Reader, opt *ChunkedUploadOption, prepare func([]byte, *UploadOption) (*preparedUpload, error)) (*ChunkedUploadResult, error) {
+
+	md5Hash := util.NewMd5For(opt.Digest)
 	var partReader = io.TeeReader(reader, md5Hash)
 
 	var fileChunks []*filer_pb.FileChunk
@@ -178,6 +186,23 @@ uploadLoop:
 				wg.Done()
 			}()
 
+			// Hash and prepare only this bounded chunk before minting its volume JWT.
+			chunkMd5 := util.Md5For(opt.Digest, buf.Bytes())
+			chunkMd5B64 := base64.StdEncoding.EncodeToString(chunkMd5[:])
+			var prepared *preparedUpload
+			if opt.UploadFunc == nil {
+				var prepareErr error
+				prepared, prepareErr = prepare(buf.Bytes(), chunkUploadOption(opt))
+				if prepareErr != nil {
+					uploadErrLock.Lock()
+					if uploadErr == nil {
+						uploadErr = fmt.Errorf("prepare chunk: %w", prepareErr)
+					}
+					uploadErrLock.Unlock()
+					return
+				}
+			}
+
 			// Assign volume for this chunk
 			_, assignResult, assignErr := opt.AssignFunc(ctx, 1, uint64(size))
 			if assignErr != nil {
@@ -196,10 +221,6 @@ uploadLoop:
 				jwt = assignResult.Auth
 			}
 
-			// Calculate MD5 for the chunk
-			chunkMd5 := md5.Sum(buf.Bytes())
-			chunkMd5B64 := base64.StdEncoding.EncodeToString(chunkMd5[:])
-
 			var uploadResult *UploadResult
 			var uploadResultErr error
 
@@ -207,7 +228,7 @@ uploadLoop:
 			// every attempt against the same fid, so ask for a fresh assignment and
 			// retry there rather than losing the whole object to one bad volume.
 			for attempt := 1; ; attempt++ {
-				uploadResult, uploadResultErr = uploadChunk(ctx, assignResult, buf.Bytes(), jwt, chunkMd5B64, opt)
+				uploadResult, uploadResultErr = uploadChunk(ctx, assignResult, buf.Bytes(), prepared, jwt, chunkMd5B64, opt)
 				if uploadResultErr == nil {
 					break
 				}
@@ -305,28 +326,23 @@ const chunkAssignAttempts = 3
 // uploadChunk writes one chunk to its assigned volume. It fans out to every
 // holder, except for cipher: per-call encryption would give each replica
 // different bytes, so keep its relay path.
-func uploadChunk(ctx context.Context, assignResult *AssignResult, data []byte, jwt security.EncodedJwt, md5b64 string, opt *ChunkedUploadOption) (*UploadResult, error) {
+func uploadChunk(ctx context.Context, assignResult *AssignResult, data []byte, prepared *preparedUpload, jwt security.EncodedJwt, md5b64 string, opt *ChunkedUploadOption) (*UploadResult, error) {
 	holders := chunkHolders(assignResult)
 	if opt.UploadFunc == nil && !opt.Cipher && len(holders) > 1 {
-		return uploadChunkToHolders(ctx, holders, assignResult.Fid, data, jwt, md5b64, assignResult.Fsync, opt)
+		return uploadChunkToHolders(ctx, holders, assignResult.Fid, prepared, jwt, md5b64, assignResult.Fsync, opt)
 	}
-	uploadOption := &UploadOption{
-		UploadUrl:         fmt.Sprintf("http://%s/%s", assignResult.Url, assignResult.Fid),
-		Cipher:            opt.Cipher,
-		IsInputCompressed: false,
-		MimeType:          opt.MimeType,
-		PairMap:           nil,
-		Jwt:               jwt,
-		Md5:               md5b64,
-		// One upload call per assignment: the caller retries everything a
-		// same-URL retry would, and a different volume is the better second try.
-		// This bounds retriedUploadData only — doUploadData still reissues once
-		// on a connection reset, with a rewound body, which is a transport
-		// stutter rather than a fresh attempt at the volume. The fan-out path
-		// keeps its retries, where absorbing a blip locally beats cancelling
-		// every holder and re-uploading the chunk.
-		MaxAttempts: 1,
-	}
+	uploadOption := chunkUploadOption(opt)
+	uploadOption.UploadUrl = fmt.Sprintf("http://%s/%s", assignResult.Url, assignResult.Fid)
+	uploadOption.Jwt = jwt
+	uploadOption.Md5 = md5b64
+	// One upload call per assignment: the caller retries everything a
+	// same-URL retry would, and a different volume is the better second try.
+	// This bounds retriedUploadData only — doUploadData still reissues once
+	// on a connection reset, with a rewound body, which is a transport
+	// stutter rather than a fresh attempt at the volume. The fan-out path
+	// keeps its retries, where absorbing a blip locally beats cancelling
+	// every holder and re-uploading the chunk.
+	uploadOption.MaxAttempts = 1
 	if assignResult.Fsync {
 		uploadOption.UploadUrl += "?fsync=true"
 	}
@@ -338,7 +354,13 @@ func uploadChunk(ctx context.Context, assignResult *AssignResult, data []byte, j
 	if err != nil {
 		return nil, fmt.Errorf("create uploader: %w", err)
 	}
-	return uploader.UploadData(ctx, data, uploadOption)
+	return uploader.retriedUploadData(ctx, prepared, uploadOption)
+}
+
+// chunkUploadOption holds the settings that shape a chunk's bytes, shared by
+// its preparation and every upload of it.
+func chunkUploadOption(opt *ChunkedUploadOption) *UploadOption {
+	return &UploadOption{Cipher: opt.Cipher, MimeType: opt.MimeType, Digest: opt.Digest}
 }
 
 // chunkHolders returns the assigned volume plus its replica holders.
@@ -356,7 +378,7 @@ func chunkHolders(assignResult *AssignResult) []string {
 // type=replicate). On the first failure it cancels the remaining uploads and
 // deletes any copies that already landed, so a partial fan-out leaves no
 // orphaned needle the caller cannot see.
-func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data []byte, jwt security.EncodedJwt, md5b64 string, fsync bool, opt *ChunkedUploadOption) (*UploadResult, error) {
+func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, prepared *preparedUpload, jwt security.EncodedJwt, md5b64 string, fsync bool, opt *ChunkedUploadOption) (*UploadResult, error) {
 	uploader, err := NewUploader()
 	if err != nil {
 		return nil, fmt.Errorf("create uploader: %w", err)
@@ -376,16 +398,11 @@ func uploadChunkToHolders(ctx context.Context, hosts []string, fid string, data 
 			if fsync {
 				uploadUrl += "&fsync=true"
 			}
-			uploadOption := &UploadOption{
-				UploadUrl:         uploadUrl,
-				Cipher:            false,
-				IsInputCompressed: false,
-				MimeType:          opt.MimeType,
-				PairMap:           nil,
-				Jwt:               jwt,
-				Md5:               md5b64,
-			}
-			r, e := uploader.UploadData(ctx, data, uploadOption)
+			uploadOption := chunkUploadOption(opt)
+			uploadOption.UploadUrl = uploadUrl
+			uploadOption.Jwt = jwt
+			uploadOption.Md5 = md5b64
+			r, e := uploader.retriedUploadData(ctx, prepared, uploadOption)
 			outcomes <- outcome{host, r, e}
 		}(host)
 	}

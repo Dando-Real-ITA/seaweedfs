@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -31,6 +32,10 @@ import (
 
 // ErrDeleteMarker is returned when the latest version is a delete marker (expected condition)
 var ErrDeleteMarker = errors.New("latest version is a delete marker")
+
+func isDeleteMarkerEntry(entry *filer_pb.Entry) bool {
+	return entry != nil && string(entry.Extended[s3_constants.ExtDeleteMarkerKey]) == "true"
+}
 
 // clearCachedVersionMetadata clears only the version metadata fields (not ID/filename).
 // Used by setCachedListMetadata to prevent stale values when updating.
@@ -197,8 +202,18 @@ type ObjectVersion struct {
 	StorageClass   string
 }
 
+// errLatestVersionChanged reports a delete marker refused by its latestGuard.
+var errLatestVersionChanged = errors.New("latest version changed")
+
 // createDeleteMarker creates a delete marker for versioned delete operations
 func (s3a *S3ApiServer) createDeleteMarker(bucket, object string) (string, error) {
+	return s3a.createDeleteMarkerIf(bucket, object, nil)
+}
+
+// createDeleteMarkerIf is createDeleteMarker whose routed commit also requires
+// latestGuard to hold on the .versions directory entry. The unrouted path
+// has no transaction to check it in and writes unconditionally.
+func (s3a *S3ApiServer) createDeleteMarkerIf(bucket, object string, latestGuard *filer_pb.WriteCondition) (string, error) {
 	// Clean up the object path first
 	cleanObject := strings.TrimPrefix(object, "/")
 
@@ -235,7 +250,11 @@ func (s3a *S3ApiServer) createDeleteMarker(bucket, object string) (string, error
 			},
 			Extended: deleteMarkerExtended,
 		}
-		if code := s3a.routedVersionedFinalize(owner, bucket, cleanObject, useInvertedFormat, deleteMarkerEntry); code != s3err.ErrNone {
+		code := s3a.routedVersionedFinalize(owner, bucket, cleanObject, useInvertedFormat, deleteMarkerEntry, latestGuard)
+		if code == s3err.ErrPreconditionFailed {
+			return "", errLatestVersionChanged
+		}
+		if code != s3err.ErrNone {
 			return "", fmt.Errorf("createDeleteMarker: routed finalize failed for %s/%s: code %d", bucket, object, code)
 		}
 		glog.V(2).Infof("createDeleteMarker: successfully created delete marker %s for %s/%s", versionId, bucket, object)
@@ -474,6 +493,26 @@ func (s3a *S3ApiServer) truncateAndSetMarkers(combinedList []versionListItem, ma
 		combinedList = combinedList[:maxKeys]
 	}
 	return combinedList, nextKeyMarker, nextVersionIdMarker, isTruncated
+}
+
+// encodeURL applies encoding-type=url to every key-bearing field, the form
+// ListObjects uses for its keys; clients decode them once.
+func (result *S3ListObjectVersionsResult) encodeURL() {
+	result.EncodingType = s3.EncodingTypeUrl
+	result.Prefix = urlPathEscape(result.Prefix)
+	result.Delimiter = urlPathEscape(result.Delimiter)
+	result.KeyMarker = urlPathEscape(result.KeyMarker)
+	result.NextKeyMarker = urlPathEscape(result.NextKeyMarker)
+	for _, e := range result.Entries {
+		switch {
+		case e.Version != nil:
+			e.Version.Key = urlPathEscape(e.Version.Key)
+		case e.DeleteMarker != nil:
+			e.DeleteMarker.Key = urlPathEscape(e.DeleteMarker.Key)
+		case e.Prefix != nil:
+			e.Prefix.Prefix = urlPathEscape(e.Prefix.Prefix)
+		}
+	}
 }
 
 // splitIntoResult builds the final S3ListObjectVersionsResult from the combined list.
@@ -1973,6 +2012,11 @@ func (s3a *S3ApiServer) ListObjectVersionsHandler(w http.ResponseWriter, r *http
 	versionIdMarker := query.Get("version-id-marker")
 	delimiter := query.Get("delimiter")
 
+	encodingTypeUrl, errCode := parseEncodingType(query)
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
 	maxKeys, errCode := parseMaxKeys(query.Get("max-keys"))
 	if errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
@@ -1989,6 +2033,9 @@ func (s3a *S3ApiServer) ListObjectVersionsHandler(w http.ResponseWriter, r *http
 
 	// Set the original prefix in the response (not the normalized internal prefix)
 	result.Prefix = originalPrefix
+	if encodingTypeUrl {
+		result.encodeURL()
+	}
 
 	glog.V(3).Infof("ListObjectVersionsHandler response: %+v", result)
 	writeSuccessResponseXML(w, r, result)

@@ -54,5 +54,5 @@ func TestAllocationSize(t *testing.T) {
 		assert.Equal(t, cap(buf), AllocationSize(size))
 		Free(buf)
 	}
-	assert.Equal(t, 257<<20, AllocationSize(257<<20))
+	assert.Equal(t, 1025<<20, AllocationSize(1025<<20))
 }

@@ -54,23 +54,25 @@ func newMemoryChunkPages(fh *FileHandle, chunkSize int64) *ChunkedDirtyPages {
 	return dirtyPages
 }
 
-func (pages *ChunkedDirtyPages) AddPage(offset int64, data []byte, isSequential bool, tsNs int64) error {
+func (pages *ChunkedDirtyPages) AddPage(offset int64, data []byte, isSequential bool, tsNs int64) (n int, err error) {
 	// A failed chunk upload already dropped its data, so this handle can never
 	// flush cleanly. Reject further writes so the writer fails fast instead of
 	// pushing the rest of the file through a pipeline that cannot persist it.
 	if err := pages.LastError(); err != nil {
-		return err
+		return 0, err
 	}
 	pages.hasWrites = true
 
 	glog.V(4).Infof("%v memory AddPage [%d, %d)", pages.fh.fh, offset, offset+int64(len(data)))
-	_, err := pages.uploadPipeline.SaveDataAt(data, offset, isSequential, tsNs)
-
-	return err
+	return pages.uploadPipeline.SaveDataAt(data, offset, isSequential, tsNs)
 }
 
 func (pages *ChunkedDirtyPages) HasWrites() bool {
 	return pages.hasWrites
+}
+
+func (pages *ChunkedDirtyPages) HasPendingUploads() bool {
+	return pages.hasWrites && pages.uploadPipeline.HasPendingUploads()
 }
 
 func (pages *ChunkedDirtyPages) FlushData() error {

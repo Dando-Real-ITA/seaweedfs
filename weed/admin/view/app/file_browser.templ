@@ -363,6 +363,17 @@ templ FileBrowser(data dash.FileBrowserData) {
 	<!-- JavaScript for file browser functionality -->
 	<script>
 	document.addEventListener('DOMContentLoaded', function() {
+		// Show folder separators and timestamps after navigation. Keep literal '+' escaped
+		// so reloading or sharing the URL preserves the time zone in Airflow run IDs.
+		const url = new URL(window.location.href);
+		const readableSearch = url.search.replace(/(^\?path=|&path=)([^&]*)/g, (_, key, value) =>
+			key + value.replace(/%2F|%3D|%3A/gi, decodeURIComponent)
+		);
+		if (readableSearch !== url.search) {
+			url.search = readableSearch;
+			window.history.replaceState(window.history.state, '', url);
+		}
+
 		// Format permissions in the main table
 		document.querySelectorAll('.permissions-display').forEach(element => {
 			const mode = element.getAttribute('data-mode');
@@ -434,7 +445,7 @@ templ FileBrowser(data dash.FileBrowserData) {
 				if (data.error) {
 					showAlert('Error loading file properties: ' + data.error, 'error');
 				} else {
-					displayFileProperties(data);
+					displayFileProperties(escapeProperties(data));
 				}
 			})
 			.catch(error => {
@@ -443,6 +454,19 @@ templ FileBrowser(data dash.FileBrowserData) {
 			});
 	}
 	
+	function escapeProperties(value) {
+		if (typeof value === 'string') {
+			return escapeHtml(value);
+		}
+		if (Array.isArray(value)) {
+			return value.map(escapeProperties);
+		}
+		if (value && typeof value === 'object') {
+			return Object.fromEntries(Object.entries(value).map(([key, item]) => [escapeHtml(key), escapeProperties(item)]));
+		}
+		return value;
+	}
+
 	function displayFileProperties(data) {
 		// Create a comprehensive modal for file properties
 		const modalHtml = '<div class="modal fade" id="filePropertiesModal" tabindex="-1">' +

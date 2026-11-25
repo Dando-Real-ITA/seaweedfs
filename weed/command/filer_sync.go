@@ -205,16 +205,19 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 	go statsCollect.StartMetricsServer(*syncOptions.metricsHttpIp, *syncOptions.metricsHttpPort)
 
 	// read a filer signature
-	aFilerSignature, aFilerErr := replication.ReadFilerSignature(grpcDialOptionA, filerA)
+	aFilerSignature, aFilerDigest, aFilerErr := replication.ReadFilerSignature(grpcDialOptionA, filerA)
 	if aFilerErr != nil {
 		glog.Errorf("get filer 'a' signature %d error from %s to %s: %v", aFilerSignature, *syncOptions.filerA, *syncOptions.filerB, aFilerErr)
 		return true
 	}
 	// read b filer signature
-	bFilerSignature, bFilerErr := replication.ReadFilerSignature(grpcDialOptionB, filerB)
+	bFilerSignature, bFilerDigest, bFilerErr := replication.ReadFilerSignature(grpcDialOptionB, filerB)
 	if bFilerErr != nil {
 		glog.Errorf("get filer 'b' signature %d error from %s to %s: %v", bFilerSignature, *syncOptions.filerA, *syncOptions.filerB, bFilerErr)
 		return true
+	}
+	if err := replication.CheckDigestsMatch(*syncOptions.filerA, aFilerDigest, *syncOptions.filerB, bFilerDigest); err != nil {
+		glog.Exitf("%v", err)
 	}
 
 	// register graceful shutdown hook to save checkpoints
@@ -495,6 +498,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		StartTsNs:              sourceFilerOffsetTsNs,
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		FilerJwtProvider:       sourceJwtProvider,
 		GetResumeTsNs: func() int64 {
 			return resumeTsNsFor(processor)
 		},
@@ -681,6 +685,10 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 		if message.NewEntry != nil {
 			sourceNewKey = util.FullPath(targetDir).Child(message.NewEntry.Name)
 		}
+		mutationTsNs := resp.MutationTsNs
+		if mutationTsNs == 0 {
+			mutationTsNs = resp.TsNs
+		}
 
 		if debug {
 			glog.V(0).Infof("received %s ts_ns=%d", resp.Directory, resp.TsNs)
@@ -733,7 +741,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				return nil
 			}
 			key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-			return sink.DeleteEntry(dataSink, key, message.OldEntry.IsDirectory, message.DeleteChunks, filer.IsMetadataOnlyDelete(message.OldEntry), message.Signatures)
+			return sink.DeleteEntryVersion(dataSink, key, message.OldEntry, mutationTsNs, message.DeleteChunks, filer.IsMetadataOnlyDelete(message.OldEntry), message.Signatures)
 		}
 
 		// handle new entries
@@ -775,7 +783,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 						if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
 							return fmt.Errorf("create entry2 : %w", err)
 						}
-						if err := dataSink.DeleteEntry(oldKey, message.OldEntry.IsDirectory, false, message.Signatures); err != nil {
+						if err := sink.DeleteEntryVersion(dataSink, oldKey, message.OldEntry, mutationTsNs, false, false, message.Signatures); err != nil {
 							return fmt.Errorf("delete old entry %v: %w", oldKey, err)
 						}
 						return nil
@@ -817,7 +825,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				// new key is outside the watched directory
 				if doDeleteFiles {
 					key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-					return dataSink.DeleteEntry(key, message.OldEntry.IsDirectory, message.DeleteChunks, message.Signatures)
+					return sink.DeleteEntryVersion(dataSink, key, message.OldEntry, mutationTsNs, message.DeleteChunks, false, message.Signatures)
 				}
 			}
 		} else {

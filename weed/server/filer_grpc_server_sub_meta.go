@@ -18,6 +18,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/log_buffer"
 )
@@ -115,19 +116,45 @@ type pipelinedSender struct {
 	sendCh   chan *filer_pb.SubscribeMetadataResponse
 	errCh    chan error
 	done     chan struct{}
-	canBatch bool // true only if client set ClientSupportsBatching
+	canBatch bool   // true only if client set ClientSupportsBatching
+	scope    string // local or aggregated, for the delivery-lag metric
 }
 
-func newPipelinedSender(ctx context.Context, stream metadataStreamSender, bufSize int, clientSupportsBatching bool) *pipelinedSender {
+func newPipelinedSender(ctx context.Context, stream metadataStreamSender, bufSize int, clientSupportsBatching bool, scope string) *pipelinedSender {
 	s := &pipelinedSender{
 		ctx:      ctx,
 		sendCh:   make(chan *filer_pb.SubscribeMetadataResponse, bufSize),
 		errCh:    make(chan error, 1),
 		done:     make(chan struct{}),
 		canBatch: clientSupportsBatching,
+		scope:    scope,
 	}
 	go s.sendLoop(stream)
 	return s
+}
+
+// observeSubscribeDeliveryLag records, for a real metadata event that was just
+// sent, the seconds from its original mutation stamp until delivery. It skips
+// control messages (heartbeats, flush reports) and log-file-ref envelopes, which
+// carry no mutation. MutationTsNs is the original stamp (TsNs is the stream
+// position, which the buffer can move forward past a late event); payloads older
+// than the MutationTsNs field still carry the stamp in TsNs.
+func observeSubscribeDeliveryLag(scope string, msg *filer_pb.SubscribeMetadataResponse) {
+	if msg == nil || msg.EventNotification == nil || len(msg.LogFileRefs) > 0 || filer_pb.IsEmpty(msg) {
+		// Skip control messages, log-file-ref envelopes, and the empty progress
+		// markers sent after MaxUnsyncedEvents filtered entries: none is a real
+		// delivery, and the marker carries the filtered entry's position (TsNs),
+		// not a mutation.
+		return
+	}
+	stampNs := msg.MutationTsNs
+	if stampNs == 0 {
+		stampNs = msg.TsNs
+	}
+	if stampNs <= 0 {
+		return
+	}
+	stats.FilerSubscribeDeliveryLagSeconds.WithLabelValues(scope).Observe(float64(time.Now().UnixNano()-stampNs) / 1e9)
 }
 
 func (s *pipelinedSender) sendLoop(stream metadataStreamSender) {
@@ -144,6 +171,14 @@ func (s *pipelinedSender) sendLoop(stream metadataStreamSender) {
 				s.reportErr(err)
 			}
 			return false
+		}
+		// Record delivery lag only after the event actually reached the client
+		// over the stream: Send() above is the real gRPC send (this loop runs
+		// off the queue), and a batched envelope carries its extra events in
+		// Events, so each one is sampled here too.
+		observeSubscribeDeliveryLag(s.scope, msg)
+		for _, ev := range msg.Events {
+			observeSubscribeDeliveryLag(s.scope, ev)
 		}
 		return true
 	}
@@ -299,6 +334,19 @@ func memoryHoldsGap(currentTsNs, lastEvictedTsNs int64) bool {
 		return true // nothing was ever dropped from the ring
 	}
 	return currentTsNs >= lastEvictedTsNs
+}
+
+// ringServesCursor reports whether the aggregated ring alone can serve a read
+// from the cursor: it was already filling at the cursor, evicted nothing
+// after it (lastEvictedTsNs in pre-bump timestamps, as the gap checks take it),
+// and every peer was streaming into it by then (newPeerStartTsNs). An empty
+// ring, or one that starts past the cursor, proves nothing about what only the
+// persisted logs hold.
+func ringServesCursor(cursorTsNs int64, earliest time.Time, lastEvictedTsNs, newPeerStartTsNs int64) bool {
+	if earliest.IsZero() || earliest.UnixNano() > cursorTsNs || cursorTsNs < newPeerStartTsNs {
+		return false
+	}
+	return memoryHoldsGap(cursorTsNs, lastEvictedTsNs)
 }
 
 // errHeldByPeerWatermark aborts a read at an entry beyond the hold point; the
@@ -627,6 +675,18 @@ func (p *gapPass) park(ctx context.Context, cursor *log_buffer.MessagePosition, 
 }
 
 func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeMetadataServer) (err error) {
+	scope, err := fs.metadataSubscriptionScope(stream.Context(), security.MethodSubscribeMetadata)
+	if err != nil {
+		return err
+	}
+	if scope != nil {
+		req.ClientSupportsMetadataChunks = false
+		req.ClientId, req.ClientEpoch = fs.unusedClientId(), scopedClientEpoch
+		scoped, cancel := newScopedMetadataStream(stream.Context(), scope)
+		defer cancel()
+		defer func() { err = scoped.endErr(err) }()
+		stream = &scopedSubscribeStream{SeaweedFiler_SubscribeMetadataServer: stream, scopedMetadataStream: scoped}
+	}
 	// A filer that has not learned remote peers yet serves the local log and
 	// upgrades when the first one appears. RemotePeerArrivedChan takes the
 	// arrival channel under the same lock as the peer check, so a peer
@@ -669,7 +729,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	// had already arrived and been delivered).
 	diskAnchorTsNs := req.SinceNs
 
-	sender := newPipelinedSender(ctx, stream, 1024, req.ClientSupportsBatching)
+	sender := newPipelinedSender(ctx, stream, 1024, req.ClientSupportsBatching, "aggregated")
 	defer sender.Close()
 
 	// Register for instant notification when new data arrives in the aggregated log buffer.
@@ -683,6 +743,8 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	aggReaderName := fmt.Sprintf("aggMeta:%s:%d:%d", clientName, req.ClientId, req.ClientEpoch)
 	aggNotifyChan := fs.filer.MetaAggregator.MetaLogBuffer.RegisterSubscriber(aggNotifyName)
 	defer fs.filer.MetaAggregator.MetaLogBuffer.UnregisterSubscriber(aggNotifyName)
+	fs.filer.MetaAggregator.MetaLogBuffer.SetSubscriberWakeFilter(aggReaderName, subscriptionWakeFilter(req))
+	defer fs.filer.MetaAggregator.MetaLogBuffer.SetSubscriberWakeFilter(aggReaderName, nil)
 
 	gapStall := &gapStallReporter{scope: "aggregated", clientName: clientName, pathPrefix: req.PathPrefix}
 	defer gapStall.close()
@@ -700,6 +762,23 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	// diskHeldAtTsNs is the same marker for the disk pass alone: a pending
 	// disk hold keeps the pass re-reading until the entry is served.
 	var heldAtTsNs, diskHeldAtTsNs int64
+
+	// A watermark hold on one entry spans many waitHeld retries; waitHeld starts
+	// the timing and the read records the whole hold once -- when it passes the
+	// held entry, or the subscription ends -- not per retry, which would turn a
+	// long hold into many short samples. holdScope is memory or disk.
+	var holdEntryTsNs int64
+	var holdStart time.Time
+	var holdScope string
+	flushHold := func() {
+		if holdEntryTsNs != 0 {
+			// time.Since uses the monotonic clock, so a wall-clock step back
+			// mid-hold cannot produce a negative duration.
+			stats.FilerSubscribeHoldSeconds.WithLabelValues(holdScope).Observe(time.Since(holdStart).Seconds())
+			holdEntryTsNs = 0
+		}
+	}
+	defer flushHold()
 	// Each read path holds at its own watermark: persisted logs are complete
 	// only up to every peer's flush watermark, the ring only up to every
 	// peer's delivery watermark.
@@ -715,6 +794,12 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			if logEntry.TsNs > holdFn() {
 				heldAtTsNs = logEntry.TsNs
 				return false, errHeldByPeerWatermark
+			}
+			if holdEntryTsNs != 0 && logEntry.TsNs >= holdEntryTsNs {
+				// The read passed the held entry: the hold is over, so record
+				// its duration now. >= also covers a cursor the gap machinery
+				// moved past the held entry.
+				flushHold()
 			}
 			lastSeenTsNs = logEntry.TsNs
 			deliveredUpToTsNs = logEntry.TsNs
@@ -750,6 +835,12 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 	// False: context ended.
 	waitHeld := func(scope string, watermarkChan <-chan struct{}) bool {
 		stats.FilerSubscribeWatermarkHolds.WithLabelValues(scope).Inc()
+		if heldAtTsNs != holdEntryTsNs {
+			// A different entry is now held: the previous hold (if any) was
+			// released, so record it and start timing this one.
+			flushHold()
+			holdEntryTsNs, holdStart, holdScope = heldAtTsNs, time.Now(), scope
+		}
 		glog.V(3).Infof("held at %v (deliveredUpTo %v, flushLow %v, deliveryLow %v) for %v",
 			time.Unix(0, heldAtTsNs), time.Unix(0, deliveredUpToTsNs),
 			time.Unix(0, fs.filer.MetaAggregator.PeerLowFlushWatermarkTsNs()),
@@ -833,6 +924,9 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			time.Since(lastDiskPassAt) >= aggDiskReprobeInterval
 
 		diskAdvanced := false
+		// Set when the persisted logs were not read because memory holds
+		// everything after the cursor: nothing on disk was proven empty.
+		memoryServesCursor := false
 		if shouldReadFromDisk {
 			lastCheckedFlushTsNs = currentFlushTsNs
 			lastCheckedFlushLowTsNs = diskPassFlushLowTsNs
@@ -853,6 +947,27 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 				} else {
 					processedTsNs, isDone, readPersistedLogErr = 0, false, nil
 				}
+			} else if cursorTsNs := lastReadTime.Time.UnixNano(); !errors.Is(readInMemoryLogErr, log_buffer.ResumeFromDiskError) &&
+				ringServesCursor(cursorTsNs, aggBuffer.GetEarliestTime(), aggBuffer.GetLastEvictedOriginalTsNs(), fs.filer.MetaAggregator.NewPeerStartTsNs()) {
+				// The ring holds everything after the cursor (every peer's log
+				// reaches it through this aggregator), so read it there, held at
+				// the delivery low-watermark. The persisted logs are complete only
+				// through the peers' flush low-watermark, and the peers that flushed
+				// after the slowest one already have files past it: a pass from a
+				// caught-up cursor holds on the first of them. Each cursor move
+				// (every memory hold, every re-probe) started such a pass, so on a
+				// cluster that keeps writing the stream stayed in the disk hold and
+				// got each event only once the slowest peer flushed it, up to a
+				// flush interval late. Chunk subscribers are served the same way:
+				// their ref listing stops below the flush hold.
+				//
+				// A cursor memory just refused still takes the pass; the gap checks
+				// below re-arm it from there.
+				if cursorTsNs < diskPassProvenTsNs {
+					diskPassProvenTsNs = cursorTsNs
+				}
+				memoryServesCursor = true
+				processedTsNs, isDone, readPersistedLogErr = 0, false, nil
 			} else {
 				processedTsNs, isDone, readPersistedLogErr = fs.filer.ReadPersistedLogBuffer(ctx, lastReadTime, req.UntilNs, diskEachLogEntryFn)
 			}
@@ -894,7 +1009,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 				if processedTsNs > diskAnchorTsNs {
 					diskAnchorTsNs = processedTsNs
 				}
-			} else if readInMemoryLogErr == nil {
+			} else if readInMemoryLogErr == nil && !memoryServesCursor {
 				// Nothing on disk and memory never spoke: scan forward for the next
 				// day that has logs.
 				nextDayTs := util.GetNextDayTsNano(lastReadTime.Time.UnixNano())
@@ -989,6 +1104,7 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 				continue
 			}
 			if errors.Is(readInMemoryLogErr, log_buffer.ResumeFromDiskError) {
+				stats.FilerSubscribeResumeFromDisk.WithLabelValues("aggregated").Inc()
 				// Fell off the ring: resume the disk pass from the anchor, not
 				// the (possibly bumped) cursor - redelivery is within the
 				// at-least-once contract, skipping is not. For an anchored
@@ -1083,7 +1199,19 @@ func (fs *FilerServer) endOfSubscription(stream context.Context, err error) erro
 	return err
 }
 
-func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeLocalMetadataServer) error {
+func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeLocalMetadataServer) (err error) {
+	scope, err := fs.metadataSubscriptionScope(stream.Context(), security.MethodSubscribeLocalMetadata)
+	if err != nil {
+		return err
+	}
+	if scope != nil {
+		req.ClientSupportsMetadataChunks = false
+		req.ClientId, req.ClientEpoch = fs.unusedClientId(), scopedClientEpoch
+		scoped, cancel := newScopedMetadataStream(stream.Context(), scope)
+		defer cancel()
+		defer func() { err = scoped.endErr(err) }()
+		stream = &scopedSubscribeLocalStream{SeaweedFiler_SubscribeLocalMetadataServer: stream, scopedMetadataStream: scoped}
+	}
 	return fs.subscribeLocalMetadata(req, stream, nil)
 }
 
@@ -1114,7 +1242,7 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	lastReadTime := log_buffer.NewMessagePosition(req.SinceNs, gapResumeCursorOffset)
 	glog.V(0).Infof(" + %v local subscribe %s from %+v clientId:%d", clientName, req.PathPrefix, lastReadTime, req.ClientId)
 
-	sender := newPipelinedSender(ctx, stream, 1024, req.ClientSupportsBatching)
+	sender := newPipelinedSender(ctx, stream, 1024, req.ClientSupportsBatching, "local")
 	defer sender.Close()
 
 	// Bounded gap waits use the buffer's subscriber notification plus a retry
@@ -1127,6 +1255,8 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	localReaderName := fmt.Sprintf("localMeta:%s:%d:%d", clientName, req.ClientId, req.ClientEpoch)
 	localFlushChan := fs.filer.LocalMetaLogBuffer.RegisterFlushSubscriber(localNotifyName)
 	defer fs.filer.LocalMetaLogBuffer.UnregisterFlushSubscriber(localNotifyName)
+	fs.filer.LocalMetaLogBuffer.SetSubscriberWakeFilter(localReaderName, subscriptionWakeFilter(req))
+	defer fs.filer.LocalMetaLogBuffer.SetSubscriberWakeFilter(localReaderName, nil)
 
 	gapStall := &gapStallReporter{scope: "local", clientName: clientName, pathPrefix: req.PathPrefix}
 	defer gapStall.close()
@@ -1283,6 +1413,7 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 				return errAggregationUpgrade
 			}
 			if errors.Is(readInMemoryLogErr, log_buffer.ResumeFromDiskError) {
+				stats.FilerSubscribeResumeFromDisk.WithLabelValues("local").Inc()
 				// Fell behind the ring: back to the disk pass (it re-runs when
 				// the flush or the cursor moved), and from there to the gap
 				// resolution above if the disk has nothing either.
@@ -1305,11 +1436,32 @@ func (fs *FilerServer) subscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 
 }
 
+// subscriptionWakeFilter lets a reader sleep through appends in directories
+// the subscription cannot match; it reads them on its next poll instead.
+func subscriptionWakeFilter(req *filer_pb.SubscribeMetadataRequest) func(key []byte) bool {
+	if req.PathPrefix == "" {
+		return nil
+	}
+	return func(key []byte) bool {
+		return filer_pb.MetadataDirectoryMayMatchSubscription(key, req.PathPrefix, req.PathPrefixes, req.Directories)
+	}
+}
+
 func eachLogEntryFn(ctx context.Context, req *filer_pb.SubscribeMetadataRequest, sender metadataStreamSender, eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64, mutationTsNs int64) error, filtered *int64) log_buffer.EachLogEntryFuncType {
 	// A shallow scan of the path fields skips unmarshaling chunk-heavy events
 	// this subscriber would filter out anyway; scan surprises fall back to the
 	// full decode. Only a delivery resets the shared unsynced-events counter.
 	prefilter := req.PathPrefix != "" || len(req.PathPrefixes) > 0 || len(req.Directories) > 0
+	mayMatch := subscriptionWakeFilter(req)
+	skip := func(data []byte) bool {
+		if mayMatch != nil {
+			if dir, target, ok := filer_pb.ScanMetadataEventDirectories(data); ok && !mayMatch(dir) && (len(target) == 0 || !mayMatch(target)) {
+				return true
+			}
+		}
+		skeleton, ok := filer_pb.ScanMetadataEventSkeleton(data)
+		return ok && !filer_pb.MetadataEventMatchesSubscription(skeleton, req.PathPrefix, req.PathPrefixes, req.Directories)
+	}
 	return func(logEntry *filer_pb.LogEntry) (bool, error) {
 		// A cancelled context ends the pass here: neither loop checks it
 		// per entry, and the send path alone cannot cover filtered entries.
@@ -1317,8 +1469,7 @@ func eachLogEntryFn(ctx context.Context, req *filer_pb.SubscribeMetadataRequest,
 			return true, nil
 		}
 		if prefilter {
-			if skeleton, ok := filer_pb.ScanMetadataEventSkeleton(logEntry.Data); ok &&
-				!filer_pb.MetadataEventMatchesSubscription(skeleton, req.PathPrefix, req.PathPrefixes, req.Directories) {
+			if skip(logEntry.Data) {
 				*filtered++
 				if *filtered > MaxUnsyncedEvents {
 					if err := sender.Send(&filer_pb.SubscribeMetadataResponse{

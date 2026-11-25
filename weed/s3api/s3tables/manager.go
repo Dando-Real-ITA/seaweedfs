@@ -47,6 +47,16 @@ func (m *Manager) SetTrusted(trusted bool) {
 	m.handler.SetTrusted(trusted)
 }
 
+// SetLocalAccountChecker sets the handler's configured local account predicate.
+func (m *Manager) SetLocalAccountChecker(fn func(string) bool) {
+	m.handler.SetLocalAccountChecker(fn)
+}
+
+// SetTrustedIssuerSource sets the handler's configured OIDC issuer source.
+func (m *Manager) SetTrustedIssuerSource(fn func(context.Context) []string) {
+	m.handler.SetTrustedIssuerSource(fn)
+}
+
 // SetEncryptionChecker sets the handler's SSE-S3 availability predicate.
 func (m *Manager) SetEncryptionChecker(fn func() bool) {
 	m.handler.SetEncryptionChecker(fn)
@@ -70,7 +80,7 @@ func (m *Manager) PrincipalFor(r *http.Request) string {
 // action scoped to that bucket apply, as the handlers do.
 func (m *Manager) PolicyContext(r *http.Request, bucket string) *PolicyContext {
 	ctx := &PolicyContext{IsLocalAccountID: m.handler.localAccountIDs, IdentityActions: getIdentityActions(r),
-		TrustedIssuers: m.handler.trustedIssuers(r), TableBucketName: bucket}
+		TrustedIssuers: m.handler.trustedIssuers(r), Subject: callerSubject(r), TableBucketName: bucket}
 	if m.handler.trusted || (m.handler.defaultAllow && s3_constants.GetIdentityNameFromContext(r) == "") {
 		ctx.DefaultAllow = true
 	}
@@ -86,6 +96,16 @@ type tableBucketCreatedAtKey struct{}
 // In-process only: no wire request can carry it.
 func WithTableBucketCreatedAt(ctx context.Context, createdAt time.Time) context.Context {
 	return context.WithValue(ctx, tableBucketCreatedAtKey{}, createdAt)
+}
+
+type tableStagedAtKey struct{}
+
+// WithTableStagedAt dates a CreateTable run through Execute from stagedAt, when
+// a staged create handed out the table's location, so the files the engine
+// wrote there before the commit are the table's. In-process only, like
+// WithTableBucketCreatedAt.
+func WithTableStagedAt(ctx context.Context, stagedAt time.Time) context.Context {
+	return context.WithValue(ctx, tableStagedAtKey{}, stagedAt)
 }
 
 // boundTableBucket returns the bucket creation time ctx binds the request to.

@@ -122,6 +122,51 @@ fn exceeds_expected_compacted_size(expected_live_bytes: u64, dst_dat_size: u64) 
     expected_live_bytes > dst_dat_size
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveTally {
+    count: u64,
+    bytes: u64,
+}
+
+impl LiveTally {
+    fn add(&mut self, size: Size) {
+        self.count += 1;
+        self.bytes += size.0.max(0) as u64;
+    }
+}
+
+fn is_live_index_entry(offset: Offset, size: Size) -> bool {
+    !offset.is_zero() && !size.is_deleted()
+}
+
+/// Fails when the copy did not account for every live entry of the snapshot,
+/// or the compacted .dat is short of them.
+fn check_compacted_against_snapshot(
+    id: VolumeId,
+    snapshot: LiveTally,
+    copied: LiveTally,
+    expired: LiveTally,
+    unreadable: LiveTally,
+    dst_dat_size: u64,
+) -> Result<(), String> {
+    let accounted = copied.count + expired.count + unreadable.count;
+    let dropped_bytes = expired.bytes + unreadable.bytes;
+    if accounted != snapshot.count || dropped_bytes > snapshot.bytes {
+        return Err(format!(
+            "volume {} compaction accounted for {} of {} live index entries ({} copied, {} expired, {} unreadable)",
+            id.0, accounted, snapshot.count, copied.count, expired.count, unreadable.count
+        ));
+    }
+    let expected_live_bytes = snapshot.bytes - dropped_bytes;
+    if exceeds_expected_compacted_size(expected_live_bytes, dst_dat_size) {
+        return Err(format!(
+            "volume {} unexpected new data size: {} does not match expected live content size {} from the pre-compaction snapshot",
+            id.0, dst_dat_size, expected_live_bytes
+        ));
+    }
+    Ok(())
+}
+
 /// Read and parse the needle at `offset` through `read_at`.
 fn read_needle_with(
     read_at: impl Fn(&mut [u8], u64) -> Result<(), VolumeError>,
@@ -897,6 +942,13 @@ impl NeedleReadPlan {
             self.io_errors.check_read_write_error(Some(e));
         }
         result?;
+        if n.id != self.needle_id {
+            warn!(
+                "index entry for needle {} resolves to needle {}; reporting not-found",
+                self.needle_id.0, n.id.0
+            );
+            return Err(VolumeError::NotFound);
+        }
         if needle_expired(n) {
             return Err(VolumeError::NotFound);
         }
@@ -966,6 +1018,23 @@ fn needle_expired(n: &Needle) -> bool {
     now_ns >= expire_at_ns
 }
 
+/// Applies the volume TTL when the volume has one, and otherwise the needle's
+/// own TTL the way reads do.
+fn vacuum_ttl_expired(
+    n: &Needle,
+    volume_ttl: &crate::storage::needle::ttl::TTL,
+    now_secs: u64,
+) -> bool {
+    if !n.has_ttl() {
+        return false;
+    }
+    let ttl_minutes = volume_ttl.minutes();
+    if ttl_minutes == 0 {
+        return needle_expired(n);
+    }
+    n.last_modified > 0 && now_secs >= n.last_modified + (ttl_minutes as u64) * 60
+}
+
 /// Holds `Volume::is_compacting` set; dropping it clears the flag.
 struct CompactionClaim(Arc<AtomicBool>);
 
@@ -987,6 +1056,7 @@ impl Drop for CompactionClaim {
 /// append-only below `idx_size`, and `makeup_diff` replays what lands after.
 pub(crate) struct CompactionJob {
     id: VolumeId,
+    collection: String,
     src_dat: NeedleStreamSource,
     src_idx: File,
     idx_size: u64,
@@ -1028,11 +1098,11 @@ impl CompactionJob {
             .unwrap_or_default()
             .as_secs();
 
-        let entries = self.live_entries()?;
+        let (entries, snapshot) = self.live_entries()?;
 
-        let mut skipped_needles: u64 = 0;
-        let mut skipped_data_bytes: u64 = 0;
-        let mut expected_live_bytes: u64 = 0;
+        let mut copied = LiveTally::default();
+        let mut expired = LiveTally::default();
+        let mut unreadable = LiveTally::default();
         for (id, offset, size) in entries {
             // Progress callback
             if !progress_fn(offset.to_actual_offset()) {
@@ -1073,11 +1143,8 @@ impl CompactionJob {
                         e
                     ))));
                 }
-                skipped_needles += 1;
-                if size.is_valid() {
-                    skipped_data_bytes += size.0 as u64;
-                }
-                warn!(
+                unreadable.add(size);
+                error!(
                     volume_id = self.id.0,
                     key = id.0,
                     offset = offset.to_actual_offset(),
@@ -1088,21 +1155,18 @@ impl CompactionJob {
                 continue;
             }
 
-            // Skip TTL-expired needles using the volume's TTL (matches Go's volume_vacuum.go)
-            if n.has_ttl() {
-                let ttl_minutes = self.super_block.ttl.minutes();
-                if ttl_minutes > 0 && n.last_modified > 0 {
-                    let expire_at = n.last_modified + (ttl_minutes as u64) * 60;
-                    if now >= expire_at {
-                        continue;
-                    }
-                }
+            if vacuum_ttl_expired(&n, &self.super_block.ttl, now) {
+                expired.add(size);
+                debug!(
+                    volume_id = self.id.0,
+                    key = id.0,
+                    offset = offset.to_actual_offset(),
+                    size = size.0,
+                    "vacuum: dropping TTL-expired needle"
+                );
+                continue;
             }
-
-            // Tally the live bytes from the frozen snapshot this loop copied
-            // from, not the live needle map. Unreadable needles return before
-            // this point, so no further skipped-byte adjustment is needed.
-            expected_live_bytes += size.0 as u64;
+            copied.add(size);
 
             // Write needle to destination
             let bytes = n.write_bytes(version);
@@ -1113,34 +1177,49 @@ impl CompactionJob {
             new_offset += bytes.len() as i64;
         }
 
-        if skipped_needles > 0 {
+        if unreadable.count > 0 {
             warn!(
                 volume_id = self.id.0,
-                skipped_needles,
-                skipped_data_bytes,
+                skipped_needles = unreadable.count,
+                skipped_data_bytes = unreadable.bytes,
                 "vacuum: dropped unreadable index entries during compaction"
+            );
+        }
+        if expired.count > 0 {
+            debug!(
+                volume_id = self.id.0,
+                expired_needles = expired.count,
+                expired_data_bytes = expired.bytes,
+                "vacuum: dropped TTL-expired needles"
             );
         }
 
         dst.sync_all()?;
 
-        if self.super_block.ttl.is_empty() {
-            let dst_dat_size = dst.metadata()?.len();
-            if exceeds_expected_compacted_size(expected_live_bytes, dst_dat_size) {
-                let _ = fs::remove_file(cpd_path);
-                let _ = fs::remove_file(cpx_path);
-                return Err(VolumeError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "volume {} unexpected new data size: {} does not match expected live content size {} from the pre-compaction snapshot",
-                        self.id.0, dst_dat_size, expected_live_bytes
-                    ),
-                )));
-            }
+        let dst_dat_size = dst.metadata()?.len();
+        if let Err(msg) = check_compacted_against_snapshot(
+            self.id,
+            snapshot,
+            copied,
+            expired,
+            unreadable,
+            dst_dat_size,
+        ) {
+            let _ = fs::remove_file(cpd_path);
+            let _ = fs::remove_file(cpx_path);
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                msg,
+            )));
         }
 
         // Save new index
         new_nm.save_to_idx(cpx_path)?;
+        if unreadable.count > 0 {
+            crate::metrics::VACUUMING_DROPPED_NEEDLES_COUNTER
+                .with_label_values(&[&self.collection])
+                .inc_by(unreadable.count);
+        }
 
         Ok(())
     }
@@ -1148,9 +1227,12 @@ impl CompactionJob {
     /// Replay `.idx` up to the recorded size, as Go's `LoadFromIdx` does, and
     /// return the live entries in `.dat` order. A short read fails: treating
     /// it as the whole index would compact away every needle past it.
-    fn live_entries(&self) -> Result<Vec<(NeedleId, Offset, Size)>, VolumeError> {
+    /// Returns the live entries in offset order, and a tally of them taken
+    /// while replaying the rows, independently of the map traversal.
+    fn live_entries(&self) -> Result<(Vec<(NeedleId, Offset, Size)>, LiveTally), VolumeError> {
         let rows = self.idx_size / NEEDLE_MAP_ENTRY_SIZE as u64;
         let mut snapshot = CompactNeedleMap::new();
+        let mut live = LiveTally::default();
         let mut seen = 0u64;
         // Rows past the recorded size are makeup_diff's; do not read them.
         let mut reader = io::BufReader::new((&self.src_idx).take(self.idx_size));
@@ -1162,10 +1244,17 @@ impl CompactionJob {
                 Err(e) => return Err(e.into()),
             }
             let (key, offset, size) = idx_entry_from_bytes(&buf);
-            if offset.is_zero() || size.is_deleted() {
-                snapshot.delete(key, offset)?;
-            } else {
+            if let Some(prior) = snapshot.get(key)
+                && is_live_index_entry(prior.offset, prior.size)
+            {
+                live.count -= 1;
+                live.bytes -= prior.size.0.max(0) as u64;
+            }
+            if is_live_index_entry(offset, size) {
+                live.add(size);
                 snapshot.put(key, offset, size)?;
+            } else {
+                snapshot.delete(key, offset)?;
             }
             seen += 1;
         }
@@ -1181,13 +1270,13 @@ impl CompactionJob {
 
         let mut entries: Vec<(NeedleId, Offset, Size)> = Vec::new();
         let _ = snapshot.ascending_visit(|id, nv| {
-            if !nv.offset.is_zero() && !nv.size.is_deleted() {
+            if is_live_index_entry(nv.offset, nv.size) {
                 entries.push((id, nv.offset, nv.size));
             }
             Ok::<(), std::convert::Infallible>(())
         });
         entries.sort_by_key(|(_, offset, _)| *offset);
-        Ok(entries)
+        Ok((entries, live))
     }
 }
 
@@ -1241,6 +1330,10 @@ struct VerifiedNeedle {
 const RANGE_CHECK_BLOCKS: u64 = 64;
 const MIN_RANGE_CHECK_BLOCK_SIZE: u64 = 64 * 1024;
 const MAX_RANGE_CHECK_BLOCK_SIZE: u64 = 1024 * 1024;
+
+pub(crate) fn compacting_error(id: VolumeId) -> VolumeError {
+    VolumeError::Io(io::Error::other(format!("volume {} is compacting", id)))
+}
 
 /// Keeps a needle to 64 blocks, each 64 KiB to 1 MiB, as Go's
 /// rangeCheckBlockSize.
@@ -1617,6 +1710,8 @@ pub struct Volume {
     dat_syncs_for_test: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     idx_syncs_for_test: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    on_flush_dat_for_test: Mutex<Option<Box<dyn FnOnce(&Volume) + Send>>>,
     needle_map_kind: NeedleMapKind,
     data_file_access_control: Arc<DataFileAccessControl>,
     /// Serializes a data-file mutation with the sync that makes it durable:
@@ -1696,6 +1791,12 @@ pub struct PendingWrite {
     writes: Arc<PendingWrites>,
     id: NeedleId,
     flag: Arc<CancelFlag>,
+}
+
+/// A write cancelled before it appends is refused: its delete may already be
+/// durable, and an unsynced row could outlive its tombstone.
+fn is_cancelled_write(pending: Option<&PendingWrite>) -> bool {
+    pending.is_some_and(|p| p.flag.cancelled.load(Ordering::Acquire))
 }
 
 impl Drop for PendingWrite {
@@ -1781,6 +1882,8 @@ impl Volume {
             dat_syncs_for_test: Default::default(),
             #[cfg(test)]
             idx_syncs_for_test: Default::default(),
+            #[cfg(test)]
+            on_flush_dat_for_test: Default::default(),
             needle_map_kind,
             data_file_access_control: Arc::new(DataFileAccessControl::default()),
             data_file_sync_lock: std::sync::Mutex::new(()),
@@ -1840,6 +1943,8 @@ impl Volume {
             dat_syncs_for_test: Default::default(),
             #[cfg(test)]
             idx_syncs_for_test: Default::default(),
+            #[cfg(test)]
+            on_flush_dat_for_test: Default::default(),
             needle_map_kind: NeedleMapKind::InMemory,
             data_file_access_control: Arc::new(DataFileAccessControl::default()),
             data_file_sync_lock: std::sync::Mutex::new(()),
@@ -1913,10 +2018,7 @@ impl Volume {
     }
 
     pub(crate) fn compacting_error(&self) -> VolumeError {
-        VolumeError::Io(io::Error::other(format!(
-            "volume {} is compacting",
-            self.id
-        )))
+        compacting_error(self.id)
     }
 
     // ---- File naming (matching Go) ----
@@ -2497,9 +2599,15 @@ impl Volume {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn load_remote_dat_file(&self) -> Result<(), VolumeError> {
         let _sync_guard = self.data_file_sync_lock.lock().unwrap();
         let _guard = self.data_file_access_control.write_lock();
+        self.load_remote_dat_file_held()
+    }
+
+    /// `load_remote_dat_file` for callers already holding the write lease.
+    pub(crate) fn load_remote_dat_file_held(&self) -> Result<(), VolumeError> {
         let mut io = self.io.write().unwrap();
         self.load_remote_dat_file_io(&mut io)
     }
@@ -2758,6 +2866,23 @@ impl Volume {
         }
 
         Ok(n.data_size as i32)
+    }
+
+    /// Go's Volume.LookupNeedle: the needle map size of `id`, without reading
+    /// its record, so a needle past its TTL still counts as present.
+    pub fn lookup_needle(&self, id: NeedleId) -> Result<Option<Size>, VolumeError> {
+        let _guard = self.data_file_access_control.read_lock();
+        if let Some(e) = self.unavailable_error() {
+            return Err(e);
+        }
+        let io = self.io.read().unwrap();
+        let Some(nm) = io.nm.as_ref() else {
+            return Ok(None);
+        };
+        Ok(nm
+            .get(id)?
+            .filter(|nv| !nv.offset.is_zero())
+            .map(|nv| nv.size))
     }
 
     /// Read needle data from .dat file at given offset.
@@ -3055,6 +3180,9 @@ impl Volume {
         let _sync_guard = self.data_file_sync_lock.lock().unwrap();
         let _guard = self.data_file_access_control.write_lock();
         let mut io = self.io.write().unwrap();
+        if is_cancelled_write(pending) {
+            return Err(VolumeError::Deleted);
+        }
         if let Err(refused) = self.check_writable() {
             return Ok(Err(refused));
         }
@@ -3105,11 +3233,14 @@ impl Volume {
                 let _guard = self.data_file_access_control.write_lock();
                 let mut io = self.io.write().unwrap();
                 for (i, (n, _)) in run.iter_mut().enumerate() {
-                    let written = self
-                        .check_writable()
-                        .and_then(|()| self.do_write_request(&mut io, n, true, false));
+                    let pending = tracked.get(i).and_then(Option::as_ref);
+                    let written = self.check_writable().and_then(|()| {
+                        if is_cancelled_write(pending) {
+                            return Err(VolumeError::Deleted);
+                        }
+                        self.do_write_request(&mut io, n, true, false)
+                    });
                     results.push(written.and_then(|written| {
-                        let pending = tracked.get(i).and_then(Option::as_ref);
                         self.drop_cancelled_write(&mut io, pending, n, &written)
                             .map(|()| written)
                     }));
@@ -3140,8 +3271,12 @@ impl Volume {
             let _guard = self.data_file_access_control.write_lock();
             let mut io = self.io.write().unwrap();
             last_append_at_ns = io.last_append_at_ns;
-            for (n, fsync) in run.iter_mut() {
-                let r = self.append_unpublished(&mut io, n, &mut last_append_at_ns);
+            for (i, (n, fsync)) in run.iter_mut().enumerate() {
+                let r = if is_cancelled_write(pending.get(i).and_then(Option::as_ref)) {
+                    Err(VolumeError::Deleted)
+                } else {
+                    self.append_unpublished(&mut io, n, &mut last_append_at_ns)
+                };
                 marks.push(self.io_errors.mark());
                 if let Ok(Some(offset)) = r {
                     run_start.get_or_insert(offset);
@@ -3287,6 +3422,13 @@ impl Volume {
     pub(crate) fn flush_dat(&self, io: &VolumeIo) -> io::Result<()> {
         #[cfg(test)]
         self.dat_syncs_for_test.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            let hook = self.on_flush_dat_for_test.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
         #[cfg(test)]
         if io.fail_fsync_for_test {
             return Err(io::Error::other("injected fsync failure"));
@@ -3798,28 +3940,85 @@ impl Volume {
 
     // ---- Delete ----
 
-    /// Delete a needle from the volume.
-    pub fn delete_needle(&self, n: &mut Needle) -> Result<Size, VolumeError> {
+    /// Delete a needle from the volume. With `fsync` the delete is only
+    /// acknowledged once its tombstone and .idx row are on disk, in the same
+    /// order as a durable write; the write guards are dropped for each flush
+    /// as in write_synced_run, so reads do not wait on the fsync.
+    pub fn delete_needle(&self, n: &mut Needle, fsync: bool) -> Result<Size, VolumeError> {
         self.cancel_pending_writes(n.id, n.cookie);
         let _sync_guard = self.data_file_sync_lock.lock().unwrap();
+        let staged = {
+            let _guard = self.data_file_access_control.write_lock();
+            let mut io = self.io.write().unwrap();
+            if self.is_closed() {
+                // A detached handle has no index; without this check the tombstone
+                // would silently no-op as Ok(0) while the needle lives on the
+                // remounted volume.
+                return Err(VolumeError::NotFound);
+            }
+            if let Some(e) = self.unavailable_error() {
+                return Err(e);
+            }
+            if self.no_write_flags().0 {
+                return Err(VolumeError::ReadOnly(self.id));
+            }
+            if !fsync {
+                return self.do_delete_request(&mut io, n);
+            }
+            self.append_delete_request(&mut io, n)?
+        };
+        // An already-deleted needle still syncs: an earlier delete may have
+        // skipped it.
+        if !self.has_remote_file() {
+            let io = self.io.read().unwrap();
+            if let Err(e) = self.flush_dat(&io) {
+                self.check_read_write_error(Some(&e));
+                if let Some((offset, _)) = staged {
+                    self.undo_unsynced_append(&io, offset);
+                }
+                return Err(VolumeError::Io(e));
+            }
+        }
+        if let Some((offset, _)) = staged {
+            let _guard = self.data_file_access_control.write_lock();
+            let mut io = self.io.write().unwrap();
+            self.publish_delete_request(&mut io, n, offset)?;
+        }
+        self.flush_idx(&self.io.read().unwrap())?;
+        let Some((_, size)) = staged else {
+            return Ok(Size(0));
+        };
         let _guard = self.data_file_access_control.write_lock();
         let mut io = self.io.write().unwrap();
-        if self.is_closed() {
-            // A detached handle has no index; without this check the tombstone
-            // would silently no-op as Ok(0) while the needle lives on the
-            // remounted volume.
-            return Err(VolumeError::NotFound);
+        if self.maybe_checkpoint_index(&mut io, true) {
+            self.check_read_write_error(None);
         }
-        if let Some(e) = self.unavailable_error() {
-            return Err(e);
-        }
-        if self.no_write_flags().0 {
-            return Err(VolumeError::ReadOnly(self.id));
-        }
-        self.do_delete_request(&mut io, n)
+        Ok(size)
     }
 
     fn do_delete_request(&self, io: &mut VolumeIo, n: &mut Needle) -> Result<Size, VolumeError> {
+        let Some((offset, size)) = self.append_delete_request(io, n)? else {
+            return Ok(Size(0));
+        };
+        self.publish_delete_request(io, n, offset)?;
+        let checkpoint_ok = self.maybe_checkpoint_index(io, false);
+
+        // Clear the EIO streak after a successful delete (tombstone append +
+        // index update + checkpoint), mirroring do_write_request.
+        if checkpoint_ok {
+            self.check_read_write_error(None);
+        }
+
+        Ok(size)
+    }
+
+    /// do_delete_request through the tombstone append, leaving the index
+    /// update to publish_delete_request. None when there is nothing to delete.
+    fn append_delete_request(
+        &self,
+        io: &mut VolumeIo,
+        n: &mut Needle,
+    ) -> Result<Option<(u64, Size)>, VolumeError> {
         let (found, size, _stored_offset) = if let Some(nm) = &io.nm {
             // Propagate: acknowledging the delete as a no-op because the index
             // could not be read would drop the tombstone on the floor while the
@@ -3834,11 +4033,11 @@ impl Volume {
                 (false, Size(0), Offset::default())
             }
         } else {
-            return Ok(Size(0));
+            return Ok(None);
         };
 
         if !found {
-            return Ok(Size(0));
+            return Ok(None);
         }
 
         // Write tombstone: append needle with empty data
@@ -3853,26 +4052,38 @@ impl Volume {
             // Remote-tiered volume: skip .dat append, use offset 0
             0
         };
+        Ok(Some((offset, size)))
+    }
+
+    fn publish_delete_request(
+        &self,
+        io: &mut VolumeIo,
+        n: &Needle,
+        offset: u64,
+    ) -> Result<(), VolumeError> {
         io.last_append_at_ns = n.append_at_ns;
 
         // Update index
-        if let Some(nm) = &mut io.nm {
-            nm.delete(n.id, Offset::from_actual_offset(offset as i64))?;
+        if let Some(nm) = &mut io.nm
+            && let Err(e) = nm.delete(n.id, Offset::from_actual_offset(offset as i64))
+        {
+            // The map already dropped the needle, so a retry, durable or not,
+            // would ack without the missing .idx row. Stop taking writes.
+            self.set_no_write_flag(NO_WRITE_OR_DELETE, true);
+            tracing::error!(
+                "volume {}: failed to index a delete at {}, marking read only: {}",
+                self.id.0,
+                offset,
+                e
+            );
+            return Err(VolumeError::Io(e));
         }
         if n.id == io.last_write_needle_key {
             io.last_write_append_at_ns = 0;
             io.last_write_needle_key = NeedleId(0);
             io.last_write_deleted = true;
         }
-        let checkpoint_ok = self.maybe_checkpoint_index(io, false);
-
-        // Clear the EIO streak after a successful delete (tombstone append +
-        // index update + checkpoint), mirroring do_write_request.
-        if checkpoint_ok {
-            self.check_read_write_error(None);
-        }
-
-        Ok(size)
+        Ok(())
     }
 
     // ---- Metrics ----
@@ -5561,13 +5772,22 @@ impl Volume {
                 ),
             )));
         }
-        let (_, _, header_size) = Needle::parse_header(needle_blob);
+        let (_, header_id, header_size) = Needle::parse_header(needle_blob);
         if header_size != size {
             return Err(VolumeError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "needle {} size {} does not match its blob header size {}",
                     needle_id.0, size.0, header_size.0
+                ),
+            )));
+        }
+        if header_id != needle_id {
+            return Err(VolumeError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "needle {} blob header holds needle {}",
+                    needle_id.0, header_id.0
                 ),
             )));
         }
@@ -5843,7 +6063,7 @@ impl Volume {
     {
         match self.begin_compact_by_index()? {
             Some(job) => job.run(progress_fn),
-            None => Ok(()), // already compacting
+            None => Err(self.compacting_error()),
         }
     }
 
@@ -5898,6 +6118,7 @@ impl Volume {
 
         Ok(Some(CompactionJob {
             id: self.id,
+            collection: self.collection.clone(),
             src_dat,
             src_idx,
             idx_size,
@@ -5948,7 +6169,7 @@ impl Volume {
             return Err(VolumeError::NotFound);
         }
         let Some(_claim) = CompactionClaim::try_claim(&self.is_compacting) else {
-            return Ok(()); // already compacting, silently skip (matches Go)
+            return Err(self.compacting_error());
         };
         // The reload would read the remote object through the compacted .idx.
         if self.has_remote_file() {
@@ -5963,6 +6184,8 @@ impl Volume {
     }
 
     fn do_commit_compact(&self) -> Result<(), VolumeError> {
+        // A duplicate commit must fail before it closes the live files.
+        self.check_compact_files()?;
         if let Err(e) = self.makeup_diff() {
             warn!("makeup_diff failed: {}", e);
             // Match Go: clean up .cpd/.cpx on makeup_diff failure
@@ -6038,8 +6261,13 @@ impl Volume {
     /// requires BOTH .cpd/.cpx to be present, so a stale or duplicate commit
     /// returns an error without deleting the live .dat/.idx.
     fn apply_compact_swap(&self) -> Result<(), VolumeError> {
-        // Normal commit: both temp files must be present, or a stale/duplicate
-        // commit could clobber the live .dat/.idx.
+        self.check_compact_files()?;
+        self.finish_compact_swap()
+    }
+
+    /// Both temp files of a normal commit must be present, or a stale or
+    /// duplicate commit could clobber the live .dat/.idx.
+    fn check_compact_files(&self) -> Result<(), VolumeError> {
         if !Path::new(&self.file_name(".cpd")).exists()
             || !Path::new(&self.file_name(".cpx")).exists()
         {
@@ -6048,7 +6276,7 @@ impl Volume {
                 "compact files (.cpd/.cpx) not found",
             )));
         }
-        self.finish_compact_swap()
+        Ok(())
     }
 
     /// Renames whichever compaction temp file is still present (.cpd->.dat,
@@ -6148,10 +6376,11 @@ impl Volume {
 
     /// Clean up leftover compaction files (.cpd, .cpx).
     pub fn cleanup_compact(&self) -> Result<(), VolumeError> {
-        // An in-flight copy is still writing .cpd/.cpx.
-        if self.is_compacting() {
+        // An in-flight copy is still writing .cpd/.cpx; claim the volume so
+        // none starts while the files are removed.
+        let Some(_claim) = CompactionClaim::try_claim(&self.is_compacting) else {
             return Err(self.compacting_error());
-        }
+        };
         // Refuse to unlink .cpd/.cpx while a .cpc marker exists: those temp files
         // are the only inputs reconcile can roll forward to, so removing them
         // mid-commit would strand a decided swap.
@@ -6259,7 +6488,7 @@ impl Volume {
         let old_dat_file = File::open(&old_dat_path)?;
 
         for (key, (needle_offset, size)) in incremented_entries {
-            if !needle_offset.is_zero() && !size.is_deleted() && size.0 > 0 {
+            if !needle_offset.is_zero() && !size.is_deleted() {
                 let actual_size = crate::storage::needle::needle::get_actual_size(size, version);
                 let mut blob = vec![0u8; actual_size as usize];
 
@@ -7229,11 +7458,14 @@ mod tests {
         let (_offset, is_last) = v.binary_search_by_append_at_ns(newest_ns).unwrap();
         assert!(is_last, "precondition: the caller starts caught up");
 
-        v.delete_needle(&mut Needle {
-            id: NeedleId(2),
-            cookie: Cookie(0x12345678),
-            ..Needle::default()
-        })
+        v.delete_needle(
+            &mut Needle {
+                id: NeedleId(2),
+                cookie: Cookie(0x12345678),
+                ..Needle::default()
+            },
+            false,
+        )
         .unwrap();
 
         let (offset, is_last) = v.binary_search_by_append_at_ns(newest_ns).unwrap();
@@ -7480,11 +7712,14 @@ mod tests {
         let written: Vec<u64> = (1..=3u64)
             .map(|id| write_test_needle(&mut v, id, b"scan"))
             .collect();
-        v.delete_needle(&mut Needle {
-            id: NeedleId(2),
-            cookie: Cookie(0x12345678),
-            ..Needle::default()
-        })
+        v.delete_needle(
+            &mut Needle {
+                id: NeedleId(2),
+                cookie: Cookie(0x12345678),
+                ..Needle::default()
+            },
+            false,
+        )
         .unwrap();
 
         let sb_size = v.super_block().block_size() as u64;
@@ -8257,6 +8492,115 @@ mod tests {
         std::fs::metadata(v.file_name(".dat")).unwrap().len()
     }
 
+    #[test]
+    fn test_durable_delete_syncs_tombstone() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+
+        let mut writes: Vec<_> = (1..=2u64)
+            .map(|id| (batch_needle(id, 0xaa, b"payload"), false))
+            .collect();
+        assert!(
+            v.write_needles_grouped(&mut writes)
+                .iter()
+                .all(|r| r.is_ok())
+        );
+        assert_eq!(v.sync_counts_for_test(), (0, 0));
+
+        v.delete_needle(&mut batch_needle(1, 0xaa, b""), false)
+            .unwrap();
+        assert_eq!(v.sync_counts_for_test(), (0, 0));
+
+        let size = v
+            .delete_needle(&mut batch_needle(2, 0xaa, b""), true)
+            .unwrap();
+        assert!(size.0 > 0);
+        assert_eq!(v.sync_counts_for_test(), (1, 1));
+    }
+
+    #[test]
+    fn test_delete_needle_failed_fsync_keeps_needle() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+
+        let mut writes = vec![(batch_needle(1, 0xaa, b"payload"), false)];
+        assert!(
+            v.write_needles_grouped(&mut writes)
+                .iter()
+                .all(|r| r.is_ok())
+        );
+
+        v.fail_next_fsync_for_test(true);
+        assert!(
+            v.delete_needle(&mut batch_needle(1, 0xaa, b""), true)
+                .is_err()
+        );
+        v.fail_next_fsync_for_test(false);
+
+        let mut n = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        v.read_needle(&mut n).unwrap();
+        assert_eq!(n.data, b"payload");
+    }
+
+    #[test]
+    fn test_durable_delete_syncs_after_unsynced_delete() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+
+        let mut writes = vec![(batch_needle(1, 0xaa, b"payload"), false)];
+        assert!(
+            v.write_needles_grouped(&mut writes)
+                .iter()
+                .all(|r| r.is_ok())
+        );
+        v.delete_needle(&mut batch_needle(1, 0xaa, b""), false)
+            .unwrap();
+        assert_eq!(v.sync_counts_for_test(), (0, 0));
+
+        let size = v
+            .delete_needle(&mut batch_needle(1, 0xaa, b""), true)
+            .unwrap();
+        assert_eq!(size.0, 0);
+        assert_eq!(v.sync_counts_for_test(), (1, 1));
+    }
+
+    /// A durable delete flushes with the write guards dropped, so a read of
+    /// the volume does not wait on its fsync.
+    #[test]
+    fn test_durable_delete_reads_during_flush() {
+        let tmp = TempDir::new().unwrap();
+        let v = Arc::new(make_test_volume(tmp.path().to_str().unwrap()));
+        let mut writes: Vec<_> = (1..=2u64)
+            .map(|id| (batch_needle(id, 0xaa, b"payload"), false))
+            .collect();
+        assert!(
+            v.write_needles_grouped(&mut writes)
+                .iter()
+                .all(|r| r.is_ok())
+        );
+
+        let read_during_flush = Arc::new(AtomicBool::new(false));
+        let (reader, flag) = (v.clone(), read_during_flush.clone());
+        *v.on_flush_dat_for_test.lock().unwrap() = Some(Box::new(move |_: &Volume| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut n = batch_needle(2, 0xaa, b"");
+                let _ = tx.send(reader.read_needle(&mut n).is_ok());
+            });
+            let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+            flag.store(read == Ok(true), Ordering::Release);
+        }));
+        v.delete_needle(&mut batch_needle(1, 0xaa, b""), true)
+            .unwrap();
+        assert!(read_during_flush.load(Ordering::Acquire));
+    }
+
     /// A batch of durable writes shares one .dat sync and one .idx sync,
     /// where writing them one at a time syncs both files per needle.
     #[test]
@@ -8714,6 +9058,77 @@ mod tests {
         assert_eq!(size, idx_len + 8);
     }
 
+    /// A delete whose .idx row fails has already dropped the needle
+    /// from the map, so a retry would find nothing to delete and ack. The
+    /// volume stops taking writes instead: nothing is appended past the
+    /// tombstone, so a reload re-indexes it from the .dat tail rather than
+    /// resurrect the needle.
+    #[test]
+    fn test_durable_delete_index_failure_refuses_writes() {
+        for first_fsync in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path().to_str().unwrap();
+            let v = make_test_volume(dir);
+            v.write_needle(&mut batch_needle(1, 0xaa, b"payload"), true, true)
+                .unwrap();
+
+            {
+                let mut io = v.io.write().unwrap();
+                let nm = io.nm.as_mut().unwrap();
+                let idx_len = nm.index_file_size();
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(format!("{dir}/1.idx"))
+                    .unwrap();
+                nm.set_idx_file(
+                    Box::new(TornIdxWriter {
+                        file,
+                        writes: 0,
+                        tear_at: 1,
+                        fail_truncates: false,
+                    }),
+                    idx_len,
+                );
+            }
+
+            assert!(
+                v.delete_needle(&mut batch_needle(1, 0xaa, b""), first_fsync)
+                    .is_err()
+            );
+            assert!(
+                v.write_needle(&mut batch_needle(2, 0xbb, b"later"), true, true)
+                    .is_err(),
+                "nothing may be appended past the unindexed tombstone"
+            );
+            assert!(
+                v.delete_needle(&mut batch_needle(1, 0xaa, b""), true)
+                    .is_err(),
+                "a retry must not ack a delete whose .idx row never landed"
+            );
+            drop(v);
+
+            let reopened = match Volume::new(
+                dir,
+                dir,
+                VolumeId(1),
+                NeedleMapKind::InMemory,
+                &VolumeSpec::default(),
+            ) {
+                Ok(v) => v,
+                Err(e) => panic!("the volume does not reload: {e}"),
+            };
+            let mut got = Needle {
+                id: NeedleId(1),
+                ..Needle::default()
+            };
+            let read = reopened.read_needle(&mut got);
+            assert!(
+                !(read.is_ok() && got.data == b"payload"),
+                "the deleted needle must not come back on reload"
+            );
+        }
+    }
+
     /// The I/O error streak after writing four durable needles, the ones in
     /// `failing` with a media error on their append, first one at a time and
     /// then as one grouped run. Also returns which grouped writes landed.
@@ -8867,11 +9282,14 @@ mod tests {
         assert_eq!(v.file_count(), 1);
 
         let deleted_size = v
-            .delete_needle(&mut Needle {
-                id: NeedleId(1),
-                cookie: Cookie(0xbb),
-                ..Needle::default()
-            })
+            .delete_needle(
+                &mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(0xbb),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
         assert!(deleted_size.0 > 0);
         // Additive-only: file_count stays at 1 after delete
@@ -8919,12 +9337,12 @@ mod tests {
 
             let n = pending_needle(1, b"late write");
             let pending = v.track_pending_write(&n);
-            v.delete_needle(&mut pending_needle(1, b"")).unwrap();
+            v.delete_needle(&mut pending_needle(1, b""), false).unwrap();
             let err = write_pending(&v, n, fsync, pending).unwrap_err();
             assert!(matches!(err, VolumeError::Deleted));
 
             let err = v.read_needle(&mut pending_needle(1, b"")).unwrap_err();
-            assert!(matches!(err, VolumeError::Deleted));
+            assert!(matches!(err, VolumeError::NotFound));
             assert!(v.pending_writes.0.lock().unwrap().is_empty());
 
             v.close();
@@ -8940,7 +9358,7 @@ mod tests {
         }
     }
 
-    /// The unsynced write path takes a cancelled write back the same way.
+    /// The unsynced write path refuses a cancelled write the same way.
     #[test]
     fn test_unsynced_write_cancelled_by_delete() {
         let tmp = TempDir::new().unwrap();
@@ -8954,7 +9372,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, VolumeError::Deleted));
         let err = v.read_needle(&mut pending_needle(1, b"")).unwrap_err();
-        assert!(matches!(err, VolumeError::Deleted));
+        assert!(matches!(err, VolumeError::NotFound));
     }
 
     /// A delete that finds a copy also cancels a retry of the same write that
@@ -8969,9 +9387,34 @@ mod tests {
             .unwrap();
         let rewrite = pending_needle(1, b"retry");
         let pending = v.track_pending_write(&rewrite);
-        v.delete_needle(&mut pending_needle(1, b"")).unwrap();
+        v.delete_needle(&mut pending_needle(1, b""), false).unwrap();
         let err = write_pending(&v, rewrite, false, pending).unwrap_err();
         assert!(matches!(err, VolumeError::Deleted));
+        let err = v.read_needle(&mut pending_needle(1, b"")).unwrap_err();
+        assert!(matches!(err, VolumeError::Deleted));
+    }
+
+    /// A rewrite cancelled before it takes the volume locks appends nothing,
+    /// so no unsynced row of it can outlive a durable delete after a crash.
+    #[test]
+    fn test_cancelled_rewrite_does_not_append() {
+        let tmp = TempDir::new().unwrap();
+        let v = make_test_volume(tmp.path().to_str().unwrap());
+
+        v.write_needle(&mut pending_needle(1, b"first"), true, false)
+            .unwrap();
+        let before = std::fs::metadata(v.file_name(".dat")).unwrap().len();
+        let rewrite = pending_needle(1, b"retry");
+        let pending = v.track_pending_write(&rewrite);
+        v.cancel_pending_writes(rewrite.id, rewrite.cookie);
+        let err = write_pending(&v, rewrite, false, pending).unwrap_err();
+        assert!(matches!(err, VolumeError::Deleted));
+        assert_eq!(
+            std::fs::metadata(v.file_name(".dat")).unwrap().len(),
+            before
+        );
+
+        v.delete_needle(&mut pending_needle(1, b""), true).unwrap();
         let err = v.read_needle(&mut pending_needle(1, b"")).unwrap_err();
         assert!(matches!(err, VolumeError::Deleted));
     }
@@ -8984,7 +9427,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap();
         let v = make_test_volume(dir);
 
-        v.delete_needle(&mut pending_needle(1, b"")).unwrap();
+        v.delete_needle(&mut pending_needle(1, b""), false).unwrap();
         let n = pending_needle(1, b"after the delete");
         let pending = v.track_pending_write(&n);
         write_pending(&v, n, false, pending).unwrap();
@@ -9041,7 +9484,10 @@ mod tests {
 
         let n = pending_needle(1, b"late write");
         let pending = v.track_pending_write(&n);
-        v.cancel_pending_writes(n.id, n.cookie);
+        let (id, cookie) = (n.id, n.cookie);
+        *v.on_flush_dat_for_test.lock().unwrap() = Some(Box::new(move |v: &Volume| {
+            v.cancel_pending_writes(id, cookie)
+        }));
         let err = write_pending(&v, n, true, pending).unwrap_err();
         assert!(matches!(err, VolumeError::Deleted));
         assert_eq!(v.sync_counts_for_test(), (2, 1));
@@ -9076,11 +9522,14 @@ mod tests {
                 };
                 v.write_needle(&mut n, true, false).unwrap();
             }
-            v.delete_needle(&mut Needle {
-                id: NeedleId(2),
-                cookie: Cookie(2),
-                ..Needle::default()
-            })
+            v.delete_needle(
+                &mut Needle {
+                    id: NeedleId(2),
+                    cookie: Cookie(2),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
             v.sync_to_disk().unwrap();
         }
@@ -9134,11 +9583,14 @@ mod tests {
             // More than one tombstone: the scan has to walk back over the whole
             // run of them to reach a write.
             for i in [2u64, 3] {
-                v.delete_needle(&mut Needle {
-                    id: NeedleId(i),
-                    cookie: Cookie(i as u32),
-                    ..Needle::default()
-                })
+                v.delete_needle(
+                    &mut Needle {
+                        id: NeedleId(i),
+                        cookie: Cookie(i as u32),
+                        ..Needle::default()
+                    },
+                    false,
+                )
                 .unwrap();
             }
             v.sync_to_disk().unwrap();
@@ -9234,11 +9686,14 @@ mod tests {
             let (offset, _, _) = v.write_needle(&mut n, true, false).unwrap();
             written.push((offset, n.size));
         }
-        v.delete_needle(&mut Needle {
-            id: NeedleId(2),
-            cookie: Cookie(2),
-            ..Needle::default()
-        })
+        v.delete_needle(
+            &mut Needle {
+                id: NeedleId(2),
+                cookie: Cookie(2),
+                ..Needle::default()
+            },
+            false,
+        )
         .unwrap();
         v.sync_to_disk().unwrap();
         for (offset, size) in written {
@@ -9326,11 +9781,14 @@ mod tests {
         // The delete lands inside the commit window: makeup_diff replays its
         // tombstone into the new .idx behind the write row the copy carried.
         v.compact_by_index(0, 0, |_| true).unwrap();
-        v.delete_needle(&mut Needle {
-            id: NeedleId(2),
-            cookie: Cookie(2),
-            ..Needle::default()
-        })
+        v.delete_needle(
+            &mut Needle {
+                id: NeedleId(2),
+                cookie: Cookie(2),
+                ..Needle::default()
+            },
+            false,
+        )
         .unwrap();
         assert!(
             v.io.read().unwrap().last_write_deleted,
@@ -9513,11 +9971,14 @@ mod tests {
                 ..Needle::default()
             };
             v.write_needle(&mut n, true, false).unwrap();
-            v.delete_needle(&mut Needle {
-                id: NeedleId(1),
-                cookie: Cookie(1),
-                ..Needle::default()
-            })
+            v.delete_needle(
+                &mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(1),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
             v.sync_to_disk().unwrap();
         }
@@ -9720,11 +10181,14 @@ mod tests {
         let mut v = make_test_volume(dir);
 
         write_test_needle(&mut v, 1, b"needle data");
-        v.delete_needle(&mut Needle {
-            id: NeedleId(1),
-            cookie: Cookie(0x12345678),
-            ..Needle::default()
-        })
+        v.delete_needle(
+            &mut Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x12345678),
+                ..Needle::default()
+            },
+            false,
+        )
         .unwrap();
         // A later record keeps the tombstone mid-file rather than at the tail.
         write_test_needle(&mut v, 2, b"needle data");
@@ -9821,11 +10285,14 @@ mod tests {
         let mut v = make_test_volume(dir);
 
         write_test_needle(&mut v, 1, b"needle data");
-        v.delete_needle(&mut Needle {
-            id: NeedleId(1),
-            cookie: Cookie(0x12345678),
-            ..Needle::default()
-        })
+        v.delete_needle(
+            &mut Needle {
+                id: NeedleId(1),
+                cookie: Cookie(0x12345678),
+                ..Needle::default()
+            },
+            false,
+        )
         .unwrap();
         v.sync_to_disk().unwrap();
 
@@ -10380,6 +10847,15 @@ mod tests {
         assert!(matches!(err, VolumeError::Io(_)), "got {err:?}");
         assert_eq!(v.dat_file_size().unwrap(), dat_size_before);
 
+        // needle 1's blob is not stored under key 2
+        let err = v
+            .write_needle_blob_and_index(NeedleId(2), &blob, n.size)
+            .unwrap_err();
+        assert!(matches!(err, VolumeError::Io(_)), "got {err:?}");
+        assert_eq!(v.dat_file_size().unwrap(), dat_size_before);
+
+        let mut blob = blob;
+        NeedleId(2).to_bytes(&mut blob[COOKIE_SIZE..COOKIE_SIZE + NEEDLE_ID_SIZE]);
         v.write_needle_blob_and_index(NeedleId(2), &blob, n.size)
             .unwrap();
     }
@@ -10402,7 +10878,8 @@ mod tests {
         };
         n.checksum = CRC::new(&n.data);
         let (offset, _, _) = v.write_needle(&mut n, true, false).unwrap();
-        let blob = v.read_needle_blob(offset as i64, n.size).unwrap();
+        let mut blob = v.read_needle_blob(offset as i64, n.size).unwrap();
+        NeedleId(2).to_bytes(&mut blob[COOKIE_SIZE..COOKIE_SIZE + NEEDLE_ID_SIZE]);
 
         let dat_size_before = v.dat_file_size().unwrap();
 
@@ -10525,7 +11002,7 @@ mod tests {
             cookie: Cookie(2),
             ..Needle::default()
         };
-        v.delete_needle(&mut del).unwrap();
+        v.delete_needle(&mut del, false).unwrap();
         // Additive-only: file_count stays at 3 after delete
         assert_eq!(v.file_count(), 3);
         assert_eq!(v.deleted_count(), 1);
@@ -10639,6 +11116,189 @@ mod tests {
         };
         v.read_needle(&mut got).unwrap();
         assert_eq!(got.data, b"late-write");
+    }
+
+    #[test]
+    fn test_compact_by_index_keeps_unexpired_needle_ttl_on_plain_volume() {
+        use crate::storage::needle::ttl::TTL;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+
+        for i in 1..=8u64 {
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: format!("data-{}", i).into_bytes(),
+                data_size: format!("data-{}", i).len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        let mut n = Needle {
+            id: NeedleId(100),
+            cookie: Cookie(100),
+            data: b"own-ttl".to_vec(),
+            data_size: 7,
+            ttl: Some(TTL::read("7d").unwrap()),
+            last_modified: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ..Needle::default()
+        };
+        n.set_has_ttl();
+        n.set_has_last_modified_date();
+        v.write_needle(&mut n, true, false).unwrap();
+
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        v.commit_compact().unwrap();
+
+        let mut got = Needle {
+            id: NeedleId(100),
+            cookie: Cookie(100),
+            ..Needle::default()
+        };
+        v.read_needle(&mut got).unwrap();
+        assert_eq!(got.data, b"own-ttl");
+    }
+
+    #[test]
+    fn test_vacuum_ttl_expired() {
+        use crate::storage::needle::ttl::TTL;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let ttl_7d = TTL::read("7d").unwrap();
+        let ttl_1h = TTL::read("1h").unwrap();
+        let ttl_needle = |ttl: TTL, age_secs: u64| {
+            let mut n = Needle {
+                ttl: Some(ttl),
+                last_modified: now.as_secs() - age_secs,
+                append_at_ns: (now.as_nanos() as u64) - age_secs * 1_000_000_000,
+                ..Needle::default()
+            };
+            n.set_has_ttl();
+            n.set_has_last_modified_date();
+            n
+        };
+        let secs = now.as_secs();
+        assert!(!vacuum_ttl_expired(&Needle::default(), &ttl_1h, secs));
+        assert!(!vacuum_ttl_expired(
+            &ttl_needle(ttl_7d, 3600),
+            &TTL::EMPTY,
+            secs
+        ));
+        assert!(vacuum_ttl_expired(
+            &ttl_needle(ttl_1h, 7200),
+            &TTL::EMPTY,
+            secs
+        ));
+        assert!(!vacuum_ttl_expired(
+            &ttl_needle(TTL::EMPTY, 172800),
+            &TTL::EMPTY,
+            secs
+        ));
+        assert!(!vacuum_ttl_expired(
+            &ttl_needle(ttl_1h, 1800),
+            &ttl_1h,
+            secs
+        ));
+        assert!(vacuum_ttl_expired(&ttl_needle(ttl_7d, 7200), &ttl_1h, secs));
+    }
+
+    #[test]
+    fn test_compact_by_index_checks_ttl_volume() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let ttl = crate::storage::needle::ttl::TTL::read("1h").unwrap();
+        let v = make_ttl_volume(dir, ttl);
+        for i in 1..=8u64 {
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: format!("data-{}", i).into_bytes(),
+                data_size: format!("data-{}", i).len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        v.commit_compact().unwrap();
+
+        for i in 1..=8u64 {
+            let mut got = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                ..Needle::default()
+            };
+            v.read_needle(&mut got).unwrap();
+            assert_eq!(got.data, format!("data-{}", i).into_bytes());
+        }
+    }
+
+    #[test]
+    fn test_check_compacted_against_snapshot() {
+        let tally = |count, bytes| LiveTally { count, bytes };
+        let none = LiveTally::default();
+        let snapshot = tally(4, 400);
+        let check = |copied, expired, unreadable, dst| {
+            check_compacted_against_snapshot(
+                VolumeId(1),
+                snapshot,
+                copied,
+                expired,
+                unreadable,
+                dst,
+            )
+        };
+        assert!(check(tally(4, 400), none, none, 500).is_ok());
+        assert!(check(tally(2, 200), tally(1, 100), tally(1, 100), 260).is_ok());
+        // A traversal that skipped entries.
+        assert!(check(tally(2, 200), none, none, 260).is_err());
+        // A short write.
+        assert!(check(tally(4, 400), none, none, 300).is_err());
+        assert!(check(none, tally(2, 300), tally(2, 300), 8).is_err());
+    }
+
+    #[test]
+    fn test_commit_compact_keeps_empty_needle_written_during_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+
+        for i in 1..=3u64 {
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data: format!("data-{}", i).into_bytes(),
+                data_size: format!("data-{}", i).len() as u32,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+
+        v.compact_by_index(0, 0, |_| true).unwrap();
+
+        let mut empty = Needle {
+            id: NeedleId(10),
+            cookie: Cookie(0x0abc_def0),
+            ..Needle::default()
+        };
+        v.write_needle(&mut empty, true, false).unwrap();
+
+        v.commit_compact().unwrap();
+
+        let nv = {
+            let io = v.io.read().unwrap();
+            io.nm.as_ref().unwrap().get(NeedleId(10)).unwrap().unwrap()
+        };
+        assert_eq!(nv.size, Size(0));
+        let mut record = Needle::default();
+        v.read_needle_data_at(&mut record, nv.offset.to_actual_offset(), nv.size)
+            .unwrap();
+        assert_eq!(record.id, NeedleId(10));
+        assert_eq!(record.cookie, Cookie(0x0abc_def0));
+        assert!(record.data.is_empty());
     }
 
     /// Mirrors Go's TestConcurrentWriteCrossesOffsetBoundary (issue #11410):
@@ -10772,6 +11432,75 @@ mod tests {
         }
     }
 
+    /// A needle whose body fails its CRC is dropped from the compacted index,
+    /// and the drop is counted per collection.
+    #[test]
+    fn test_compact_by_index_counts_dropped_crc_damaged_needle() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let collection = "vacuum_crc_drop";
+        let v = Volume::new(
+            dir,
+            dir,
+            VolumeId(1),
+            NeedleMapKind::InMemory,
+            &VolumeSpec {
+                collection,
+                ..VolumeSpec::default()
+            },
+        )
+        .unwrap();
+        for i in 1..=3u64 {
+            let data = format!("payload-{}", i).into_bytes();
+            let mut n = Needle {
+                id: NeedleId(i),
+                cookie: Cookie(i as u32),
+                data_size: data.len() as u32,
+                data,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        v.sync_to_disk().unwrap();
+
+        let nv = {
+            let io = v.io.read().unwrap();
+            io.nm.as_ref().unwrap().get(NeedleId(2)).unwrap().unwrap()
+        };
+        // The first body byte follows the header and the 4-byte DataSize field.
+        let at = nv.offset.to_actual_offset() as u64 + NEEDLE_HEADER_SIZE as u64 + 4;
+        let mut dat = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(v.file_name(".dat"))
+            .unwrap();
+        let mut b = [0u8; 1];
+        dat.seek(SeekFrom::Start(at)).unwrap();
+        dat.read_exact(&mut b).unwrap();
+        b[0] ^= 0xff;
+        dat.seek(SeekFrom::Start(at)).unwrap();
+        dat.write_all(&b).unwrap();
+        dat.sync_all().unwrap();
+
+        let dropped =
+            crate::metrics::VACUUMING_DROPPED_NEEDLES_COUNTER.with_label_values(&[collection]);
+        let before = dropped.get();
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        assert_eq!(dropped.get() - before, 1);
+
+        let mut cpx = File::open(v.file_name(".cpx")).unwrap();
+        let mut kept: Vec<u64> = Vec::new();
+        idx::walk_index_file(&mut cpx, 0, |key, _, size| {
+            if !size.is_deleted() {
+                kept.push(key.0);
+            }
+            Ok(())
+        })
+        .unwrap();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![1, 3]);
+    }
+
     /// The needle map's max_needle_end accumulator must let volume.load
     /// detect an .idx whose entries point past the end of the .dat — the
     /// deeper-than-tail corruption shape that the existing
@@ -10829,6 +11558,42 @@ mod tests {
             bad_end,
             dat_size
         );
+    }
+
+    #[test]
+    fn test_read_meta_rejects_index_entry_naming_another_needle() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+
+        for id in [1u64, 2] {
+            let mut n = Needle {
+                id: NeedleId(id),
+                cookie: Cookie(0xDEADBEEF),
+                data: vec![id as u8; 2048],
+                data_size: 2048,
+                ..Needle::default()
+            };
+            v.write_needle(&mut n, true, false).unwrap();
+        }
+        // point key 9 at needle 2's record with the record's own size
+        {
+            let mut io = v.io.write().unwrap();
+            let nm = io.nm.as_mut().unwrap();
+            let nv = nm.get(NeedleId(2)).unwrap().unwrap();
+            nm.put(NeedleId(9), nv.offset, nv.size).unwrap();
+        }
+
+        let mut read_n = Needle {
+            id: NeedleId(9),
+            cookie: Cookie(0xDEADBEEF),
+            ..Needle::default()
+        };
+        let mut plan = v.needle_read_plan(NeedleId(9), false).unwrap();
+        assert!(matches!(
+            plan.read_meta(&mut read_n),
+            Err(VolumeError::NotFound)
+        ));
     }
 
     #[test]
@@ -10951,11 +11716,14 @@ mod tests {
         assert!(matches!(err, VolumeError::ReadOnly(_)));
 
         let deleted_size = v
-            .delete_needle(&mut Needle {
-                id: NeedleId(1),
-                cookie: Cookie(0x1234),
-                ..Needle::default()
-            })
+            .delete_needle(
+                &mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(0x1234),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
         assert!(deleted_size.0 > 0);
         assert_eq!(v.dat_file_size().unwrap(), dat_size_before_reload);
@@ -11784,11 +12552,14 @@ mod tests {
         // Deletes are still allowed on a tiered volume and land in .idx.
         let idx_before = std::fs::metadata(&idx_path).unwrap().len();
         let deleted = v
-            .delete_needle(&mut Needle {
-                id: NeedleId(3),
-                cookie: Cookie(0x1234),
-                ..Needle::default()
-            })
+            .delete_needle(
+                &mut Needle {
+                    id: NeedleId(3),
+                    cookie: Cookie(0x1234),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
         assert!(deleted.0 > 0);
         assert_eq!(
@@ -11974,11 +12745,14 @@ mod tests {
             assert!(matches!(err, VolumeError::ReadOnly(_)));
 
             let deleted = v
-                .delete_needle(&mut Needle {
-                    id: NeedleId(1),
-                    cookie: Cookie(1),
-                    ..Needle::default()
-                })
+                .delete_needle(
+                    &mut Needle {
+                        id: NeedleId(1),
+                        cookie: Cookie(1),
+                        ..Needle::default()
+                    },
+                    false,
+                )
                 .unwrap();
             assert!(deleted.0 > 0, "deletes must still land");
             v.sync_to_disk().unwrap();
@@ -12015,11 +12789,14 @@ mod tests {
         assert!(matches!(err, VolumeError::ReadOnly(_)));
 
         let deleted = v
-            .delete_needle(&mut Needle {
-                id: NeedleId(2),
-                cookie: Cookie(2),
-                ..Needle::default()
-            })
+            .delete_needle(
+                &mut Needle {
+                    id: NeedleId(2),
+                    cookie: Cookie(2),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
         assert!(deleted.0 > 0, "deletes must still land after restart");
 
@@ -12089,11 +12866,14 @@ mod tests {
             Some(NeedleMap::SortedFile(_))
         ));
         for id in ids.clone() {
-            v.delete_needle(&mut Needle {
-                id: NeedleId(id),
-                cookie: Cookie(id as u32),
-                ..Needle::default()
-            })
+            v.delete_needle(
+                &mut Needle {
+                    id: NeedleId(id),
+                    cookie: Cookie(id as u32),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
         }
         let after_deletes = counters(&v);
@@ -12141,11 +12921,14 @@ mod tests {
         .unwrap();
         assert!(v.no_write_flags().0);
         let err = v
-            .delete_needle(&mut Needle {
-                id: NeedleId(1),
-                cookie: Cookie(1),
-                ..Needle::default()
-            })
+            .delete_needle(
+                &mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(1),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap_err();
         assert!(
             matches!(err, VolumeError::ReadOnly(_)),
@@ -12160,11 +12943,14 @@ mod tests {
             "upgrade to canDelete must attach the .idx writer"
         );
         let deleted = v
-            .delete_needle(&mut Needle {
-                id: NeedleId(1),
-                cookie: Cookie(1),
-                ..Needle::default()
-            })
+            .delete_needle(
+                &mut Needle {
+                    id: NeedleId(1),
+                    cookie: Cookie(1),
+                    ..Needle::default()
+                },
+                false,
+            )
             .unwrap();
         assert!(deleted.0 > 0, "deletes must land once canDelete is set");
     }
@@ -12815,7 +13601,7 @@ mod tests {
                 cookie: Cookie(id as u32),
                 ..Needle::default()
             };
-            v.delete_needle(&mut del).unwrap();
+            v.delete_needle(&mut del, false).unwrap();
         }
         let expected_live = v.file_count() - v.deleted_count();
 
@@ -12928,5 +13714,36 @@ mod tests {
             dat_len_before,
             "live .dat unchanged"
         );
+    }
+
+    /// A commit that finds no .cpd/.cpx (another vacuum already committed
+    /// them) must leave the volume loaded and writable.
+    #[test]
+    fn test_commit_compact_without_temp_files_keeps_volume_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let v = make_test_volume(dir);
+        let needle = |i: u64| Needle {
+            id: NeedleId(i),
+            cookie: Cookie(i as u32),
+            data: format!("data-{}", i).into_bytes(),
+            data_size: format!("data-{}", i).len() as u32,
+            ..Needle::default()
+        };
+        for i in 1..=3u64 {
+            v.write_needle(&mut needle(i), true, false).unwrap();
+        }
+        v.compact_by_index(0, 0, |_| true).unwrap();
+        v.commit_compact().unwrap();
+
+        assert!(v.commit_compact().is_err());
+        assert!(!Path::new(&v.file_name(".cpc")).exists());
+        v.write_needle(&mut needle(4), true, false).unwrap();
+        let mut n1 = Needle {
+            id: NeedleId(1),
+            ..Needle::default()
+        };
+        v.read_needle(&mut n1).unwrap();
+        assert_eq!(n1.data, b"data-1");
     }
 }

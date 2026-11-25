@@ -123,7 +123,7 @@ def write_tls(directory):
             "-out", "outsider.pem", "-days", "2", "-extfile", "ext.cnf")
     cert, key, ca = (f'{key} = {json.dumps(str(directory / name), ensure_ascii=False)}\n' for key, name in (("cert", "cert.pem"), ("key", "key.pem"), ("ca", "ca.pem")))
     pem = cert + key + ca
-    grpc = "".join(f"[grpc.{component}]\n{cert}{key}\n" for component in ("master", "volume", "filer", "s3"))
+    grpc = "".join(f"[grpc.{component}]\n{cert}{key}\n" for component in ("master", "volume", "filer", "s3", "admin", "worker"))
     # Clients (the gateway, the engine) accept only servers named localhost;
     # the engine serves only clients named localhost.
     grpc += f"[grpc.client]\n{cert}{key}allowed_server_commonNames = \"localhost\"\n"
@@ -242,23 +242,22 @@ def run_cluster(param, tmp_path_factory, identities):
     # VECTOR_WORKER=1 adds the admin server and the Lance maintenance worker,
     # for the tests that build vector indexes through a plugin job.
     lance_worker = binary("LANCE_WORKER_BINARY", "weed-worker") if os.environ.get("VECTOR_WORKER") else None
-    worker = binary("VECTOR_WORKER_BINARY", "weed-vector-worker") if mode == "distributed" else None
     volume_binary = binary("RUST_VOLUME_SERVER_BINARY", "weed-volume") if volume == "rust" else weed
     processes = {}
     with contextlib.ExitStack() as stack:
         with contextlib.ExitStack() as reservations:
             ports = []
-            for _ in range(14):
+            for _ in range(16):
                 sock = reservations.enter_context(socket.socket())
                 sock.bind(("127.0.0.1", 0))
                 ports.append(sock.getsockname()[1])
-        (master, master_grpc, vol, vol_grpc, filer, filer_grpc, s3, s3_grpc, lance, vector, worker1, worker2,
-         admin, admin_grpc) = ports
+        (master, master_grpc, vol, vol_grpc, filer, filer_grpc, s3, s3_grpc, lance, vector, engine1, engine2,
+         admin, admin_grpc, vector_metrics, volume_metrics) = ports
         master_addr = f"127.0.0.1:{master}.{master_grpc}"
         filer_addr = f"127.0.0.1:{filer}.{filer_grpc}"
 
         # VECTOR_READ_JWT=1 makes volume reads need a JWT; every weed process
-        # and the workers sign with the key.
+        # and the engines sign with the key.
         read_jwt_key = os.environ.get("VECTOR_READ_JWT") and uuid.uuid4().hex
         # The cluster's filer signing key: the gateway's catalog authenticates
         # the worker and the CLI by the token they derive from it.
@@ -280,9 +279,10 @@ def run_cluster(param, tmp_path_factory, identities):
                 env.pop(key)
             return env
 
-        def start(name, args, unset=()):
-            log = stack.enter_context((directory / f"{name}.log").open("w"))
-            process = subprocess.Popen(args, cwd=directory, stdout=log, stderr=log, env=process_env(unset))
+        def start(name, args, unset=(), env=None):
+            log = stack.enter_context((directory / f"{name}.log").open("a"))
+            process = subprocess.Popen(args, cwd=directory, stdout=log, stderr=log,
+                                       env={**process_env(unset), **(env or {})})
             processes[name] = process
             stack.callback(stop, process)
             return process
@@ -298,16 +298,17 @@ def run_cluster(param, tmp_path_factory, identities):
         start("volume", prefix + [f"{flag}{key}={value}" for key, value in {
             "master": master_addr, "ip": "127.0.0.1", "ip.bind": "127.0.0.1",
             "port": vol, "port.grpc": vol_grpc, "dir": directory / "volume",
-            "max": 64, "preStopSeconds": 0,
+            "max": 64, "preStopSeconds": 0, "metricsPort": volume_metrics,
         }.items()])
         wait_for(lambda: listening(vol_grpc), processes, "volume not ready")
         # VECTOR_ENCRYPT_VOLUMES=1 turns on the filer's volume encryption, which
         # the gateway, the engine and the worker all follow: every chunk they
         # store is encrypted, and direct reads must undo it.
+        filer_group = os.environ.get("VECTOR_FILER_GROUP", "")
         encrypt = ["-encryptVolumeData"] if os.environ.get("VECTOR_ENCRYPT_VOLUMES") else []
         start("filer", [weed, "filer", f"-master={master_addr}", "-ip=127.0.0.1",
                         "-ip.bind=127.0.0.1", f"-port={filer}", f"-port.grpc={filer_grpc}",
-                        f"-defaultStoreDir={directory / 'filer'}", *encrypt])
+                        f"-defaultStoreDir={directory / 'filer'}", f"-filerGroup={filer_group}", *encrypt])
         wait_for(lambda: listening(filer_grpc), processes, "filer not ready")
         endpoint = f"http://127.0.0.1:{s3}"
         # weed s3 turns AWS_ACCESS_KEY_ID into an admin identity.
@@ -325,8 +326,20 @@ def run_cluster(param, tmp_path_factory, identities):
         # The engine keeps tables on the filers and volume servers itself; it
         # has no S3 credentials to be given, and encrypts its chunks for the
         # volume servers as the gateway does.
-        start("vector", [engine, "--masters", master_addr, "--listen", f"127.0.0.1:{vector}"])
+        start("vector", [engine, "--masters", master_addr, "--listen", f"127.0.0.1:{vector}", "--metrics-port", str(vector_metrics), "--filer-group", filer_group])
         wait_for(lambda: listening(vector), processes, "vector engine not ready")
+        def vector_ready():
+            with urllib.request.urlopen(f"http://127.0.0.1:{vector_metrics}/ready", timeout=1) as response:
+                return response.status == 200
+        wait_for(vector_ready, processes, "vector engine did not register with master")
+
+        def restart_engine():
+            """Restart the single engine, so a workload starts with empty caches."""
+            old = processes["vector"]
+            stop(old)
+            start("vector", old.args)
+            wait_for(vector_ready, processes, "vector engine did not come back")
+
         if os.environ.get("VECTOR_TLS"):
             wait_for(lambda: listening(s3_grpc), processes, "s3 gRPC not ready")
             for name, port in (("master", master_grpc), ("volume", vol_grpc), ("filer", filer_grpc),
@@ -335,41 +348,46 @@ def run_cluster(param, tmp_path_factory, identities):
             probe_grpc_tls("engine", vector, directory, outsider=True)
 
         wait_for(
-            lambda: f"Cluster: vector node 127.0.0.1:{vector} added to group ''"
+            lambda: f"Cluster: vector node 127.0.0.1:{vector} added to group '{filer_group}'"
             in (directory / "master.log").read_text(),
             processes,
             "vector engine never registered with the master",
         )
 
-        if worker:
-            for i, port in enumerate((worker1, worker2)):
-                start(f"worker-{i}", [worker, "--masters", master_addr, "--listen", f"127.0.0.1:{port}"])
-                wait_for(lambda: listening(port), processes, "vector worker not ready")
+        # Distributed mode needs the Enterprise weed-vector, whose engines all
+        # join the masters' placement controller.
+        if mode == "distributed":
+            for i, port in enumerate((engine1, engine2), 1):
+                start(f"vector-{i}", [engine, "--masters", master_addr, "--listen", f"127.0.0.1:{port}",
+                                      "--filer-group", filer_group, "--state-dir", str(directory / f"vector-{i}"),
+                                      "--capacity-bytes", str(1 << 30), "--drain-timeout", "5s"])
+                wait_for(lambda: listening(port), processes, f"vector-{i} not ready")
             wait_for(
-                lambda: all(
-                    f"S3 Vectors: discovered search worker 127.0.0.1:{port}"
-                    in (directory / "s3.log").read_text()
-                    for port in (worker1, worker2)
-                ),
+                lambda: all(f"joined at 127.0.0.1:{port}" in (directory / "master.log").read_text()
+                            for port in (engine1, engine2)),
                 processes,
-                "gateway did not discover both search workers",
+                "the engines never joined the placement controller",
             )
         admin_url = None
         if lance_worker:
             (directory / "admin").mkdir()
             admin_url = f"http://127.0.0.1:{admin}"
-            start("admin", [weed, "admin", "-ip=127.0.0.1", f"-port={admin}", f"-port.grpc={admin_grpc}",
+            start("admin", [weed, "admin", f"-filerGroup={filer_group}", "-ip=127.0.0.1", f"-port={admin}", f"-port.grpc={admin_grpc}",
                             "-port.legacy=0", f"-master={master_addr}", f"-dataDir={directory / 'admin'}"])
             wait_for(lambda: http_ready(f"{admin_url}/api/plugin/job-types"), processes, "admin not ready")
+            tls_args = []
+            if os.environ.get("VECTOR_TLS"):
+                tls_args = ["--tls-ca", str(directory / "ca.pem"), "--tls-cert", str(directory / "cert.pem"), "--tls-key", str(directory / "key.pem"), "--tls-server-name", "localhost"]
             start("lance-worker", [lance_worker, "--admin", f"127.0.0.1:{admin}.{admin_grpc}",
-                                   "--namespace", f"http://127.0.0.1:{lance}", "--id", "vectors-test-worker",
-                                   "--masters", master_addr])
+                                   "--id", "vectors-test-worker", *tls_args])
             wait_for(lambda: "lance_vector_index" in
                      [jt["job_type"] for jt in json.load(urllib.request.urlopen(f"{admin_url}/api/plugin/job-types", timeout=2))],
                      processes, "the Lance worker never registered with admin")
 
         yield {"endpoint": endpoint, "mode": mode, "processes": processes, "directory": directory, "filer": filer,
                "masters": master_addr, "filer_signing_key": filer_signing_key,
+               "vector_metrics": f"http://127.0.0.1:{vector_metrics}", "restart_engine": restart_engine,
+               "volume_metrics": f"http://127.0.0.1:{volume_metrics}",
                "catalog": f"http://127.0.0.1:{lance}", "admin": admin_url, "env": process_env()}
 
 

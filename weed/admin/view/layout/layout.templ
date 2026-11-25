@@ -12,6 +12,56 @@ script setBasePath(prefix string) {
     window.__BASE_PATH__ = prefix;
 }
 
+// themeScript applies the saved color theme (auto, light or dark) inline, so
+// the root is themed before any external script or stylesheet is fetched.
+templ themeScript() {
+    <script>
+        (function () {
+            var storageKey = 'admin-theme';
+            var choices = ['auto', 'light', 'dark'];
+            var media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+            var root = document.documentElement;
+
+            function savedChoice() {
+                try {
+                    var value = localStorage.getItem(storageKey);
+                    return choices.indexOf(value) >= 0 ? value : 'auto';
+                } catch (e) {
+                    return 'auto';
+                }
+            }
+
+            function apply(choice) {
+                var dark = choice === 'dark' || (choice === 'auto' && media && media.matches);
+                root.setAttribute('data-bs-theme', dark ? 'dark' : 'light');
+                root.setAttribute('data-theme-choice', choice);
+                root.style.colorScheme = dark ? 'dark' : 'light';
+            }
+
+            var current = savedChoice();
+            apply(current);
+
+            if (media && media.addEventListener) {
+                media.addEventListener('change', function () {
+                    apply(current);
+                });
+            }
+
+            document.addEventListener('click', function (event) {
+                var toggle = event.target.closest && event.target.closest('[data-theme-toggle]');
+                if (!toggle) {
+                    return;
+                }
+                current = choices[(choices.indexOf(current) + 1) % choices.length];
+                try {
+                    localStorage.setItem(storageKey, current);
+                } catch (e) {}
+                apply(current);
+            });
+        })();
+    </script>
+}
+
 templ Layout(view ViewContext, content templ.Component) {
 {{
   username := view.Username
@@ -32,7 +82,7 @@ templ Layout(view ViewContext, content templ.Component) {
   isStoragePage := strings.HasPrefix(currentPath, "/storage/volumes") || strings.HasPrefix(currentPath, "/storage/ec-shards") || strings.HasPrefix(currentPath, "/storage/collections")
 
   // Detect if we're on a cluster page (but not storage page) to keep submenu expanded
-  isClusterPage := (strings.HasPrefix(currentPath, "/cluster/masters") || strings.HasPrefix(currentPath, "/cluster/volume-servers") || strings.HasPrefix(currentPath, "/cluster/filers") || strings.HasPrefix(currentPath, "/cluster/s3") || strings.HasPrefix(currentPath, "/cluster/mount-clients"))
+  isClusterPage := (strings.HasPrefix(currentPath, "/cluster/masters") || strings.HasPrefix(currentPath, "/cluster/volume-servers") || strings.HasPrefix(currentPath, "/cluster/filers") || strings.HasPrefix(currentPath, "/cluster/s3") || strings.HasPrefix(currentPath, "/cluster/vector-servers") || strings.HasPrefix(currentPath, "/cluster/mount-clients"))
 
   isDefaultWorkerPage := currentPath == "/plugin" ||
     strings.HasPrefix(currentPath, "/plugin/configuration") ||
@@ -55,6 +105,7 @@ templ Layout(view ViewContext, content templ.Component) {
     <meta name="csrf-token" content={ csrfToken }>
     <link rel="icon" href={ string(view.P("/static/favicon.ico")) } type="image/x-icon">
 
+    @themeScript()
     <!-- Bootstrap CSS -->
     <link href={ string(view.P("/static/css/bootstrap.min.css")) } rel="stylesheet">
     <!-- Bootstrap Icons CSS -->
@@ -69,10 +120,10 @@ templ Layout(view ViewContext, content templ.Component) {
 <body>
     <div class="container-fluid p-0">
         <!-- Header -->
-        <header class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top">
+        <header class="navbar navbar-expand-lg sticky-top admin-toolbar">
             <div class="container-fluid">
-                <a class="navbar-brand fw-bold" href={ view.P("/admin") }>
-                    <i class="bi bi-server me-2"></i>
+                <a class="navbar-brand" href={ view.P("/admin") }>
+                    <span class="brand-mark"><i class="bi bi-server"></i></span>
                     SeaweedFS Admin
                 </a>
 
@@ -84,12 +135,19 @@ templ Layout(view ViewContext, content templ.Component) {
                 </button>
 
                 <div class="collapse navbar-collapse" id="navbarNav">
-                    <ul class="navbar-nav ms-auto">
+                    <ul class="navbar-nav ms-auto align-items-lg-center">
+                        <li class="nav-item">
+                            <button class="theme-toggle" type="button" data-theme-toggle title="Switch theme: auto, light, dark" aria-label="Switch color theme">
+                                <i class="bi bi-circle-half theme-icon theme-icon-auto"></i>
+                                <i class="bi bi-sun theme-icon theme-icon-light"></i>
+                                <i class="bi bi-moon-stars theme-icon theme-icon-dark"></i>
+                            </button>
+                        </li>
                         <li class="nav-item dropdown">
                             <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown">
                                 <i class="bi bi-person me-1"></i>{username}
                             </a>
-                            <ul class="dropdown-menu">
+                            <ul class="dropdown-menu dropdown-menu-end">
                                 <li><a class="dropdown-item" href={ view.P("/logout") }>
                                     <i class="bi bi-box-arrow-right me-2"></i>Logout
                                 </a></li>
@@ -138,6 +196,11 @@ templ Layout(view ViewContext, content templ.Component) {
                                     <li class="nav-item">
                                         <a class="nav-link py-2" href={ view.P("/cluster/s3") }>
                                             <i class="bi bi-cloud me-2"></i>S3 Servers
+                                        </a>
+                                    </li>
+                                    <li class="nav-item">
+                                        <a class="nav-link py-2" href={ view.P("/cluster/vector-servers") }>
+                                            <i class="bi bi-arrow-up-right me-2"></i>Vector Servers
                                         </a>
                                     </li>
                                     <li class="nav-item">
@@ -191,7 +254,7 @@ templ Layout(view ViewContext, content templ.Component) {
                         </li>
                         <li class="nav-item">
                             <a class="nav-link" href={ view.P("/object-store/vector-buckets") }>
-                                <i class="bi bi-bounding-box-circles me-2"></i>Vector Buckets
+                                <i class="bi bi-arrow-up-right me-2"></i>Vector Buckets
                             </a>
                         </li>
                         <li class="nav-item">
@@ -223,6 +286,11 @@ templ Layout(view ViewContext, content templ.Component) {
                         <li class="nav-item">
                             <a class="nav-link" href={ view.P("/files") }>
                                 <i class="bi bi-folder me-2"></i>File Browser
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href={ view.P("/notifications/webhooks") }>
+                                <i class="bi bi-broadcast me-2"></i>Webhooks
                             </a>
                         </li>
                         <li class="nav-item">
@@ -391,17 +459,19 @@ templ LoginForm(title string, errorMessage string, csrfToken string) {
     <title>{title} - Login</title>
     <link rel="icon" href={ prefix + "/static/favicon.ico" } type="image/x-icon">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    @themeScript()
     <link href={ prefix + "/static/css/bootstrap.min.css" } rel="stylesheet">
-        <link href={ prefix + "/static/css/bootstrap-icons.min.css" } rel="stylesheet">
+    <link href={ prefix + "/static/css/bootstrap-icons.min.css" } rel="stylesheet">
+    <link href={ prefix + "/static/css/admin.css" } rel="stylesheet">
 </head>
-<body class="bg-light">
+<body class="login-page">
     <div class="container">
         <div class="row justify-content-center min-vh-100 align-items-center">
             <div class="col-md-6 col-lg-4">
                 <div class="card shadow">
                     <div class="card-body p-5">
                         <div class="text-center mb-4">
-                            <i class="bi bi-server icon-3x text-primary mb-3"></i>
+                            <span class="brand-mark mb-3"><i class="bi bi-server"></i></span>
                             <h4 class="card-title">{title}</h4>
                             <p class="text-muted">Please sign in to continue</p>
                         </div>

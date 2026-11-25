@@ -3,7 +3,6 @@ package sftpd
 
 import (
 	"context"
-	"crypto/md5"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +19,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	filer_pb "github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_objectlock"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	"github.com/seaweedfs/seaweedfs/weed/sftpd/user"
@@ -82,7 +83,7 @@ func isNotExistError(err error) bool {
 // updateEntry sends an UpdateEntryRequest for the given entry.
 func (fs *SftpServer) updateEntry(dir string, entry *filer_pb.Entry) error {
 	return fs.callWithClient(false, func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
-		_, err := client.UpdateEntry(ctx, &filer_pb.UpdateEntryRequest{Directory: dir, Entry: entry})
+		_, err := client.UpdateEntry(ctx, &filer_pb.UpdateEntryRequest{Directory: dir, Entry: entry, ExpectedExtended: s3_objectlock.ObjectLockState(entry)})
 		return err
 	})
 }
@@ -160,6 +161,9 @@ func (fs *SftpServer) newFileWriter(r *sftp.Request) (io.WriterAt, error) {
 	if err := fs.requireParentDir(absPath); err != nil {
 		return nil, err
 	}
+	if err := fs.checkWritable(absPath); err != nil {
+		return nil, err
+	}
 	// Create a temporary file to buffer writes
 	tmpFile, err := os.CreateTemp("", "sftp-upload-*")
 	if err != nil {
@@ -184,6 +188,22 @@ func (fs *SftpServer) newFileWriter(r *sftp.Request) (io.WriterAt, error) {
 		gid:         fs.user.Gid,
 		offset:      0,
 	}, nil
+}
+
+// checkWritable refuses an upload onto a directory, which the filer would
+// redirect to a child, or onto a protected entry.
+func (fs *SftpServer) checkWritable(absPath string) error {
+	entry, err := fs.getEntry(absPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if entry.IsDirectory {
+		return fmt.Errorf("%s is a directory", absPath)
+	}
+	return fs.checkEntryProtected(absPath, entry)
 }
 
 func (fs *SftpServer) copyExistingContent(absPath string, dst io.Writer) error {
@@ -271,8 +291,15 @@ func (fs *SftpServer) renameEntry(absPath, absTarget string) error {
 		return err
 	}
 	requireAbsentTarget := false
+	var srcEntry *filer_pb.Entry
 	if path.Clean(absPath) != path.Clean(absTarget) {
 		var err error
+		if srcEntry, err = fs.getEntry(absPath); err != nil {
+			return err
+		}
+		if err := fs.checkEntryProtected(absPath, srcEntry); err != nil {
+			return err
+		}
 		requireAbsentTarget, err = fs.checkRenameTargetDelete(absTarget, targetDir)
 		if err != nil {
 			return err
@@ -283,6 +310,11 @@ func (fs *SftpServer) renameEntry(absPath, absTarget string) error {
 	}
 	if err := fs.requireParentDir(absTarget); err != nil {
 		return err
+	}
+	if srcEntry != nil && srcEntry.IsDirectory {
+		if err := fs.checkSubtreeProtected(absPath); err != nil {
+			return err
+		}
 	}
 	oldDir, oldName := util.FullPath(absPath).DirAndName()
 	newDir, newName := util.FullPath(absTarget).DirAndName()
@@ -310,7 +342,10 @@ func (fs *SftpServer) renameEntry(absPath, absTarget string) error {
 // stay absent, so the filer rejects the overwrite of one created in the gap.
 // Lookup failures other than not-found fail closed.
 func (fs *SftpServer) checkRenameTargetDelete(absTarget, targetDir string) (requireAbsentTarget bool, err error) {
-	if _, err := fs.getEntry(absTarget); err == nil {
+	if entry, err := fs.getEntry(absTarget); err == nil {
+		if err := fs.checkEntryProtected(absTarget, entry); err != nil {
+			return false, err
+		}
 		return false, fs.checkFilePermission(absTarget, "delete")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
@@ -421,6 +456,9 @@ func (fs *SftpServer) setFileStatWithRequest(absPath string, r *sftp.Request) er
 	}
 	entry, err := fs.getEntry(absPath)
 	if err != nil {
+		return err
+	}
+	if err := fs.checkEntryProtected(absPath, entry); err != nil {
 		return err
 	}
 	dir, _ := util.FullPath(absPath).DirAndName()
@@ -603,7 +641,7 @@ func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User
 	uploadUrl = normalizedUrl
 
 	// Compute MD5 while uploading
-	hash := md5.New()
+	hash := util.NewMd5()
 	body := io.TeeReader(reader, hash)
 
 	// We can skip ContentLength if unknown (chunked transfer encoding)
@@ -691,9 +729,16 @@ func (fs *SftpServer) deleteEntry(p string, recursive bool) error {
 	if err := fs.checkFilePermission(p, "delete"); err != nil {
 		return err
 	}
+	entry, err := fs.getEntry(p)
+	if err != nil {
+		return err
+	}
+	if err := fs.checkEntryProtected(p, entry); err != nil {
+		return err
+	}
 	dir, name := util.FullPath(p).DirAndName()
 	return fs.callWithClient(false, func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
-		r, err := client.DeleteEntry(ctx, &filer_pb.DeleteEntryRequest{Directory: dir, Name: name, IsDeleteData: true, IsRecursive: recursive})
+		r, err := client.DeleteEntry(ctx, &filer_pb.DeleteEntryRequest{Directory: dir, Name: name, IsDeleteData: true, IsRecursive: recursive, ExpectedExtended: s3_objectlock.ObjectLockState(entry)})
 		if err != nil {
 			return err
 		}
@@ -702,6 +747,60 @@ func (fs *SftpServer) deleteEntry(p string, recursive bool) error {
 		}
 		return nil
 	})
+}
+
+// checkEntryProtected refuses to change an entry that the S3 API or the filer
+// HTTP API would refuse to change: one under an active Object Lock or WORM.
+func (fs *SftpServer) checkEntryProtected(p string, entry *filer_pb.Entry) error {
+	if string(entry.Extended[s3_constants.ExtDeleteMarkerKey]) != "true" && s3_objectlock.EntryHasActiveLock(entry, time.Now()) {
+		glog.V(0).Infof("permission denied for user %s: %s is under Object Lock", fs.user.Username, p)
+		return os.ErrPermission
+	}
+	if entry.WormEnforcedAtTsNs == 0 {
+		return nil
+	}
+	fc, err := fs.readFilerConf()
+	if err != nil {
+		return err
+	}
+	if fc.WormEnforced(p, entry.WormEnforcedAtTsNs) {
+		glog.V(0).Infof("permission denied for user %s: %s is write-once", fs.user.Username, p)
+		return os.ErrPermission
+	}
+	return nil
+}
+
+// checkSubtreeProtected refuses to move a directory that a WORM rule covers
+// or that holds an object under Object Lock, since every descendant moves.
+func (fs *SftpServer) checkSubtreeProtected(dir string) error {
+	fc, err := fs.readFilerConf()
+	if err != nil {
+		return err
+	}
+	if fc.IntersectsWorm(dir) {
+		glog.V(0).Infof("permission denied for user %s: %s intersects a WORM rule", fs.user.Username, dir)
+		return os.ErrPermission
+	}
+	var locked bool
+	if err := fs.callWithClient(true, func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+		locked, err = s3_objectlock.HasObjectsWithActiveLocks(ctx, client, dir)
+		return err
+	}); err != nil {
+		return err
+	}
+	if locked {
+		glog.V(0).Infof("permission denied for user %s: %s holds objects under Object Lock", fs.user.Username, dir)
+		return os.ErrPermission
+	}
+	return nil
+}
+
+func (fs *SftpServer) readFilerConf() (fc *filer.FilerConf, err error) {
+	err = fs.withTimeoutContext(func(ctx context.Context) error {
+		fc, err = filer.ReadFilerConfFromClient(ctx, fs, lookupFileIdFn(filer.LookupFn(fs)))
+		return err
+	})
+	return fc, err
 }
 
 // ==================== Custom Types ====================

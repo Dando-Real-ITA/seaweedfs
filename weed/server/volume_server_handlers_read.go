@@ -266,7 +266,9 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 	defer func() {
 		atomic.AddInt64(&vs.inFlightDownloadDataSize, -int64(memoryCost))
 		if vs.concurrentDownloadLimit != 0 {
+			vs.inFlightDownloadDataLimitCond.L.Lock()
 			vs.inFlightDownloadDataLimitCond.Broadcast()
+			vs.inFlightDownloadDataLimitCond.L.Unlock()
 		}
 	}()
 
@@ -352,7 +354,8 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 			}
 			// } else if strings.Contains(r.Header.Get("Accept-Encoding"), "zstd") && util.IsZstdContent(n.Data) {
 			//	w.Header().Set("Content-Encoding", "zstd")
-		} else if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && util.IsGzippedContent(n.Data) {
+		} else if r.Header.Get("Range") == "" && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && util.IsGzippedContent(n.Data) {
+			// A range is over the decoded bytes, so only a whole read passes gzip through.
 			w.Header().Set("Content-Encoding", "gzip")
 		} else {
 			if n.Data, err = util.DecompressData(n.Data); err != nil {

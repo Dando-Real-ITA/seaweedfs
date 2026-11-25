@@ -109,6 +109,9 @@ func (wfs *WFS) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) 
 	if fhIn.entry.IsDirectory || fhOut.entry.IsDirectory {
 		return 0, fuse.EISDIR
 	}
+	if fhIn.entry.hasSSES3Data() {
+		return 0, fuse.ENOTSUP
+	}
 
 	glog.V(4).Infof(
 		"CopyFileRange %s fhIn %d -> %s fhOut %d, [%d,%d) -> [%d,%d)",
@@ -159,6 +162,9 @@ func (wfs *WFS) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) 
 		numBytesRead, err := readDataByFileHandle(
 			buff[:readLen], fhIn, offsetIn)
 		if err != nil {
+			if err == errNativeSSES3Read {
+				return 0, fuse.ENOTSUP
+			}
 			glog.Warningf("file handle read %s %d (total %d): %v",
 				fhIn.FullPath(), numBytesRead, totalCopied, err)
 			return 0, fuse.EIO
@@ -180,17 +186,23 @@ func (wfs *WFS) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) 
 
 		// Perform the write
 		fhOut.dirtyPages.writerPattern.MonitorWriteAt(offsetOut, int(numBytesRead))
-		if err := fhOut.dirtyPages.AddPage(
+		buffered, err := fhOut.dirtyPages.AddPage(
 			offsetOut,
 			buff[:numBytesRead],
 			fhOut.dirtyPages.writerPattern.IsSequentialMode(),
-			nowUnixNano); err != nil {
-			glog.Errorf("AddPage error: %v", err)
-			return 0, writeErrorToFuseStatus(err)
+			nowUnixNano)
+		if buffered > 0 {
+			fhOut.pageWrites.Add(1)
+			totalCopied += buffered
+			fhOut.dirtyContent = true
 		}
-
-		// Accumulate for the next loop iteration
-		totalCopied += numBytesRead
+		if err != nil {
+			glog.Errorf("AddPage error: %v", err)
+			if totalCopied == 0 {
+				return 0, writeErrorToFuseStatus(err)
+			}
+			break
+		}
 	}
 
 	if totalCopied == 0 {
@@ -209,6 +221,10 @@ func (wfs *WFS) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) 
 }
 
 func (wfs *WFS) tryServerSideWholeFileCopy(cancel <-chan struct{}, in *fuse.CopyFileRangeIn, fhIn, fhOut *FileHandle) (written uint32, handled bool, code fuse.Status) {
+	if err := wfs.checkContentPublication(fhOut, nil); err != nil {
+		glog.V(4).Infof("server-side copy: skipped (%v)", err)
+		return 0, false, fuse.OK
+	}
 	copyRequest, ok := wholeFileServerCopyCandidate(fhIn, fhOut, in)
 	if !ok {
 		return 0, false, fuse.OK
@@ -256,6 +272,7 @@ func (wfs *WFS) applyServerSideWholeFileCopyResult(fhIn, fhOut *FileHandle, dstP
 		fhOut.contentType = entry.Attributes.Mime
 	}
 	fhOut.dirtyMetadata = false
+	fhOut.dirtyContent = false
 	wfs.updateServerSideWholeFileCopyMetaCache(dstPath, entry)
 	// Note: we intentionally skip fuseServer.InodeNotify/EntryNotify here.
 	// This runs inside the CopyFileRange request handler; those notifies
@@ -316,8 +333,8 @@ func wholeFileServerCopyCandidate(fhIn, fhOut *FileHandle, in *fuse.CopyFileRang
 		glog.V(4).Infof("server-side copy: skipped (same file handle)")
 		return wholeFileServerCopyRequest{}, false
 	}
-	if fhIn.dirtyMetadata || fhOut.dirtyMetadata {
-		glog.V(4).Infof("server-side copy: skipped (dirty metadata: in=%v out=%v)", fhIn.dirtyMetadata, fhOut.dirtyMetadata)
+	if fhIn.dirtyMetadata || fhIn.dirtyContent || fhOut.dirtyMetadata || fhOut.dirtyContent {
+		glog.V(4).Infof("server-side copy: skipped (dirty handle: in=%v/%v out=%v/%v)", fhIn.dirtyMetadata, fhIn.dirtyContent, fhOut.dirtyMetadata, fhOut.dirtyContent)
 		return wholeFileServerCopyRequest{}, false
 	}
 	if in.OffIn != 0 || in.OffOut != 0 {

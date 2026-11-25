@@ -122,6 +122,9 @@ pub struct Store {
     /// The copy-claim set installed on every location by
     /// set_volume_load_guard, kept here so a later add_location gets it too.
     load_guard: Option<Arc<Mutex<HashSet<VolumeId>>>>,
+    /// The data directory of every disk this server loads, set before the
+    /// first `add_location` so a disk's EC mounts can see its siblings.
+    pub store_dirs: Vec<String>,
 }
 
 impl Store {
@@ -148,6 +151,7 @@ impl Store {
             disk_stats_of: super::disk_location::get_disk_stats,
             load_guard: None,
             preallocate_supported: PREALLOCATE_SUPPORTED,
+            store_dirs: Vec::new(),
         }
     }
 
@@ -170,6 +174,7 @@ impl Store {
             tags,
         )?;
         loc.load_guard = self.load_guard.clone();
+        loc.store_dirs = self.store_dirs.clone();
         loc.load_existing_volumes(self.needle_map_kind)?;
 
         // Check for duplicate volume IDs across existing locations
@@ -287,12 +292,20 @@ impl Store {
 
     // ---- Volume lifecycle ----
 
-    /// Find the location with fewest volumes (load-balance) of the given disk type.
-    /// Matches Go's FindFreeLocation: accounts for EC shards when computing free slots.
-    fn find_free_location(&self, disk_type: &DiskType, preallocate: u64) -> Option<usize> {
+    /// Find the location with the fewest writable volumes of `collection`, so
+    /// they do not share one disk's write bandwidth, then the most free slots
+    /// (load-balance) of the given disk type. Matches Go's FindFreeLocation:
+    /// accounts for EC shards when computing free slots.
+    fn find_free_location(
+        &self,
+        disk_type: &DiskType,
+        collection: &str,
+        preallocate: u64,
+    ) -> Option<usize> {
         use crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT;
 
-        let mut best: Option<(usize, i64)> = None; // (index, effective_free)
+        let volume_size_limit = self.volume_size_limit.load(Ordering::Relaxed);
+        let mut best: Option<(usize, usize, i64)> = None; // (index, writable, effective_free)
         for (i, loc) in self.locations.iter().enumerate() {
             if &loc.disk_type != disk_type {
                 continue;
@@ -322,11 +335,14 @@ impl Store {
             ) {
                 continue;
             }
-            if best.is_none() || effective_free > best.unwrap().1 {
-                best = Some((i, effective_free));
+            let writable = loc.writable_collection_volumes_len(collection, volume_size_limit);
+            if best.is_none_or(|(_, min_writable, max_free)| {
+                writable < min_writable || (writable == min_writable && effective_free > max_free)
+            }) {
+                best = Some((i, writable, effective_free));
             }
         }
-        best.map(|(i, _)| i)
+        best.map(|(i, _, _)| i)
     }
 
     /// Find a free location matching a predicate.
@@ -462,6 +478,10 @@ impl Store {
     /// their index files across disks of the same node and lose them at
     /// startup. See seaweedfs/seaweedfs#9212.
     ///
+    /// A non-empty `required_disk_type` limits every step to disks of that
+    /// type, so a copy meant for one medium never lands beside the volume's
+    /// copy on another.
+    ///
     /// `data_shard_count` is taken as a parameter rather than read from
     /// `DATA_SHARDS_COUNT` so custom-ratio builds can swap the default
     /// without touching this helper.
@@ -475,6 +495,7 @@ impl Store {
         collection: &str,
         vid: VolumeId,
         data_shard_count: u32,
+        required_disk_type: &str,
         shard_ids: &[ShardId],
     ) -> Option<usize> {
         const TIER_ANY_DISK: u8 = 1;
@@ -483,14 +504,21 @@ impl Store {
         const TIER_MOUNTED: u8 = 4;
         const TIER_OWNS_SHARD: u8 = 5;
 
+        let required =
+            (!required_disk_type.is_empty()).then(|| DiskType::from_string(required_disk_type));
         // (index, tier, owned shard count, free shard slots)
         let mut best: Option<(usize, u8, usize, i64)> = None;
         for (i, loc) in self.locations.iter().enumerate() {
             let owned = owned_ec_shard_count(loc, vid, shard_ids);
-            if loc.read_only_mount {
-                // A read-only owner still owns the shard: placing another
-                // copy on a writable sibling would register it on two disks.
-                if owned > 0 {
+            if loc.read_only_mount || required.as_ref().is_some_and(|t| loc.disk_type != *t) {
+                // An owner that cannot take the copy still owns the shard:
+                // placing another copy on a sibling would register it on two disks.
+                // A typed copy also yields to an unmounted file of the shard there,
+                // which a later mount would pick ahead of the copy.
+                if owned > 0
+                    || (required.is_some()
+                        && has_ec_shard_file_on_disk(loc, collection, vid, shard_ids))
+                {
                     return None;
                 }
                 continue;
@@ -596,7 +624,7 @@ impl Store {
             return Err(VolumeError::AlreadyExists);
         }
         let loc_idx = self
-            .find_free_location(&disk_type, spec.preallocate)
+            .find_free_location(&disk_type, spec.collection, spec.preallocate)
             .ok_or_else(|| {
                 VolumeError::Io(io::Error::other(format!(
                     "no free location for disk type {:?}",
@@ -1037,13 +1065,18 @@ impl Store {
     }
 
     /// Delete a needle from a volume.
-    pub fn delete_volume_needle(&self, vid: VolumeId, n: &mut Needle) -> Result<Size, VolumeError> {
+    pub fn delete_volume_needle(
+        &self,
+        vid: VolumeId,
+        n: &mut Needle,
+        fsync: bool,
+    ) -> Result<Size, VolumeError> {
         // Match Go's DeleteVolumeNeedle: check noWriteOrDelete before proceeding.
         let (_, vol) = self.find_volume(vid).ok_or(VolumeError::NotFound)?;
         if vol.is_no_write_or_delete() {
             return Err(VolumeError::ReadOnly(vid));
         }
-        vol.delete_needle(n)
+        vol.delete_needle(n, fsync)
     }
 
     // ---- Collection operations ----
@@ -1340,6 +1373,19 @@ impl Store {
             }
         }
         None
+    }
+
+    /// Takes the journal lock of every runtime of `vid`, in disk order, so no
+    /// delete append is in flight while the caller reads the journals.
+    pub(crate) fn lock_ec_journals(
+        &self,
+        vid: VolumeId,
+    ) -> Vec<std::sync::MutexGuard<'_, crate::storage::erasure_coding::ec_volume::EcJournal>> {
+        self.locations
+            .iter()
+            .filter_map(|loc| loc.find_ec_volume(vid))
+            .map(|ecv| ecv.journal())
+            .collect()
     }
 
     /// Find an EC volume across all locations (mutable).
@@ -1807,7 +1853,7 @@ impl Store {
     {
         match self.begin_compact_volume(vid, preallocate)? {
             Some(job) => job.run(progress_fn),
-            None => Ok(()),
+            None => Err(crate::storage::volume::compacting_error(vid)),
         }
     }
 
@@ -2064,6 +2110,19 @@ fn ec_free_shard_count(loc: &DiskLocation, data_shard_count: u32) -> i64 {
         return 0;
     }
     free
+}
+
+/// Whether `loc` holds a file for one of `shard_ids` of `vid`, mounted or not.
+fn has_ec_shard_file_on_disk(
+    loc: &DiskLocation,
+    collection: &str,
+    vid: VolumeId,
+    shard_ids: &[ShardId],
+) -> bool {
+    let base = crate::storage::volume::volume_file_name(&loc.directory, collection, vid);
+    shard_ids
+        .iter()
+        .any(|shard_id| std::path::Path::new(&format!("{}.ec{:02}", base, shard_id)).exists())
 }
 
 /// Reports how many of `shard_ids` this disk already claims for `vid`, per
@@ -2918,7 +2977,9 @@ mod tests {
             cookie: Cookie(0xaa),
             ..Needle::default()
         };
-        let deleted = store.delete_volume_needle(VolumeId(1), &mut del_n).unwrap();
+        let deleted = store
+            .delete_volume_needle(VolumeId(1), &mut del_n, false)
+            .unwrap();
         assert!(deleted.0 > 0);
     }
 
@@ -3025,6 +3086,87 @@ mod tests {
         // Both locations should have 1 volume each (load-balanced)
         assert_eq!(store.locations[0].volumes_len(), 1);
         assert_eq!(store.locations[1].volumes_len(), 1);
+    }
+
+    fn add_spread_test_volume(store: &mut Store, vid: u32, collection: &str) {
+        let spec = VolumeSpec {
+            collection,
+            ..VolumeSpec::default()
+        };
+        store
+            .add_volume(VolumeId(vid), DiskType::HardDrive, &spec)
+            .unwrap();
+    }
+
+    fn location_of(store: &Store, vid: u32) -> Option<usize> {
+        store
+            .locations
+            .iter()
+            .position(|loc| loc.find_volume(VolumeId(vid)).is_some())
+    }
+
+    // Mirrors Go's TestAddVolumeSpreadsCollectionOverDisks.
+    #[test]
+    fn test_add_volume_spreads_collection_over_disks() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let mut store =
+            make_test_store(&[tmp1.path().to_str().unwrap(), tmp2.path().to_str().unwrap()]);
+
+        add_spread_test_volume(&mut store, 1, "other");
+        add_spread_test_volume(&mut store, 2, "other");
+        add_spread_test_volume(&mut store, 3, "spread");
+        let first = location_of(&store, 3);
+        // Leave the disk with the "spread" volume holding fewer volumes overall.
+        let other_on_first = if first == Some(1) { 2 } else { 1 };
+        store
+            .delete_volume(VolumeId(other_on_first), false, false, false)
+            .unwrap();
+
+        add_spread_test_volume(&mut store, 4, "spread");
+        assert_ne!(location_of(&store, 4), first);
+    }
+
+    // Mirrors Go's TestAddVolumeIgnoresFullVolumesOfCollection.
+    #[test]
+    fn test_add_volume_ignores_full_volumes_of_collection() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let mut store =
+            make_test_store(&[tmp1.path().to_str().unwrap(), tmp2.path().to_str().unwrap()]);
+        // Every .dat holds at least its superblock, so all volumes are full.
+        store.volume_size_limit.store(1, Ordering::Relaxed);
+
+        add_spread_test_volume(&mut store, 1, "spread");
+        let full_disk = location_of(&store, 1);
+        add_spread_test_volume(&mut store, 2, "other");
+        add_spread_test_volume(&mut store, 3, "spread");
+        assert_eq!(location_of(&store, 3), full_disk);
+    }
+
+    // Mirrors Go's TestAddVolumeIgnoresReadOnlyVolumesOfCollection.
+    #[test]
+    fn test_add_volume_ignores_read_only_volumes_of_collection() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let mut store =
+            make_test_store(&[tmp1.path().to_str().unwrap(), tmp2.path().to_str().unwrap()]);
+
+        add_spread_test_volume(&mut store, 1, "spread");
+        let writable_disk = location_of(&store, 1);
+        add_spread_test_volume(&mut store, 2, "other");
+        add_spread_test_volume(&mut store, 3, "spread");
+        assert_ne!(location_of(&store, 3), writable_disk);
+        store
+            .find_volume(VolumeId(3))
+            .unwrap()
+            .1
+            .set_read_only()
+            .unwrap();
+
+        // The other disk holds more volumes, but its "spread" volume is read-only.
+        add_spread_test_volume(&mut store, 4, "spread");
+        assert_ne!(location_of(&store, 4), writable_disk);
     }
 
     #[test]
@@ -3395,7 +3537,7 @@ mod tests {
             cookie: Cookie(2),
             ..Needle::default()
         };
-        store.delete_volume_needle(vid, &mut del).unwrap();
+        store.delete_volume_needle(vid, &mut del, false).unwrap();
 
         let size_before = store.find_volume(vid).unwrap().1.dat_file_size().unwrap();
 
@@ -3671,8 +3813,8 @@ mod tests {
         assert!(store.cleanup_compact_volume(vid).is_err());
         let (_, v) = store.find_volume(vid).unwrap();
         assert!(v.relocate_index_to(other.path().to_str().unwrap()).is_err());
-        // Go parity: a commit that finds the volume compacting is a no-op.
-        store.commit_compact_volume(vid).unwrap();
+        assert!(store.commit_compact_volume(vid).is_err());
+        assert!(store.compact_volume(vid, 0, 0, |_| true).is_err());
 
         let (_, v) = store.find_volume(vid).expect("still mounted");
         assert!(v.is_compacting());
@@ -3719,7 +3861,7 @@ mod tests {
             cookie: Cookie(2),
             ..Needle::default()
         };
-        store.delete_volume_needle(vid, &mut del).unwrap();
+        store.delete_volume_needle(vid, &mut del, false).unwrap();
         let revision = {
             let (_, v) = store.find_volume(vid).unwrap();
             v.super_block().compaction_revision
@@ -3744,7 +3886,7 @@ mod tests {
             cookie: Cookie(4),
             ..Needle::default()
         };
-        store.delete_volume_needle(vid, &mut del).unwrap();
+        store.delete_volume_needle(vid, &mut del, false).unwrap();
 
         drop(release_tx);
         copy.join().unwrap().unwrap();
@@ -3817,7 +3959,7 @@ mod tests {
         let base = volume_file_name(&store.locations[2].idx_directory, collection, vid);
         std::fs::write(format!("{}.ecx", base), vec![0u8; 20]).unwrap();
 
-        let got = store.find_ec_shard_target_location(collection, vid, 10, &[]);
+        let got = store.find_ec_shard_target_location(collection, vid, 10, "", &[]);
         assert_eq!(
             got,
             Some(2),
@@ -4027,7 +4169,7 @@ mod tests {
         let base = volume_file_name(&store.locations[2].idx_directory, collection, vid);
         std::fs::write(format!("{}.ecx", base), vec![0u8; 20]).unwrap();
 
-        let got = store.find_ec_shard_target_location(collection, vid, 10, &[]);
+        let got = store.find_ec_shard_target_location(collection, vid, 10, "", &[]);
         assert_eq!(
             got,
             Some(1),
@@ -4041,7 +4183,7 @@ mod tests {
     #[test]
     fn test_find_ec_shard_target_location_falls_through_to_hdd_when_nothing_matches() {
         let (store, _tmp) = make_ec_target_test_store(2);
-        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(3333), 10, &[]);
+        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(3333), 10, "", &[]);
         assert!(got.is_some(), "expected an HDD fallback");
         assert_eq!(store.locations[got.unwrap()].disk_type, DiskType::HardDrive);
     }
@@ -4057,7 +4199,7 @@ mod tests {
             .max_volume_count
             .store(0, Ordering::Relaxed);
 
-        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(4444), 10, &[]);
+        let got = store.find_ec_shard_target_location("grafana-loki", VolumeId(4444), 10, "", &[]);
         assert_eq!(
             got,
             Some(0),
@@ -4106,7 +4248,7 @@ mod tests {
             .mount_ec_shards(vid, collection, &[0], "")
             .unwrap();
 
-        let got = store.find_ec_shard_target_location(collection, vid, 10, &[]);
+        let got = store.find_ec_shard_target_location(collection, vid, 10, "", &[]);
         assert_eq!(
             got,
             Some(1),
@@ -4148,21 +4290,65 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[0]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[0]),
             Some(0),
             "a copy of shard 0 left its owning disk",
         );
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[2]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[2]),
             Some(1),
             "a copy of shard 2 left its owning disk",
         );
         // A shard no disk owns yet is placed by the unchanged waterfall: both
         // disks have it mounted, so the emptier one wins.
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[7]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[7]),
             Some(1),
             "placement of an unclaimed shard changed",
+        );
+    }
+
+    /// A copy that names a disk type skips the other medium even when that
+    /// disk has the EC volume mounted, and refuses rather than split a shard
+    /// another medium already owns.
+    #[test]
+    fn test_find_ec_shard_target_location_required_disk_type() {
+        let (mut store, _tmp) = make_ec_target_test_store(2);
+        store.locations[0].disk_type = DiskType::Ssd;
+        store.locations[1].disk_type = DiskType::from_string("hdd_ht");
+        let collection = "grafana-loki";
+        let vid = VolumeId(5555);
+        let base0 = volume_file_name(&store.locations[0].directory, collection, vid);
+        std::fs::write(format!("{}.ec00", base0), b"x").unwrap();
+        std::fs::write(format!("{}.ec01", base0), b"x").unwrap();
+        std::fs::write(format!("{}.ecx", base0), vec![0u8; 20]).unwrap();
+        store.locations[0]
+            .mount_ec_shards(vid, collection, &[0, 1], "")
+            .unwrap();
+
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[2]),
+            Some(0)
+        );
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd_ht", &[2]),
+            Some(1),
+            "a hdd_ht copy landed off the hdd_ht disk",
+        );
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd_ht", &[1]),
+            None,
+            "a shard the ssd disk owns must not get a second claim on hdd_ht",
+        );
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd", &[2]),
+            None
+        );
+        std::fs::write(format!("{}.ec03", base0), b"x").unwrap();
+        assert_eq!(
+            store.find_ec_shard_target_location(collection, vid, 10, "hdd_ht", &[3]),
+            None,
+            "an unmounted shard file on ssd would be mounted ahead of a hdd_ht copy",
         );
     }
 
@@ -4200,13 +4386,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[0]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[0]),
             Some(0),
             "a copy of shard 0 left its owning disk when the disk was full",
         );
         // A shard it does not own still respects the space filter.
         assert_eq!(
-            store.find_ec_shard_target_location(collection, vid, 10, &[7]),
+            store.find_ec_shard_target_location(collection, vid, 10, "", &[7]),
             Some(1),
             "an unclaimed shard should go to the disk with free slots",
         );

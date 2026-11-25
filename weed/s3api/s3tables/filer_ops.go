@@ -72,7 +72,9 @@ func (h *S3TablesHandler) createDirectoryEntry(ctx context.Context, client filer
 	})
 }
 
-// ensureDirectory ensures a directory exists at the specified path
+// ensureDirectory ensures a directory exists at the specified path. The create
+// is exclusive: a directory another writer made since the lookup may already
+// carry a record, which a plain create would replace with a bare directory.
 func (h *S3TablesHandler) ensureDirectory(ctx context.Context, client filer_pb.SeaweedFilerClient, path string) error {
 	dir, name := splitPath(path)
 	_, err := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
@@ -83,7 +85,9 @@ func (h *S3TablesHandler) ensureDirectory(ctx context.Context, client filer_pb.S
 		return nil
 	}
 	if errors.Is(err, filer_pb.ErrNotFound) {
-		return h.createDirectory(ctx, client, path)
+		if err = h.createDirectoryExclusive(ctx, client, path, nil); errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
+			return nil
+		}
 	}
 	return err
 }
@@ -202,6 +206,12 @@ func (h *S3TablesHandler) removeExtendedAttributes(ctx context.Context, client f
 		}
 		return nil
 	})
+}
+
+// catalogRecordKeys are the attributes that make a directory a catalog record.
+var catalogRecordKeys = []string{
+	ExtendedKeyMetadata, ExtendedKeyMetadataVersion, ExtendedKeyPolicy, ExtendedKeyTags, ExtendedKeyEntryType,
+	ExtendedKeyMaintenance, ExtendedKeyMaintenanceStatus, ExtendedKeyDeleting, ExtendedKeyMoving,
 }
 
 // removeExtendedAttributesIf drops the given attributes only while they still
@@ -895,17 +905,51 @@ func (w *markRemovalWrites) UpdateEntry(ctx context.Context, in *filer_pb.Update
 	return resp, err
 }
 
-// dirListPageSize is how many entries dirHoldsFiles reads per ListEntries call.
+// dirListPageSize is how many entries DirHoldsFiles reads per ListEntries call.
 const dirListPageSize = 1024
 
-// dirHoldsFiles reports whether any file sits under dirPath, at any depth. It
-// walks breadth-first, pages through each directory, and stops at the first
-// file it sees. Returning at that file abandons the page being read, so the
-// listings run on a context of their own that ends with the call: otherwise
-// the filer keeps producing that page until the whole request is over.
-func (h *S3TablesHandler) dirHoldsFiles(ctx context.Context, client filer_pb.SeaweedFilerClient, dirPath string) (bool, error) {
+// anyFileTime is a DirHoldsFiles cutoff past every file time.
+var anyFileTime = time.Unix(1<<62, 0)
+
+// ViewHoldsFiles reports whether dirPath holds a file a view created at
+// createdAt did not write: any file but its metadata, which it writes only
+// after its record, and any metadata file from an earlier second.
+func ViewHoldsFiles(ctx context.Context, client filer_pb.SeaweedFilerClient, dirPath string, createdAt time.Time) (bool, error) {
+	if holds, err := DirHoldsFiles(ctx, client, dirPath, anyFileTime); holds || err != nil {
+		return holds, err
+	}
+	return DirHoldsFiles(ctx, client, path.Join(dirPath, "metadata"), createdAt)
+}
+
+// DirHoldsFiles reports whether any file sits under dirPath, at any depth, or
+// an S3 object is stored on dirPath or a directory under it. A non-zero before
+// counts only those created in an earlier second (file times have second
+// granularity, and a writer's first file can share the record's second), other
+// than Iceberg metadata files in dirPath/metadata, which a create stages ahead
+// of its record. It walks breadth-first, pages through
+// each directory, and stops at the first file it sees. Returning at that file
+// abandons the page being read, so the listings run on a context of their own
+// that ends with the call: otherwise the filer keeps producing that page until
+// the whole request is over.
+func DirHoldsFiles(ctx context.Context, client filer_pb.SeaweedFilerClient, dirPath string, before time.Time) (bool, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	counts := func(dir string, entry *filer_pb.Entry) bool {
+		if entry.IsDirectory && !entry.IsDirectoryKeyObject() {
+			return false
+		}
+		return before.IsZero() || (entry.GetAttributes().GetCrtime() < before.Unix() &&
+			!(dir == path.Join(dirPath, "metadata") && strings.HasSuffix(entry.Name, ".metadata.json")))
+	}
+	parent, name := path.Split(dirPath)
+	if resp, err := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{Directory: strings.TrimSuffix(parent, "/"), Name: name}); err == nil {
+		if counts(parent, resp.Entry) {
+			return true, nil
+		}
+	} else if !errors.Is(err, filer_pb.ErrNotFound) {
+		return false, err
+	}
 
 	pending := []string{dirPath}
 	for len(pending) > 0 {
@@ -942,10 +986,12 @@ func (h *S3TablesHandler) dirHoldsFiles(ctx context.Context, client filer_pb.Sea
 				}
 				received = true
 				lastFileName = entry.Entry.Name
-				if !entry.Entry.IsDirectory {
+				if counts(dir, entry.Entry) {
 					return true, nil
 				}
-				pending = append(pending, path.Join(dir, entry.Entry.Name))
+				if entry.Entry.IsDirectory {
+					pending = append(pending, path.Join(dir, entry.Entry.Name))
+				}
 			}
 			if !received {
 				break
@@ -1091,6 +1137,24 @@ func RootClaimed(roots map[string][]string, selfPath, root string) bool {
 	return false
 }
 
+// rootFilesShared reports whether a record other than selfPath keeps its files
+// at root, above it or under it. Unlike RootClaimed it ignores where the other
+// records themselves sit: a table created under a renamed table's old name has
+// its entry on that directory and its files elsewhere.
+func rootFilesShared(roots map[string][]string, selfPath, root string) bool {
+	for recordPath, others := range roots {
+		if recordPath == selfPath {
+			continue
+		}
+		for _, other := range others {
+			if PathsOverlap(other, root) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // checkLocationUnclaimed returns ErrLocationInUse when root, the one the record
 // at recordPath would have, is claimed by another record.
 func checkLocationUnclaimed(ctx context.Context, client filer_pb.SeaweedFilerClient, bucketName, recordPath, root string) error {
@@ -1170,6 +1234,27 @@ func (h *S3TablesHandler) refuseClaimedLocation(w http.ResponseWriter, r *http.R
 		h.writeError(w, http.StatusConflict, ErrCodeConflict, err.Error())
 	} else if err != nil {
 		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to check location")
+	}
+	return err
+}
+
+// refuseUpdatedMetadataLocation answers an update whose metadata location the
+// record at recordPath, whose stored metadata is current, may not take; see
+// validateUpdatedMetadataLocation.
+func (h *S3TablesHandler) refuseUpdatedMetadataLocation(w http.ResponseWriter, r *http.Request, filerClient FilerClient, bucketName, namespace, recordPath string, current *tableMetadataInternal, metadataLocation string) error {
+	var checkErr error
+	err := validateUpdatedMetadataLocation(metadataLocation, bucketName, namespace, recordPath, current, func(root string) (shared bool, err error) {
+		checkErr = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+			roots, err := CatalogRecordRoots(r.Context(), client, bucketName)
+			shared = err == nil && rootFilesShared(roots, recordPath, root)
+			return err
+		})
+		return shared, checkErr
+	})
+	if checkErr != nil {
+		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to check location")
+	} else if err != nil {
+		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
 	}
 	return err
 }

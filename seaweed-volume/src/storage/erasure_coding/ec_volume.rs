@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::pb::master_pb;
@@ -31,6 +31,17 @@ pub(crate) struct ShardLocationCache {
     /// Maps shard ID -> list of server addresses where that shard exists.
     /// Used for distributed EC reads across the cluster.
     locations: HashMap<ShardId, Vec<String>>,
+    /// Holders a complete lookup stopped placing a shard on (Go's
+    /// `ShardReadHints`). Reads ask them before reconstructing, for a delete only
+    /// such a holder journaled, but take nothing else from them: a delete made
+    /// since went to a listed holder, which reconstruction asks. Deletes never
+    /// use them.
+    read_hints: HashMap<ShardId, Vec<String>>,
+    /// Changes with every change to `read_hints` (Go's `ShardReadHintsRevision`),
+    /// so a read only forgets the hint holders it asked if no lookup changed them.
+    /// Drawn from `READ_HINTS_REVISION`, so a revision read before a remount
+    /// never matches the new `EcVolume`'s cache.
+    read_hints_revision: u64,
     /// Wall-clock timestamp of the most recent successful `LookupEcVolume`
     /// refresh of `locations`. `None` until the first refresh. Drives the
     /// staleness heuristic in `cached_lookup_ec_shard_locations` (mirrors Go's
@@ -48,6 +59,12 @@ pub(crate) struct ShardLocationCache {
 /// Bytes read per positional read when seeding `deleted_needles` from `.ecj`.
 /// A multiple of `NEEDLE_ID_SIZE`; 1 MiB is 131072 entries per syscall.
 const ECJ_LOAD_CHUNK_BYTES: usize = 1 << 20;
+
+static READ_HINTS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_read_hints_revision() -> u64 {
+    READ_HINTS_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
 
 /// Process-wide epoch bumped whenever a failed .ecj append truncates its
 /// uncommitted tail. A decode that read the journal without the store lock
@@ -180,6 +197,146 @@ fn read_ecj_ids_with(
     Ok(())
 }
 
+/// A volume's `.ecj` append handle and on-disk size, under the volume's own
+/// journal lock (Go's `EcVolume.ecjFileAccessLock`). The size is what
+/// mount-time compaction compares against the id set; the runtime delete count
+/// comes from `deleted_needles`.
+#[derive(Default)]
+pub(crate) struct EcJournal {
+    file: Option<File>,
+    size: i64,
+    /// Set once the volume is closed or dropped: an appender that resolved the
+    /// volume before that must re-resolve rather than write a detached file.
+    closed: bool,
+}
+
+impl EcJournal {
+    /// Append whole records and sync them. On any failure the file is
+    /// truncated back to the pre-append length so the on-disk journal and
+    /// `deleted_needles` cannot drift.
+    fn append(&mut self, records: &[u8], volume_id: VolumeId, ecj_path: &str) -> io::Result<()> {
+        let ecj_file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("ecj file not open"))?;
+        // The file's own length, not this handle's cached size: another disk
+        // holding the same journal may have appended since.
+        let prev_ecj_size = ecj_file.metadata()?.len() as i64;
+        let append_result = ecj_file
+            .write_all(records)
+            .and_then(|_| ecj_file.sync_all());
+
+        match append_result {
+            Ok(()) => {
+                self.size = prev_ecj_size + records.len() as i64;
+                Ok(())
+            }
+            Err(e) => {
+                // write_all may have extended the file on disk before
+                // sync_all failed; truncate back to the known-good size so
+                // the on-disk journal never drifts past `deleted_needles`.
+                // Uses its own write handle: on Windows the append handle
+                // lacks FILE_WRITE_DATA, so set_len through it fails with
+                // ERROR_ACCESS_DENIED and the rollback would silently not
+                // happen.
+                let rollback = open_volume_file(OpenOptions::new().write(true), ecj_path)
+                    .and_then(|f| f.set_len(prev_ecj_size as u64).and_then(|_| f.sync_all()));
+                // Bumped on attempt, not success: a failed rollback leaves the
+                // bytes in place and a decode re-reading for the epoch change
+                // simply sees them — harmless — while a successful one must
+                // never go unnoticed by an unlocked journal read.
+                ECJ_ROLLBACK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Err(trunc_err) = rollback {
+                    tracing::error!(
+                        volume_id = volume_id.0,
+                        truncate_error = %trunc_err,
+                        "failed to truncate ecj after append failure"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Takes a `.ecj` path's append lock, ahead of any holder's journal lock.
+pub(crate) fn lock_path(lock: &Option<Arc<Mutex<()>>>) -> Option<MutexGuard<'_, ()>> {
+    lock.as_ref()
+        .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// A mounted volume's deletion journal, usable after the store lock that found
+/// the volume is released, so the append's fsync stalls only this volume.
+pub struct EcJournalAppender {
+    volume_id: VolumeId,
+    ecj_path: String,
+    path_lock: Option<Arc<Mutex<()>>>,
+    ecj: Arc<Mutex<EcJournal>>,
+    deleted_needles: Arc<RwLock<HashSet<NeedleId>>>,
+}
+
+impl EcJournalAppender {
+    /// Journal a delete of a needle the caller found live in `.ecx`.
+    /// `must_wait` runs under the journal lock, which a decode takes for its
+    /// catch-up, so a `true` answer (the decode publishing tail) is current
+    /// when the append would commit; it gives `WouldBlock`. A volume closed
+    /// since it was resolved gives `NotFound` with nothing written.
+    pub fn journal_delete(
+        &self,
+        needle_id: NeedleId,
+        must_wait: impl FnOnce() -> bool,
+    ) -> io::Result<()> {
+        let _path = lock_path(&self.path_lock);
+        let mut journal = self.ecj.lock().unwrap_or_else(|e| e.into_inner());
+        if journal.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("ec volume {} closed", self.volume_id.0),
+            ));
+        }
+        if self
+            .deleted_needles
+            .read()
+            .map(|s| s.contains(&needle_id))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if must_wait() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "ec volume {} is in decode publishing tail",
+                    self.volume_id.0
+                ),
+            ));
+        }
+        let mut buf = [0u8; NEEDLE_ID_SIZE];
+        needle_id.to_bytes(&mut buf);
+        journal.append(&buf, self.volume_id, &self.ecj_path)?;
+        if let Ok(mut set) = self.deleted_needles.write() {
+            set.insert(needle_id);
+        }
+        Ok(())
+    }
+
+    /// Holds the journal lock, standing in for an append stuck in its fsync.
+    #[cfg(test)]
+    pub(crate) fn lock_journal(&self) -> MutexGuard<'_, EcJournal> {
+        self.ecj.lock().unwrap()
+    }
+
+    /// Drops the journal file, so every later append fails.
+    #[cfg(test)]
+    pub(crate) fn drop_journal_file(&self) {
+        self.ecj.lock().unwrap().file = None;
+    }
+}
+
+/// The encode run a holder reports when its disks serve shards of more than
+/// one encode run for the volume (Go `erasure_coding.MixedEncodeRuns`).
+pub const MIXED_ENCODE_RUNS: i64 = -1;
+
 /// An erasure-coded volume managing its local shards and index.
 pub struct EcVolume {
     pub volume_id: VolumeId,
@@ -196,22 +353,17 @@ pub struct EcVolume {
     pub block_size: i64,
     ecx_file: Option<File>,
     ecx_file_size: i64,
-    ecj_file: Option<File>,
+    ecj: Arc<Mutex<EcJournal>>,
     /// This volume's registration as a holder of its `.ecj` path. Held for as
-    /// long as `ecj_file` may be open; see `ecj_registry`.
+    /// long as the journal handle may be open; see `ecj_registry`.
     ecj_hold: Option<EcjHold>,
-    /// On-disk size of the .ecj deletion journal: the rollback point for a
-    /// failed append, and the size mount-time compaction compares against the
-    /// id set and re-checks on disk before replacing the file. The runtime
-    /// delete count comes from `deleted_needles.len()`, not from this.
-    ecj_file_size: i64,
     /// In-memory set of needle ids that have been deleted since the volume
     /// was encoded. .ecx is immutable at runtime — it only stores the
     /// sorted (id, offset, size) index written at encode time — and runtime
     /// deletes are journaled to .ecj + tracked here. Reads consult this
     /// set to mask out deleted needles on top of the sealed .ecx lookup.
     /// Seeded from .ecj in `new()` and updated by `journal_delete`.
-    deleted_needles: RwLock<HashSet<NeedleId>>,
+    deleted_needles: Arc<RwLock<HashSet<NeedleId>>>,
     pub disk_type: DiskType,
     /// Directory where .ecx/.ecj were actually found (may differ from dir_idx after fallback).
     ecx_actual_dir: String,
@@ -272,6 +424,96 @@ fn locate_vif_path(dir: &str, dir_idx: &str, collection: &str, volume_id: Volume
     data_vif
 }
 
+/// [`locate_vif_path`], except that a data-dir `.vif` recording no EC config
+/// yields to the idx dir's when that one records it: a source volume's own
+/// `.vif` stays on a disk that later receives shards of the same volume id,
+/// while the encode's `.vif` lands with the index on a sibling.
+fn resolve_vif_path(dir: &str, dir_idx: &str, collection: &str, volume_id: VolumeId) -> String {
+    let path = locate_vif_path(dir, dir_idx, collection, volume_id);
+    let data_vif = format!(
+        "{}.vif",
+        crate::storage::volume::volume_file_name(dir, collection, volume_id),
+    );
+    if dir_idx == dir || path != data_vif {
+        return path;
+    }
+    let idx_vif = format!(
+        "{}.vif",
+        crate::storage::volume::volume_file_name(dir_idx, collection, volume_id),
+    );
+    prefer_ec_config_vif(path, idx_vif)
+}
+
+fn read_vif_file(path: &str) -> Result<Option<crate::storage::volume::VifVolumeInfo>, ()> {
+    match std::fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => Ok(None),
+        Ok(content) => serde_json::from_str(&content).map(Some).map_err(|_| ()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// Returns `alt` when `local` records no EC config but `alt` does.
+fn prefer_ec_config_vif(local: String, alt: String) -> String {
+    match read_vif_file(&local) {
+        Ok(Some(info)) if info.ec_shard_config.is_some() => return local,
+        Err(()) => return local,
+        _ => {}
+    }
+    match read_vif_file(&alt) {
+        Ok(Some(info)) if info.ec_shard_config.is_some() => alt,
+        _ => local,
+    }
+}
+
+/// The `.vif` a disk mounting against a shared `-dir.idx` takes from a sibling
+/// data dir in `vif_dirs`: its own records no EC config, the index is not its
+/// own, and every sibling `.vif` recording an EC config names the same run.
+/// `Err` when a sibling `.vif` cannot be read or the siblings name different runs.
+pub(crate) fn sibling_ec_config_vif(
+    dir: &str,
+    dir_idx: &str,
+    vif_dirs: &[String],
+    collection: &str,
+    volume_id: VolumeId,
+) -> Result<Option<crate::storage::volume::VifVolumeInfo>, ()> {
+    let data_base = crate::storage::volume::volume_file_name(dir, collection, volume_id);
+    let data_vif = format!("{}.vif", data_base);
+    if dir_idx == dir
+        || vif_dirs.iter().any(|d| d == dir_idx)
+        || matches!(ecx_file_size(&format!("{}.ecx", data_base)), Some(n) if n > 0)
+        || resolve_vif_path(dir, dir_idx, collection, volume_id) != data_vif
+    {
+        return Ok(None);
+    }
+    match read_vif_file(&data_vif) {
+        Ok(Some(info)) if info.ec_shard_config.is_some() => return Ok(None),
+        Err(()) => return Ok(None),
+        _ => {}
+    }
+    let mut found: Option<crate::storage::volume::VifVolumeInfo> = None;
+    for other in vif_dirs.iter().filter(|d| d.as_str() != dir) {
+        let path = format!(
+            "{}.vif",
+            crate::storage::volume::volume_file_name(other, collection, volume_id)
+        );
+        let info = match read_vif_file(&path) {
+            Ok(Some(info)) if info.ec_shard_config.is_some() => info,
+            Ok(_) => continue,
+            Err(()) => return Err(()),
+        };
+        let run = |v: &crate::storage::volume::VifVolumeInfo| {
+            v.ec_shard_config.as_ref().map(|c| c.encode_ts_ns)
+        };
+        match &found {
+            None => found = Some(info),
+            Some(f) if run(f) != run(&info) => return Err(()),
+            Some(_) => {}
+        }
+    }
+    Ok(found)
+}
+
 /// Load the volume's `.vif` (data dir first, then idx dir, then the active
 /// generation's versioned sidecar — see [`locate_vif_path`]). Absent
 /// everywhere is legal — legacy volumes predate the sidecar — and returns
@@ -286,7 +528,7 @@ pub fn load_vif_info(
     collection: &str,
     volume_id: VolumeId,
 ) -> io::Result<Option<crate::storage::volume::VifVolumeInfo>> {
-    let vif_path = locate_vif_path(dir, dir_idx, collection, volume_id);
+    let vif_path = resolve_vif_path(dir, dir_idx, collection, volume_id);
     match std::fs::read_to_string(&vif_path) {
         Ok(content) if content.trim().is_empty() => Ok(None),
         Ok(content) => serde_json::from_str(&content).map(Some).map_err(|e| {
@@ -336,15 +578,16 @@ pub fn load_vif_info_across_dirs(
         // pointed callers at the wrong disk whenever the vif lived with the
         // index — and a caller resolving the rest of the volume's metadata
         // against that answer would look in a directory holding none of it.
-        let data_vif = format!(
+        let idx_vif = format!(
             "{}.vif",
-            crate::storage::volume::volume_file_name(dir, collection, volume_id)
+            crate::storage::volume::volume_file_name(dir_idx, collection, volume_id)
         );
-        let found_in = if std::path::Path::new(&data_vif).exists() {
-            dir.to_string()
-        } else {
-            dir_idx.to_string()
-        };
+        let found_in =
+            if dir_idx != dir && resolve_vif_path(dir, dir_idx, collection, volume_id) == idx_vif {
+                dir_idx.to_string()
+            } else {
+                dir.to_string()
+            };
         return Ok(Some((vif, found_in)));
     }
     for other in other_dirs {
@@ -569,7 +812,25 @@ impl EcVolume {
         collection: &str,
         volume_id: VolumeId,
     ) -> io::Result<Self> {
-        Self::open_with(dir, dir_idx, collection, volume_id, EcjFsOps::REAL)
+        Self::open_with(dir, dir_idx, collection, volume_id, EcjFsOps::REAL, &[])
+    }
+
+    /// [`Self::new`] for a disk whose server's data directories are `vif_dirs`.
+    pub fn new_with_vif_dirs(
+        dir: &str,
+        dir_idx: &str,
+        vif_dirs: &[String],
+        collection: &str,
+        volume_id: VolumeId,
+    ) -> io::Result<Self> {
+        Self::open_with(
+            dir,
+            dir_idx,
+            collection,
+            volume_id,
+            EcjFsOps::REAL,
+            vif_dirs,
+        )
     }
 
     /// [`Self::new`] with the journal-compaction filesystem steps supplied, so
@@ -580,10 +841,15 @@ impl EcVolume {
         collection: &str,
         volume_id: VolumeId,
         ecj_ops: EcjFsOps,
+        vif_dirs: &[String],
     ) -> io::Result<Self> {
         // One load of the volume's `.vif`, used for both the shard config and
         // the version / dat-size fields below.
         let vif = load_vif_info(dir, dir_idx, collection, volume_id)?;
+        let vif = sibling_ec_config_vif(dir, dir_idx, vif_dirs, collection, volume_id)
+            .ok()
+            .flatten()
+            .or(vif);
         // Both directories: a split -dir/-dir.idx layout keeps the .ecsum with
         // the INDEX, and it is the only layout record a volume whose vif is
         // absent or config-free still has.
@@ -641,10 +907,9 @@ impl EcVolume {
             block_size,
             ecx_file: None,
             ecx_file_size: 0,
-            ecj_file: None,
+            ecj: Arc::default(),
             ecj_hold: None,
-            ecj_file_size: 0,
-            deleted_needles: RwLock::new(HashSet::new()),
+            deleted_needles: Arc::default(),
             disk_type: DiskType::default(),
             ecx_actual_dir: dir_idx.to_string(),
             shard_locations: RwLock::new(ShardLocationCache::default()),
@@ -732,6 +997,10 @@ impl EcVolume {
         // the tail repair and the handle below see the final inode, and it
         // stops any compaction from replacing the file under this handle.
         vol.ecj_hold = Some(EcjHold::acquire(&ecj_path));
+        // Another disk's runtime may be appending to this file: repair and
+        // load only settled records.
+        let path_lock = vol.journal_path_lock();
+        let path_guard = lock_path(&path_lock);
 
         // Repair a torn tail BEFORE the append handle exists.
         //
@@ -772,11 +1041,15 @@ impl EcVolume {
         }
 
         let ecj_file = open_ecj_append(&ecj_path)?;
-        vol.ecj_file_size = ecj_file.metadata()?.len() as i64;
-        vol.ecj_file = Some(ecj_file);
+        {
+            let mut journal = vol.journal();
+            journal.size = ecj_file.metadata()?.len() as i64;
+            journal.file = Some(ecj_file);
+        }
 
         // Seed the in-memory deleted set from the journal.
         vol.load_deleted_needles_from_ecj(ecj_ops.read_at)?;
+        drop(path_guard);
 
         // Load the generation-0 EC bitrot checksum sidecar. Optional, except
         // when it contradicts the volume's own geometry — see
@@ -1015,11 +1288,12 @@ impl EcVolume {
         &mut self,
         read_at: fn(&File, &mut [u8], u64) -> io::Result<()>,
     ) -> io::Result<()> {
-        let ecj_file = match self.ecj_file.as_ref() {
+        let journal = self.journal();
+        let ecj_file = match journal.file.as_ref() {
             Some(f) => f,
             None => return Ok(()),
         };
-        if self.ecj_file_size < NEEDLE_ID_SIZE as i64 {
+        if journal.size < NEEDLE_ID_SIZE as i64 {
             return Ok(());
         }
 
@@ -1027,7 +1301,8 @@ impl EcVolume {
         // held the `deleted_needles` write lock for the whole scan, which on a
         // bloated journal is the entire (unbounded) startup.
         let mut loaded: HashSet<NeedleId> = HashSet::new();
-        read_ecj_ids_with(read_at, ecj_file, 0, self.ecj_file_size as u64, &mut loaded)?;
+        read_ecj_ids_with(read_at, ecj_file, 0, journal.size as u64, &mut loaded)?;
+        drop(journal);
 
         let mut set = self
             .deleted_needles
@@ -1117,7 +1392,7 @@ impl EcVolume {
         tracing::warn!(
             volume_id = self.volume_id.0,
             collection = %self.collection,
-            on_disk_bytes = self.ecj_file_size,
+            on_disk_bytes = self.journal().size,
             unique_ids = ids.len(),
             compacted_bytes = ids.len() * NEEDLE_ID_SIZE,
             "compacting bloated .ecj deletion journal",
@@ -1151,8 +1426,11 @@ impl EcVolume {
             .map_err(|_| io::Error::other("deleted_needles lock poisoned"))?
             .len();
         let compacted_len = (distinct as i64).saturating_mul(NEEDLE_ID_SIZE as i64);
-        Ok(self.ecj_file_size >= ECJ_COMPACT_MIN_BYTES
-            && self.ecj_file_size >= compacted_len.saturating_mul(ECJ_COMPACT_RATIO))
+        let size = self.journal().size;
+        Ok(
+            size >= ECJ_COMPACT_MIN_BYTES
+                && size >= compacted_len.saturating_mul(ECJ_COMPACT_RATIO),
+        )
     }
 
     /// The deleted set, sorted so the rewritten file is deterministic: two
@@ -1175,7 +1453,8 @@ impl EcVolume {
     /// A copy that appended, or replaced the file, after the load fails this,
     /// and compacting then would drop what it wrote.
     fn ecj_unchanged_since_load(&self, ecj_path: &str) -> io::Result<bool> {
-        let Some(held) = self.ecj_file.as_ref() else {
+        let journal = self.journal();
+        let Some(held) = journal.file.as_ref() else {
             return Ok(false);
         };
         let held = held.metadata()?;
@@ -1187,7 +1466,7 @@ impl EcVolume {
                 return Ok(false);
             }
         }
-        Ok(held.len() == on_path.len() && on_path.len() as i64 == self.ecj_file_size)
+        Ok(held.len() == on_path.len() && on_path.len() as i64 == journal.size)
     }
 
     /// Publish a compacted tmp file over the live journal: drop the handle
@@ -1209,12 +1488,13 @@ impl EcVolume {
         // rename over a file that is still open fails outright, which would
         // make compaction a permanent no-op there; on Unix the handle would
         // survive as an unlinked inode, which is worse than useless.
-        self.ecj_file = None;
+        let mut journal = self.journal();
+        journal.file = None;
         if let Err(rename_err) = (ops.rename)(tmp_path, ecj_path) {
             let _ = fs::remove_file(tmp_path);
             return match (ops.reopen)(ecj_path) {
                 Ok(f) => {
-                    self.ecj_file = Some(f);
+                    journal.file = Some(f);
                     Err(EcjPublishError::Abandoned(rename_err))
                 }
                 Err(reopen_err) => Err(EcjPublishError::HandleLost(io::Error::new(
@@ -1241,8 +1521,8 @@ impl EcVolume {
         // Reopen so later journal_delete appends land in the file just written.
         let reopened = (ops.reopen)(ecj_path).map_err(|e| lost("reopen it", e))?;
         let size = reopened.metadata().map_err(|e| lost("stat it", e))?.len();
-        self.ecj_file_size = size as i64;
-        self.ecj_file = Some(reopened);
+        journal.size = size as i64;
+        journal.file = Some(reopened);
         Ok(())
     }
 
@@ -1305,8 +1585,12 @@ impl EcVolume {
     /// Sync the EC volume's journal and index files to disk (matching Go's ecv.Sync()).
     /// Go flushes both .ecj and .ecx to ensure in-place deletion marks are persisted.
     pub fn sync_to_disk(&self) -> io::Result<()> {
-        if let Some(ref ecj_file) = self.ecj_file {
-            ecj_file.sync_all()?;
+        // Every append syncs its own record, so one in flight is not waited
+        // for: callers such as CopyFile hold the store lock here.
+        if let Ok(journal) = self.ecj.try_lock() {
+            if let Some(ref ecj_file) = journal.file {
+                ecj_file.sync_all()?;
+            }
         }
         if let Some(ref ecx_file) = self.ecx_file {
             ecx_file.sync_all()?;
@@ -1465,10 +1749,11 @@ impl EcVolume {
     /// stamp the refresh time, returning a clone of the resulting map.
     ///
     /// Per-shard upsert (mirrors Go's `cachedLookupEcShardLocations`): each shard
-    /// id present in the reply overwrites its cached entry, while shard ids absent
-    /// from the reply keep their previously-cached locations — so a reply that
-    /// passes the data-shard completeness guard but omits a shard already in cache
-    /// does not drop that shard's known location (unlike a full replace).
+    /// id present in the reply overwrites its cached entry, and one the reply
+    /// places nowhere is dropped, while shard ids absent from the reply keep
+    /// their previously-cached locations — so a reply that passes the data-shard
+    /// completeness guard but omits a shard already in cache does not drop that
+    /// shard's known location (unlike a full replace).
     ///
     /// Map and refresh time advance in one write section, so no reader can pair
     /// the merged map with the previous lookup's timestamp.
@@ -1478,9 +1763,48 @@ impl EcVolume {
     ) -> HashMap<ShardId, Vec<String>> {
         let mut cache = self.shard_locations.write().unwrap();
         for (shard_id, addrs) in locations {
-            cache.locations.insert(shard_id, addrs);
+            if addrs.is_empty() {
+                if let Some(known) = cache.locations.remove(&shard_id)
+                    && !known.is_empty()
+                {
+                    cache.read_hints.insert(shard_id, known);
+                    cache.read_hints_revision = next_read_hints_revision();
+                }
+            } else {
+                if cache.read_hints.remove(&shard_id).is_some() {
+                    cache.read_hints_revision = next_read_hints_revision();
+                }
+                cache.locations.insert(shard_id, addrs);
+            }
         }
         cache.refreshed_at = Some(Instant::now());
+        cache.locations.clone()
+    }
+
+    /// Put a partial reply's holders ahead of the cached ones for each shard it
+    /// places, keeping the cached addresses as fallback and every other shard
+    /// and the refresh time alone. A partial is not the volume's map, but a read
+    /// can still go straight to a shard it names; the map stays marked so the
+    /// next read looks it up again.
+    pub(crate) fn merge_partial_shard_locations(
+        &self,
+        locations: HashMap<ShardId, Vec<String>>,
+    ) -> HashMap<ShardId, Vec<String>> {
+        let mut cache = self.shard_locations.write().unwrap();
+        for (shard_id, mut addrs) in locations {
+            if addrs.is_empty() {
+                continue;
+            }
+            if let Some(known) = cache.locations.get(&shard_id) {
+                for addr in known {
+                    if !addrs.contains(addr) {
+                        addrs.push(addr.clone());
+                    }
+                }
+            }
+            cache.locations.insert(shard_id, addrs);
+        }
+        cache.stale = true;
         cache.locations.clone()
     }
 
@@ -1492,6 +1816,37 @@ impl EcVolume {
     ) -> (HashMap<ShardId, Vec<String>>, Option<Instant>) {
         let cache = self.shard_locations.read().unwrap();
         (cache.locations.clone(), cache.refreshed_at)
+    }
+
+    /// The shard's hint with the revision to pass back to
+    /// `forget_shard_read_hints`.
+    pub(crate) fn shard_read_hints(&self, shard_id: ShardId) -> Option<(Vec<String>, u64)> {
+        let cache = self.shard_locations.read().unwrap();
+        let hints = cache.read_hints.get(&shard_id)?.clone();
+        Some((hints, cache.read_hints_revision))
+    }
+
+    /// Drops the `failed` holders from the shard's hint only if no lookup
+    /// changed the hints since `revision`, as one may have while the reads were
+    /// in flight.
+    pub(crate) fn forget_shard_read_hints(
+        &self,
+        shard_id: ShardId,
+        revision: u64,
+        failed: &[String],
+    ) {
+        let mut cache = self.shard_locations.write().unwrap();
+        if cache.read_hints_revision != revision {
+            return;
+        }
+        let Some(hints) = cache.read_hints.get_mut(&shard_id) else {
+            return;
+        };
+        hints.retain(|h| !failed.contains(h));
+        if hints.is_empty() {
+            cache.read_hints.remove(&shard_id);
+        }
+        cache.read_hints_revision = next_read_hints_revision();
     }
 
     /// Mark the cached map for a prompt re-check after a read failed against one
@@ -1969,6 +2324,7 @@ impl EcVolume {
     /// in place and the error is propagated so tombstones are not lost.
     pub(crate) fn rebuild_ecx_from_journal(&mut self) -> io::Result<()> {
         let ecj_path = self.ecj_file_name();
+        let mut journal = self.journal();
         if !std::path::Path::new(&ecj_path).exists() {
             return Ok(());
         }
@@ -2004,9 +2360,9 @@ impl EcVolume {
         // if the recreate fails, deletes must error rather than keep
         // appending to the removed inode.
         fs::remove_file(&ecj_path)?;
-        self.ecj_file = None;
-        self.ecj_file = Some(open_ecj_append(&ecj_path)?);
-        self.ecj_file_size = 0;
+        journal.file = None;
+        journal.file = Some(open_ecj_append(&ecj_path)?);
+        journal.size = 0;
         if let Ok(mut set) = self.deleted_needles.write() {
             set.clear();
         }
@@ -2024,10 +2380,11 @@ impl EcVolume {
         // The old handle points at the replaced file: drop it before the
         // reopen so a failure leaves deletes erroring, not appending to a
         // detached inode. Mirrors Go's ReopenDeletionJournal.
-        self.ecj_file = None;
+        let mut journal = self.journal();
+        journal.file = None;
         let reopened = open_ecj_append(&ecj_path)?;
-        self.ecj_file_size = reopened.metadata()?.len() as i64;
-        self.ecj_file = Some(reopened);
+        journal.size = reopened.metadata()?.len() as i64;
+        journal.file = Some(reopened);
         if let Ok(mut set) = self.deleted_needles.write() {
             set.clear();
         }
@@ -2070,61 +2427,36 @@ impl EcVolume {
             return Ok(());
         }
 
-        let mut buf = [0u8; NEEDLE_ID_SIZE];
-        needle_id.to_bytes(&mut buf);
-        self.append_journal(&buf)?;
-        if let Ok(mut set) = self.deleted_needles.write() {
-            set.insert(needle_id);
-        }
-        Ok(())
+        self.journal_appender().journal_delete(needle_id, || false)
     }
 
-    /// Append whole records to `.ecj` and sync them. On any failure the file is
-    /// truncated back to the pre-append length so the on-disk journal and
-    /// `deleted_needles` cannot drift.
-    fn append_journal(&mut self, records: &[u8]) -> io::Result<()> {
-        let prev_ecj_size = self.ecj_file_size;
-        let append_result: io::Result<()> = {
-            let ecj_file = self
-                .ecj_file
-                .as_mut()
-                .ok_or_else(|| io::Error::other("ecj file not open"))?;
-            ecj_file
-                .write_all(records)
-                .and_then(|_| ecj_file.sync_all())
-        };
-
-        match append_result {
-            Ok(()) => {
-                self.ecj_file_size += records.len() as i64;
-                Ok(())
-            }
-            Err(e) => {
-                // write_all may have extended the file on disk before
-                // sync_all failed; truncate back to the known-good size so
-                // the on-disk journal never drifts past `deleted_needles`.
-                // Uses its own write handle: on Windows the append handle
-                // lacks FILE_WRITE_DATA, so set_len through it fails with
-                // ERROR_ACCESS_DENIED and the rollback would silently not
-                // happen.
-                let ecj_path = self.ecj_file_name();
-                let rollback = open_volume_file(OpenOptions::new().write(true), &ecj_path)
-                    .and_then(|f| f.set_len(prev_ecj_size as u64).and_then(|_| f.sync_all()));
-                // Bumped on attempt, not success: a failed rollback leaves the
-                // bytes in place and a decode re-reading for the epoch change
-                // simply sees them — harmless — while a successful one must
-                // never go unnoticed by an unlocked journal read.
-                ECJ_ROLLBACK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Err(trunc_err) = rollback {
-                    tracing::error!(
-                        volume_id = self.volume_id.0,
-                        truncate_error = %trunc_err,
-                        "failed to truncate ecj after append failure"
-                    );
-                }
-                Err(e)
-            }
+    /// This volume's journal, detached from the borrow of the volume.
+    pub fn journal_appender(&self) -> EcJournalAppender {
+        EcJournalAppender {
+            volume_id: self.volume_id,
+            ecj_path: self.ecj_file_name(),
+            path_lock: self.journal_path_lock(),
+            ecj: self.ecj.clone(),
+            deleted_needles: self.deleted_needles.clone(),
         }
+    }
+
+    /// The append lock of this volume's `.ecj` path, shared with every other
+    /// disk's runtime journaling into the same file.
+    pub(crate) fn journal_path_lock(&self) -> Option<Arc<Mutex<()>>> {
+        self.ecj_hold.as_ref().map(EcjHold::append_lock)
+    }
+
+    /// Takes this volume's journal lock, waiting out an append in flight.
+    pub(crate) fn journal(&self) -> MutexGuard<'_, EcJournal> {
+        self.ecj.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn append_journal(&mut self, records: &[u8]) -> io::Result<()> {
+        let ecj_path = self.ecj_file_name();
+        let path_lock = self.journal_path_lock();
+        let _path = lock_path(&path_lock);
+        self.journal().append(records, self.volume_id, &ecj_path)
     }
 
     /// Internal: binary search .ecx without masking by `deleted_needles`.
@@ -2266,9 +2598,9 @@ impl EcVolume {
     /// Fold a peer's deletion journal into this mounted volume: append only
     /// the ids not already deleted here, in one write and one fsync, then
     /// publish them into the in-memory set — the same commit order as
-    /// `journal_delete`. `&mut self` serializes it with deletes under the store
-    /// lock, and the live handle is appended to in place, so no delete can land
-    /// in an orphaned file. Returns how many ids were added.
+    /// `journal_delete`. The journal lock serializes it with deletes, and the
+    /// live handle is appended to in place, so no delete can land in an
+    /// orphaned file. Returns how many ids were added.
     pub fn merge_journal(&mut self, ids: &HashSet<NeedleId>) -> io::Result<usize> {
         let delta = super::ecj_merge::ecj_delta(ids, |id| self.is_needle_deleted(*id));
         if delta.is_empty() {
@@ -2291,6 +2623,13 @@ impl EcVolume {
 
     // ---- Lifecycle ----
 
+    /// Closes the journal handle under its lock, after any append in flight.
+    fn close_journal(&self) {
+        let mut journal = self.journal();
+        journal.file = None;
+        journal.closed = true;
+    }
+
     pub fn close(&mut self) {
         for shard in &mut self.shards {
             if let Some(s) = shard {
@@ -2303,7 +2642,7 @@ impl EcVolume {
             let _ = ecx_file.sync_all();
         }
         self.ecx_file = None;
-        self.ecj_file = None;
+        self.close_journal();
         self.ecj_hold = None;
     }
 
@@ -2365,8 +2704,14 @@ impl EcVolume {
             let _ = crate::storage::erasure_coding::ec_bitrot::remove_bitrot_sidecars(&idx_base);
         }
         self.ecx_file = None;
-        self.ecj_file = None;
+        self.close_journal();
         self.ecj_hold = None;
+    }
+}
+
+impl Drop for EcVolume {
+    fn drop(&mut self) {
+        self.close_journal();
     }
 }
 
@@ -3390,6 +3735,44 @@ mod tests {
         assert!(deleted.contains(&NeedleId(7)));
     }
 
+    /// Disks sharing one `.ecj` share its append lock: a delete through one
+    /// disk's handle waits while another disk's runtime reads or replaces the
+    /// file, so a fold or a mount never sees an append half done.
+    #[test]
+    fn test_sibling_holders_share_the_append_lock() {
+        let tmp = TempDir::new().unwrap();
+        let a_dir = tmp.path().join("a");
+        let b_dir = tmp.path().join("b");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::create_dir_all(&b_dir).unwrap();
+        let (a, b) = (a_dir.to_str().unwrap(), b_dir.to_str().unwrap());
+        let vid = VolumeId(49);
+        write_ecx_file(
+            a,
+            "",
+            vid,
+            &[(NeedleId(7), Offset::from_actual_offset(8), Size(10))],
+        );
+
+        let on_a = EcVolume::new(a, a, "", vid).unwrap();
+        let on_b = EcVolume::new(b, a, "", vid).unwrap();
+        assert_eq!(on_b.ecj_file_name(), on_a.ecj_file_name());
+
+        let path_lock = on_a.journal_path_lock();
+        let held = lock_path(&path_lock);
+        let appender = on_b.journal_appender();
+        let delete = std::thread::spawn(move || appender.journal_delete(NeedleId(7), || false));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !delete.is_finished(),
+            "a sibling's append must wait for the path lock"
+        );
+        drop(held);
+        delete.join().unwrap().unwrap();
+        assert!(on_b.is_needle_deleted(NeedleId(7)));
+        assert_eq!(on_a.read_deleted_needles().unwrap(), vec![NeedleId(7)]);
+    }
+
     /// A copy appending to the journal by path must not have its bytes
     /// dropped by a compaction renaming over the file.
     #[test]
@@ -3418,6 +3801,33 @@ mod tests {
             (ids.len() * NEEDLE_ID_SIZE) as u64,
         );
         assert_eq!(vol.read_deleted_needles().unwrap(), ids);
+    }
+
+    /// A read hint revision taken from one instance of a volume must not let
+    /// a read forget the hint a later instance holds after a remount.
+    #[test]
+    fn test_read_hint_revision_is_not_shared_across_instances() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let vid = VolumeId(50);
+        write_ecx_file(dir, "", vid, &[]);
+        let holder = "127.0.0.1:8080".to_string();
+        let delist = |vol: &EcVolume| {
+            vol.merge_shard_locations(HashMap::from([(0, vec![holder.clone()])]));
+            vol.merge_shard_locations(HashMap::from([(0, Vec::new())]));
+            vol.shard_read_hints(0).unwrap().1
+        };
+        let old = EcVolume::new(dir, dir, "", vid).unwrap();
+        let revision = delist(&old);
+        drop(old);
+
+        let vol = EcVolume::new(dir, dir, "", vid).unwrap();
+        delist(&vol);
+        vol.forget_shard_read_hints(0, revision, std::slice::from_ref(&holder));
+        assert_eq!(
+            vol.shard_read_hints(0).map(|(hints, _)| hints),
+            Some(vec![holder])
+        );
     }
 
     /// A journal that grew, or was replaced, after it was loaded must not be
@@ -3541,7 +3951,10 @@ mod tests {
         write_bloated_ecj(dir, "", VolumeId(43), &ids, 4096);
 
         let mut vol = EcVolume::new(dir, dir, "", VolumeId(43)).unwrap();
-        assert!(vol.ecj_file.is_some(), "mount must leave a journal handle");
+        assert!(
+            vol.journal().file.is_some(),
+            "mount must leave a journal handle"
+        );
 
         let ecj_path = format!(
             "{}.ecj",
@@ -3580,7 +3993,7 @@ mod tests {
         );
         let before = std::fs::read(&ecj_path).unwrap();
         (
-            EcVolume::open_with(dir, dir, "", vid, ops),
+            EcVolume::open_with(dir, dir, "", vid, ops, &[]),
             ecj_path,
             before,
         )
@@ -3801,7 +4214,7 @@ mod tests {
             read_at: rewrite_after_last_read,
             ..EcjFsOps::REAL
         };
-        let vol = EcVolume::open_with(dir, dir, "", vid, ops).unwrap();
+        let vol = EcVolume::open_with(dir, dir, "", vid, ops, &[]).unwrap();
         assert!(
             IN_PLACE_REWRITE.with(|r| r.borrow().is_none()),
             "the rewrite never ran"
@@ -4106,6 +4519,143 @@ mod tests {
         assert_eq!(vol.data_shards, DATA_SHARDS_COUNT as u32);
         assert_eq!(vol.parity_shards, PARITY_SHARDS_COUNT as u32);
         assert_eq!(vol.block_size, 0, "legacy layout for a pre-record volume");
+    }
+
+    /// Shards placed on the disk that still holds the source volume's `.vif`
+    /// mount against an index on a sibling disk; the encode identity and
+    /// layout come from the sibling's `.vif`, not the source's config-free one.
+    #[test]
+    fn test_ec_volume_prefers_idx_vif_over_config_free_data_vif() {
+        let data_tmp = TempDir::new().unwrap();
+        let idx_tmp = TempDir::new().unwrap();
+        let dir = data_tmp.path().to_str().unwrap();
+        let dir_idx = idx_tmp.path().to_str().unwrap();
+        write_ecx_file(dir_idx, "pics", VolumeId(1), &[]);
+        let data_base = crate::storage::volume::volume_file_name(dir, "pics", VolumeId(1));
+        std::fs::write(
+            format!("{}.vif", data_base),
+            r#"{"version":3,"readOnly":true}"#,
+        )
+        .unwrap();
+        let vif = crate::storage::volume::VifVolumeInfo {
+            version: 3,
+            dat_file_size: 4096,
+            ec_shard_config: Some(crate::storage::volume::VifEcShardConfig {
+                data_shards: 12,
+                parity_shards: 4,
+                encode_ts_ns: 1_700_000_000_123_456_789,
+                block_size: 3 * 1024 * 1024,
+            }),
+            ..Default::default()
+        };
+        let idx_base = crate::storage::volume::volume_file_name(dir_idx, "pics", VolumeId(1));
+        std::fs::write(
+            format!("{}.vif", idx_base),
+            serde_json::to_string_pretty(&vif).unwrap(),
+        )
+        .unwrap();
+
+        let vol = EcVolume::new(dir, dir_idx, "pics", VolumeId(1)).unwrap();
+        assert_eq!(vol.encode_ts_ns, 1_700_000_000_123_456_789);
+        assert_eq!((vol.data_shards, vol.parity_shards), (12, 4));
+        assert_eq!(vol.block_size, 3 * 1024 * 1024);
+        assert_eq!(vol.dat_file_size, 4096);
+        let (_, found_in) = load_vif_info_across_dirs(dir, dir_idx, &[], "pics", VolumeId(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found_in, dir_idx);
+    }
+
+    /// A data-dir `.vif` that records an EC config stays authoritative.
+    #[test]
+    fn test_ec_volume_keeps_data_vif_with_ec_config() {
+        let data_tmp = TempDir::new().unwrap();
+        let idx_tmp = TempDir::new().unwrap();
+        let dir = data_tmp.path().to_str().unwrap();
+        let dir_idx = idx_tmp.path().to_str().unwrap();
+        write_ecx_file(dir_idx, "pics", VolumeId(1), &[]);
+        for (d, ts) in [(dir, 11), (dir_idx, 22)] {
+            let vif = crate::storage::volume::VifVolumeInfo {
+                version: 3,
+                ec_shard_config: Some(crate::storage::volume::VifEcShardConfig {
+                    data_shards: 10,
+                    parity_shards: 4,
+                    encode_ts_ns: ts,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let base = crate::storage::volume::volume_file_name(d, "pics", VolumeId(1));
+            std::fs::write(
+                format!("{}.vif", base),
+                serde_json::to_string_pretty(&vif).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let vol = EcVolume::new(dir, dir_idx, "pics", VolumeId(1)).unwrap();
+        assert_eq!(vol.encode_ts_ns, 11);
+    }
+
+    /// With a shared `-dir.idx` the encode's `.vif` sits in the data dir of the
+    /// disk that received the index, so a disk holding a source volume's
+    /// config-free `.vif` takes it from that sibling, but only when the
+    /// siblings agree on one run.
+    #[test]
+    fn test_ec_volume_takes_sibling_vif_with_shared_index() {
+        const RUN_A: i64 = 1_700_000_000_000_000_011;
+        const RUN_B: i64 = 1_700_000_000_000_000_022;
+        let cases: [(&str, &[i64], bool, i64); 4] = [
+            ("one sibling", &[RUN_A], false, RUN_A),
+            ("siblings agree", &[RUN_A, RUN_A], false, RUN_A),
+            ("siblings disagree", &[RUN_A, RUN_B], false, 0),
+            ("local index", &[RUN_A], true, 0),
+        ];
+        for (name, sibling_ts, local_index, want) in cases {
+            let data_tmp = TempDir::new().unwrap();
+            let idx_tmp = TempDir::new().unwrap();
+            let dir = data_tmp.path().to_str().unwrap();
+            let dir_idx = idx_tmp.path().to_str().unwrap();
+            let entry = [(NeedleId(1), Offset::from_actual_offset(8), Size(10))];
+            write_ecx_file(dir_idx, "c", VolumeId(1), &entry);
+            if local_index {
+                write_ecx_file(dir, "c", VolumeId(1), &entry);
+            }
+            let data_base = crate::storage::volume::volume_file_name(dir, "c", VolumeId(1));
+            std::fs::write(
+                format!("{}.vif", data_base),
+                r#"{"version":3,"readOnly":true}"#,
+            )
+            .unwrap();
+            let mut dirs = vec![dir.to_string()];
+            let mut siblings = Vec::new();
+            for &ts in sibling_ts {
+                let sibling = TempDir::new().unwrap();
+                let sibling_dir = sibling.path().to_str().unwrap().to_string();
+                let vif = crate::storage::volume::VifVolumeInfo {
+                    version: 3,
+                    dat_file_size: 4096,
+                    ec_shard_config: Some(crate::storage::volume::VifEcShardConfig {
+                        data_shards: 10,
+                        parity_shards: 4,
+                        encode_ts_ns: ts,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let base = crate::storage::volume::volume_file_name(&sibling_dir, "c", VolumeId(1));
+                std::fs::write(
+                    format!("{}.vif", base),
+                    serde_json::to_string(&vif).unwrap(),
+                )
+                .unwrap();
+                dirs.push(sibling_dir);
+                siblings.push(sibling);
+            }
+
+            let vol = EcVolume::new_with_vif_dirs(dir, dir_idx, &dirs, "c", VolumeId(1)).unwrap();
+            assert_eq!(vol.encode_ts_ns, want, "{}", name);
+        }
     }
 
     #[test]
@@ -5018,6 +5568,78 @@ mod tests {
         assert!(
             later.unwrap() >= before,
             "the second merge re-stamped the refresh time"
+        );
+
+        // A shard the master places nowhere is dropped, not kept at an address
+        // a delete would trust; its holder stays a place a read can ask first.
+        let merged = vol.merge_shard_locations(HashMap::from([(0, Vec::new())]));
+        assert_eq!(merged, HashMap::from([(1, vec!["c:3".to_string()])]));
+        let hint = || vol.shard_read_hints(0).map(|(hint, _)| hint);
+        let a = vec!["a:1".to_string()];
+        assert_eq!(hint(), Some(a.clone()));
+        vol.merge_shard_locations(HashMap::from([(0, Vec::new())]));
+        assert_eq!(
+            hint(),
+            Some(a.clone()),
+            "a later reply placing the shard nowhere keeps the hint"
+        );
+        let (_, revision) = vol.shard_read_hints(0).unwrap();
+        vol.merge_shard_locations(HashMap::from([(0, a.clone())]));
+        assert_eq!(hint(), None);
+        vol.merge_shard_locations(HashMap::from([(0, Vec::new())]));
+        vol.forget_shard_read_hints(0, revision, &a);
+        assert_eq!(
+            hint(),
+            Some(a.clone()),
+            "a failed read keeps a hint a lookup reinstalled meanwhile, even for the same holder"
+        );
+        let (_, revision) = vol.shard_read_hints(0).unwrap();
+        vol.forget_shard_read_hints(0, revision, &a);
+        assert_eq!(hint(), None);
+        vol.merge_shard_locations(HashMap::from([(0, vec!["e:5".into(), "f:6".into()])]));
+        vol.merge_shard_locations(HashMap::from([(0, Vec::new())]));
+        let (_, revision) = vol.shard_read_hints(0).unwrap();
+        vol.forget_shard_read_hints(0, revision, &["e:5".into()]);
+        assert_eq!(
+            hint(),
+            Some(vec!["f:6".to_string()]),
+            "only the holders that failed are forgotten"
+        );
+    }
+
+    #[test]
+    fn merge_partial_shard_locations_keeps_known_holders_and_refresh_time() {
+        let tmp = TempDir::new().unwrap();
+        let vol = mount_bare_ec_volume(tmp.path().to_str().unwrap());
+
+        let filled =
+            vol.merge_partial_shard_locations(HashMap::from([(0, vec!["a:1".to_string()])]));
+        assert_eq!(filled.get(&0), Some(&vec!["a:1".to_string()]));
+        assert!(
+            vol.shard_locations_snapshot().1.is_none(),
+            "a partial reply is not a refresh"
+        );
+
+        vol.merge_shard_locations(HashMap::from([(1, vec!["b:2".to_string()])]));
+        let stamped = vol.shard_locations_snapshot().1;
+        vol.claim_shard_locations_refresh(|_| true);
+        let filled = vol.merge_partial_shard_locations(HashMap::from([
+            (1, vec!["c:3".to_string()]),
+            (2, vec!["d:4".to_string()]),
+            (3, Vec::new()),
+        ]));
+        assert_eq!(
+            filled.get(&1),
+            Some(&vec!["c:3".to_string(), "b:2".to_string()]),
+            "a holder the partial names goes first, the cached one stays as fallback"
+        );
+        assert_eq!(filled.get(&0), Some(&vec!["a:1".to_string()]));
+        assert_eq!(filled.get(&2), Some(&vec!["d:4".to_string()]));
+        assert!(!filled.contains_key(&3), "a partial reply's empty slot adds nothing");
+        assert_eq!(vol.shard_locations_snapshot().1, stamped);
+        assert!(
+            vol.claim_shard_locations_refresh(|stale| stale),
+            "the partial leaves the map marked for the next lookup"
         );
     }
 

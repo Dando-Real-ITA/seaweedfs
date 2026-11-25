@@ -8,12 +8,12 @@ import (
 	"os"
 
 	"github.com/syndtr/goleveldb/leveldb"
-	leveldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	leveldb_util "github.com/syndtr/goleveldb/leveldb/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/leveldb_handle"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
@@ -32,7 +32,7 @@ func init() {
 }
 
 type LevelDBStore struct {
-	db *leveldb.DB
+	db *leveldb_handle.DB
 }
 
 func (store *LevelDBStore) GetName() string {
@@ -57,14 +57,8 @@ func (store *LevelDBStore) initialize(dir string) (err error) {
 		Filter:             filter.NewBloomFilter(8), // false positive rate 0.02
 	}
 
-	if store.db, err = leveldb.OpenFile(dir, opts); err != nil {
-		if leveldb_errors.IsCorrupted(err) {
-			store.db, err = leveldb.RecoverFile(dir, opts)
-		}
-		if err != nil {
-			glog.Infof("filer store open dir %s: %v", dir, err)
-			return
-		}
+	if store.db, err = leveldb_handle.OpenFile(dir, opts); err != nil {
+		glog.Infof("filer store open dir %s: %v", dir, err)
 	}
 	return
 }
@@ -149,6 +143,25 @@ func (store *LevelDBStore) BatchInsertEntries(ctx context.Context, entries []*fi
 	return nil
 }
 
+// BatchDeleteEntries deletes multiple entries in a single LevelDB batch write,
+// the counterpart of BatchInsertEntries.
+func (store *LevelDBStore) BatchDeleteEntries(ctx context.Context, paths []weed_util.FullPath) error {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	batch := new(leveldb.Batch)
+	for _, fullpath := range paths {
+		batch.Delete(genKey(fullpath.DirAndName()))
+	}
+
+	if err := store.db.Write(batch, writeOptions(ctx)); err != nil {
+		return fmt.Errorf("batch delete: %w", err)
+	}
+
+	return nil
+}
+
 func (store *LevelDBStore) FindEntry(ctx context.Context, fullpath weed_util.FullPath) (entry *filer.Entry, err error) {
 	key := genKey(fullpath.DirAndName())
 
@@ -202,7 +215,11 @@ func (store *LevelDBStore) DeleteFolderChildren(ctx context.Context, fullpath we
 		}
 		batch.Delete([]byte(genKey(string(fullpath), fileName)))
 	}
+	iterErr := iter.Error()
 	iter.Release()
+	if iterErr != nil {
+		return fmt.Errorf("delete %s : %v", fullpath, iterErr)
+	}
 
 	err = store.db.Write(batch, writeOptions(ctx))
 
@@ -261,6 +278,9 @@ func (store *LevelDBStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		if !resEachEntryFunc {
 			break
 		}
+	}
+	if err == nil {
+		err = iter.Error()
 	}
 	iter.Release()
 

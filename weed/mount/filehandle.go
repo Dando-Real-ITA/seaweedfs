@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -20,25 +21,32 @@ type FileHandleId uint64
 var IsDebugFileReadWrite = false
 
 type FileHandle struct {
-	fh              FileHandleId
-	counter         int64
-	fhs             map[FileHandleId]struct{} // live fh values, one per open; guarded by fhMap's lock
-	entry           *LockedEntry
+	fh      FileHandleId
+	counter int64
+	fhs     map[FileHandleId]bool // live fh values, one per open; guarded by fhMap's lock
+	entry   *LockedEntry
+	// Nested handle lock order: wfs.fhLockTable[fh.fh] -> entryLock ->
+	// LockedEntry.RWMutex. Paths may use a subset, but must never acquire an
+	// earlier lock while holding a later one. Release in reverse order.
 	entryLock       sync.RWMutex
 	entryChunkGroup *filer.ChunkGroup
 	inode           uint64
 	wfs             *WFS
 
 	// cache file has been written to
-	dirtyMetadata     bool
-	dirtyPages        *PageWriter
-	reader            *filer.ChunkReadAt
-	contentType       string
-	asyncFlushPending bool   // set in writebackCache mode to defer flush to Release
-	asyncFlushUid     uint32 // saved uid for deferred metadata flush
-	asyncFlushGid     uint32 // saved gid for deferred metadata flush
-	savedDir          string // last known parent path if inode-to-path state is forgotten
-	savedName         string // last known file name if inode-to-path state is forgotten
+	pendingAppend         bool
+	pendingAppendOffset   uint64
+	writebackContentError *atomic.Bool
+	dirtyMetadata         bool
+	dirtyContent          bool
+	dirtyPages            *PageWriter
+	reader                *filer.ChunkReadAt
+	contentType           string
+	asyncFlushPending     bool   // set in writebackCache mode to defer flush to Release
+	asyncFlushUid         uint32 // saved uid for deferred metadata flush
+	asyncFlushGid         uint32 // saved gid for deferred metadata flush
+	savedDir              string // last known parent path if inode-to-path state is forgotten
+	savedName             string // last known file name if inode-to-path state is forgotten
 
 	isDeleted bool
 	// deleteEpoch counts the times isDeleted was raised, all of them under the
@@ -46,6 +54,15 @@ type FileHandle struct {
 	// nothing to delete after all can tell its own mark from a later one.
 	deleteEpoch uint64
 	isRenamed   bool // set by Rename before waiting for async flush; skips old-path metadata flush
+	// nameTaken is set when another mount's rename took the name of this
+	// unpublished create; its publication is refused from then on.
+	nameTaken bool
+	// linkRefresh is the hard link id of a link change whose stored entry
+	// could not be read; the next flush reads it before publishing.
+	linkRefresh []byte
+
+	// pageWrites counts the pages added to dirtyPages, under the handle lock.
+	pageWrites atomic.Uint64
 
 	// entryVersionTsNs is the filer log position the handle's entry reflects.
 	// State at or below it must not replace the entry — that rolls it back.
@@ -62,6 +79,15 @@ type FileHandle struct {
 	// Local writes move the live entry away from it, so "is this event new"
 	// must be judged here, not against the live entry. Always store a clone.
 	baseEntry atomic.Pointer[filer_pb.Entry]
+
+	// sinceBase marks a truncate or chunk rewrite over baseEntry that a
+	// merge must honor: later writes can grow the file past a truncate, and
+	// rewritten chunks carry the handle's view of the base.
+	sinceBase atomic.Pointer[baseMark]
+
+	// chunkViewStale marks a read view whose manifest resolution failed; the
+	// next read or lseek resolves the entry's chunks again.
+	chunkViewStale atomic.Bool
 
 	// dlmLock holds the distributed lock for cross-mount write coordination.
 	// Non-nil only when -dlm is enabled and the file was opened for writing.
@@ -80,7 +106,7 @@ func newFileHandle(wfs *WFS, handleId FileHandleId, inode uint64, entry *filer_p
 	fh := &FileHandle{
 		fh:      handleId,
 		counter: 1,
-		fhs:     map[FileHandleId]struct{}{handleId: {}},
+		fhs:     map[FileHandleId]bool{handleId: false},
 		inode:   inode,
 		wfs:     wfs,
 	}
@@ -126,6 +152,25 @@ func (fh *FileHandle) GetEntry() *LockedEntry {
 	return fh.entry
 }
 
+// entrySnapshot copies the handle's entry under the locks of both of its
+// writers, as GetAttr reads it: Write and the metadata flush change size,
+// times and chunks under the handle lock, while async upload workers append
+// chunks under the LockedEntry lock.
+func (fh *FileHandle) entrySnapshot(dir string) *filer.Entry {
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("entrySnapshot", fh.fh, util.SharedLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	fh.entry.RLock()
+	var snapshot *filer_pb.Entry
+	if fh.entry.Entry != nil {
+		snapshot = proto.Clone(fh.entry.Entry).(*filer_pb.Entry)
+	}
+	fh.entry.RUnlock()
+	if snapshot == nil {
+		return nil
+	}
+	return filer.FromPbEntry(dir, snapshot)
+}
+
 func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 	if entry != nil {
 		fileSize := filer.FileSize(entry)
@@ -133,11 +178,16 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 		if fh.entryChunkGroup != nil {
 			_ = fh.entryChunkGroup.Close()
 		}
+		// Record the chunk -> path index before the chunk group resolves any
+		// manifest chunk: that resolution reads the manifest from a volume server
+		// and needs the entry's read token.
+		fh.wfs.readAuth.Track(fh.FullPath(), entry.Chunks)
 		var resolveManifestErr error
 		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, entry.Chunks, fh.wfs.option.ConcurrentReaders, fh.wfs.CacheInvalidator(), fh.wfs.manifestCache, fh.wfs.readerCacheBudget)
 		if resolveManifestErr != nil {
 			glog.Warningf("failed to resolve manifest chunks in %+v", filer_pb.ScrubCipherKeys(entry))
 		}
+		fh.chunkViewStale.Store(resolveManifestErr != nil)
 	} else {
 		glog.Fatalf("setting file handle entry to nil")
 	}
@@ -171,9 +221,171 @@ func (fh *FileHandle) installAckedEntry(entry *filer_pb.Entry, versionTsNs int64
 	fh.advanceEntryVersion(versionTsNs, signature)
 }
 
+// rebaseEntry installs an entry merged with a peer's changes, keeping the
+// chunks and growth writers added after sent was taken, and refreshes the
+// read view.
+func (fh *FileHandle) rebaseEntry(merged, sent *filer_pb.Entry) {
+	inSent := make(map[string]bool, len(sent.Chunks))
+	for _, c := range sent.Chunks {
+		inSent[contentChunkKey(c)] = true
+	}
+	merged = proto.Clone(merged).(*filer_pb.Entry)
+	fh.UpdateEntry(func(e *filer_pb.Entry) {
+		chunks := merged.Chunks
+		for _, c := range e.Chunks {
+			if !inSent[contentChunkKey(c)] {
+				chunks = append(chunks, c)
+			}
+		}
+		attrs := merged.Attributes
+		if size := e.GetAttributes().GetFileSize(); size > sent.GetAttributes().GetFileSize() && size > attrs.FileSize {
+			attrs.FileSize = size
+		}
+		e.Attributes, e.Extended, e.Content, e.Chunks = attrs, merged.Extended, merged.Content, chunks
+		err := fh.entryChunkGroup.SetChunks(chunks)
+		if err != nil {
+			glog.Warningf("rebase %s: resolve chunks: %v", fh.FullPath(), err)
+		}
+		fh.chunkViewStale.Store(err != nil)
+	})
+}
+
+// installRewrittenChunks replaces the chunks a merge rewrote, taken from
+// snapshot, with rewritten, and moves the read view to the result: the filer
+// deletes the replaced chunks once the merge is committed, and a view still
+// naming them would send reads to needles a vacuum removes. Chunks attached
+// after snapshot was taken were not part of the merge and stay.
+func (fh *FileHandle) installRewrittenChunks(snapshot, rewritten []*filer_pb.FileChunk) {
+	fh.UpdateEntry(func(e *filer_pb.Entry) {
+		chunks := withChunksAttachedSince(snapshot, rewritten, e.Chunks)
+		e.Chunks = chunks
+		err := fh.entryChunkGroup.SetChunks(chunks)
+		if err != nil {
+			glog.Warningf("merge %s: resolve chunks: %v", fh.FullPath(), err)
+		}
+		fh.chunkViewStale.Store(err != nil)
+	})
+}
+
+// withChunksAttachedSince returns processed, the chunks a flush made from
+// snapshot, followed by the chunks uploads attached to current after snapshot
+// was taken: they attach without the handle lock.
+func withChunksAttachedSince(snapshot, processed, current []*filer_pb.FileChunk) []*filer_pb.FileChunk {
+	inSnapshot := make(map[string]bool, len(snapshot))
+	for _, c := range snapshot {
+		inSnapshot[contentFileIdKey(c)] = true
+	}
+	chunks := append([]*filer_pb.FileChunk{}, processed...)
+	for _, c := range current {
+		if !inSnapshot[contentFileIdKey(c)] {
+			chunks = append(chunks, c)
+		}
+	}
+	return chunks
+}
+
+// refreshChunkView retries a read view whose manifest resolution failed.
+func (fh *FileHandle) refreshChunkView() {
+	if !fh.chunkViewStale.Load() {
+		return
+	}
+	fh.UpdateEntry(func(e *filer_pb.Entry) {
+		fh.chunkViewStale.Store(fh.entryChunkGroup.SetChunks(e.Chunks) != nil)
+	})
+}
+
+// mergePeerContent folds a peer's change into a dirty handle, so its own
+// writes stay on top of the peer's instead of being discarded.
+func (fh *FileHandle) mergePeerContent(peer, base *filer_pb.Entry) bool {
+	var local *filer_pb.Entry
+	fh.UpdateEntry(func(e *filer_pb.Entry) {
+		local = proto.Clone(e).(*filer_pb.Entry)
+	})
+	mark := fh.markSince(base)
+	merged, ok := mergeContentEntry(peer, base, local, local, mark.truncatedTo, mark.rewrote)
+	ok = ok && mergeKeepsBuffered(merged, local)
+	if ok {
+		fh.rebaseEntry(merged, local)
+	}
+	return ok
+}
+
+// mergeKeepsBuffered reports whether merged leaves room for writes still
+// buffered over local. They are not chunks yet, so a merge that shrinks the
+// file or brings in inline content (read ahead of chunks) waits for the flush.
+func mergeKeepsBuffered(merged, local *filer_pb.Entry) bool {
+	return merged.Attributes.FileSize >= filer.FileSize(local) && bytes.Equal(merged.Content, local.Content)
+}
+
+// baseMark records what the handle did over base that its entry does not
+// show: the lowest size a truncate set (-1 for none), and a whole-file
+// rewrite of its chunks.
+type baseMark struct {
+	base        *filer_pb.Entry
+	truncatedTo int64
+	rewrote     bool
+}
+
+func (fh *FileHandle) markBase(update func(m *baseMark)) {
+	for {
+		base, old := fh.baseEntry.Load(), fh.sinceBase.Load()
+		next := baseMark{base: base, truncatedTo: -1}
+		if old != nil && old.base == base {
+			next = *old
+		}
+		update(&next)
+		if fh.sinceBase.CompareAndSwap(old, &next) {
+			return
+		}
+	}
+}
+
+// noteTruncate records a truncate to size over the current base.
+func (fh *FileHandle) noteTruncate(size uint64) {
+	fh.markBase(func(m *baseMark) {
+		if m.truncatedTo < 0 || int64(size) < m.truncatedTo {
+			m.truncatedTo = int64(size)
+		}
+	})
+}
+
+// noteRewrite records that the handle's chunks were rewritten from its view
+// of the current base.
+func (fh *FileHandle) noteRewrite() {
+	fh.markBase(func(m *baseMark) { m.rewrote = true })
+}
+
+// adoptPeerBase moves a dirty handle's base to a peer's entry. What the
+// handle has not published yet still applies over the new base.
+func (fh *FileHandle) adoptPeerBase(base *filer_pb.Entry) {
+	old := fh.baseEntry.Swap(base)
+	if m := fh.sinceBase.Load(); m != nil && m.base == old {
+		moved := *m
+		moved.base = base
+		fh.sinceBase.CompareAndSwap(m, &moved)
+	}
+}
+
+// markSince is what the handle did over base.
+func (fh *FileHandle) markSince(base *filer_pb.Entry) baseMark {
+	if m := fh.sinceBase.Load(); m != nil && m.base == base {
+		return *m
+	}
+	return baseMark{base: base, truncatedTo: -1}
+}
+
 // setAuthoritativeBase installs the base snapshot a local ack acknowledged.
 func (fh *FileHandle) setAuthoritativeBase(base *filer_pb.Entry) {
 	fh.baseEntry.Store(base)
+}
+
+// unpublishedCreate reports a file this mount created whose deferred create
+// has not reached the filer yet: Create leaves such a handle dirty with no
+// base, and the first successful flush installs one. The filer holds nothing
+// of the file, so an event at its name from another mount is about another
+// file. The caller holds the handle's lock.
+func (fh *FileHandle) unpublishedCreate() bool {
+	return fh.dirtyMetadata && fh.baseEntry.Load() == nil
 }
 
 // advanceEntryVersion raises the entry version, never regresses it, and
@@ -201,6 +413,8 @@ func (fh *FileHandle) ResetDirtyPages() {
 	fh.dirtyPages.Destroy()
 	fh.dirtyPages = newPageWriter(fh, fh.wfs.option.ChunkSizeLimit)
 	fh.dirtyMetadata = false
+	fh.dirtyContent = false
+	fh.pendingAppend = false
 	fh.contentType = ""
 }
 
@@ -211,6 +425,7 @@ func (fh *FileHandle) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Entr
 }
 
 func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
+	fh.wfs.readAuth.Track(fh.FullPath(), chunks)
 	fh.entry.AppendChunks(chunks)
 }
 

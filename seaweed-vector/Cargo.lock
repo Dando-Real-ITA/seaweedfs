@@ -6685,6 +6685,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic-health"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "tonic-prost"
 version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7130,8 +7143,10 @@ dependencies = [
  "aes",
  "aes-gcm",
  "anyhow",
+ "arrow-array",
  "arrow-cast",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -7145,6 +7160,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "hyper-util",
+ "jsonb",
  "jsonwebtoken",
  "lance",
  "lance-datafusion",
@@ -7177,6 +7193,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "x509-parser",
  "zstd",
 ]
@@ -7195,6 +7212,7 @@ dependencies = [
  "lance",
  "lance-index",
  "lance-linalg",
+ "lance-select",
  "lance-table",
  "object_store",
  "roaring",
@@ -7217,14 +7235,17 @@ dependencies = [
  "arrow-cast",
  "arrow-schema",
  "async-trait",
+ "axum",
  "bytes",
  "clap",
  "futures",
  "lance",
  "lance-arrow",
+ "lance-index",
  "lance-linalg",
  "moka",
  "object_store",
+ "prometheus",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -7236,10 +7257,12 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "weed-lance-worker",
  "weed-vector-core",
 ]

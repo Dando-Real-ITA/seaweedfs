@@ -20,9 +20,11 @@ func TestReadUrlAsStreamValidatesDecodedLength(t *testing.T) {
 		name string
 		body string
 		gzip bool
+		want string // empty when the read must fail
 	}{
 		{name: "short", body: "abc"},
-		{name: "oversized", body: "abcdefghijk"},
+		// a needle outlives a mount truncate of its chunk
+		{name: "oversized", body: "abcdefghijk", want: "abcdefghij"},
 		{name: "gzip short", body: "abc", gzip: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -37,8 +39,16 @@ func TestReadUrlAsStreamValidatesDecodedLength(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			retry, err := ReadUrlAsStreamWithError(t.Context(), srv.URL, "", nil, tc.gzip, true, 0, 10, func([]byte) error { return nil })
-			if !retry || err == nil {
+			var got bytes.Buffer
+			retry, err := ReadUrlAsStreamWithError(t.Context(), srv.URL, "", nil, tc.gzip, true, 0, 10, func(p []byte) error {
+				_, err := got.Write(p)
+				return err
+			})
+			if tc.want != "" {
+				if err != nil || got.String() != tc.want {
+					t.Fatalf("got=%q err=%v, want %q", got.String(), err, tc.want)
+				}
+			} else if !retry || err == nil {
 				t.Fatalf("retry=%v err=%v, want retryable length failure", retry, err)
 			}
 		})
@@ -96,8 +106,8 @@ func TestReadUrlAsStreamEncryptedDecodedLength(t *testing.T) {
 				return err
 			})
 			srv.Close()
-			if body == "0123456789" {
-				if err != nil || got.String() != body {
+			if len(body) >= 10 {
+				if err != nil || got.String() != body[:10] {
 					t.Fatalf("compressed=%v body=%q retry=%v err=%v", compressed, got.String(), retry, err)
 				}
 			} else if !retry || err == nil {

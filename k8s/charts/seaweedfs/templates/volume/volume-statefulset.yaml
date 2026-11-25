@@ -55,6 +55,7 @@ spec:
       {{- with $volume.podAnnotations }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with include "seaweedfs.volumeHttpsAnnotation" $ }}{{ . | nindent 8 }}{{ end }}
     spec:
       {{- if $volume.affinity }}
       affinity:
@@ -281,7 +282,7 @@ spec:
             httpGet:
               path: {{ $volume.readinessProbe.httpGet.path }}
               port: {{ $volume.port }}
-              scheme: {{ $volume.readinessProbe.httpGet.scheme }}
+              scheme: {{ if include "seaweedfs.volumeHttps" $ }}HTTPS{{ else }}{{ $volume.readinessProbe.httpGet.scheme }}{{ end }}
             initialDelaySeconds: {{ $volume.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ $volume.readinessProbe.periodSeconds }}
             successThreshold: {{ $volume.readinessProbe.successThreshold }}
@@ -293,7 +294,7 @@ spec:
             httpGet:
               path: {{ $volume.livenessProbe.httpGet.path }}
               port: {{ $volume.port }}
-              scheme: {{ $volume.livenessProbe.httpGet.scheme }}
+              scheme: {{ if include "seaweedfs.volumeHttps" $ }}HTTPS{{ else }}{{ $volume.livenessProbe.httpGet.scheme }}{{ end }}
             initialDelaySeconds: {{ $volume.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ $volume.livenessProbe.periodSeconds }}
             successThreshold: {{ $volume.livenessProbe.successThreshold }}
@@ -370,8 +371,8 @@ spec:
      {{- end }}
      {{- if include "seaweedfs.securityConfigEnabled" $ }}
         - name: security-config
-          configMap:
-            name: {{ include "seaweedfs.fullname" $ }}-security-config
+          secret:
+            secretName: {{ include "seaweedfs.fullname" $ }}-security-config
      {{- end }}
      {{- if $.Values.global.seaweedfs.enableSecurity }}
         - name: ca-cert
@@ -411,6 +412,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ $dir.storageClass }}
+        {{- with $dir.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ $dir.size }}
@@ -429,6 +433,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ $volume.idx.storageClass }}
+        {{- with $volume.idx.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ $volume.idx.size }}
@@ -445,6 +452,9 @@ spec:
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ $volume.logs.storageClass }}
+        {{- with $volume.logs.volumeAttributesClassName }}
+        volumeAttributesClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ $volume.logs.size }}

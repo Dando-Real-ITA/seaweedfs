@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"testing"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func TestAppendQueryParameter(t *testing.T) {
@@ -94,6 +98,87 @@ func TestReadUrlAsStreamReturnsGzipReaderError(t *testing.T) {
 	}
 }
 
+// A truncated chunk keeps its needle, so a full-chunk read must stop at the
+// chunk's recorded size instead of returning every stored byte.
+func TestReadUrlAsStreamStopsAtChunkSize(t *testing.T) {
+	InitGlobalHttpClient()
+
+	stored := bytes.Repeat([]byte("t"), 300)
+	cipherKey := util.GenCipherKey()
+	encrypted, err := util.Encrypt(stored, cipherKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gzipped bytes.Buffer
+	zw := gzip.NewWriter(&gzipped)
+	zw.Write(stored)
+	zw.Close()
+
+	for _, tc := range []struct {
+		name      string
+		body      []byte
+		encoding  string
+		cipherKey []byte
+	}{
+		{name: "plain", body: stored},
+		{name: "gzip", body: gzipped.Bytes(), encoding: "gzip"},
+		{name: "cipher", body: encrypted, cipherKey: cipherKey},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.encoding != "" {
+					w.Header().Set("Content-Encoding", tc.encoding)
+				}
+				_, _ = w.Write(tc.body)
+			}))
+			defer server.Close()
+
+			var got []byte
+			if _, err := ReadUrlAsStream(context.Background(), server.URL, "", tc.cipherKey, false, true, 0, 100, func(data []byte) {
+				got = append(got, data...)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, stored[:100]) {
+				t.Fatalf("full-chunk read returned %d bytes, want 100", len(got))
+			}
+
+			got = nil
+			if _, err := ReadUrlAsStream(context.Background(), server.URL, "", tc.cipherKey, false, true, 0, 0, func(data []byte) {
+				got = append(got, data...)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, stored) {
+				t.Fatalf("whole-needle read returned %d bytes, want %d", len(got), len(stored))
+			}
+		})
+	}
+}
+
+func TestReadUrlAsStreamReportsAbortPastChunkSize(t *testing.T) {
+	InitGlobalHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "300")
+		_, _ = w.Write(bytes.Repeat([]byte("t"), 200))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	defer server.Close()
+
+	var got int
+	retryable, err := ReadUrlAsStream(context.Background(), server.URL, "", nil, false, true, 0, 100, func(data []byte) {
+		got += len(data)
+	})
+	if err == nil || !retryable {
+		t.Fatalf("aborted response read as retryable=%v err=%v, want a retryable error", retryable, err)
+	}
+	if got != 100 {
+		t.Fatalf("delivered %d bytes, want 100", got)
+	}
+}
+
 func TestReadErrorsCarryTheServerMessage(t *testing.T) {
 	InitGlobalHttpClient()
 
@@ -115,7 +200,7 @@ func TestReadErrorsCarryTheServerMessage(t *testing.T) {
 	if _, _, err := ReadUrlAsReaderCloser(server.URL, "", ""); err == nil || err.Error() != want {
 		t.Errorf("ReadUrlAsReaderCloser: got %v, want %q", err, want)
 	}
-	if _, _, err := readUrlDirectToBuffer(context.Background(), server.URL, "", make([]byte, 16)); err == nil || err.Error() != want {
+	if _, _, err := readUrlDirectToBuffer(context.Background(), server.URL, "", make([]byte, 16), nil); err == nil || err.Error() != want {
 		t.Errorf("readUrlDirectToBuffer: got %v, want %q", err, want)
 	}
 	if _, _, err := GetAuthenticated(context.Background(), server.URL, ""); err == nil || err.Error() != want {
@@ -161,6 +246,19 @@ func TestReadErrorWithoutBodyIsTheStatus(t *testing.T) {
 	want := server.URL + ": 500 Internal Server Error"
 	if _, err := ReadUrlAsStream(context.Background(), server.URL, "", nil, false, true, 0, 0, func(data []byte) {}); err == nil || err.Error() != want {
 		t.Errorf("got %v, want %q", err, want)
+	}
+}
+
+func TestDeleteErrorWithoutBodyIsTheStatus(t *testing.T) {
+	InitGlobalHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	if err := Delete(server.URL, ""); err == nil || err.Error() != "500 Internal Server Error" {
+		t.Errorf("got %v, want %q", err, "500 Internal Server Error")
 	}
 }
 
@@ -317,6 +415,70 @@ func TestRetriedFetchChunkDataRefreshesLocationsAfterPartialFailure(t *testing.T
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// cancelOnReadBody cancels the request's context inside the read that returns
+// the last piece of the body, after ReadUrlAsStream's check of ctx has passed.
+type cancelOnReadBody struct {
+	data   []byte
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnReadBody) Read(p []byte) (int, error) {
+	b.cancel()
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	if len(b.data) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (b *cancelOnReadBody) Close() error { return nil }
+
+// TestRetriedFetchChunkDataCancelledWhileTheLastPieceArrives covers a read
+// whose caller gives up as the last piece of the body arrives, as a FUSE read
+// does when a signal interrupts it. It must return the whole data or an error:
+// fewer bytes and no error reach the kernel as a short read, which it takes as
+// the end of the file. An encrypted chunk reaches the callback in one piece, so
+// there a lost piece is the whole chunk.
+func TestRetriedFetchChunkDataCancelledWhileTheLastPieceArrives(t *testing.T) {
+	payload := []byte("chunk contents")
+	cipherKey := util.GenCipherKey()
+	encrypted, err := util.Encrypt(payload, cipherKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := GetGlobalHttpClient().Client
+	saved := client.Transport
+	t.Cleanup(func() { client.Transport = saved })
+
+	for _, tc := range []struct {
+		name        string
+		body        []byte
+		cipherKey   []byte
+		isFullChunk bool
+	}{
+		{"range", payload, nil, false},
+		{"encrypted", encrypted, cipherKey, true},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: &cancelOnReadBody{data: tc.body, cancel: cancel}, Request: r}, nil
+		})
+
+		buffer := make([]byte, len(payload))
+		n, err := RetriedFetchChunkData(ctx, buffer, []string{"http://volume:8080/3,abc"}, tc.cipherKey, false, tc.isFullChunk, 0, "3,abc", nil)
+		cancel()
+		if err == nil && !bytes.Equal(buffer[:n], payload) {
+			t.Errorf("%s: got %q and no error, want %q or an error", tc.name, buffer[:n], payload)
+		}
+	}
+}
+
 func TestSameUrlsIgnoresOrder(t *testing.T) {
 	a := []string{"http://a:8080/3,x", "http://b:8080/3,x"}
 	if !SameUrls(a, []string{a[1], a[0]}) {
@@ -327,5 +489,177 @@ func TestSameUrlsIgnoresOrder(t *testing.T) {
 	}
 	if SameUrls(a, a[:1]) {
 		t.Fatal("a shorter list should count as fresh")
+	}
+}
+
+// stalledBodyServer answers with the status and the start of a body, and then
+// sends nothing more until the test ends.
+func stalledBodyServer(t *testing.T, status int, bodyStart string) *httptest.Server {
+	return stalledServer(t, status, "", bodyStart)
+}
+
+// stalledGzipServer announces a gzip body and then stalls before the gzip
+// header. A request that leaves Accept-Encoding to the transport gets a body
+// the transport decodes, and up to Go 1.26 closing that body cannot interrupt
+// a read waiting for the gzip header.
+func stalledGzipServer(t *testing.T, status int) *httptest.Server {
+	return stalledServer(t, status, "gzip", "")
+}
+
+func stalledServer(t *testing.T, status int, contentEncoding, bodyStart string) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if contentEncoding != "" {
+			w.Header().Set("Content-Encoding", contentEncoding)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(bodyStart))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+	return server
+}
+
+func setUnwantedBodyTimeout(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	old := unwantedBodyTimeout
+	unwantedBodyTimeout = timeout
+	t.Cleanup(func() { unwantedBodyTimeout = old })
+}
+
+// returnsWithin fails the test if fn is still running after limit, instead of
+// hanging the test run.
+func returnsWithin(t *testing.T, limit time.Duration, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		t.Fatalf("still waiting on the response body after %v", limit)
+	}
+}
+
+// A server that sends its headers and then stalls the body must not hold
+// CloseResponse: the caller is done with the response and may have another
+// replica to try.
+func TestCloseResponseGivesUpOnAStalledBody(t *testing.T) {
+	InitGlobalHttpClient()
+	setUnwantedBodyTimeout(t, 50*time.Millisecond)
+	server := stalledBodyServer(t, http.StatusInternalServerError, "disk ")
+
+	resp, err := GetGlobalHttpClient().Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	returnsWithin(t, 5*time.Second, func() { CloseResponse(resp) })
+	returnsWithin(t, 5*time.Second, func() {
+		if _, err := resp.Body.Read(make([]byte, 1)); err == nil || err == io.EOF {
+			t.Errorf("read after CloseResponse: got %v, want the body closed", err)
+		}
+	})
+}
+
+// The same holds when the transport is decoding gzip and the server stalls
+// before the gzip header, where closing the body does not end the read.
+func TestUnwantedBodyReadsDoNotWaitForAStalledGzipHeader(t *testing.T) {
+	InitGlobalHttpClient()
+	setUnwantedBodyTimeout(t, 50*time.Millisecond)
+	server := stalledGzipServer(t, http.StatusInternalServerError)
+
+	get := func() *http.Response {
+		resp, err := GetGlobalHttpClient().Get(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !resp.Uncompressed {
+			t.Fatal("the transport is not decoding the body")
+		}
+		return resp
+	}
+	resp := get()
+	returnsWithin(t, 5*time.Second, func() { CloseResponse(resp) })
+
+	resp = get()
+	want := server.URL + ": 500 Internal Server Error"
+	returnsWithin(t, 5*time.Second, func() {
+		if err := StatusError(server.URL, resp); err.Error() != want {
+			t.Errorf("StatusError: got %v, want %q", err, want)
+		}
+	})
+	returnsWithin(t, 5*time.Second, func() { CloseResponse(resp) })
+}
+
+// A body that arrives is still read to its end, which lets the next request
+// reuse the connection.
+func TestCloseResponseKeepsTheConnectionOfADrainedBody(t *testing.T) {
+	InitGlobalHttpClient()
+	setUnwantedBodyTimeout(t, 5*time.Second)
+	leftover := bytes.Repeat([]byte("leftover"), 64*1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(leftover)
+	}))
+	defer server.Close()
+
+	var reused []bool
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = append(reused, info.Reused) }}
+	for i := 0; i < 2; i++ {
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, server.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := GetGlobalHttpClient().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		CloseResponse(resp)
+	}
+	if len(reused) != 2 || reused[0] || !reused[1] {
+		t.Errorf("connection reused per request: got %v, want [false true]", reused)
+	}
+}
+
+// A read that fails on the status must return it even when the server never
+// finishes the error body. 404 goes straight to CloseResponse; 500 waits for
+// the server's message first and then goes without it.
+func TestReadErrorsDoNotWaitForAStalledBody(t *testing.T) {
+	InitGlobalHttpClient()
+	setUnwantedBodyTimeout(t, 50*time.Millisecond)
+
+	for _, tc := range []struct {
+		name             string
+		status           int
+		wantStream       string
+		wantReaderCloser string
+	}{
+		{"not found", http.StatusNotFound, ": 404 Not Found: not found", ": 404 Not Found"},
+		{"server error", http.StatusInternalServerError, ": 500 Internal Server Error", ": 500 Internal Server Error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := stalledBodyServer(t, tc.status, "disk ")
+			returnsWithin(t, 5*time.Second, func() {
+				want := server.URL + tc.wantStream
+				if _, err := ReadUrlAsStream(context.Background(), server.URL, "", nil, false, true, 0, 0, func(data []byte) {}); err == nil || err.Error() != want {
+					t.Errorf("ReadUrlAsStream: got %v, want %q", err, want)
+				}
+			})
+			returnsWithin(t, 5*time.Second, func() {
+				want := server.URL + tc.wantReaderCloser
+				if _, _, err := ReadUrlAsReaderCloser(server.URL, "", ""); err == nil || err.Error() != want {
+					t.Errorf("ReadUrlAsReaderCloser: got %v, want %q", err, want)
+				}
+			})
+		})
 	}
 }

@@ -13,6 +13,9 @@ name = "weed-vector"
 path = "src/main.rs"
 
 [dependencies]
+axum = "0.8"
+prometheus = { version = "0.13", default-features = false }
+tonic-health = "0.14"
 weed-vector-core = { path = "../core" }
 weed-lance-worker = { path = "../../../seaweed-worker/crates/lance" }
 sw-client = { path = "../../../seaweed-worker/crates/sw-client" }
@@ -33,6 +36,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 moka = { version = "0.12", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
 object_store = { version = "0.13", features = ["aws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,6 +46,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+lance-index = "10"
 tempfile = "3"
 
 [build-dependencies]

@@ -72,6 +72,10 @@ func (p *masterVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []
 		func() error {
 			result = make(map[string][]Location)
 			lookupErrors = nil
+			epoch := p.masterClient.mapEpoch()
+			// Taken with the epoch: what the master answers is not cached over
+			// locations learned and set aside while it was asked.
+			asked := p.masterClient.vidMap.learnedSoFar()
 
 			// Per-attempt timeout bounds both master resolution and the RPC
 			// so a single attempt cannot consume the entire retry budget.
@@ -124,10 +128,9 @@ func (p *masterVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []
 							ReadOnly:          masterLoc.ReadOnly,
 							ReadOnlyCanDelete: masterLoc.ReadOnlyCanDelete,
 						}
-						// Update cache with the location
-						p.masterClient.addLocation(uint32(vid), loc)
 						locations = append(locations, loc)
 					}
+					p.masterClient.fillLocations(uint32(vid), locations, epoch, asked)
 
 					if len(locations) > 0 {
 						result[vidOnly] = locations
@@ -195,12 +198,27 @@ type MasterClient struct {
 	// client to the master's list, so a server can connect and query masters
 	// before it is ready to be routed to.
 	announceCh chan struct{}
+
+	lancePort  uint32
+	s3Endpoint string
 }
 
 // SetAnnounceCh sets a channel that must be closed before this client
 // registers itself on the master.
 func (mc *MasterClient) SetAnnounceCh(ch chan struct{}) {
 	mc.announceCh = ch
+}
+
+// SetLancePort advertises the port this S3 gateway serves its Lance Namespace
+// on. Must be called before KeepConnectedToMaster starts.
+func (mc *MasterClient) SetLancePort(port uint32) {
+	mc.lancePort = port
+}
+
+// SetS3Endpoint advertises the URL this S3 gateway serves the S3 API on. Must
+// be called before KeepConnectedToMaster starts.
+func (mc *MasterClient) SetS3Endpoint(endpoint string) {
+	mc.s3Endpoint = endpoint
 }
 
 // ListMasters returns the configured master addresses without waiting for a
@@ -377,6 +395,8 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 			ClientAddress: string(mc.clientHost),
 			Version:       version.Version(),
 			LeaveLockRing: mc.leavingLockRing,
+			LancePort:     mc.lancePort,
+			S3Endpoint:    mc.s3Endpoint,
 		})
 		if err == nil {
 			mc.stream = stream

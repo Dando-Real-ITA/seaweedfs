@@ -35,10 +35,16 @@ lance-table = "10"
 # For the execution options the sort needs; the scanner's own stream helper
 # takes the default, which has spilling off.
 lance-datafusion = "10"
+arrow-array = "58"
 arrow-schema = "58"
 arrow-cast = "58"
+arrow-select = "58"
+# Lance's stored form of the metadata JSON, read when deriving the
+# indexed-key columns.
+jsonb = { version = "0.5", default-features = false }
 chrono = "0.4"
 futures = "0.3"
+uuid = "1"
 anyhow.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
@@ -88,9 +94,10 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tonic.workspace = true
-arrow-array = "58"
+lance-arrow = "10"
 arrow-schema = "58"
 arrow-cast = "58"
+arrow-select = "58"
 lance-linalg = "10"
 tempfile = "3"
 

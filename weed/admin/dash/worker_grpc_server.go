@@ -13,7 +13,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/admin/maintenance"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
@@ -107,7 +106,7 @@ func (s *WorkerGrpcServer) StartWithTLS(bindIp string, port int, listener net.Li
 
 	worker_pb.RegisterWorkerServiceServer(grpcServer, s)
 	if plugin := s.adminServer.GetPlugin(); plugin != nil {
-		plugin_pb.RegisterPluginControlServiceServer(grpcServer, plugin)
+		plugin.RegisterGrpcServices(grpcServer)
 		glog.V(0).Infof("Plugin gRPC service registered on worker gRPC server")
 	}
 
@@ -199,7 +198,8 @@ func (s *WorkerGrpcServer) Stop() error {
 func (s *WorkerGrpcServer) WorkerStream(stream worker_pb.WorkerService_WorkerStreamServer) error {
 	ctx := stream.Context()
 
-	if err := security.CheckGrpcAdminPeer(ctx, security.SigningKey(util.GetViper().GetString("jwt.filer_signing.key"))); err != nil {
+	signingKey, previousKey := security.FilerAdminKeys()
+	if err := security.CheckGrpcAdminPeer(ctx, signingKey, previousKey); err != nil {
 		return err
 	}
 

@@ -2,6 +2,9 @@ package redis2
 
 import (
 	"context"
+	"crypto/fips140"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"testing"
@@ -364,6 +367,22 @@ func TestDeleteExpiredEntryKeepsRecreatedValue(t *testing.T) {
 	}
 }
 
+// TestScriptDigests checks that each pinned digest runScript sends with EVALSHA
+// is the SHA-1 of the script it falls back to with EVAL. It hashes outside FIPS
+// enforcement so it also runs under GODEBUG=fips140=only.
+func TestScriptDigests(t *testing.T) {
+	for _, s := range []struct{ name, src, sha1Hex string }{
+		{"existsScript", existsScript, existsScriptSHA1},
+		{"deleteIfUnchangedScript", deleteIfUnchangedScript, deleteIfUnchangedScriptSHA1},
+	} {
+		var sum [sha1.Size]byte
+		fips140.WithoutEnforcement(func() { sum = sha1.Sum([]byte(s.src)) })
+		if got := hex.EncodeToString(sum[:]); got != s.sha1Hex {
+			t.Errorf("%s digest is %s, want %s", s.name, s.sha1Hex, got)
+		}
+	}
+}
+
 func TestDeleteIfUnchangedScriptOnlyDeletesSameBytes(t *testing.T) {
 	store, dir := newTestStore(t, "")
 
@@ -372,11 +391,11 @@ func TestDeleteIfUnchangedScriptOnlyDeletesSameBytes(t *testing.T) {
 		t.Fatalf("set: %v", err)
 	}
 
-	if deleted, err := deleteIfUnchangedScript.Run(context.Background(), store.Client, []string{key}, []byte("v2")).Int(); err != nil || deleted != 0 {
+	if deleted, err := runScript(context.Background(), store.Client, deleteIfUnchangedScript, deleteIfUnchangedScriptSHA1, []string{key}, []byte("v2")).Int(); err != nil || deleted != 0 {
 		t.Fatalf("deleted=%d err=%v, want no delete on changed bytes", deleted, err)
 	}
 
-	if deleted, err := deleteIfUnchangedScript.Run(context.Background(), store.Client, []string{key}, []byte("v1")).Int(); err != nil || deleted != 1 {
+	if deleted, err := runScript(context.Background(), store.Client, deleteIfUnchangedScript, deleteIfUnchangedScriptSHA1, []string{key}, []byte("v1")).Int(); err != nil || deleted != 1 {
 		t.Fatalf("deleted=%d err=%v, want delete on matching bytes", deleted, err)
 	}
 
@@ -384,7 +403,7 @@ func TestDeleteIfUnchangedScriptOnlyDeletesSameBytes(t *testing.T) {
 		t.Fatalf("exists=%d err=%v, want key gone", exists, err)
 	}
 
-	if deleted, err := deleteIfUnchangedScript.Run(context.Background(), store.Client, []string{key}, []byte("v1")).Int(); err != nil || deleted != -1 {
+	if deleted, err := runScript(context.Background(), store.Client, deleteIfUnchangedScript, deleteIfUnchangedScriptSHA1, []string{key}, []byte("v1")).Int(); err != nil || deleted != -1 {
 		t.Fatalf("deleted=%d err=%v, want -1 on a missing key", deleted, err)
 	}
 }
@@ -416,5 +435,44 @@ func TestDeleteEntryKeepsChildListing(t *testing.T) {
 		t.Fatalf("exists %s: %v", dir, err)
 	} else if n != 0 {
 		t.Errorf("listing key should be removed with the children, still present")
+	}
+}
+
+// What OverwritesAtOnce declares: an InsertEntry over an existing entry
+// replaces the stored entry together with its expiry, and leaves the name
+// listed once.
+func TestInsertEntryOverAnExistingEntryReplacesIt(t *testing.T) {
+	for _, keyPrefix := range []string{"", "sw:"} {
+		t.Run("keyPrefix="+keyPrefix, func(t *testing.T) {
+			store, dir := newTestStore(t, keyPrefix)
+			if !store.OverwritesAtOnce() {
+				t.Fatal("OverwritesAtOnce = false")
+			}
+			ctx := context.Background()
+			path := dir.Child("replaced")
+			insertTestEntry(t, store, path, 3600)
+
+			now := time.Now()
+			if err := store.InsertEntry(ctx, &filer.Entry{
+				FullPath: path,
+				Attr:     filer.Attr{Crtime: now, Mtime: now, Mode: 0600, Inode: 4242},
+			}); err != nil {
+				t.Fatalf("InsertEntry over %s: %v", path, err)
+			}
+
+			got, err := store.FindEntry(ctx, path)
+			if err != nil || got.Attr.Inode != 4242 || got.Attr.TtlSec != 0 {
+				t.Fatalf("FindEntry = %+v, %v; want the second entry", got, err)
+			}
+			if ttl, err := store.Client.TTL(ctx, store.getKey(string(path))).Result(); err != nil || ttl != -1 {
+				t.Fatalf("TTL of the stored entry = %v, %v; want none left from the first entry", ttl, err)
+			}
+			if members := indexMembers(t, store, dir); len(members) != 1 || members[0] != "replaced" {
+				t.Fatalf("directory index holds %v, want [replaced]", members)
+			}
+			if names := listNames(t, store, dir); len(names) != 1 || names[0] != "replaced" {
+				t.Fatalf("listed %v, want [replaced]", names)
+			}
+		})
 	}
 }

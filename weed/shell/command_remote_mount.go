@@ -76,7 +76,7 @@ func (c *commandRemoteMount) Do(args []string, commandEnv *CommandEnv, writer io
 	cacheWait := remoteMountCommand.Duration("cacheWait", -1, "how long a read of an uncached object waits for the local cache, ex. 0 or 500ms (default: by object size)")
 
 	if err = remoteMountCommand.Parse(args); err != nil {
-		return nil
+		return err
 	}
 
 	if *dir == "" {
@@ -202,7 +202,7 @@ func ensureMountDirectory(commandEnv *CommandEnv, dir string, nonEmpty bool, rem
 		})
 		if lookupErr != nil {
 			if errors.Is(lookupErr, filer_pb.ErrNotFound) {
-				_, createErr := client.CreateEntry(context.Background(), &filer_pb.CreateEntryRequest{
+				createErr := filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{
 					Directory: parent,
 					Entry: &filer_pb.Entry{
 						Name:        name,

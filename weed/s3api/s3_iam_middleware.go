@@ -245,19 +245,11 @@ func (s3iam *S3IAMIntegration) AuthorizeAction(ctx context.Context, identity *IA
 	// See https://github.com/seaweedfs/seaweedfs/issues/8969
 	resourceObjectKey := objectKey
 	if isBucketListingRequest(r, action) {
-		listPrefix := r.URL.Query().Get("prefix")
-		if listPrefix != "" {
-			requestContext["s3:prefix"] = listPrefix
-		} else if objectKey != "" && objectKey != "/" {
-			requestContext["s3:prefix"] = objectKey
-		} else {
-			requestContext["s3:prefix"] = ""
-		}
+		addBucketListingConditions(requestContext, r, objectKey)
 		resourceObjectKey = ""
 	}
 
 	// Build resource ARN for the S3 operation
-	resourceArn := buildS3ResourceArn(bucket, resourceObjectKey)
 
 	// Add identity claims to request context for policy variables
 	// Only add claim keys if they don't already exist (to avoid overwriting request-derived context)
@@ -283,7 +275,7 @@ func (s3iam *S3IAMIntegration) AuthorizeAction(ctx context.Context, identity *IA
 	// Determine the specific S3 action based on the HTTP request details. The
 	// prefix promoted into objectKey is not part of the URL; resolve against
 	// the bucket-level object so ?versions and ?uploads keep their own action.
-	specificAction := ResolveS3Action(r, string(action), bucket, resourceObjectKey)
+	specificAction, resourceArn := resolveS3AuthTarget(action, bucket, resourceObjectKey, r)
 
 	// Create action request
 	actionRequest := &integration.ActionRequest{
@@ -309,6 +301,36 @@ func (s3iam *S3IAMIntegration) AuthorizeAction(ctx context.Context, identity *IA
 	}
 
 	return s3err.ErrNone
+}
+
+// addBucketListingConditions adds the condition keys AWS exposes for bucket
+// listing requests. An omitted prefix is the empty prefix, matching AWS; an
+// omitted delimiter or max-keys stays absent so conditions on them fail closed.
+func addBucketListingConditions(requestContext map[string]interface{}, r *http.Request, objectKey string) {
+	if r == nil || r.URL == nil {
+		return
+	}
+	query := r.URL.Query()
+
+	listPrefix := query.Get("prefix")
+	if listPrefix != "" {
+		requestContext["s3:prefix"] = listPrefix
+	} else if objectKey != "" && objectKey != "/" {
+		requestContext["s3:prefix"] = objectKey
+	} else {
+		requestContext["s3:prefix"] = ""
+	}
+
+	if delimiter := query.Get("delimiter"); delimiter != "" {
+		requestContext["s3:delimiter"] = delimiter
+	}
+
+	// Multipart listings use max-uploads, so max-keys cannot constrain them.
+	if !query.Has("uploads") {
+		if maxKeys := query.Get("max-keys"); maxKeys != "" {
+			requestContext["s3:max-keys"] = maxKeys
+		}
+	}
 }
 
 // ValidateTrustPolicyForPrincipal delegates to IAMManager to validate trust policy
@@ -397,6 +419,13 @@ func (s3iam *S3IAMIntegration) extractRequestContext(r *http.Request) map[string
 		context["referer"] = referer
 	}
 
+	for key, values := range policy_engine.RequestConditionValues(r) {
+		context[key] = values
+	}
+
+	for key, values := range vectorIAMConditions(r) {
+		context[key] = values
+	}
 	return context
 }
 

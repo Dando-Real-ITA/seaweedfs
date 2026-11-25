@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"strconv"
@@ -89,7 +90,7 @@ func Uint8toBytes(b []byte, v uint8) {
 
 // returns a 64 bit big int
 func HashStringToLong(dir string) (v int64) {
-	h := md5.New()
+	h := NewMd5()
 	io.WriteString(h, dir)
 
 	b := h.Sum(nil)
@@ -113,8 +114,15 @@ func HashStringToLong(dir string) (v int64) {
 	return
 }
 
+// HashToInt32 follows GODEBUG only, not the digest mode: processes that never
+// adopt a filer's digest derive the same names, such as a mount's socket path.
 func HashToInt32(data []byte) (v int32) {
-	h := md5.New()
+	var h hash.Hash
+	if fips140Enforced() {
+		h = NewTruncatedSha256(md5.Size)
+	} else {
+		h = md5.New()
+	}
 	h.Write(data)
 
 	b := h.Sum(nil)
@@ -135,9 +143,7 @@ func Base64Encode(data []byte) string {
 }
 
 func Md5(data []byte) []byte {
-	hash := md5.New()
-	hash.Write(data)
-	return hash.Sum(nil)
+	return Md5For("", data)
 }
 
 func Md5String(data []byte) string {

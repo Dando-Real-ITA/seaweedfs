@@ -5,12 +5,17 @@ use clap::Parser;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use weed_lance_worker::cluster::Cluster;
-use weed_vector_server::master_client;
+use weed_vector_server::memory::CacheSizes;
 use weed_vector_server::pb::vector::vector_service_server::VectorServiceServer;
 use weed_vector_server::read_cache::ReadCache;
 use weed_vector_server::security::Security;
 use weed_vector_server::service::VectorServer;
 use weed_vector_server::tls::{self, ServerTls};
+use weed_vector_server::{
+    master_client,
+    metrics::{self, Metrics},
+    observed::ObservedService,
+};
 
 /// The VectorService the S3 gateway fans vector calls out to.
 #[derive(Parser)]
@@ -18,6 +23,9 @@ struct Args {
     /// gRPC listen address.
     #[arg(long, env = "WEED_VECTOR_LISTEN", default_value = "127.0.0.1:8090")]
     listen: String,
+    /// Address to register when it differs from the listen address.
+    #[arg(long, env = "WEED_VECTOR_ADVERTISE")]
+    advertise: Option<String>,
     /// Comma-separated master addresses. The engine registers with them, so
     /// the gateway finds it, and asks them for the filers it keeps tables
     /// through.
@@ -31,24 +39,27 @@ struct Args {
         default_value = ""
     )]
     filer_group: String,
-    /// Memory for caching reads of write-once table files, in MiB; 0 disables.
-    #[arg(long, env = "WEED_VECTOR_READ_CACHE_MB", default_value_t = 512)]
-    read_cache_mb: u64,
-    /// Partitions each query probes in a table's vector index. Default: a
-    /// tenth of the index's partitions, at least 8; more under a filter.
-    #[arg(long, env = "WEED_VECTOR_NPROBES")]
-    nprobes: Option<std::num::NonZeroUsize>,
     /// The cluster's security.toml: [grpc.vector] for this server,
     /// [grpc.client] for the masters and filers, https.client for volume
     /// servers under HTTPS, jwt.signing.read.key for signed volume reads,
     /// s3.sse.kek or s3.sse.key for SSE-S3 buckets. By default the file weed
-    /// processes find in -config_dir, ., ~/.seaweedfs and /etc/seaweedfs.
+    /// processes find in ., ~/.seaweedfs and /etc/seaweedfs.
     #[arg(long, env = "WEED_VECTOR_SECURITY_TOML")]
     security_toml: Option<PathBuf>,
-    /// The directory weed's -config_dir names, searched for security.toml
-    /// first.
-    #[arg(long, alias = "config_dir", env = "WEED_VECTOR_CONFIG_DIR")]
-    config_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        alias = "metricsPort",
+        env = "WEED_VECTOR_METRICS_PORT",
+        default_value_t = 0
+    )]
+    metrics_port: u16,
+    #[arg(
+        long,
+        alias = "metricsIp",
+        env = "WEED_VECTOR_METRICS_IP",
+        default_value = "127.0.0.1"
+    )]
+    metrics_ip: String,
 }
 
 // weed tools take Go-style single-dash long flags; normalize_args converts
@@ -78,7 +89,13 @@ fn normalize_args(args: Vec<String>) -> Vec<String> {
 
 /// A wildcard listen address is not reachable for peers; derive the outbound
 /// IP toward the first master instead — the address the master sees anyway.
-fn advertised_addr(listen: &str, masters: &[String]) -> String {
+fn advertised_addr(listen: &str, masters: &[String], advertise: Option<&str>) -> String {
+    if let Some(address) = advertise
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+    {
+        return address.to_string();
+    }
     let Some((host, _)) = listen.rsplit_once(':') else {
         return listen.to_string();
     };
@@ -113,7 +130,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse_from(normalize_args(std::env::args().collect()));
     weed_lance_worker::tls::install_default_crypto_provider();
-    let security = Security::load(args.security_toml.as_deref(), args.config_dir.as_deref())?;
+    let security = Security::load(args.security_toml.as_deref())?;
     if let Some(path) = security.path() {
         tracing::info!("security settings from {}", path.display());
     }
@@ -128,11 +145,35 @@ async fn main() -> Result<()> {
         .with_context(|| format!("listen on {}", args.listen))?;
     let cluster = Cluster::new(&args.masters, &args.filer_group, &security)?;
     let reads = cluster.storage(&security).await?;
-    let mut service = VectorServer::new()
-        .with_nprobes(args.nprobes.map(std::num::NonZeroUsize::get))
-        .with_storage(reads);
-    if args.read_cache_mb > 0 {
-        service = service.with_read_cache(ReadCache::new(args.read_cache_mb << 20));
+    let (health, health_service) = tonic_health::server::health_reporter();
+    let metrics = Metrics::new()?.with_health(health);
+    metrics.set_connected(false).await;
+    let sizes = CacheSizes::detect();
+    tracing::info!(
+        "caching {} MiB of file reads, {} MiB of indexes, {} MiB of table metadata",
+        sizes.read >> 20,
+        sizes.index >> 20,
+        sizes.metadata >> 20
+    );
+    let cache = ReadCache::new(sizes.read).with_metrics(metrics.clone());
+    let service = VectorServer::new()
+        .with_lance_caches(sizes.index as usize, sizes.metadata as usize)
+        .with_storage(reads)
+        .with_read_cache(cache.clone());
+    if args.metrics_port > 0 {
+        let ip = args
+            .metrics_ip
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()?;
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::new(ip, args.metrics_port)).await?;
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(error) = metrics::serve_listener(metrics, listener, Some(cache)).await {
+                tracing::error!(%error, "vector metrics server stopped");
+            }
+        });
     }
     tracing::info!(
         listen = %args.listen,
@@ -148,19 +189,26 @@ async fn main() -> Result<()> {
     );
     // Registered only now, with storage connected and the listener bound,
     // so the gateway never finds an engine that cannot serve yet.
-    let advertise = advertised_addr(&args.listen, &cluster.masters);
+    let advertise = advertised_addr(&args.listen, &cluster.masters, args.advertise.as_deref());
     tokio::spawn(master_client::keep_connected(
         cluster.masters.clone(),
         advertise,
+        args.filer_group.clone(),
+        args.metrics_port,
         cluster.master_tls.clone(),
+        metrics.clone(),
     ));
     let router = Server::builder()
+        .add_service(health_service)
         // Match the gateway's 1 GiB cap — put batches over the tonic 4 MiB
         // default otherwise get rejected before they reach the handler.
         .add_service(
-            VectorServiceServer::new(service)
-                .max_decoding_message_size(1 << 30)
-                .max_encoding_message_size(1 << 30),
+            VectorServiceServer::new(ObservedService {
+                inner: service,
+                metrics,
+            })
+            .max_decoding_message_size(1 << 30)
+            .max_encoding_message_size(1 << 30),
         );
     match server_tls {
         Some(tls) => {
@@ -181,13 +229,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nprobes_must_be_positive() {
-        let parse = |nprobes: &str| {
-            Args::try_parse_from(["weed-vector", "--masters", "m:9333", "--nprobes", nprobes])
-        };
-        assert!(parse("0").is_err());
-        let args = parse("12").unwrap();
-        assert_eq!(args.nprobes.map(std::num::NonZeroUsize::get), Some(12));
+    fn an_empty_advertise_uses_the_listen_address() {
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                advertised_addr("127.0.0.1:8090", &[], value),
+                "127.0.0.1:8090"
+            );
+        }
+        assert_eq!(
+            advertised_addr("127.0.0.1:8090", &[], Some("vector.example:8090")),
+            "vector.example:8090"
+        );
     }
 
     #[test]

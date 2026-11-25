@@ -20,6 +20,7 @@ type MountOptions struct {
 	chunkSizeLimitMB     *int
 	concurrentWriters    *int
 	concurrentReaders    *int
+	volumeReadAuth       *bool
 	readerCacheSizeMB    *int64
 	memoryLimitMB        *int64
 	cacheMetaTtlSec      *int
@@ -31,9 +32,11 @@ type MountOptions struct {
 	dataCenter           *string
 	allowOthers          *bool
 	defaultPermissions   *bool
+	idmap                *bool
 	umaskString          *string
 	nonempty             *bool
 	volumeServerAccess   *string
+	sseS3Read            *bool
 	uidMap               *string
 	gidMap               *string
 	readOnly             *bool
@@ -67,9 +70,14 @@ type MountOptions struct {
 	// POSIX compliance options
 	posixDirNlink *bool
 
+	// report opens for reading to the filer
+	accessReport         *bool
+	accessReportInterval *time.Duration
+
 	// FUSE performance options
 	writebackCache          *bool
 	asyncDio                *bool
+	nfsExport               *bool
 	cacheSymlink            *bool
 	fuseMaxBackground       *int
 	fuseCongestionThreshold *int
@@ -106,6 +114,7 @@ func init() {
 	mountOptions.chunkSizeLimitMB = cmdMount.Flag.Int("chunkSizeLimitMB", 2, "local write buffer size, also chunk large files")
 	mountOptions.concurrentWriters = cmdMount.Flag.Int("concurrentWriters", 128, "limit concurrent goroutine writers")
 	mountOptions.concurrentReaders = cmdMount.Flag.Int("concurrentReaders", 128, "limit concurrent chunk fetches for read operations")
+	mountOptions.volumeReadAuth = cmdMount.Flag.Bool("volumeReadAuth", false, "read chunks with the exact-fid tokens the filer returns (LookupDirectoryEntries read_auth) instead of signing with jwt.signing.read.key")
 	mountOptions.memoryLimitMB = cmdMount.Flag.Int64("memoryLimitMB", 0, "soft Go runtime memory limit in MiB; 0 preserves GOMEMLIMIT; leave headroom below the container limit")
 	mountOptions.readerCacheSizeMB = cmdMount.Flag.Int64("readerCacheSizeMB", 256, "memory budget in MiB for downloaded and in-flight reader buffers across all files; must fit the largest pooled chunk buffer")
 	mountOptions.cacheDirForRead = cmdMount.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks and meta data")
@@ -117,9 +126,11 @@ func init() {
 	mountOptions.dataCenter = cmdMount.Flag.String("dataCenter", "", "prefer to write to the data center")
 	mountOptions.allowOthers = cmdMount.Flag.Bool("allowOthers", true, "allows other users to access the file system; on Linux, when mounting as a non-root user, this requires 'user_allow_other' in /etc/fuse.conf, so set -allowOthers=false otherwise")
 	mountOptions.defaultPermissions = cmdMount.Flag.Bool("defaultPermissions", true, "enforce permissions by the operating system")
+	mountOptions.idmap = cmdMount.Flag.Bool("idmap", false, "allow ID-mapped bind mounts of this mount (mount --bind -o X-mount.idmap=...); needs Linux 6.12 or later and -defaultPermissions")
 	mountOptions.umaskString = cmdMount.Flag.String("umask", "022", "octal umask, e.g., 022, 0111")
 	mountOptions.nonempty = cmdMount.Flag.Bool("nonempty", false, "allows the mounting over a non-empty directory")
 	mountOptions.volumeServerAccess = cmdMount.Flag.String("volumeServerAccess", "direct", "access volume servers by [direct|publicUrl|filerProxy]")
+	mountOptions.sseS3Read = cmdMount.Flag.Bool("sseS3Read", false, "read SSE-S3 objects through a registered S3 gateway using the mount user's AWS credentials (single-user, read-only bucket mount); uses plain HTTP when no HTTPS gateway is registered")
 	mountOptions.uidMap = cmdMount.Flag.String("map.uid", "", "map local uid to uid on filer, comma-separated <local_uid>:<filer_uid>")
 	mountOptions.gidMap = cmdMount.Flag.String("map.gid", "", "map local gid to gid on filer, comma-separated <local_gid>:<filer_gid>")
 	mountOptions.readOnly = cmdMount.Flag.Bool("readOnly", false, "read only")
@@ -156,9 +167,13 @@ func init() {
 	// POSIX compliance options
 	mountOptions.posixDirNlink = cmdMount.Flag.Bool("posix.dirNLink", false, "report POSIX-compliant directory nlink (2 + subdirectory count); costs one directory listing per stat")
 
+	mountOptions.accessReport = cmdMount.Flag.Bool("accessReport", false, "report opens of a file for reading to the filer with TouchAccessTime, including opens answered from the metadata cache, at most once per -accessReport.interval for each file unless it was modified since its last report. Has no effect unless the filer implements TouchAccessTime")
+	mountOptions.accessReportInterval = cmdMount.Flag.Duration("accessReport.interval", time.Hour, "with -accessReport, the least time between two reports of the same unmodified file; 0 reports every open")
+
 	// FUSE performance options
 	mountOptions.writebackCache = cmdMount.Flag.Bool("writebackCache", false, "enable FUSE writeback cache for improved write performance (at risk of data loss on crash)")
 	mountOptions.asyncDio = cmdMount.Flag.Bool("asyncDio", false, "enable async direct I/O for better concurrency")
+	mountOptions.nfsExport = cmdMount.Flag.Bool("nfsExport", false, "support file handles that outlive the kernel's inode cache, for re-exporting the mount over NFS")
 	mountOptions.cacheSymlink = cmdMount.Flag.Bool("cacheSymlink", false, "enable symlink caching to reduce metadata lookups")
 	mountOptions.fuseMaxBackground = cmdMount.Flag.Int("fuse.maxBackground", 128, "FUSE max_background: maximum in-flight asynchronous requests the kernel will queue. Heavy upload workloads may benefit from higher values (e.g. 2048). Equivalent to writing /sys/fs/fuse/connections/<id>/max_background. If -fuse.congestionThreshold is 0, the kernel derives it as 3/4 of this value.")
 	mountOptions.fuseCongestionThreshold = cmdMount.Flag.Int("fuse.congestionThreshold", 0, "FUSE congestion_threshold: in-flight async request count at which the kernel marks the FUSE bdi as congested and throttles new submissions. 0 means use the default (3/4 of -fuse.maxBackground). Equivalent to writing /sys/fs/fuse/connections/<id>/congestion_threshold. The kernel silently clamps this to -fuse.maxBackground when set higher.")

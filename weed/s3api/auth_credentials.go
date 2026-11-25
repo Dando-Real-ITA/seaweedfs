@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,7 +86,7 @@ type IdentityAccessManagement struct {
 	// primeBucketForIAM loads a bucket's config (and with it the advanced-IAM
 	// bucket-policy mirror backfill) before an IAM authorization that will
 	// evaluate that mirror. Set by NewS3ApiServer; nil in tests.
-	primeBucketForIAM func(bucket string)
+	primeBucketForIAM func(bucket string) s3err.ErrorCode
 
 	// Cached policy engine for IAM policy fallback evaluation.
 	// Keyed by policy name, kept in sync by PutPolicy/DeletePolicy.
@@ -136,6 +137,7 @@ type Identity struct {
 	Claims        map[string]interface{} // JWT claims for policy substitution
 	IsStatic      bool                   // Whether identity was loaded from static config (immutable)
 	IdentityClaim string                 // Authoritative OIDC identity claim for audit logging (preferred_username/email/sub); empty for non-federated sessions
+	Certificates  []*iam_pb.CertificateMatch
 }
 
 // Account represents a system user, a system user can
@@ -821,6 +823,7 @@ func (iam *IdentityAccessManagement) loadS3ApiConfigurationWithSource(config *ia
 
 // ReplaceS3ApiConfiguration completely replaces the current configuration (used when no static config)
 func (iam *IdentityAccessManagement) ReplaceS3ApiConfiguration(config *iam_pb.S3ApiConfiguration) error {
+	warnFips140ShortSecrets(config)
 	var identities []*Identity
 	var identityAnonymous *Identity
 	accessKeyIdent := make(map[string]*Identity)
@@ -889,6 +892,7 @@ func (iam *IdentityAccessManagement) ReplaceS3ApiConfiguration(config *iam_pb.S3
 			PrincipalArn: generatePrincipalArn(ident.Name),
 			Disabled:     ident.Disabled, // false (default) = enabled, true = disabled
 			PolicyNames:  ident.PolicyNames,
+			Certificates: ident.Certificates,
 		}
 		if ident.Name == AccountAnonymous.Id {
 			t.Account = &AccountAnonymous
@@ -1022,6 +1026,7 @@ func (iam *IdentityAccessManagement) ReplaceS3ApiConfiguration(config *iam_pb.S3
 // isFullState marks config as the complete store snapshot, so dynamic identities
 // absent from it are removed; partial merges (a single pushed identity) pass false.
 func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3ApiConfiguration, fromStaticFile bool, isFullState bool) error {
+	warnFips140ShortSecrets(config)
 	// Start with current configuration (which includes static identities)
 	iam.m.RLock()
 	identities := make([]*Identity, len(iam.identities))
@@ -1108,6 +1113,7 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 			PrincipalArn: generatePrincipalArn(ident.Name),
 			Disabled:     ident.Disabled,
 			PolicyNames:  ident.PolicyNames,
+			Certificates: ident.Certificates,
 			// File identities are static; set it here so the published identity is
 			// never briefly observable as non-static (RemoveIdentity guards on it).
 			IsStatic: fromStaticFile,
@@ -1615,6 +1621,68 @@ func (iam *IdentityAccessManagement) LookupAnonymous() (identity *Identity, foun
 	return nil, false
 }
 
+// authenticateUnsigned names the identity of a request that carries no
+// signature or token: the one matching the client certificate the gateway
+// verified, else the anonymous identity. It returns no identity when neither
+// applies, or when more than one identity matches the certificate.
+func (iam *IdentityAccessManagement) authenticateUnsigned(r *http.Request) (*Identity, s3err.ErrorCode, string) {
+	if identity, matches := iam.lookupByCertificate(r); matches > 0 {
+		if matches > 1 {
+			glog.Warningf("client certificate %q matches %d identities", r.TLS.VerifiedChains[0][0].Subject, matches)
+			return nil, s3err.ErrAccessDenied, "Certificate"
+		}
+		if identity.Disabled {
+			return nil, s3err.ErrAccessDenied, "Certificate"
+		}
+		return identity, s3err.ErrNone, "Certificate"
+	}
+	if identity, found := iam.LookupAnonymous(); found {
+		return identity, s3err.ErrNone, "Anonymous"
+	}
+	return nil, s3err.ErrAccessDenied, "Anonymous"
+}
+
+// isAnonymousRequest reports a request that carries no signature or token and
+// whose client certificate names no identity.
+func (iam *IdentityAccessManagement) isAnonymousRequest(r *http.Request) bool {
+	if getRequestAuthType(r) != authTypeAnonymous {
+		return false
+	}
+	_, matches := iam.lookupByCertificate(r)
+	return matches == 0
+}
+
+// lookupByCertificate returns an identity the client certificate the gateway
+// verified matches, and how many identities it matches.
+func (iam *IdentityAccessManagement) lookupByCertificate(r *http.Request) (match *Identity, matches int) {
+	if iam == nil || r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
+		return nil, 0
+	}
+	cert := r.TLS.VerifiedChains[0][0]
+	iam.m.RLock()
+	defer iam.m.RUnlock()
+	for _, identity := range iam.identities {
+		if slices.ContainsFunc(identity.Certificates, func(m *iam_pb.CertificateMatch) bool { return certificateMatches(m, cert) }) {
+			match = identity
+			matches++
+		}
+	}
+	return match, matches
+}
+
+func certificateMatches(m *iam_pb.CertificateMatch, cert *x509.Certificate) bool {
+	if m.GetUriSan() == "" && m.GetDnsSan() == "" && m.GetSubjectCn() == "" {
+		return false
+	}
+	if m.GetUriSan() != "" && !slices.ContainsFunc(cert.URIs, func(u *url.URL) bool { return u.String() == m.GetUriSan() }) {
+		return false
+	}
+	if m.GetDnsSan() != "" && !slices.ContainsFunc(cert.DNSNames, func(name string) bool { return strings.EqualFold(name, m.GetDnsSan()) }) {
+		return false
+	}
+	return m.GetSubjectCn() == "" || cert.Subject.CommonName == m.GetSubjectCn()
+}
+
 func (iam *IdentityAccessManagement) lookupByIdentityName(name string) *Identity {
 	iam.m.RLock()
 	defer iam.m.RUnlock()
@@ -1854,7 +1922,6 @@ func scrubInternalHeaders(r *http.Request) {
 func (iam *IdentityAccessManagement) authenticateRequestInternal(r *http.Request) (*Identity, s3err.ErrorCode, authType) {
 	var identity *Identity
 	var s3Err s3err.ErrorCode
-	var found bool
 	var amzAuthType string
 
 	// Clearing them here — the shared entry point for every auth path —
@@ -1898,10 +1965,9 @@ func (iam *IdentityAccessManagement) authenticateRequestInternal(r *http.Request
 			amzAuthType = "Jwt"
 		default:
 			glog.V(4).Infof("unsigned streaming upload, anonymous request")
-			amzAuthType = "Anonymous"
-			if identity, found = iam.LookupAnonymous(); !found {
+			if identity, s3Err, amzAuthType = iam.authenticateUnsigned(r); identity == nil {
 				r.Header.Set(s3_constants.AmzAuthType, amzAuthType)
-				return identity, s3err.ErrAccessDenied, reqAuthType
+				return identity, s3Err, reqAuthType
 			}
 		}
 	case authTypeJWT:
@@ -1915,10 +1981,9 @@ func (iam *IdentityAccessManagement) authenticateRequestInternal(r *http.Request
 			return identity, s3err.ErrNotImplemented, reqAuthType
 		}
 	case authTypeAnonymous:
-		amzAuthType = "Anonymous"
-		if identity, found = iam.LookupAnonymous(); !found {
+		if identity, s3Err, amzAuthType = iam.authenticateUnsigned(r); identity == nil {
 			r.Header.Set(s3_constants.AmzAuthType, amzAuthType)
-			return identity, s3err.ErrAccessDenied, reqAuthType
+			return identity, s3Err, reqAuthType
 		}
 	default:
 		return identity, s3err.ErrNotImplemented, reqAuthType
@@ -1946,6 +2011,14 @@ func isBucketListingRequest(r *http.Request, action Action) bool {
 	}
 	_, object := s3_constants.GetBucketAndObject(r)
 	return object == "" || object == "/"
+}
+
+// addEmptyListPrefix reports a listing that names no prefix as s3:prefix "",
+// as AWS and the advanced IAM path do.
+func addEmptyListPrefix(conditions map[string][]string, r *http.Request, action Action) {
+	if _, ok := conditions["s3:prefix"]; !ok && isBucketListingRequest(r, action) {
+		conditions["s3:prefix"] = []string{""}
+	}
 }
 
 // multipartListingAction returns the scoped action for a request the router
@@ -2748,12 +2821,15 @@ func (iam *IdentityAccessManagement) evaluateAttachedIAMPolicies(r *http.Request
 	if isBucketListingRequest(r, action) {
 		resourceObject = ""
 	}
-	resource := buildResourceARN(bucket, resourceObject)
+	s3Action, resource := resolveS3AuthTarget(action, bucket, resourceObject, r)
 	principal := buildPrincipalARN(identity, r)
-	s3Action := ResolveS3Action(r, string(action), bucket, resourceObject)
 	explicitAllow := false
 	conditions := engine.ExtractConditionValuesFromRequest(r)
-	for k, v := range policy_engine.ExtractPrincipalVariables(principal) {
+	addEmptyListPrefix(conditions, r, action)
+	for key, values := range vectorIAMConditions(r) {
+		conditions[key] = values
+	}
+	for k, v := range principalVariables(principal, identity.Claims) {
 		conditions[k] = v
 	}
 
@@ -3132,6 +3208,11 @@ func (iam *IdentityAccessManagement) authorizeObjectKeyAction(r *http.Request, i
 	keyReq := objectKeyPolicyRequest(r, method, bucket, objectKey, versionId)
 
 	if iam.policyEngine != nil {
+		if iam.primeBucketForIAM != nil {
+			if code := iam.primeBucketForIAM(bucket); code != s3err.ErrNone && code != s3err.ErrNoSuchBucket {
+				return code
+			}
+		}
 		principal := buildPrincipalARN(identity, keyReq)
 		allowed, evaluated, err := iam.policyEngine.EvaluatePolicy(bucket, objectKey, string(action), principal, keyReq, identity.Claims, nil)
 		if err != nil {
@@ -3214,7 +3295,7 @@ func (iam *IdentityAccessManagement) authorizeWithIAM(r *http.Request, identity 
 	// The evaluation below consults the bucket-policy:<bucket> mirror, so the
 	// bucket's lazy load (which backfills that mirror) must happen first -
 	// nothing earlier on a denied request's path would ever trigger it.
-	if iam.primeBucketForIAM != nil && bucket != "" {
+	if iam.primeBucketForIAM != nil && bucket != "" && !strings.HasPrefix(string(action), "s3vectors:") {
 		iam.primeBucketForIAM(bucket)
 	}
 
@@ -3276,6 +3357,9 @@ func (iam *IdentityAccessManagement) authorizeWithIAM(r *http.Request, identity 
 // AuthorizeAction applies, so the native-permission floor's explicit-deny
 // check evaluates the same action and resource ARN as the policy engine.
 func resolveS3AuthTarget(action Action, bucket, object string, r *http.Request) (s3Action, resourceArn string) {
+	if strings.HasPrefix(string(action), "s3vectors:") {
+		return string(action), bucket
+	}
 	resourceObjectKey := object
 	if isBucketListingRequest(r, action) {
 		resourceObjectKey = ""

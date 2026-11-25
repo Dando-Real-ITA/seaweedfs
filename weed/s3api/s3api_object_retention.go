@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -238,6 +239,14 @@ func isObjectEntryMiss(err error) bool {
 		errors.Is(err, errInvalidVersionID)
 }
 
+// missAs reports a genuine miss as sentinel and keeps any other failure as is.
+func missAs(err, sentinel error) error {
+	if isObjectEntryMiss(err) {
+		return sentinel
+	}
+	return err
+}
+
 // getObjectEntryForUpdate resolves the entry a metadata update targets and the
 // filer path it is written under. It applies the same version resolution as
 // getSpecificObjectVersion - "null" names the plain pre-versioning entry, not a
@@ -247,7 +256,10 @@ func (s3a *S3ApiServer) getObjectEntryForUpdate(bucket, object, versionId string
 	if versionId != "" {
 		entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to get version %s for object %s/%s: %w", versionId, bucket, object, ErrVersionNotFound)
+			return nil, "", fmt.Errorf("failed to get version %s for object %s/%s: %w", versionId, bucket, object, missAs(err, ErrVersionNotFound))
+		}
+		if isDeleteMarkerEntry(entry) {
+			return nil, "", fmt.Errorf("version %s of object %s/%s is a delete marker: %w", versionId, bucket, object, ErrVersionNotFound)
 		}
 		if versionId != "null" {
 			entryPath = object + ".versions/" + s3a.getVersionFileName(versionId)
@@ -262,14 +274,17 @@ func (s3a *S3ApiServer) getObjectEntryForUpdate(bucket, object, versionId string
 	if !versioningEnabled {
 		entry, err = s3a.fetchObjectEntryRequired(bucket, object)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to get object %s/%s: %w", bucket, object, ErrObjectNotFound)
+			return nil, "", fmt.Errorf("failed to get object %s/%s: %w", bucket, object, missAs(err, ErrObjectNotFound))
 		}
 		return entry, entryPath, nil
 	}
 
 	entry, err = s3a.getLatestObjectVersion(bucket, object)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to get latest version for object %s/%s: %w", bucket, object, ErrLatestVersionNotFound)
+		return nil, "", fmt.Errorf("failed to get latest version for object %s/%s: %w", bucket, object, missAs(err, ErrLatestVersionNotFound))
+	}
+	if isDeleteMarkerEntry(entry) {
+		return nil, "", fmt.Errorf("latest version of object %s/%s is a delete marker: %w", bucket, object, ErrLatestVersionNotFound)
 	}
 	if entry.Extended != nil {
 		if versionIdBytes, exists := entry.Extended[s3_constants.ExtVersionIdKey]; exists {
@@ -290,6 +305,9 @@ func (s3a *S3ApiServer) getObjectRetention(bucket, object, versionId string) (*O
 	entry, err := s3a.getObjectEntry(bucket, object, versionId)
 	if err != nil {
 		return nil, err
+	}
+	if isDeleteMarkerEntry(entry) {
+		return nil, fmt.Errorf("object %s/%s is a delete marker: %w", bucket, object, ErrObjectNotFound)
 	}
 
 	if entry.Extended == nil {
@@ -405,6 +423,9 @@ func (s3a *S3ApiServer) getObjectLegalHold(bucket, object, versionId string) (*O
 	entry, err := s3a.getObjectEntry(bucket, object, versionId)
 	if err != nil {
 		return nil, err
+	}
+	if isDeleteMarkerEntry(entry) {
+		return nil, fmt.Errorf("object %s/%s is a delete marker: %w", bucket, object, ErrObjectNotFound)
 	}
 
 	if entry.Extended == nil {
@@ -523,11 +544,15 @@ func (s3a *S3ApiServer) checkGovernanceBypassPermission(request *http.Request, b
 	return true
 }
 
+// AWS SDKs send the boolean as "true" or "True".
+func governanceBypassRequested(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get(s3_constants.AmzBypassGovernanceRetention), "true")
+}
+
 // evaluateGovernanceBypassRequest evaluates if governance bypass is requested and permitted
 func (s3a *S3ApiServer) evaluateGovernanceBypassRequest(r *http.Request, bucket, object string) bool {
 	// Step 1: Check if governance bypass was requested via header
-	bypassRequested := r.Header.Get("x-amz-bypass-governance-retention") == "true"
-	if !bypassRequested {
+	if !governanceBypassRequested(r) {
 		// No bypass requested - normal retention enforcement applies
 		return false
 	}
@@ -593,6 +618,11 @@ func (s3a *S3ApiServer) enforceObjectLockProtections(request *http.Request, buck
 // of its own, or the one a write is about to replace -- use it directly, so that
 // the decision lives in one place.
 func (s3a *S3ApiServer) enforceObjectLockOnEntry(entry *filer_pb.Entry, bucket, object, versionId string, governanceBypassAllowed bool) error {
+	// Delete markers are never WORM-protected; a lock recorded on one must
+	// not keep it from being removed.
+	if isDeleteMarkerEntry(entry) {
+		return nil
+	}
 	retention, retentionActive, err := s3a.getRetentionFromEntry(entry)
 	if err != nil {
 		glog.Warningf("Error parsing retention for %s/%s (versionId: %s): %v", bucket, object, versionId, err)

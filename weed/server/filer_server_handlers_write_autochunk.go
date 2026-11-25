@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -48,6 +50,8 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 	if err != nil {
 		errStr := err.Error()
 		switch {
+		case errors.Is(err, ErrReadOnly):
+			writeJsonError(w, r, http.StatusInsufficientStorage, err)
 		case errStr == constants.ErrMsgOperationNotPermitted:
 			writeJsonError(w, r, http.StatusForbidden, err)
 		case strings.HasPrefix(errStr, "read input:") || errStr == io.ErrUnexpectedEOF.Error():
@@ -63,7 +67,7 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 			writeJsonError(w, r, http.StatusInternalServerError, err)
 		}
 	} else if reply != nil {
-		if len(md5bytes) > 0 {
+		if len(md5bytes) > 0 && !util.DigestIsSha256() {
 			md5InBase64 := util.Base64Encode(md5bytes)
 			w.Header().Set("Content-MD5", md5InBase64)
 		}
@@ -103,8 +107,7 @@ func (fs *FilerServer) doPostAutoChunk(ctx context.Context, w http.ResponseWrite
 			return nil, nil, fmt.Errorf("read input: %w", err)
 		}
 		md5bytes = util.Md5(buf.Bytes())
-		headerMd5 := r.Header.Get("Content-Md5")
-		if headerMd5 != "" && !(util.Base64Encode(md5bytes) == headerMd5 || fmt.Sprintf("%x", md5bytes) == headerMd5) {
+		if contentMd5Mismatch(util.BodyMd5Of(md5bytes, buf.Bytes()), r.Header.Get("Content-Md5")) {
 			bufPool.Put(buf)
 			return nil, nil, errors.New(constants.ErrMsgBadDigest)
 		}
@@ -119,8 +122,7 @@ func (fs *FilerServer) doPostAutoChunk(ctx context.Context, w http.ResponseWrite
 	}
 
 	md5bytes = md5Hash.Sum(nil)
-	headerMd5 := r.Header.Get("Content-Md5")
-	if headerMd5 != "" && !(util.Base64Encode(md5bytes) == headerMd5 || fmt.Sprintf("%x", md5bytes) == headerMd5) {
+	if contentMd5Mismatch(uploadBodyMd5(md5bytes, md5Hash), r.Header.Get("Content-Md5")) {
 		fs.filer.DeleteUncommittedChunks(ctx, fileChunks)
 		return nil, nil, errors.New(constants.ErrMsgBadDigest)
 	}
@@ -152,8 +154,7 @@ func (fs *FilerServer) doPutAutoChunk(ctx context.Context, w http.ResponseWriter
 	}
 
 	md5bytes = md5Hash.Sum(nil)
-	headerMd5 := r.Header.Get("Content-Md5")
-	if headerMd5 != "" && !(util.Base64Encode(md5bytes) == headerMd5 || fmt.Sprintf("%x", md5bytes) == headerMd5) {
+	if contentMd5Mismatch(uploadBodyMd5(md5bytes, md5Hash), r.Header.Get("Content-Md5")) {
 		fs.filer.DeleteUncommittedChunks(ctx, fileChunks)
 		return nil, nil, errors.New(constants.ErrMsgBadDigest)
 	}
@@ -192,6 +193,9 @@ func (fs *FilerServer) requestChunkSize(query url.Values) int32 {
 
 func (fs *FilerServer) checkPermissions(ctx context.Context, r *http.Request, fileName string) error {
 	fullPath := fs.fixFilePath(ctx, r, fileName)
+	if fs.filer.FilerConf.MatchStorageRule(fullPath).ReadOnly {
+		return fmt.Errorf("%w: %s", ErrReadOnly, fullPath)
+	}
 	enforced, err := fs.wormEnforcedForEntry(ctx, fullPath)
 	if err != nil {
 		return err
@@ -204,8 +208,8 @@ func (fs *FilerServer) checkPermissions(ctx context.Context, r *http.Request, fi
 }
 
 func (fs *FilerServer) wormEnforcedForEntry(ctx context.Context, fullPath string) (bool, error) {
-	rule := fs.filer.FilerConf.MatchStorageRule(fullPath)
-	if !rule.GetWorm() {
+	conf := fs.filer.FilerConf
+	if !conf.MatchStorageRule(fullPath).GetWorm() {
 		return false, nil
 	}
 
@@ -218,24 +222,7 @@ func (fs *FilerServer) wormEnforcedForEntry(ctx context.Context, fullPath string
 		return false, err
 	}
 
-	// worm is not enforced
-	if entry.WORMEnforcedAtTsNs == 0 {
-		return false, nil
-	}
-
-	// worm will never expire
-	if rule.WormRetentionTimeSeconds == 0 {
-		return true, nil
-	}
-
-	enforcedAt := time.Unix(0, entry.WORMEnforcedAtTsNs)
-
-	// worm is expired
-	if time.Now().Sub(enforcedAt).Seconds() >= float64(rule.WormRetentionTimeSeconds) {
-		return false, nil
-	}
-
-	return true, nil
+	return conf.WormEnforced(fullPath, entry.WORMEnforcedAtTsNs), nil
 }
 
 func (fs *FilerServer) fixFilePath(ctx context.Context, r *http.Request, fileName string) string {
@@ -274,6 +261,10 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 
 	// fix the path
 	path := fs.fixFilePath(ctx, r, fileName)
+	if fs.filer.FilerConf.MatchStorageRule(path).ReadOnly {
+		replyerr = fmt.Errorf("%w: %s", ErrReadOnly, path)
+		return
+	}
 
 	var entry *filer.Entry
 	var newChunks []*filer_pb.FileChunk
@@ -423,6 +414,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 			// New request chunks start at offset zero; append them after the
 			// existing chunk-backed file.
 			if isAppend {
+				entry.FileSize = entry.Size()
 				for _, chunk := range fileChunks {
 					chunk.Offset += int64(entry.FileSize)
 				}
@@ -525,14 +517,48 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 			replyerr = fmt.Errorf("entry %s changed during append; retry the request", path)
 			return
 		}
+	} else if fs.entryLockTable != nil {
+		// CreateEntry deletes the chunks of the entry it replaces, so concurrent
+		// overwrites must not both replace the same entry.
+		pathLock := fs.entryLockTable.AcquireLock("CreateEntry", util.FullPath(path), util.ExclusiveLock)
+		defer fs.entryLockTable.ReleaseLock(util.FullPath(path), pathLock)
 	}
 
-	dbErr := fs.filer.CreateEntry(context.WithoutCancel(ctx), entry, nil, false, false, nil, skipCheckParentDirEntry(r), so.MaxFileNameLength)
+	var dbErr error
+	routed := false
+	if isAppend || isOffsetWrite {
+		routed, dbErr = fs.forwardToWriteOwner(ctx, entryRouteKey(util.FullPath(path)), func(owner pb.ServerAddress) error {
+			return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+				dir, _ := entry.FullPath.DirAndName()
+				return filer_pb.CreateEntry(context.WithoutCancel(ctx), client, &filer_pb.CreateEntryRequest{
+					Directory:                dir,
+					Entry:                    entry.ToProtoEntry(),
+					IsMoved:                  true,
+					SkipCheckParentDirectory: skipCheckParentDirEntry(r),
+					Fsync:                    filer.SyncWrite(ctx),
+					Condition: &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{
+						Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+						ExpectedEntry: existingSnapshot,
+					}}},
+				})
+			})
+		})
+	}
+	if !routed {
+		dbErr = fs.filer.CreateEntry(context.WithoutCancel(ctx), entry, nil, false, false, nil, skipCheckParentDirEntry(r), so.MaxFileNameLength)
+	}
 	if dbErr != nil {
 		replyerr = dbErr
 		filerResult.Error = dbErr.Error()
 		glog.V(0).InfofCtx(ctx, "failing to write %s to filer server : %v", path, dbErr)
-		if inlineAppendConverted {
+		switch {
+		case routed && errors.Is(dbErr, filer_pb.ErrPreconditionFailed):
+			replyerr = fmt.Errorf("entry %s changed during append; retry the request", path)
+		case routed:
+			// The owner may have committed before the reply was lost, and a
+			// separate local store may not hold that commit yet.
+			uncommittedChunks = nil
+		case inlineAppendConverted:
 			uncommittedChunks = fs.inlineAppendChunksNotReferenced(ctx, util.FullPath(path), mergedChunks)
 		}
 	} else {
@@ -678,4 +704,59 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 		glog.V(0).InfofCtx(ctx, "failing to create dir %s on filer server : %v", path, dbErr)
 	}
 	return filerResult, replyerr
+}
+
+// contentMd5Mismatch compares the body's MD5, from util.BodyMd5, with the
+// client's Content-MD5, base64 or hex. bodyMd5 is nil only under fips140=only
+// with digest sha256, where no MD5 can be computed, and Content-MD5 then goes
+// unchecked.
+func contentMd5Mismatch(bodyMd5 []byte, headerMd5 string) bool {
+	if headerMd5 == "" || bodyMd5 == nil {
+		return false
+	}
+	return util.Base64Encode(bodyMd5) != headerMd5 && fmt.Sprintf("%x", bodyMd5) != headerMd5
+}
+
+// uploadHash is the content digest of an upload, which also feeds a separate
+// MD5 of the body for the client's Content-MD5.
+type uploadHash struct {
+	hash.Hash
+	contentMd5 hash.Hash
+}
+
+// newUploadHash returns the content digest hash for an upload of r's body. It
+// is an uploadHash when r carries Content-MD5 and the content digest is not
+// itself an MD5 (see util.NewContentMd5), else the plain digest; r may be nil.
+// The MD5 rides on the digest hash rather than on the body reader, so the
+// body's path through the upload stays as it is in every digest mode.
+func newUploadHash(r *http.Request) hash.Hash {
+	digest := util.NewMd5()
+	if r == nil || r.Header.Get("Content-Md5") == "" {
+		return digest
+	}
+	contentMd5 := util.NewContentMd5()
+	if contentMd5 == nil {
+		return digest
+	}
+	return &uploadHash{Hash: digest, contentMd5: contentMd5}
+}
+
+func (h *uploadHash) Write(p []byte) (int, error) {
+	h.contentMd5.Write(p)
+	return h.Hash.Write(p)
+}
+
+func (h *uploadHash) Reset() {
+	h.Hash.Reset()
+	h.contentMd5.Reset()
+}
+
+// uploadBodyMd5 returns the body's MD5 for a Content-MD5 check, as
+// util.BodyMd5 does, given the content digest and the hash from newUploadHash.
+func uploadBodyMd5(contentDigest []byte, md5Hash hash.Hash) []byte {
+	var contentMd5 hash.Hash
+	if h, ok := md5Hash.(*uploadHash); ok {
+		contentMd5 = h.contentMd5
+	}
+	return util.BodyMd5(contentDigest, contentMd5)
 }

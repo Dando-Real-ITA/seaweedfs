@@ -234,7 +234,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.telemetryCollector.StartPeriodicCollection(24 * time.Hour)
 	}
 
-	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
+	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec, "", "")
 
 	handleStaticResources2(r)
 	r.HandleFunc("/healthz", requestIDMiddleware(ms.healthzHandler)).Methods(http.MethodGet, http.MethodHead)
@@ -440,8 +440,11 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// determine the scheme based on HTTPS client configuration
-		scheme := util_http.GetGlobalHttpClient().GetHttpScheme()
+		// the leader serves HTTPS exactly when this master does
+		scheme := "http"
+		if util.GetViper().GetString("https.master.key") != "" {
+			scheme = "https"
+		}
 
 		targetUrl, err := url.Parse(scheme + "://" + raftServerLeader)
 		if err != nil {
@@ -731,6 +734,8 @@ func (ms *MasterServer) Reload() {
 		v.GetInt("jwt.signing.expires_after_seconds"),
 		v.GetString("jwt.signing.read.key"),
 		v.GetInt("jwt.signing.read.expires_after_seconds"),
+		"",
+		"",
 	)
 }
 

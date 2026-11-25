@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,27 @@ type renameTestStore struct {
 	findDelay time.Duration // optional: widen check-then-act windows in tests
 	findErr   error         // simulates a failing entry lookup
 	strictTx  bool          // like a SQL store: calls through a committed transaction fail
+	openTx    int           // strictTx transactions begun and not yet committed or rolled back
+
+	kv        map[string][]byte // optional KV (hard links); nil: every key is absent
+	kvGetErrs int               // fail this many KvGet calls before answering
+
+	afterOp   func(op string, p util.FullPath) // optional: runs after each insert, update or delete
+	afterFind func(p util.FullPath)            // optional: runs after each lookup
+	listing   map[string]bool                  // optional: directory listing kept the way Redis keeps it
+
+	overwritesAtOnce bool // declares filer.OverwritingStore, as the Redis stores do
+}
+
+// OverwritesAtOnce is what the store declares; its InsertEntry does replace an
+// entry at once and whole either way.
+func (s *renameTestStore) OverwritesAtOnce() bool { return s.overwritesAtOnce }
+
+// noteOp runs the afterOp hook after a write, outside the store's lock.
+func (s *renameTestStore) noteOp(op string, p util.FullPath) {
+	if s.afterOp != nil {
+		s.afterOp(op, p)
+	}
 }
 
 type renameTestTxKey struct{}
@@ -60,47 +82,90 @@ func (s *renameTestStore) Initialize(util.Configuration, string) error { return 
 func (s *renameTestStore) Shutdown()                                   {}
 func (s *renameTestStore) BeginTransaction(ctx context.Context) (context.Context, error) {
 	if s.strictTx {
+		s.mu.Lock()
+		s.openTx++
+		s.mu.Unlock()
 		return context.WithValue(ctx, renameTestTxKey{}, &renameTestTx{}), nil
 	}
 	return ctx, nil
 }
-func (s *renameTestStore) CommitTransaction(ctx context.Context) error {
+
+// endTx marks the transaction in ctx committed or rolled back.
+func (s *renameTestStore) endTx(ctx context.Context) {
 	if tx, ok := ctx.Value(renameTestTxKey{}).(*renameTestTx); ok {
-		tx.done = true
+		s.mu.Lock()
+		if !tx.done {
+			s.openTx--
+			tx.done = true
+		}
+		s.mu.Unlock()
 	}
+}
+
+func (s *renameTestStore) openTransactions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openTx
+}
+
+func (s *renameTestStore) CommitTransaction(ctx context.Context) error {
+	s.endTx(ctx)
 	return s.commitErr
 }
 func (s *renameTestStore) RollbackTransaction(ctx context.Context) error {
-	if tx, ok := ctx.Value(renameTestTxKey{}).(*renameTestTx); ok {
-		tx.done = true
+	s.endTx(ctx)
+	return nil
+}
+func (s *renameTestStore) KvPut(_ context.Context, key []byte, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.kv != nil {
+		s.kv[string(key)] = append([]byte(nil), value...)
 	}
 	return nil
 }
-func (s *renameTestStore) KvPut(context.Context, []byte, []byte) error {
-	return nil
-}
-func (s *renameTestStore) KvGet(context.Context, []byte) ([]byte, error) {
+func (s *renameTestStore) KvGet(_ context.Context, key []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.kvGetErrs > 0 {
+		s.kvGetErrs--
+		return nil, errors.New("kv get: transient failure")
+	}
+	if value, found := s.kv[string(key)]; found {
+		return value, nil
+	}
 	return nil, filer.ErrKvNotFound
 }
-func (s *renameTestStore) KvDelete(context.Context, []byte) error { return nil }
+func (s *renameTestStore) KvDelete(_ context.Context, key []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.kv, string(key))
+	return nil
+}
 
 func (s *renameTestStore) InsertEntry(ctx context.Context, entry *filer.Entry) error {
 	if err := s.txDone(ctx); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.entries[string(entry.FullPath)] = entry.ShallowClone()
+	if s.listing != nil {
+		s.listing[string(entry.FullPath)] = true
+	}
+	s.mu.Unlock()
+	s.noteOp("insert", entry.FullPath)
 	return nil
 }
 
+// UpdateEntry rewrites the entry and leaves the listing alone, as Redis does.
 func (s *renameTestStore) UpdateEntry(ctx context.Context, entry *filer.Entry) error {
 	if err := s.txDone(ctx); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.entries[string(entry.FullPath)] = entry.ShallowClone()
+	s.mu.Unlock()
+	s.noteOp("update", entry.FullPath)
 	return nil
 }
 
@@ -110,6 +175,9 @@ func (s *renameTestStore) FindEntry(ctx context.Context, p util.FullPath) (*file
 	}
 	if s.findDelay > 0 {
 		time.Sleep(s.findDelay)
+	}
+	if s.afterFind != nil {
+		defer s.afterFind(p)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,8 +200,12 @@ func (s *renameTestStore) DeleteEntry(ctx context.Context, p util.FullPath) erro
 		return s.deleteErr
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.entries, string(p))
+	if s.listing != nil {
+		delete(s.listing, string(p))
+	}
+	s.mu.Unlock()
+	s.noteOp("delete", p)
 	return nil
 }
 
@@ -277,7 +349,7 @@ func swapNotificationQueue(t *testing.T, q notification.MessageQueue) {
 // each, and its loop goroutines keep the whole filer reachable, so the tens of
 // filers this package builds would otherwise pin gigabytes for the rest of the
 // run - fatal on 32-bit, where that exhausts the address space.
-func newRenameTestFiler(t *testing.T, store *renameTestStore) *filer.Filer {
+func newRenameTestFiler(t *testing.T, store filer.FilerStore) *filer.Filer {
 	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
 	masterClient := wdclient.NewMasterClient(
 		dialOption,
@@ -299,6 +371,9 @@ func newRenameTestFiler(t *testing.T, store *renameTestStore) *filer.Filer {
 	t.Cleanup(logBuffer.ShutdownLogBuffer)
 
 	return &filer.Filer{
+		// Use an explicit bucket root so ordinary fixture paths retain the
+		// default collection. Collection tests configure their own bucket root.
+		DirBucketsPath:      "/test-buckets",
 		Store:               filer.NewFilerStoreWrapper(store),
 		MasterClient:        masterClient,
 		FilerConf:           filer.NewFilerConf(),
@@ -586,5 +661,150 @@ func TestAtomicRenameEntryRejectsDotSegmentTarget(t *testing.T) {
 		if len(store.entries) != 1 {
 			t.Fatalf("rename to %s/%s left entries %v", tc.dir, tc.name, store.entries)
 		}
+	}
+}
+
+// A peer filer with its own store applies only the events it is sent, so the
+// directories a rename creates at its destination need events of their own.
+func TestAtomicRenameEntryAnnouncesCreatedParents(t *testing.T) {
+	store := newRenameTestStore()
+	store.entries["/buckets"] = newDirectoryEntry("/buckets", 100)
+	store.entries["/buckets/arc"] = newDirectoryEntry("/buckets/arc", 101)
+	store.entries["/buckets/arc/xxx"] = newDirectoryEntry("/buckets/arc/xxx", 102)
+	store.entries["/buckets/arc/xxx/rate_data"] = newFileEntry("/buckets/arc/xxx/rate_data", 103)
+
+	queue := &captureQueue{}
+	swapNotificationQueue(t, queue)
+
+	f := newRenameTestFiler(t, store)
+	server := &FilerServer{filer: f, entryLockTable: util.NewLockTable[util.FullPath]()}
+	_, err := server.AtomicRenameEntry(context.Background(), &filer_pb.AtomicRenameEntryRequest{
+		OldDirectory: "/buckets/arc/xxx",
+		OldName:      "rate_data",
+		NewDirectory: "/buckets/arc/keep/2026/xxx",
+		NewName:      "rate_data",
+	})
+	if err != nil {
+		t.Fatalf("AtomicRenameEntry: %v", err)
+	}
+
+	peer := newRenameTestFiler(t, newRenameTestStore())
+	keys := replayCapturedEvents(t, peer, queue)
+	wantKeys := []string{"/buckets/arc/keep", "/buckets/arc/keep/2026", "/buckets/arc/keep/2026/xxx", "/buckets/arc/xxx/rate_data"}
+	if !slices.Equal(keys, wantKeys) {
+		t.Fatalf("event keys = %v, want %v", keys, wantKeys)
+	}
+
+	for dir, name := range map[string]string{
+		"/buckets/arc":               "keep",
+		"/buckets/arc/keep":          "2026",
+		"/buckets/arc/keep/2026":     "xxx",
+		"/buckets/arc/keep/2026/xxx": "rate_data",
+	} {
+		var listed []string
+		if _, err := peer.Store.ListDirectoryEntries(context.Background(), util.FullPath(dir), "", false, 100, func(entry *filer.Entry) (bool, error) {
+			listed = append(listed, entry.Name())
+			return true, nil
+		}); err != nil {
+			t.Fatalf("list %s on the peer: %v", dir, err)
+		}
+		if !slices.Contains(listed, name) {
+			t.Fatalf("peer lists %v under %s, want %s", listed, dir, name)
+		}
+	}
+
+	now := time.Now().UnixNano()
+	if got := f.LocalDeliveredThroughTsNs(now); got != now {
+		t.Fatalf("LocalDeliveredThroughTsNs = %d, want %d: a parent's stamp was never adopted", got, now)
+	}
+}
+
+func replayCapturedEvents(t *testing.T, peer *filer.Filer, queue *captureQueue) (keys []string) {
+	t.Helper()
+	for _, event := range queue.snapshot() {
+		keys = append(keys, event.key)
+		dir, _ := util.FullPath(event.key).DirAndName()
+		if err := peer.Replay(&filer_pb.SubscribeMetadataResponse{
+			Directory:         dir,
+			EventNotification: event.notification,
+			TsNs:              time.Now().UnixNano(),
+		}); err != nil {
+			t.Fatalf("replay %s: %v", event.key, err)
+		}
+	}
+	return keys
+}
+
+func TestAtomicRenameEntryAnnouncesPromotedParent(t *testing.T) {
+	seed := func() *renameTestStore {
+		store := newRenameTestStore()
+		store.entries["/buckets"] = newDirectoryEntry("/buckets", 100)
+		store.entries["/buckets/arc"] = newDirectoryEntry("/buckets/arc", 101)
+		store.entries["/buckets/arc/report"] = newFileEntry("/buckets/arc/report", 102)
+		return store
+	}
+	store := seed()
+	store.entries["/buckets/arc/rate_data"] = newFileEntry("/buckets/arc/rate_data", 103)
+
+	queue := &captureQueue{}
+	swapNotificationQueue(t, queue)
+
+	f := newRenameTestFiler(t, store)
+	server := &FilerServer{filer: f, entryLockTable: util.NewLockTable[util.FullPath]()}
+	if _, err := server.AtomicRenameEntry(context.Background(), &filer_pb.AtomicRenameEntryRequest{
+		OldDirectory: "/buckets/arc",
+		OldName:      "rate_data",
+		NewDirectory: "/buckets/arc/report",
+		NewName:      "rate_data",
+	}); err != nil {
+		t.Fatalf("AtomicRenameEntry: %v", err)
+	}
+
+	peer := newRenameTestFiler(t, seed())
+	keys := replayCapturedEvents(t, peer, queue)
+	if wantKeys := []string{"/buckets/arc/report", "/buckets/arc/rate_data"}; !slices.Equal(keys, wantKeys) {
+		t.Fatalf("event keys = %v, want %v", keys, wantKeys)
+	}
+	report, err := peer.Store.FindEntry(context.Background(), "/buckets/arc/report")
+	if err != nil {
+		t.Fatalf("find the promoted parent on the peer: %v", err)
+	}
+	if !report.IsDirectory() {
+		t.Fatalf("peer keeps %s as a file, mode %v", report.FullPath, report.Mode)
+	}
+	if _, err := peer.Store.FindEntry(context.Background(), "/buckets/arc/report/rate_data"); err != nil {
+		t.Fatalf("find the moved entry on the peer: %v", err)
+	}
+
+	now := time.Now().UnixNano()
+	if got := f.LocalDeliveredThroughTsNs(now); got != now {
+		t.Fatalf("LocalDeliveredThroughTsNs = %d, want %d: the promotion stamp was never adopted", got, now)
+	}
+}
+
+func TestAtomicRenameReleasesCreatedParentStampsOnCommitFailure(t *testing.T) {
+	store := newRenameTestStore()
+	store.entries["/src.txt"] = newFileEntry("/src.txt", 101)
+	store.commitErr = errors.New("commit failed")
+
+	queue := &captureQueue{}
+	swapNotificationQueue(t, queue)
+
+	f := newRenameTestFiler(t, store)
+	server := &FilerServer{filer: f, entryLockTable: util.NewLockTable[util.FullPath]()}
+	if _, err := server.AtomicRenameEntry(context.Background(), &filer_pb.AtomicRenameEntryRequest{
+		OldDirectory: "/",
+		OldName:      "src.txt",
+		NewDirectory: "/a/b",
+		NewName:      "dst.txt",
+	}); err == nil {
+		t.Fatal("expected commit failure")
+	}
+	if events := queue.snapshot(); len(events) != 0 {
+		t.Fatalf("a failed rename published %d events", len(events))
+	}
+	now := time.Now().UnixNano()
+	if got := f.LocalDeliveredThroughTsNs(now); got != now {
+		t.Fatalf("LocalDeliveredThroughTsNs = %d, want %d: a leaked parent stamp still caps the claim", got, now)
 	}
 }

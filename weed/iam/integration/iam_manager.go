@@ -1672,10 +1672,16 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 
 	// Parse principal ARN to extract details for context variables (e.g. ${aws:username})
 	arnInfo := utils.ParsePrincipalARN(request.Principal)
-	if arnInfo.RoleName != "" {
-		// For assumed roles, AWS docs say aws:username IS the role name.
-		// However, for user isolation in these tests, we typically map the session name (the user who assumed the role) to aws:username.
-		// arn:aws:sts::account:assumed-role/RoleName/SessionName
+	if arnInfo.RoleName != "" && strings.HasPrefix(request.Principal, "arn:aws:sts::") {
+		// An assumed-role ARN ends in the session name the caller chose; the
+		// session's user is the one it was issued to.
+		if sessionInfo != nil && sessionInfo.ExternalUserId != "" {
+			evalCtx.RequestContext["aws:username"] = sessionInfo.ExternalUserId
+		} else {
+			delete(evalCtx.RequestContext, "aws:username")
+		}
+		evalCtx.RequestContext["aws:userid"] = arnInfo.RoleName
+	} else if arnInfo.RoleName != "" {
 		awsUsername := arnInfo.RoleName
 		if idx := strings.LastIndex(request.Principal, "/"); idx != -1 && idx < len(request.Principal)-1 {
 			awsUsername = request.Principal[idx+1:]
@@ -1808,8 +1814,8 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 // statement is not a denial. Used to enforce AWS deny-always-wins when the allow
 // is granted elsewhere (e.g. a role trust policy for sts:AssumeRole).
 //
-// A chained session that fails validation or has been revoked yields an error so
-// callers fail closed. Raw OIDC tokens are skipped here — they are validated on
+// A chained session that fails validation, has been revoked, or outlived its
+// role yields an error so callers fail closed. Raw OIDC tokens are skipped here — they are validated on
 // the JWT path, not by the STS service.
 func (m *IAMManager) IsPrincipalActionExplicitlyDenied(ctx context.Context, principal, action, resource string, policyNames []string, sessionToken string, requestContext map[string]interface{}) (bool, error) {
 	if !m.initialized {
@@ -1857,6 +1863,9 @@ func (m *IAMManager) IsPrincipalActionExplicitlyDenied(ctx context.Context, prin
 			if revoked {
 				return false, fmt.Errorf("session has been revoked")
 			}
+		}
+		if _, err := m.checkSessionRoleBinding(ctx, sessionInfo); err != nil {
+			return false, err
 		}
 		if sessionInfo != nil && sessionInfo.SessionPolicy != "" {
 			var sessionPolicy policy.PolicyDocument
@@ -2014,6 +2023,27 @@ func (m *IAMManager) validateTrustPolicyForWebIdentity(ctx context.Context, role
 func (m *IAMManager) validateTrustPolicyForCredentials(ctx context.Context, roleDef *RoleDefinition, request *sts.AssumeRoleWithCredentialsRequest) error {
 	if roleDef.TrustPolicy == nil {
 		return fmt.Errorf("role has no trust policy")
+	}
+
+	requestContext := map[string]interface{}{
+		"aws:FederatedProvider": request.ProviderName,
+	}
+	if request.DurationSeconds != nil {
+		requestContext["sts:DurationSeconds"] = *request.DurationSeconds
+	}
+	result, err := m.policyEngine.EvaluateTrustPolicy(ctx, roleDef.TrustPolicy, &policy.EvaluationContext{
+		Principal:      request.Username,
+		Action:         sts.ActionAssumeRoleWithCredentials,
+		Resource:       roleDef.RoleArn,
+		RequestContext: requestContext,
+	})
+	if err != nil {
+		return fmt.Errorf("trust policy evaluation failed: %w", err)
+	}
+	for _, match := range result.MatchingStatements {
+		if match.Effect == policy.EffectDeny {
+			return fmt.Errorf("trust policy denies credential assumption for provider: %s", request.ProviderName)
+		}
 	}
 
 	// Check if trust policy allows credential assumption for the specific provider

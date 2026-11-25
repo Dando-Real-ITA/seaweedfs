@@ -17,7 +17,10 @@ type BucketPolicyEngine struct {
 	// "aws:kms") that was stored when a multipart upload was initiated.
 	// Returns "" when the upload had no SSE or when the entry cannot be found.
 	// Set by S3ApiServer after construction to give the engine filer access.
-	MultipartSSELookup func(bucket, uploadID string) string
+	MultipartSSELookup func(bucket, object, uploadID string) string
+	// RestrictsPublicBuckets reports whether a bucket's public access block
+	// sets RestrictPublicBuckets. Set by S3ApiServer after construction.
+	RestrictsPublicBuckets func(bucket string) bool
 }
 
 // NewBucketPolicyEngine creates a new bucket policy engine
@@ -122,6 +125,10 @@ func (bpe *BucketPolicyEngine) EvaluatePolicy(bucket, object, action, principal 
 		return false, false, fmt.Errorf("action cannot be empty")
 	}
 
+	if principal == "*" && bpe.restrictsPublicPolicy(bucket) {
+		return false, true, nil
+	}
+
 	// Convert action to S3 action format
 	// ResolveS3Action handles nil request internally (falls back to mapBaseActionToS3Format)
 	s3Action := ResolveS3Action(r, action, bucket, object)
@@ -147,9 +154,10 @@ func (bpe *BucketPolicyEngine) EvaluatePolicy(bucket, object, action, principal 
 	if r != nil {
 		args.OriginalGrantConditions = policy_engine.OriginalGrantConditionsFromRequest(r)
 		args.Conditions = bpe.engine.ExtractConditionValuesFromRequest(r)
+		addEmptyListPrefix(args.Conditions, r, Action(action))
 
 		// Extract principal-related variables (aws:username, etc.) from principal ARN
-		principalVars := policy_engine.ExtractPrincipalVariables(principal)
+		principalVars := principalVariables(principal, claims)
 		for k, v := range principalVars {
 			args.Conditions[k] = v
 		}
@@ -169,7 +177,7 @@ func (bpe *BucketPolicyEngine) EvaluatePolicy(bucket, object, action, principal 
 		// policy conditions on s3:x-amz-server-side-encryption evaluate correctly.
 		if policy_engine.IsMultipartContinuationAction(s3Action) && bpe.MultipartSSELookup != nil {
 			if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
-				args.InheritedSSEAlgorithm = bpe.MultipartSSELookup(bucket, uploadID)
+				args.InheritedSSEAlgorithm = bpe.MultipartSSELookup(bucket, object, uploadID)
 			}
 		}
 	}
@@ -179,6 +187,9 @@ func (bpe *BucketPolicyEngine) EvaluatePolicy(bucket, object, action, principal 
 	switch result {
 	case policy_engine.PolicyResultAllow:
 		// glog.V(4).Infof("EvaluatePolicy [Wrapper]: ALLOW - bucket=%s, action=%s, principal=%s", bucket, s3Action, principal)
+		if principal == "*" && bpe.restrictsPublicPolicy(bucket) {
+			return false, true, nil
+		}
 		return true, true, nil
 	case policy_engine.PolicyResultDeny:
 		// glog.V(4).Infof("EvaluatePolicy [Wrapper]: DENY - bucket=%s, action=%s, principal=%s", bucket, s3Action, principal)
@@ -190,4 +201,30 @@ func (bpe *BucketPolicyEngine) EvaluatePolicy(bucket, object, action, principal 
 	default:
 		return false, false, fmt.Errorf("unknown policy result: %v", result)
 	}
+}
+
+// restrictsPublicPolicy reports whether RestrictPublicBuckets denies the
+// bucket to anonymous callers, which it does while the bucket has a public
+// policy. It is checked before and after evaluation, so a policy replaced
+// in between cannot slip an anonymous grant past it.
+func (bpe *BucketPolicyEngine) restrictsPublicPolicy(bucket string) bool {
+	doc, err := bpe.engine.GetBucketPolicy(bucket)
+	if err != nil || !isPublicPolicy(doc) {
+		return false
+	}
+	return bpe.RestrictsPublicBuckets != nil && bpe.RestrictsPublicBuckets(bucket)
+}
+
+// principalVariables resolves the policy variables of a principal. A role
+// session's ARN ends in the session name the caller chose, so its user comes
+// from the session itself: the user the session was issued to.
+func principalVariables(principal string, claims map[string]interface{}) map[string][]string {
+	vars := policy_engine.ExtractPrincipalVariables(principal)
+	if types := vars["aws:principaltype"]; len(types) == 1 && types[0] == "AssumedRole" {
+		if user, ok := claims["aws:username"].(string); ok && user != "" {
+			vars["aws:username"] = []string{user}
+			vars["aws:userid"] = []string{user}
+		}
+	}
+	return vars
 }

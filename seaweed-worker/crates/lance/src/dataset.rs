@@ -15,9 +15,11 @@ use lance::io::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
     WrappingObjectStore,
 };
+use lance::session::Session;
 
 use crate::catalog::{NamespaceClient, TableDescription};
-use crate::direct_read::DirectReads;
+use crate::direct_read::{DirectReads, Wrappers};
+use crate::drop_guard::DropGuard;
 
 /// A table the worker is about to work on.
 pub struct OpenTable {
@@ -74,7 +76,7 @@ pub fn unsigned_options() -> HashMap<String, String> {
 pub async fn open(client: &NamespaceClient, id: &[String], storage: &Storage) -> Result<OpenTable> {
     let description = client.describe_table(id).await?;
     let wrapper = storage.wrapper(&description.location).await?;
-    let dataset = open_at(&description, wrapper).await?;
+    let dataset = open_guarded(&description, wrapper).await?;
     Ok(OpenTable {
         id: id.to_vec(),
         location: description.location,
@@ -82,13 +84,34 @@ pub async fn open(client: &NamespaceClient, id: &[String], storage: &Storage) ->
     })
 }
 
-/// Open a table the caller has already resolved, with the store wrapped.
-pub async fn open_at(
+/// [`open_at`] for a job that writes the table: its writes fail once the
+/// table is dropped under it (see [`DropGuard`]).
+pub async fn open_guarded(
     description: &TableDescription,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    DatasetBuilder::from_uri(&description.location)
-        .with_store_params(store_params(wrapper))
+    let guard = DropGuard::new();
+    let mut wrappers: Vec<Arc<dyn WrappingObjectStore>> = wrapper.into_iter().collect();
+    wrappers.push(guard.clone());
+    let dataset = open_at(description, Some(Arc::new(Wrappers(wrappers))), None).await?;
+    let opened = dataset.manifest_location();
+    guard.arm(opened.path.clone(), opened.e_tag.clone());
+    Ok(dataset)
+}
+
+/// Open a table the caller has already resolved, with the store wrapped, in
+/// `session` when given, otherwise in a session of its own.
+pub async fn open_at(
+    description: &TableDescription,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    session: Option<Arc<Session>>,
+) -> Result<Dataset> {
+    let mut builder =
+        DatasetBuilder::from_uri(&description.location).with_store_params(store_params(wrapper));
+    if let Some(session) = session {
+        builder = builder.with_session(session);
+    }
+    builder
         .load()
         .await
         .with_context(|| format!("open lance dataset at {}", description.location))

@@ -50,7 +50,7 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 	useIAM := h.shouldUseIAM(r, identityActions, identityPolicyNames)
 	useLegacy := !useIAM
 	if useIAM {
-		allowed, err := h.authorizeIAMAction(r, identityPolicyNames, "CreateTableBucket", h.generateTableBucketARN(principal, req.Name), h.generateS3BucketARN(req.Name))
+		allowed, err := h.authorizeIAMAction(r, identityPolicyNames, "CreateTableBucket", req.Tags, h.generateTableBucketARN(principal, req.Name), h.generateS3BucketARN(req.Name))
 		if err != nil {
 			h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table buckets")
 			return NewAuthError("CreateTableBucket", principal, "not authorized to create table buckets")
@@ -71,6 +71,7 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 		}
 		if !CheckPermissionWithContext("CreateTableBucket", principal, owner, "", "", &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			IdentityActions:  identityActions,
 			DefaultAllow:     h.defaultAllowFor(r),
