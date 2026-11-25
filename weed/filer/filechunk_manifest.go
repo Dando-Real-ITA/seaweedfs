@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"sync"
-	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
@@ -17,7 +16,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
@@ -92,6 +90,7 @@ type chunkManifestResolver struct {
 	lookupFileIdFn wdclient.LookupFileIdFunctionType
 	invalidator    CacheInvalidator
 	filerJwtFn     security.FilerJwtProvider
+	manifestCache  *ChunkManifestCache
 	jobs           chan chunkManifestResolveJob
 	overflowSem    chan struct{}
 	workers        sync.WaitGroup
@@ -115,7 +114,7 @@ func newChunkManifestResolver(ctx context.Context, lookupFileIdFn wdclient.Looku
 }
 
 func (r *chunkManifestResolver) executeJob(job chunkManifestResolveJob) {
-	job.result.chunks, job.result.err = resolveOneChunkManifest(job.batchCtx, r.lookupFileIdFn, job.chunk, r.invalidator, nil, r.filerJwtFn)
+	job.result.chunks, job.result.err = resolveOneChunkManifest(job.batchCtx, r.lookupFileIdFn, job.chunk, r.invalidator, r.manifestCache, r.filerJwtFn)
 	if job.result.err != nil && r.parentCtx.Err() == nil {
 		if job.batchCtx.Err() != nil && errors.Is(job.result.err, context.Canceled) {
 			job.result.internalCancel = true
@@ -398,105 +397,15 @@ func fetchWholeChunk(ctx context.Context, bytesBuffer *bytes.Buffer, lookupFileI
 		// stream error it provoked is a symptom, not the cause
 		return ctxErr
 	}
-	return retryFetchWithFreshLocations(ctx, invalidator, lookupFileIdFn, fileId, urlStrings, err, func(newUrls []string) error {
-		// the failed attempt may have streamed a partial prefix into the buffer
-		bytesBuffer.Reset()
-		_, retryErr := retriedStreamFetchChunkData(ctx, bytesBuffer, newUrls, jwt, cipherKey, isGzipped, true, 0, 0, nil)
-		return retryErr
-	})
+	// The inner loop refreshes locations and retries even a single volume.
+	return err
 }
 
 // retriedStreamFetchChunkData streams a chunk from the first location that
 // answers. refreshUrls may be nil; when a location failed and a later one
 // answered, it is called so the reads that follow start from a fresh list.
 func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrings []string, jwt string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int, refreshUrls util_http.RefreshUrlsFunc) (written int64, err error) {
-
-	var shouldRetry bool
-	var totalWritten int
-
-	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
-		// Check for context cancellation before starting retry loop
-		select {
-		case <-ctx.Done():
-			return int64(totalWritten), ctx.Err()
-		default:
-		}
-
-		retriedCnt := 0
-		var failed bool
-		for _, urlString := range util_http.ReachableFirst(urlStrings) {
-			// Check for context cancellation before each volume server request
-			select {
-			case <-ctx.Done():
-				return int64(totalWritten), ctx.Err()
-			default:
-			}
-
-			retriedCnt++
-			var localProcessed int
-			var writeErr error
-			shouldRetry, err = util_http.ReadUrlAsStream(ctx, util_http.AppendQueryParameter(urlString, "readDeleted", "true"), jwt, cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
-				// Check for context cancellation during data processing
-				select {
-				case <-ctx.Done():
-					writeErr = ctx.Err()
-					return
-				default:
-				}
-
-				if totalWritten > localProcessed {
-					toBeSkipped := totalWritten - localProcessed
-					if len(data) <= toBeSkipped {
-						localProcessed += len(data)
-						return // skip if already processed
-					}
-					data = data[toBeSkipped:]
-					localProcessed += toBeSkipped
-				}
-				var writtenCount int
-				writtenCount, writeErr = writer.Write(data)
-				localProcessed += writtenCount
-				totalWritten += writtenCount
-			})
-			if writeErr != nil {
-				err = writeErr
-				break
-			}
-			if !shouldRetry {
-				break
-			}
-			if err != nil {
-				failed = true
-				glog.V(0).InfofCtx(ctx, "read %s failed, err: %v", urlString, err)
-			} else {
-				break
-			}
-		}
-		if err == nil && failed && refreshUrls != nil {
-			refreshUrls()
-		}
-		// all nodes have tried it
-		if retriedCnt == len(urlStrings) {
-			break
-		}
-		if err != nil && shouldRetry {
-			glog.V(0).InfofCtx(ctx, "retry reading in %v", waitTime)
-			// Sleep with proper context cancellation and timer cleanup
-			timer := time.NewTimer(waitTime)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return int64(totalWritten), ctx.Err()
-			case <-timer.C:
-				// Continue with retry
-			}
-		} else {
-			break
-		}
-	}
-
-	return int64(totalWritten), err
-
+	return fetchChunkDataWithRetry(ctx, writer, urlStrings, jwt, cipherKey, isGzipped, isFullChunk, offset, size, refreshUrls)
 }
 
 // SmallChunkManifestBatch is how many chunks under smallChunkSize fold into one

@@ -489,13 +489,18 @@ func TestResolveChunkManifestQueuesJobsBeyondWorkerCount(t *testing.T) {
 	// the failing job, which cancels the batch and unblocks the rest.
 	stallRelease := make(chan struct{})
 	stallStarted := make(chan struct{}, 4)
+	emptyManifest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// An empty protobuf manifest is valid, but an empty location list is not.
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer emptyManifest.Close()
 	lookup := func(ctx context.Context, fileID string) ([]string, error) {
 		switch fileID {
 		case "stall-0", "stall-1", "stall-2", "stall-3":
 			stallStarted <- struct{}{}
 			select {
 			case <-stallRelease:
-				return nil, nil
+				return []string{emptyManifest.URL}, nil
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}

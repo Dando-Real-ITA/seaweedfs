@@ -241,22 +241,10 @@ func PrepareStreamContentWithThrottler(ctx context.Context, masterClient wdclien
 			start := time.Now()
 			jwt := jwtFunc(chunkView.FileId)
 			invalidator, _ := masterClient.(CacheInvalidator)
-			written, err := retriedStreamFetchChunkData(ctx, writer, urlStrings, jwt, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize), refreshUrls(ctx, invalidator, masterClient.GetLookupFileIdFunction(), chunkView.FileId))
+			_, err := retriedStreamFetchChunkData(ctx, writer, urlStrings, jwt, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize), refreshUrls(ctx, invalidator, masterClient.GetLookupFileIdFunction(), chunkView.FileId))
 
 			if err != nil && ctx.Err() != nil {
 				return ctx.Err()
-			}
-
-			// If read failed, try to invalidate cache and re-lookup
-			if err != nil && written == 0 {
-				err = retryFetchWithFreshLocations(ctx, invalidator, masterClient.GetLookupFileIdFunction(), chunkView.FileId, urlStrings, err, func(newUrls []string) error {
-					_, refetchErr := retriedStreamFetchChunkData(ctx, writer, newUrls, jwt, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize), nil)
-					if refetchErr == nil {
-						// Update the map so subsequent references use fresh URLs
-						fileId2Url[chunkView.FileId] = newUrls
-					}
-					return refetchErr
-				})
 			}
 
 			offset += int64(chunkView.ViewSize)
@@ -283,15 +271,19 @@ func PrepareStreamContentWithThrottler(ctx context.Context, masterClient wdclien
 
 // PrepareStreamContentWithPrefetch is like PrepareStreamContentWithThrottler but uses
 // concurrent chunk prefetching to overlap network I/O. When prefetchAhead > 1, fetch
-// goroutines establish HTTP connections to volume servers ahead of time, streaming data
-// through io.Pipe with minimal memory overhead.
+// goroutines fetch and validate chunks into bounded memory/disk spools before
+// delivery, so slow clients do not leave unread volume responses open.
 //
 // prefetchAhead controls the number of chunks fetched concurrently:
 //   - 0 or 1: falls back to sequential fetching (same as PrepareStreamContentWithThrottler)
-//   - 2+: uses pipe-based prefetch pipeline with that many concurrent fetches
-func PrepareStreamContentWithPrefetch(ctx context.Context, masterClient wdclient.HasLookupFileIdFunction, jwtFunc VolumeServerJwtFunction, chunks []*filer_pb.FileChunk, offset int64, size int64, downloadMaxBytesPs int64, prefetchAhead int) (DoStreamContent, error) {
+//   - 2+: bounds outstanding fetches and unconsumed spools to this many chunks
+func PrepareStreamContentWithPrefetch(ctx context.Context, masterClient wdclient.HasLookupFileIdFunction, jwtFunc VolumeServerJwtFunction, chunks []*filer_pb.FileChunk, offset int64, size int64, downloadMaxBytesPs int64, prefetchAhead int, caches ...*DownloadCache) (DoStreamContent, error) {
 	if prefetchAhead <= 1 {
 		return PrepareStreamContentWithThrottler(ctx, masterClient, jwtFunc, chunks, offset, size, downloadMaxBytesPs)
+	}
+
+	if len(caches) > 0 && caches[0] != nil {
+		return prepareCachedStreamContent(ctx, masterClient, jwtFunc, chunks, offset, size, downloadMaxBytesPs, prefetchAhead, caches[0])
 	}
 
 	glog.V(4).InfofCtx(ctx, "prepare to stream content with prefetch=%d for chunks: %d", prefetchAhead, len(chunks))
